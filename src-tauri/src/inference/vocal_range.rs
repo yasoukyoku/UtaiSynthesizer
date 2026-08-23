@@ -3329,6 +3329,72 @@ fn parse_dejitter(v: Option<&str>) -> f64 {
 /// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
 const DEJITTER_DEFAULT: f64 = 0.0;
 
+/// ⚙ 出厂默认 = 0.0 = 关 —— `UTAI_RANGE_FORMANT_KNEE=<c>`:**共振峰跟随只在膝盖以外起作用。**
+///
+/// 位移 `s` 半音时,共振峰搬 `c · max(0, |s| − FORMANT_KNEE_ST)` 个半音(符号同 `s`)。
+/// ⇒ **|s| ≤ 6 时恒等于 0,安全区按构造不受影响**,不是靠调参调出来的。
+///
+/// ## 靶子(S159zzh→zzk 验过的那一个,不是我挑的)
+///
+/// 同一批音、**同一个输出音高**、救 vs 不救:被救音的 **H1−H3 / H1−H4 偏高**
+/// = 上方谐波供电不足 = 音源谱倾斜偏离。验收面 **两个模型 × 两个谱面 × 三个母音 × 空对照**:
+/// 鹅妈妈 137 音 H1−H3 均值 −2 **−0.37** · −4 −0.08 · −6 **−1.40** · −8 +1.44 · −10 +4.58 ·
+/// −12 +7.02 · −14 **+11.05**(完全单调,**−6 以内 ≈ 0**);炉心融解 142 音 −6 +1.28 · −14 **+10.60**;
+/// akiko 上同样成立(用户 2026-08-24 主动要求验的跨模型)。
+/// ⇒ **膝盖取 6 半音是从这条曲线读出来的**,与 S159zzb 那条 `envmod` 膝盖(≤8 无效应)独立一致。
+///
+/// ## 实测(`c = 0.5`,整台走 `scripts/range_rulers/rescue_bench.py`)
+///
+/// | 谱面 · 深度 | H1−H3 | H1−H4 | ⛔次基频 | ⛔梳 | ⛔倾斜 |
+/// |---|---|---|---|---|---|
+/// | 鹅妈妈 −10 出厂 | +4.58 | +4.69 | −1.60 | +6.65 | −1.00 |
+/// | 鹅妈妈 −10 **带膝盖** | **+1.49** | **+0.68** | −2.09 | +7.48 | −3.48 |
+/// | 鹅妈妈 −14 出厂 | +11.05 | +7.26 | −0.12 | +5.02 | −1.42 |
+/// | 鹅妈妈 −14 **带膝盖** | **+3.81** | **+3.10** | −0.68 | +4.33 | −2.46 |
+/// | 炉心 −14 出厂 | +10.60 | +10.34 | −1.96 | +1.22 | −0.62 |
+/// | 炉心 −14 **带膝盖** | **+6.45** | **+6.35** | −2.09 | +0.05 | −4.31 |
+///
+/// ⇒ 靶子砍掉 **55-85 %**(炉心 40 %),**两个谱面都成立**。
+///
+/// ## ⛔ 已登记的代价与护栏
+///
+/// * ⚠ **8-12 kHz 倾斜一致地掉 2-3 dB**(出厂各档 −0.04…−3.05 → 带膝盖 −2.46…−4.31)。
+///   机理大概是把包络往上搬之后顶端没内容可搬。
+///   ⛔ **不许用高频 shelf 去补** —— 用户 2026-08-24:「小心不要去手动画波形或者去开 EQ,
+///   那样损伤听感还吃音质」。这条**只作为已知代价登记,交给耳朵裁**。
+/// * ✅ **面状伪影那条护栏(次基频 0.25-0.75 f0)全程往下走**(−0.68 / −2.09 / −2.09)。
+///   用户原话「那个面状伪影问题非常神秘,动不动就会回来」⇒ 这条是**必查项**,不是可选项。
+/// * ✅ 谐波梳深度与电平基本不动(κ 不改它们)。
+/// * ⛔ **常数 κ 判负**:`κ = 0.30` 在 −6 上**既过冲又白掉 3 dB 高频**(H1−H4 +1.83 → **−3.56**,
+///   倾斜 −0.04 → **−3.00**),而那一档本来是干净的。**膝盖不是装饰,是它能不能用的前提。**
+///
+/// ⛔ 翻默认要成对 bump `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`,而且**必须先过盲测**。
+pub fn formant_knee() -> f64 {
+    parse_formant_knee(std::env::var("UTAI_RANGE_FORMANT_KNEE").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+fn parse_formant_knee(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse().ok())
+        .filter(|v: &f64| v.is_finite() && (0.0..=1.0).contains(v))
+        .unwrap_or(FORMANT_KNEE_DEFAULT)
+}
+
+/// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
+const FORMANT_KNEE_DEFAULT: f64 = 0.0;
+
+/// 膝盖的位置(半音)。⛔ 它是从 S159zzk 那条剂量曲线读出来的,不是调出来的 ——
+/// H1−H3 在 −2/−4/−6 上是 −0.37 / −0.08 / −1.40(≈0),到 −8 才 +1.44。
+const FORMANT_KNEE_ST: f64 = 6.0;
+
+/// 位移 `semis` 半音时,共振峰实际搬多少半音。`knee == 0` ⇒ 退回 `κ · semis`(今天,逐位不变)。
+fn formant_shift_semitones(semis: f64, kappa: f32, knee: f64) -> f64 {
+    if knee <= 0.0 {
+        return f64::from(kappa) * semis;
+    }
+    knee * (semis.abs() - FORMANT_KNEE_ST).max(0.0) * semis.signum()
+}
+
 /// ⚙ 出厂默认 = 0 —— LP-PSOLA = 关(S157b 判负,旋钮留着)
 /// S157b —— `UTAI_PSOLA_LPC=<order>`:**LP-PSOLA** —— 颗粒搬运挪进**残差域**。
 /// `0` = 关 = 今天,逐位不变。
@@ -3794,7 +3860,7 @@ pub fn apply_inverse_windowed_with(
                 &audio,
                 sample_rate,
                 semis,
-                f64::from(k) * semis,
+                formant_shift_semitones(semis, k, formant_knee()),
                 f0,
                 hop,
                 frac,
@@ -6206,6 +6272,7 @@ mod tests {
             ("ENV_RESTORE_MS_DEFAULT", "pub fn env_restore_ms("),
             ("BRIDGE_UNVOICED_MS_DEFAULT", "pub fn bridge_unvoiced_ms("),
             ("WINDOWED_INVERSE_DEFAULT", "pub fn windowed_inverse("),
+            ("FORMANT_KNEE_DEFAULT", "pub fn formant_knee("),
             ("DEJITTER_DEFAULT", "pub fn dejitter("),
         ];
         let src = include_str!("vocal_range.rs");
@@ -6267,6 +6334,55 @@ mod tests {
                  ⇒ 翻默认时那段 doc 没跟着改。三个已经翻过的默认都在这一处漏过(见本判据的 doc)。"
             );
         }
+    }
+
+
+    /// ⭐⭐⭐ S159zzl —— **带膝盖的共振峰跟随:关着逐位不变,膝盖以内恒等,越过之后按 `c·(|s|−6)` 起。**
+    ///
+    /// 靶子、实测表、已登记的代价与护栏全在 [`formant_knee`] 的 doc。这条判据钉五件:
+    /// ⑴ `knee == 0` ⇒ 退回 `κ·semis`(今天,**逐位不变**,而且不依赖任何浮点等价);
+    /// ⑵ ⛔ **膝盖以内恒等于 0** —— 这是它相对常数 κ 的**全部理由**:
+    ///    常数 `κ=0.30` 在 −6 上既过冲(H1−H4 +1.83 → −3.56)又白掉 3 dB 高频;
+    /// ⑶ 膝盖以外**线性**且**符号跟着位移走**(下移时共振峰也往下);
+    /// ⑷ ⛔ **膝盖处连续**(`|s| = 6` 左右两侧都是 0)—— 不连续会在计划边界上造出可闻的跳变;
+    /// ⑸ `knee` 的越界值退回出厂,不许静默夹住。
+    #[test]
+    fn the_formant_knee_is_identity_inside_the_knee_and_linear_outside() {
+        // ⑴ 关着 = 今天
+        for k in [0.0f32, 0.3, 1.0] {
+            for s in [-14.0f64, -6.0, 2.0, 14.0] {
+                assert_eq!(
+                    formant_shift_semitones(s, k, 0.0),
+                    f64::from(k) * s,
+                    "knee = 0 必须逐位退回 κ·semis(κ {k}, s {s})"
+                );
+            }
+        }
+        // ⑵ 膝盖以内恒 0 —— 与 κ 无关
+        for s in [-6.0f64, -5.5, -1.0, 0.0, 3.0, 6.0] {
+            assert_eq!(
+                formant_shift_semitones(s, 1.0, 0.5),
+                0.0,
+                "|s| <= {FORMANT_KNEE_ST} 时必须恒等于 0(s {s})—— 安全区不许被碰"
+            );
+        }
+        // ⑶ 膝盖以外线性,符号跟着位移
+        let up = formant_shift_semitones(14.0, 0.0, 0.5);
+        let dn = formant_shift_semitones(-14.0, 0.0, 0.5);
+        assert!((up - 0.5 * (14.0 - FORMANT_KNEE_ST)).abs() < 1e-12, "上移读到 {up}");
+        assert!((dn + 0.5 * (14.0 - FORMANT_KNEE_ST)).abs() < 1e-12, "下移必须反号,读到 {dn}");
+        assert!((formant_shift_semitones(10.0, 0.0, 0.5) - 2.0).abs() < 1e-12);
+        // ⑷ 膝盖处连续
+        let eps = 1e-6;
+        let a = formant_shift_semitones(FORMANT_KNEE_ST - eps, 0.0, 0.5);
+        let b = formant_shift_semitones(FORMANT_KNEE_ST + eps, 0.0, 0.5);
+        assert!(a.abs() < 1e-9 && b.abs() < 1e-6, "膝盖处必须连续(左 {a}, 右 {b})");
+        // ⑸ 旋钮
+        assert_eq!(FORMANT_KNEE_DEFAULT, 0.0, "出厂必须是关的");
+        assert_eq!(parse_formant_knee(None), 0.0);
+        assert!((parse_formant_knee(Some("0.5")) - 0.5).abs() < 1e-12);
+        assert_eq!(parse_formant_knee(Some("1.5")), 0.0, "越界退回出厂,不许静默夹住");
+        assert_eq!(parse_formant_knee(Some("nan")), 0.0, "NaN 不许通过");
     }
 
     #[test]
