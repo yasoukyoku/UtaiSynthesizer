@@ -3310,6 +3310,25 @@ fn parse_xgrain(v: Option<&str>) -> f64 {
 /// ⚠ 而它的代价落在**所有**被救音上 —— 见 [`xgrain`] 的 doc 末尾那条登记。
 const XGRAIN_DEFAULT: f64 = 1.0;
 
+/// ⚙ 出厂默认 = 0.0 = 关 —— `UTAI_PSOLA_DEJITTER=<alpha>`:颗粒**读点**去抖的强度。
+///
+/// 机理、受控实验的读数表、以及它与 WSOLA 的根本区别,全在
+/// `utai_dsp::psola::dejitter_marks` 的 doc(**别在这里再写一份**)。
+/// ⛔ 翻它要成对 bump `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`,而且必须先过盲测。
+pub fn dejitter() -> f64 {
+    parse_dejitter(std::env::var("UTAI_PSOLA_DEJITTER").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+fn parse_dejitter(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse().ok())
+        .filter(|v: &f64| v.is_finite() && (0.0..=1.0).contains(v))
+        .unwrap_or(DEJITTER_DEFAULT)
+}
+
+/// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
+const DEJITTER_DEFAULT: f64 = 0.0;
+
 /// ⚙ 出厂默认 = 0 —— LP-PSOLA = 关(S157b 判负,旋钮留着)
 /// S157b —— `UTAI_PSOLA_LPC=<order>`:**LP-PSOLA** —— 颗粒搬运挪进**残差域**。
 /// `0` = 关 = 今天,逐位不变。
@@ -3789,6 +3808,7 @@ pub fn apply_inverse_windowed_with(
                 lpc,
                 keep,
                 fill,
+                dejitter(),
             );
             // ⛔⛔ S159 —— 判据是 `islands_seen`(窗过滤**之前**的候选岛数),不是 `islands`。
             // 加了窗之后 `islands == 0` 多了一个**正常**的来源:这一遍的窗全落在休止里。
@@ -6186,6 +6206,7 @@ mod tests {
             ("ENV_RESTORE_MS_DEFAULT", "pub fn env_restore_ms("),
             ("BRIDGE_UNVOICED_MS_DEFAULT", "pub fn bridge_unvoiced_ms("),
             ("WINDOWED_INVERSE_DEFAULT", "pub fn windowed_inverse("),
+            ("DEJITTER_DEFAULT", "pub fn dejitter("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
@@ -6721,7 +6742,7 @@ mod tests {
     /// ⇒ 表在 `utai_dsp::psola::PROBE_ARM_DEFAULTS`,这一条让「改了默认却没改表」变成红。
     #[test]
     fn the_probe_defaults_are_the_production_defaults() {
-        let want: [(&str, f64); 10] = [
+        let want: [(&str, f64); 11] = [
             ("UTAI_PSOLA_FRAC", f64::from(u8::from(parse_frac_transport(None)))),
             ("UTAI_PSOLA_WSOLA", parse_wsola_frac(None)),
             ("UTAI_PSOLA_LOCK", parse_phase_lock(None)),
@@ -6732,6 +6753,7 @@ mod tests {
             ("UTAI_PSOLA_WIN", parse_win_periods(None)),
             ("UTAI_PSOLA_XGRAIN", parse_xgrain(None)),
             ("UTAI_PSOLA_LPC", parse_lpc_order(None) as f64),
+            ("UTAI_PSOLA_DEJITTER", parse_dejitter(None)),
         ];
         let table = utai_dsp::psola::PROBE_ARM_DEFAULTS;
         assert_eq!(

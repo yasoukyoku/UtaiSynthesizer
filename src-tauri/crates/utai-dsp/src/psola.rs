@@ -1173,7 +1173,86 @@ fn infrasonic_width_ms(src_periods: &[f64], sample_rate: u32, ratio: f64) -> f64
 /// that test goes red. (Same shape as `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`.)
 ///
 /// Booleans are 0.0 / 1.0; the rest are the knob's own unit (ms, periods, fraction).
-pub const PROBE_ARM_DEFAULTS: [(&str, f64); 10] = [
+/// S159zzf —— **读点用【局部理想】的标记,而不是实际抖动的那个。**`0.0` = 关 = 今天,逐位不变。
+///
+/// # ⛔⛔ 判负(S159zzf 当天实测)—— 旋钮留着只为把下面那张受控实验表留在原地
+///
+/// | alpha | [1035] | [515] | 全曲中位 Δ | 变脏% | 梳深 Δ |
+/// |---|---|---|---|---|---|
+/// | 0(出厂) | −1.72 | −2.76 | — | — | — |
+/// | 0.25 | −1.74 | −2.51 | **+0.01** | 64 % | −0.20 |
+/// | 1.00 | −1.72 | **−1.79**(更差) | **+0.11** | 72 % | −1.03 |
+///
+/// ⇒ **一点用都没有,而且 [515] 反而变差。**音高闸全程 98.7-99.1 %(设计如此),所以不是臂坏了。
+///
+/// ⭐ **它错在哪(这条比读数值钱)**:抖动在**波形内容自己的周期**里,不在**我们把读窗放哪儿**里。
+/// 挪读点**不会**让内容的周期变规整 —— 只会让窗偏离脉冲(`lock_phase` 正是为了避免这个),
+/// 于是收益为零、代价照付。**真要去抖必须把音频【时间弯曲】,不是挪读点。**
+/// ⇒ 下一步该验的是「把 donor 按标记重采样成恒定周期 → PSOLA → 再弯回去」,而不是再调这个 alpha。
+///
+/// ## 机理(受控实验证出来的,不是推的)
+///
+/// 同一个源周期被连续用 `ratio` 次;**换到下一个源周期时**,若 `T_k ≠ T_{k+1}`,铺排就出现
+/// 一次相位跳变 —— 在 2-4 kHz 上几个样本的错位就是几十度,于是那一处忽强忽弱。
+/// 这些跳变以 `F_src` 的速率出现、幅度随机 ⇒ 序列带限在 `F_src/2`(≈185 Hz)
+/// ⇒ **正好落在 `envmod` 量的 20-200 Hz**。
+///
+/// ⭐ 受控实验(合成元音,固定共振峰,**只改源周期抖动**;`inverse_probe` +14;
+/// 读数 = 输出在 2-4 kHz 的 `envmod`):
+///
+/// | 抖动 | 0 % | 0.5 % | 1 % | 2 % | 4 % |
+/// |---|---|---|---|---|---|
+/// | 输出调制 | **−39.1** | −12.3 | −6.3 | −2.8 | −2.2 |
+///
+/// ⇒ **抖动为零时 PSOLA 几乎不产生调制**;抖动一上来就产生。
+/// ⛔ 阴性对照在**每一个** ratio 上都成立(+2…+16,抖动 0 那一列一律 ≤ −39 dB)。
+/// ⚠ 真实 donor 的周期抖动实测:原生 MIDI 76-78 **2.63 %**,−2 **2.85** · −6 **2.65** ·
+/// −12 **2.99** · **−14 4.30 %**(p90 7.60)—— 与上表对照,量级正好落在「油」的读数上。
+/// ⛔ 合成台只用来标定机理,**永远不许拿它判算法好坏**(`range_rulers/README.md` A 档那条)。
+///
+/// ## 这一刀做什么
+///
+/// 把标记序列在**「下标 ↔ 时间」**上做局部线性拟合,得到「理想」位置(= 局部恒定周期),
+/// 读点按 `alpha` 在实际与理想之间插值。**局部拟合保平均间距 ⇒ 音高按构造不变**
+/// (`inverse_probe` 的音高闸会当场验它)。
+///
+/// ⛔ **只改读【点】,不碰几何**:`tgt`(输出摆放)、`src_l`/`src_r`、`wmax`、`lw`/`rw`
+/// 全部仍按原来的 `src` 算 —— 输出时基一个字节不动。
+/// ⛔ 与 WSOLA 的**根本区别**:那个做**相似度搜索**,而最像的就是源自己的下一个周期
+/// ⇒ 它会把 PSOLA 退化成恒等变换(S159zze 实测 −1228 cents)。这里**没有搜索**,
+/// 位置由拟合定死,偏移的均值结构上为零 ⇒ 音高不可能漂。
+///
+/// ⚠ 已知代价:读窗不再精确压在脉冲上(偏移约等于抖动本身,2-4 % 个周期)。
+/// `lock_phase` 把标记钉在脉冲上正是为了避免这个 ⇒ 这是一笔**取舍**,`alpha` 是它的旋钮。
+fn dejitter_marks(src: &[f64], alpha: f64, span: usize) -> Vec<f64> {
+    if alpha <= 0.0 || src.len() < 3 {
+        return src.to_vec();
+    }
+    let n = src.len();
+    let h = span.max(1);
+    (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(h);
+            let hi = (i + h + 1).min(n);
+            let m = (hi - lo) as f64;
+            let mean_x = (lo..hi).map(|j| j as f64).sum::<f64>() / m;
+            let mean_y = src[lo..hi].iter().sum::<f64>() / m;
+            let sxy: f64 = (lo..hi).map(|j| (j as f64 - mean_x) * (src[j] - mean_y)).sum();
+            let sxx: f64 = (lo..hi).map(|j| (j as f64 - mean_x).powi(2)).sum();
+            if sxx <= 0.0 {
+                return src[i];
+            }
+            let ideal = mean_y + (sxy / sxx) * (i as f64 - mean_x);
+            src[i] + alpha * (ideal - src[i])
+        })
+        .collect()
+}
+
+/// 局部拟合的半宽(标记数)。⚠ 太宽会把**颤音**也当成抖动抹掉:5 个标记在 350 Hz 上是 14 ms,
+/// 远短于任何颤音周期(≥100 ms),而足够长于逐周期抖动。
+const DEJITTER_SPAN: usize = 5;
+
+pub const PROBE_ARM_DEFAULTS: [(&str, f64); 11] = [
     // S157c —— 翻成默认开:整曲实测被救高音的谐波间噪声 −7.0 dB(1000-2100 Hz,地板 0.13)。
     ("UTAI_PSOLA_FRAC", 1.0),
     ("UTAI_PSOLA_WSOLA", 0.0),
@@ -1186,6 +1265,8 @@ pub const PROBE_ARM_DEFAULTS: [(&str, f64); 10] = [
     ("UTAI_PSOLA_XGRAIN", 1.0),
     // S157b —— LP-PSOLA 的阶数。⚠ 它是 f64 只因为这张表是 f64;读的时候取整。
     ("UTAI_PSOLA_LPC", 0.0),
+    // S159zzf —— 读点去抖的强度。0 = 关。
+    ("UTAI_PSOLA_DEJITTER", 0.0),
 ];
 
 // ── S157b —— LP-PSOLA:把颗粒搬运挪进【残差域】 ───────────────────────────────
@@ -2170,7 +2251,7 @@ pub fn psola_shift_win(
     psola_shift_edge(
         x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
         phase_lock, infrasonic, env_restore_ms, bridge_unvoiced_ms, win_periods, xgrain, lpc_order,
-        keep, false,
+        keep, false, 0.0,
     )
 }
 
@@ -2225,6 +2306,8 @@ pub fn psola_shift_edge(
     lpc_order: usize,
     keep: &[(usize, usize)],
     edge_fill: bool,
+    // S159zzf —— 读点去抖的强度(0…1)。`0.0` = 关 = 逐位不变。见 [`dejitter_marks`]。
+    dejitter: f64,
 ) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
@@ -2397,6 +2480,8 @@ pub fn psola_shift_edge(
         island_edges.push((c0, c1));
         // S159zj —— 爬坡宽度取**第一颗/最后一颗真的落下去**的颗粒(被 `wmax` 跳过的不算),
         // 否则这一刀会去补一段根本没有颗粒的区间。见 `psola_shift_edge` 的 doc。
+        // S159zzf —— 这条岛的**去抖读点表**(几何仍然用 `src`,见 [`dejitter_marks`])。
+        let src_rd = dejitter_marks(&src, dejitter, DEJITTER_SPAN);
         let (mut first_lw, mut last_rw) = (f64::NAN, f64::NAN);
         for s in covered.iter_mut().take(c1).skip(c0) {
             *s = true;
@@ -2517,6 +2602,8 @@ pub fn psola_shift_edge(
             //
             // ⚠ `xgrain == 0.0` 时走的是**原来那一行**,不是「权重 (1,0) 的两颗粒」——
             //   后者依赖 `round()` 与 `fr < 0.5` 的等价性,而我不想让逐位恒等挂在那个等价性上。
+            // S159zzf —— 读点去抖(见 [`dejitter_marks`])。⛔ 只换读点,几何仍用 `src`。
+            let rd = |i: usize| -> f64 { src_rd[i.min(src_rd.len() - 1)] };
             let (p0, g0, p1, g1) = if xgrain > 0.0 {
                 let uu = us[i];
                 let lo = (uu as usize).min(src.len() - 1);
@@ -2525,14 +2612,15 @@ pub fn psola_shift_edge(
                 let (nl, nh) = if fr < 0.5 { (1.0, 0.0) } else { (0.0, 1.0) };
                 // wsola 挪的是**读点**,对两颗粒施加同一个位移(wsola 默认 0 ⇒ off = 0)。
                 let off = s_pos - src[k];
+                let (lo, hi) = (lo, hi);
                 (
-                    src[lo] + off,
+                    rd(lo) + off,
                     (1.0 - xgrain) * nl + xgrain * (1.0 - fr),
-                    src[hi] + off,
+                    rd(hi) + off,
                     (1.0 - xgrain) * nh + xgrain * fr,
                 )
             } else {
-                (s_pos, 1.0, 0.0, 0.0)
+                (s_pos + (rd(k) - src[k]), 1.0, 0.0, 0.0)
             };
             // S151 —— **源覆盖率**:这一颗粒从源上读的是 `[s_pos − lw, s_pos + rw)`。上移时
             // `lw = rw = T_src / ratio`(上面那两个 `min` 取的是目标邻距),所以一旦
@@ -3435,7 +3523,7 @@ mod tests {
         let run = |st: f64, win: f64, fill: bool| {
             psola_shift_edge(
                 &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, win, 0.0, 0,
-                &[], fill,
+                &[], fill, 0.0,
             )
         };
 
