@@ -7876,6 +7876,15 @@ mod tests {
         let y = apply_inverse_with(engine, x, spec.sample_rate, shift, kappa, Some((&f0, hop)))
             .expect("inverse");
         assert_eq!(y.len(), n, "exact-length contract");
+        // ⛔ S159zz —— 下面那条 wav 出口是 **PCM_16 + 逐臂峰值归一**:比值型尺子不怕增益,
+        // 但量化地板骗过我们一次了(S159z 的「唱音内绝对静音」)。⇒ 想量小差就读这份原始 f32。
+        if let Ok(p) = std::env::var("UTAI_INV_DUMP") {
+            let mut b = Vec::with_capacity(y.len() * 4);
+            for v in &y {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(&p, b).expect("dump");
+        }
         let peak = y.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
         let g = 0.92 / peak;
         let mut w = hound::WavWriter::create(

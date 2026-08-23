@@ -1,435 +1,491 @@
 {
- "_why": "预注册。g2p_rulers/README.md 第 3 条:期望答案在跑之前写死,每条带『凭什么它不容争辩』。这里分两类,⛔ 不许混着引用:predictions = 与本工装无关就能知道的真值(尺子错了才会不过);fingerprints = 本工装在 S145 夹具上量出来的数,只用来查漂移(它们不是真值,是指纹)。",
- "_provenance": "S145(2026-08-14)炉心融解 bars28-44 × Sovits4.1东雪莲主模型;工装复现于 S146(2026-08-14),读数与 project_v2_session145 §A3 的表逐位相同。",
- "calibration": {
-  "_why": "口径闸。变异测试实测(S146):把包络尺的对数轴从 200-9000 改成 300-6000,**A 档零红**,而真素材上 k0 从 +2.40 变成 +3.15。⇒ 『尺子还能量出正确答案』与『尺子还是同一把尺子』是两件事,后者需要单独一条判据。⚠ 同一次实测也说明:排序(psola 0.30/0.40 ≪ k0 2.40/3.15)对轴不敏感,但**绝对数只在同一口径下可比**。",
-  "rulers.FLO": 200.0,
-  "rulers.FHI": 9000.0,
-  "rulers.CENTS_PER_BIN": 10.0,
-  "rulers.MAXLAG": 90,
-  "rulers.NAX": 659,
-  "rulers.FRAME_PERIOD_MS": 5.0,
-  "rulers.F0_FLOOR": 80.0,
-  "rulers.F0_CEIL": 1500.0,
-  "rulers.NFFT": 1024,
-  "rulers.HOP": 220,
-  "rulers.FLUX_LO": 2000.0,
-  "rulers.FLUX_HI": 11000.0,
-  "rulers.SMEAR_SECONDS": 0.002,
-  "rulers.HNR_TIME_STEP": 0.01,
-  "rulers.HNR_MIN_PITCH": 75.0,
-  "arms.PRAAT_TIME_STEP": 0.01,
-  "arms.PRAAT_PITCH_FLOOR": 75.0,
-  "arms.PRAAT_PITCH_CEILING": 1400.0
- },
- "fixtures": {
-  "dir_env": "UTAI_RANGE_FIXTURES",
-  "dir_default": "D:\\MyDev\\TESTING\\s145_range_color\\lch",
-  "_note": "夹具在仓库外(体积)。指纹不符 ⇒ 退 3【跑不起来】,不许退 1,更不许当通过 —— 换过夹具的读数与登记值不构成比较(g2p_rulers 第 8 条)。",
-  "sample_rate": 44100,
-  "samples": 1635328,
-  "sha256": {
-   "arm_raw.wav": "8989c5302a7b707a6a4b79b7af10c9b175d0ffb40aebac2014040598133364e1",
-   "arm_k0.wav": "222d1232cd349b295b19b85bac80e25f994361afa961042ef9de98d76894e986",
-   "arm_k1.wav": "befd3da24702d875b3cdc666c302237a89bce98c394b0b4dd30939021ea5505f",
-   "arm_world.wav": "090d33a51c95f60225cf9443b26d8ac4c8e9c625419923daeebe5121d10eba0b",
-   "arm_psola.wav": "fca51cda1fb1f934c32699878b5235553866fba8af58d6fabd38bd0a7712f141",
-   "arm_off.wav": "45e5eedd040a21b1b712bed02be80e58ed94b38075a6cd06b0154a382b8b558c"
-  }
- },
- "window": {
-  "spans": [
-   [
-    396924,
-    458668
-   ],
-   [
-    910279,
-    972023
-   ]
-  ],
-  "shift_st": 6.0,
-  "_provenance": "生产 dead_group_windows 在这一片上产出的两条被救乐句窗:notes[186..191] 与 notes[234..239],音高均 [75,76,85,83,81,80],各 1.40 s。⛔ 登记成字面量而不是在尺子里再复刻一遍生产逻辑 —— 那会造出第二份 dead_group_windows 并慢慢漂开。",
-  "_identity": "notes[186..191] 与整曲 2911 base 点已与用户 S142 实机日志逐字对上(project_v2_session145 §1)。"
- },
- "note_delta": {
-  "_why": "S148 —— 逐音配对 Δ 的预注册。⛔ 绝对读数在这条线上一律作废:S147 的两把新尺子(ASR/EDR)量出「被抱怨的音排在全曲前列」,而同样那几个音在一条 **PSOLA 一次都没跑** 的渲染上仍占前 1-6 名(Spearman +0.929),且在那条零位移臂上 `corr(读数, |计划位移|) = +0.880` —— 救援计划优先挑的就是这把尺子读数高的音。⇒ 只有【同一个音、两条臂、相减】站得住。",
-  "_window_rule": "窗 = 该音**全部 phone 的并集**(`mg_lane.json` 的 `phones[]`,生产产物,零复刻);起音区的锚点是**音符边界**不是窗起点。⛔ 不许用 `notes[].frame0` 当窗起点:实测窗外能量占比 `notes[]` 最好 0.523%(offset −1)vs `phones[]` **0.0263%**(offset 0),长休止 p99 泄漏 −45.1 → **−74.5 dB**。⭐ 顺带证伪「音频比谱面栅格早约 2 帧」——那是用 `notes[]` 量出来的假象,换 `phones[]` 后最佳 offset 就是 0,那 2 帧整个是 consonant preroll。⛔ `phones[].zero_frames` 清的是 `note_hz` 不是音频:`[753]` 的 `/t/` 在那 5 个 \"zeroed\" 帧里峰值 −1.00 dBFS。",
-  "dir_env": "UTAI_NOTE_DELTA_FIXTURES",
-  "dir_default": "D:\\MyDev\\TESTING\\不为人所知的鹅妈妈童谣\\probe",
-  "lane": "mg_lane.json",
-  "baseline_arm": "s148\\F_full_s0.wav",
-  "full_samples": 12837888,
-  "caliber": {
-   "ATTACK_MS": 30.0,
-   "BODY_SKIP_MS": 60.0,
-   "LOW_HZ": 1000.0,
-   "FPS": 50.0
+  "_why": "预注册。g2p_rulers/README.md 第 3 条:期望答案在跑之前写死,每条带『凭什么它不容争辩』。这里分两类,⛔ 不许混着引用:predictions = 与本工装无关就能知道的真值(尺子错了才会不过);fingerprints = 本工装在 S145 夹具上量出来的数,只用来查漂移(它们不是真值,是指纹)。",
+  "_provenance": "S145(2026-08-14)炉心融解 bars28-44 × Sovits4.1东雪莲主模型;工装复现于 S146(2026-08-14),读数与 project_v2_session145 §A3 的表逐位相同。",
+  "calibration": {
+    "_why": "口径闸。变异测试实测(S146):把包络尺的对数轴从 200-9000 改成 300-6000,**A 档零红**,而真素材上 k0 从 +2.40 变成 +3.15。⇒ 『尺子还能量出正确答案』与『尺子还是同一把尺子』是两件事,后者需要单独一条判据。⚠ 同一次实测也说明:排序(psola 0.30/0.40 ≪ k0 2.40/3.15)对轴不敏感,但**绝对数只在同一口径下可比**。",
+    "rulers.FLO": 200.0,
+    "rulers.FHI": 9000.0,
+    "rulers.CENTS_PER_BIN": 10.0,
+    "rulers.MAXLAG": 90,
+    "rulers.NAX": 659,
+    "rulers.FRAME_PERIOD_MS": 5.0,
+    "rulers.F0_FLOOR": 80.0,
+    "rulers.F0_CEIL": 1500.0,
+    "rulers.NFFT": 1024,
+    "rulers.HOP": 220,
+    "rulers.FLUX_LO": 2000.0,
+    "rulers.FLUX_HI": 11000.0,
+    "rulers.SMEAR_SECONDS": 0.002,
+    "rulers.HNR_TIME_STEP": 0.01,
+    "rulers.HNR_MIN_PITCH": 75.0,
+    "arms.PRAAT_TIME_STEP": 0.01,
+    "arms.PRAAT_PITCH_FLOOR": 75.0,
+    "arms.PRAAT_PITCH_CEILING": 1400.0
   },
-  "sha256": {
-   "mg_lane.json": "9fc70ee5ef1e0c5f54ef2cd9de2f157cacbf07394f48c2ef1d9c36b7e400f350",
-   "s148\\F_full_s0.wav": "f72b97b27936a20437eede9772f4b419e52c993b09a369af826e08559ce40c4c",
-   "mg_deadonly_A_akiko_320000.wav": "f1aa27c789d717712661edb8d55edc51030c86db951b2eedc7a3b1e4eaa66db0",
-   "mg_deadonly_A2_akiko_320000.wav": "aed9196ca9ca27ff345e211e3a46950217e660963eb06871fe7c8614136aa2c3"
-  },
-  "floor_same_config": {
-   "_what": "整曲同配置两跑(A 与 A2:同一条命令、同一份计划、同一个 binary,只是跑了两遍)的逐音 |Δ|。**这才是地板**;⛔ 别用切片两跑的数当整曲的地板 —— 切片(5.8 s 单 chunk)量出来 |Δrms| max 0.016,而整曲是 7.80,差 487 倍,因为整曲多了 25 个 chunk 的累积 + 全曲 `peak_normalize` 的全局峰。",
-   "arm_a": "mg_deadonly_A_akiko_320000.wav",
-   "arm_b": "mg_deadonly_A2_akiko_320000.wav",
-   "n": 706,
-   "percentiles": {
-    "onset_peak_dbfs": {
-     "p50": 0.0079,
-     "p90": 0.0526,
-     "p99": 0.4716,
-     "max": 6.1705
-    },
-    "attack_db": {
-     "p50": 0.0088,
-     "p90": 0.0656,
-     "p99": 0.4232,
-     "max": 6.202
-    },
-    "rms_db": {
-     "p50": 0.0013,
-     "p90": 0.0282,
-     "p99": 0.249,
-     "max": 7.797
-    },
-    "low_ratio": {
-     "p50": 0.0001,
-     "p90": 0.0021,
-     "p99": 0.0214,
-     "max": 0.1026
-    },
-    "ripple_db": {
-     "p50": 0.002,
-     "p90": 0.0176,
-     "p99": 0.0966,
-     "max": 2.2392
+  "fixtures": {
+    "dir_env": "UTAI_RANGE_FIXTURES",
+    "dir_default": "D:\\MyDev\\TESTING\\s145_range_color\\lch",
+    "_note": "夹具在仓库外(体积)。指纹不符 ⇒ 退 3【跑不起来】,不许退 1,更不许当通过 —— 换过夹具的读数与登记值不构成比较(g2p_rulers 第 8 条)。",
+    "sample_rate": 44100,
+    "samples": 1635328,
+    "sha256": {
+      "arm_raw.wav": "8989c5302a7b707a6a4b79b7af10c9b175d0ffb40aebac2014040598133364e1",
+      "arm_k0.wav": "222d1232cd349b295b19b85bac80e25f994361afa961042ef9de98d76894e986",
+      "arm_k1.wav": "befd3da24702d875b3cdc666c302237a89bce98c394b0b4dd30939021ea5505f",
+      "arm_world.wav": "090d33a51c95f60225cf9443b26d8ac4c8e9c625419923daeebe5121d10eba0b",
+      "arm_psola.wav": "fca51cda1fb1f934c32699878b5235553866fba8af58d6fabd38bd0a7712f141",
+      "arm_off.wav": "45e5eedd040a21b1b712bed02be80e58ed94b38075a6cd06b0154a382b8b558c"
     }
-   },
-   "_tail": "⛔ **重尾,别只报 max**:`rms_db` 的 p50 是 0.0013 而 max 是 7.80,后者几乎全部来自 **`[512] が`** —— 一个 0.18 s 的短音,模型在两次渲染之间偶发掉 8 dB。⇒ 判据一律用 p50/p90;单个音超出 p99 只说明它不稳定,不说明改动生效。这条是实测抓出来的:第一次看到 A vs B 在 `[512]` 上差 7.93 dB 时我以为是 B 的计划泄漏,而 A vs A2 在同一个音上差 7.80。",
-   "_negative_control": "同一个文件与自己比 ⇒ 全部 Δ 恒 0(证明工装本身无随机性)。⚠ 那是**恒等式不是阴性对照**,它只能证明工装干净,不能替代上面那份两跑地板。"
   },
-  "separation": {
-   "_why": "⛔ ③ 与 ④ 合起来仍有一个洞:**一把「永远返回常数」的尺子会同时通过它们** —— 自比恒 0、地板也恒 0。⇒ 必须再加一条【正】判据:拿零救援基线臂与生产臂比,被救援的音**必须**读出很大的 Δ,而没被救援的音**必须**落在地板里。两侧都钉,那把常数尺子和一把「什么都读得到」的尺子就都过不去。",
-   "ref": "s148\\F_full_s0.wav",
-   "cand": "mg_deadonly_A_akiko_320000.wav",
-   "plan_json": "mg_deadonly_A_akiko_320000.plan.json",
-   "measured": {
-    "rescued_n": 239,
-    "unrescued_n": 467,
-    "rescued_rms_p50": 1.1383,
-    "rescued_rms_p90": 10.2147,
-    "unrescued_rms_p50": 0.0008,
-    "unrescued_rms_p90": 0.0025,
-    "rescued_onset_p50": 1.4661,
-    "unrescued_onset_p50": 0.0063
-   },
-   "gate": {
-    "rescued_rms_p50_min": 0.5,
-    "unrescued_rms_p50_max": 0.01,
-    "ratio_min": 100.0
-   },
-   "_note": "闸的三个数是**实测值的安全边**(实测 1.1383 / 0.0008 / 1400×),不是从实测值算出来的 —— 拿被测量算期望值是恒真的空判据(S146f 一场犯四次)。"
+  "window": {
+    "spans": [
+      [
+        396924,
+        458668
+      ],
+      [
+        910279,
+        972023
+      ]
+    ],
+    "shift_st": 6.0,
+    "_provenance": "生产 dead_group_windows 在这一片上产出的两条被救乐句窗:notes[186..191] 与 notes[234..239],音高均 [75,76,85,83,81,80],各 1.40 s。⛔ 登记成字面量而不是在尺子里再复刻一遍生产逻辑 —— 那会造出第二份 dead_group_windows 并慢慢漂开。",
+    "_identity": "notes[186..191] 与整曲 2911 base 点已与用户 S142 实机日志逐字对上(project_v2_session145 §1)。"
   },
-  "window_rule_gate": {
-   "_why": "⛔ 变异探针实测:把窗从 `phones[]` 改回 `notes[]`(= 丢掉 consonant preroll),**上面 ①-⑤ 全绿** —— 因为 ③④⑤ 都是「两条臂用同一套窗」的比较,窗错位在两侧同时发生、**相消了**。⇒ 窗规则必须有一条**只看单条臂**的判据。",
-   "arm": "s148\\F_full_s0.wav",
-   "measured": {
-    "out_of_window_energy_pct": 0.1595,
-    "coverage_pct": 68.22,
-    "_alternative_notes_windows_pct": 1.246
-   },
-   "gate": {
-    "out_of_window_energy_pct_max": 0.5
-   },
-   "_note": "闸设在 0.5%:实测 phones[] 是 **0.16%**,而错误的 notes[] 是 **1.25%** —— 闸落在两者之间且不贴任何一边。"
+  "note_delta": {
+    "_why": "S148 —— 逐音配对 Δ 的预注册。⛔ 绝对读数在这条线上一律作废:S147 的两把新尺子(ASR/EDR)量出「被抱怨的音排在全曲前列」,而同样那几个音在一条 **PSOLA 一次都没跑** 的渲染上仍占前 1-6 名(Spearman +0.929),且在那条零位移臂上 `corr(读数, |计划位移|) = +0.880` —— 救援计划优先挑的就是这把尺子读数高的音。⇒ 只有【同一个音、两条臂、相减】站得住。",
+    "_window_rule": "窗 = 该音**全部 phone 的并集**(`mg_lane.json` 的 `phones[]`,生产产物,零复刻);起音区的锚点是**音符边界**不是窗起点。⛔ 不许用 `notes[].frame0` 当窗起点:实测窗外能量占比 `notes[]` 最好 0.523%(offset −1)vs `phones[]` **0.0263%**(offset 0),长休止 p99 泄漏 −45.1 → **−74.5 dB**。⭐ 顺带证伪「音频比谱面栅格早约 2 帧」——那是用 `notes[]` 量出来的假象,换 `phones[]` 后最佳 offset 就是 0,那 2 帧整个是 consonant preroll。⛔ `phones[].zero_frames` 清的是 `note_hz` 不是音频:`[753]` 的 `/t/` 在那 5 个 \"zeroed\" 帧里峰值 −1.00 dBFS。",
+    "dir_env": "UTAI_NOTE_DELTA_FIXTURES",
+    "dir_default": "D:\\MyDev\\TESTING\\不为人所知的鹅妈妈童谣\\probe",
+    "lane": "mg_lane.json",
+    "baseline_arm": "s148\\F_full_s0.wav",
+    "full_samples": 12837888,
+    "caliber": {
+      "ATTACK_MS": 30.0,
+      "BODY_SKIP_MS": 60.0,
+      "LOW_HZ": 1000.0,
+      "FPS": 50.0
+    },
+    "sha256": {
+      "mg_lane.json": "9fc70ee5ef1e0c5f54ef2cd9de2f157cacbf07394f48c2ef1d9c36b7e400f350",
+      "s148\\F_full_s0.wav": "f72b97b27936a20437eede9772f4b419e52c993b09a369af826e08559ce40c4c",
+      "mg_deadonly_A_akiko_320000.wav": "f1aa27c789d717712661edb8d55edc51030c86db951b2eedc7a3b1e4eaa66db0",
+      "mg_deadonly_A2_akiko_320000.wav": "aed9196ca9ca27ff345e211e3a46950217e660963eb06871fe7c8614136aa2c3"
+    },
+    "floor_same_config": {
+      "_what": "整曲同配置两跑(A 与 A2:同一条命令、同一份计划、同一个 binary,只是跑了两遍)的逐音 |Δ|。**这才是地板**;⛔ 别用切片两跑的数当整曲的地板 —— 切片(5.8 s 单 chunk)量出来 |Δrms| max 0.016,而整曲是 7.80,差 487 倍,因为整曲多了 25 个 chunk 的累积 + 全曲 `peak_normalize` 的全局峰。",
+      "arm_a": "mg_deadonly_A_akiko_320000.wav",
+      "arm_b": "mg_deadonly_A2_akiko_320000.wav",
+      "n": 706,
+      "percentiles": {
+        "onset_peak_dbfs": {
+          "p50": 0.0079,
+          "p90": 0.0526,
+          "p99": 0.4716,
+          "max": 6.1705
+        },
+        "attack_db": {
+          "p50": 0.0088,
+          "p90": 0.0656,
+          "p99": 0.4232,
+          "max": 6.202
+        },
+        "rms_db": {
+          "p50": 0.0013,
+          "p90": 0.0282,
+          "p99": 0.249,
+          "max": 7.797
+        },
+        "low_ratio": {
+          "p50": 0.0001,
+          "p90": 0.0021,
+          "p99": 0.0214,
+          "max": 0.1026
+        },
+        "ripple_db": {
+          "p50": 0.002,
+          "p90": 0.0176,
+          "p99": 0.0966,
+          "max": 2.2392
+        }
+      },
+      "_tail": "⛔ **重尾,别只报 max**:`rms_db` 的 p50 是 0.0013 而 max 是 7.80,后者几乎全部来自 **`[512] が`** —— 一个 0.18 s 的短音,模型在两次渲染之间偶发掉 8 dB。⇒ 判据一律用 p50/p90;单个音超出 p99 只说明它不稳定,不说明改动生效。这条是实测抓出来的:第一次看到 A vs B 在 `[512]` 上差 7.93 dB 时我以为是 B 的计划泄漏,而 A vs A2 在同一个音上差 7.80。",
+      "_negative_control": "同一个文件与自己比 ⇒ 全部 Δ 恒 0(证明工装本身无随机性)。⚠ 那是**恒等式不是阴性对照**,它只能证明工装干净,不能替代上面那份两跑地板。"
+    },
+    "separation": {
+      "_why": "⛔ ③ 与 ④ 合起来仍有一个洞:**一把「永远返回常数」的尺子会同时通过它们** —— 自比恒 0、地板也恒 0。⇒ 必须再加一条【正】判据:拿零救援基线臂与生产臂比,被救援的音**必须**读出很大的 Δ,而没被救援的音**必须**落在地板里。两侧都钉,那把常数尺子和一把「什么都读得到」的尺子就都过不去。",
+      "ref": "s148\\F_full_s0.wav",
+      "cand": "mg_deadonly_A_akiko_320000.wav",
+      "plan_json": "mg_deadonly_A_akiko_320000.plan.json",
+      "measured": {
+        "rescued_n": 239,
+        "unrescued_n": 467,
+        "rescued_rms_p50": 1.1383,
+        "rescued_rms_p90": 10.2147,
+        "unrescued_rms_p50": 0.0008,
+        "unrescued_rms_p90": 0.0025,
+        "rescued_onset_p50": 1.4661,
+        "unrescued_onset_p50": 0.0063
+      },
+      "gate": {
+        "rescued_rms_p50_min": 0.5,
+        "unrescued_rms_p50_max": 0.01,
+        "ratio_min": 100.0
+      },
+      "_note": "闸的三个数是**实测值的安全边**(实测 1.1383 / 0.0008 / 1400×),不是从实测值算出来的 —— 拿被测量算期望值是恒真的空判据(S146f 一场犯四次)。"
+    },
+    "window_rule_gate": {
+      "_why": "⛔ 变异探针实测:把窗从 `phones[]` 改回 `notes[]`(= 丢掉 consonant preroll),**上面 ①-⑤ 全绿** —— 因为 ③④⑤ 都是「两条臂用同一套窗」的比较,窗错位在两侧同时发生、**相消了**。⇒ 窗规则必须有一条**只看单条臂**的判据。",
+      "arm": "s148\\F_full_s0.wav",
+      "measured": {
+        "out_of_window_energy_pct": 0.1595,
+        "coverage_pct": 68.22,
+        "_alternative_notes_windows_pct": 1.246
+      },
+      "gate": {
+        "out_of_window_energy_pct_max": 0.5
+      },
+      "_note": "闸设在 0.5%:实测 phones[] 是 **0.16%**,而错误的 notes[] 是 **1.25%** —— 闸落在两者之间且不贴任何一边。"
+    },
+    "anchor_pin": {
+      "_why": "⛔ 同族的第二个洞:把起音区的锚点从**音符边界**改回**窗起点**,①-⑥ 也全绿(地板的 p50/p90 动得不够)。而这个错法的后果是灾难性的:窗起点前面是 preroll,「前 30 ms」会落在辅音爆发**之前**那段安静里。",
+      "arm": "s148\\F_full_s0.wav",
+      "measured": {
+        "note": 753,
+        "lyric": "と",
+        "attack_db": 14.223,
+        "onset_peak_dbfs": -0.998,
+        "_if_anchored_at_window_start": -39.92
+      },
+      "gate": {
+        "note": 753,
+        "attack_db_min": 12.0,
+        "attack_db_max": 17.0
+      },
+      "_note": "`[753] と` 是这条线上被用户点名的那个「辅音脉冲太强」,它的 `/t/` 落在音符边界【前】100 ms 且峰值 −1.00 dBFS。⇒ 拿它当锚点的钉子,同时也是这条线索的活样本。"
+    },
+    "_mutation_log": {
+      "_why": "README 硬规矩 7:一个绿不代表任何事,除非它红过。这里记每一档【只有它能抓到的那个变异】。",
+      "M1 ATTACK_MS 30→40": "② 口径闸 红,EXIT 1",
+      "M2 窗从 phones[] 改回 notes[]": "⑥ 窗规则 红(窗外能量 0.16% → 3.88%),EXIT 1。⛔ 加 ⑥ 之前这条变异 **①-⑤ 全绿** —— 因为 ③④⑤ 都是两侧同窗的比较,窗错位相消了。",
+      "M3 rms_db 恒返回 −20": "⑤ 分离度 红(被救音 p50 0.0000),EXIT 1。⛔ 加 ⑤ 之前这条**也全绿**:③(自比)与 ④(地板)对一把常数尺子结构上都是绿的。",
+      "M4 起音锚点改回窗起点": "⑦ 锚点钉 红([753] attack_db 14.22 → −38.06),EXIT 1。⛔ 加 ⑦ 之前全绿。",
+      "M5 夹具改一个字节": "① 指纹 红,**EXIT 3(跑不起来)**而不是 1 —— 两者必须分得开(S129 铁律)。",
+      "_honest": "⚠ **③ 与 ④ 至今没有一条【只有它们】能抓到的变异**:③ 是「同一个文件与自己比」的恒等式(它只证明工装没有随机性),④ 的 p50/p90 在上面五条变异下都没漂到闸外。⇒ 别把它们读成硬判据;真正咬人的是 ②⑤⑥⑦ 与 ① 的出口码。",
+      "_tooling": "⚠ 变异工装第一版用**文本模式**写回原文,在 Windows 上把 LF 翻成 CRLF ⇒ 还原自证当场报「不一致」(内容其实完好)。⇒ 还原必须走**二进制拷贝**。"
+    },
+    "_cross_check": "⚠ `sha256` 与后续任何新增的臂之间**没有自动的包含关系断言** —— `selfcheck` 只查这里列出的四件。加新臂时**必须同时把它登进 `sha256`**,否则它会绕过指纹闸(与 `fingerprints.arms` ⊄ `fixtures.sha256` 是同一个洞,S148 侦察指出)。"
   },
-  "anchor_pin": {
-   "_why": "⛔ 同族的第二个洞:把起音区的锚点从**音符边界**改回**窗起点**,①-⑥ 也全绿(地板的 p50/p90 动得不够)。而这个错法的后果是灾难性的:窗起点前面是 preroll,「前 30 ms」会落在辅音爆发**之前**那段安静里。",
-   "arm": "s148\\F_full_s0.wav",
-   "measured": {
-    "note": 753,
-    "lyric": "と",
-    "attack_db": 14.223,
-    "onset_peak_dbfs": -0.998,
-    "_if_anchored_at_window_start": -39.92
-   },
-   "gate": {
-    "note": 753,
-    "attack_db_min": 12.0,
-    "attack_db_max": 17.0
-   },
-   "_note": "`[753] と` 是这条线上被用户点名的那个「辅音脉冲太强」,它的 `/t/` 落在音符边界【前】100 ms 且峰值 −1.00 dBFS。⇒ 拿它当锚点的钉子,同时也是这条线索的活样本。"
+  "user_coordinates": {
+    "_why": "⛔ S148 之前,用户报的坐标一律是【小节号】,而 bar→triple 下标的映射**盘上根本不存在** —— 只有 `scratchpad/waveform_lead.py:7` 一句「坐标已核对」的注释担保,而那份 scratchpad 属于另一个 session、随时会被 GC。仓内 `lch_score.json` 与 `probe/mg_lane.json` 都没有小节栏。⇒ 这一块把映射算出来并登记,以后引用「第 N 小节」必须对着它,不许再靠注释。",
+    "_method": "bar ≈ (Σframes[0..k] / 50) / (4 × 60 / tempo) + 1;tempo = 165(lch_score.json),按 4/4。⚠ 实测与用户口径**系统性差约 0.5-1 小节**(用户说 169,算出来 168.1;用户说 189-192,算出来 188.9-191.0)⇒ 这个映射只可用来**定位**,不可用来当判据;判据一律用 triple 下标。",
+    "spots": [
+      {
+        "user": "169 小节的高音爆发",
+        "triples": [
+          685,
+          693
+        ],
+        "lyric": "ぴゃ…に",
+        "top_midi": 83,
+        "shift": -5,
+        "bar_calc": 168.1,
+        "note": "= S147 §10 的 `[685]`,用户「波形甚是诡异」的那一处"
+      },
+      {
+        "user": "189-192 小节 いだあああ",
+        "triples": [
+          787,
+          794
+        ],
+        "lyric": "せ…いだあああ",
+        "top_midi": 83,
+        "shift": -5,
+        "bar_calc": "188.4-191.0"
+      },
+      {
+        "user": "181 小节 と(S147 §10 的辅音脉冲)",
+        "triples": [
+          753,
+          762
+        ],
+        "lyric": "とすばらしくてええ",
+        "top_midi": 85,
+        "shift": -7,
+        "bar_calc": 180.8
+      },
+      {
+        "user": "187 小节长音 あ",
+        "triples": [
+          781,
+          785
+        ],
+        "lyric": "とそんなあ",
+        "top_midi": 85,
+        "shift": -7,
+        "bar_calc": "185.1-186.1",
+        "note": "`[785]` 是这一组的**组尾**(2.18 s 长音),而 `[753]`/`[685]` 是各自组的**组首** ⇒ 「两个坏例都是组的第一个音」那条线索天然覆盖不到它"
+      },
+      {
+        "user": "89-90 小节(对照,用户判正常)",
+        "triples": [
+          481,
+          490
+        ],
+        "lyric": "とびこんんでみいたら",
+        "top_midi": 80,
+        "shift": -2,
+        "bar_calc": 89.0
+      }
+    ],
+    "_conflict": "⛔ `utai-dsp/src/psola.rs` 的 S146g 记录写着「bars 169 「たらああ」 at −7」,而按本表:**bar 169 是 `[685]` ぴゃ,位移 −5**;歌词「たらああ」在 `triples[236..239]`(bar≈40)与 `triples[711..714]`(bar≈174),两处都是 −7。⇒ 那句话把**小节号**与**歌词**接错了,至少一半是错的;S146g 的包里到底放的哪一段,从 ANSWER_KEY 看不出来(只有 frac0/frac1 标签)。**未定,别再引用那句话的素材描述**(它的结论 —— 盲测判负 —— 不受影响)。"
   },
-  "_mutation_log": {
-   "_why": "README 硬规矩 7:一个绿不代表任何事,除非它红过。这里记每一档【只有它能抓到的那个变异】。",
-   "M1 ATTACK_MS 30→40": "② 口径闸 红,EXIT 1",
-   "M2 窗从 phones[] 改回 notes[]": "⑥ 窗规则 红(窗外能量 0.16% → 3.88%),EXIT 1。⛔ 加 ⑥ 之前这条变异 **①-⑤ 全绿** —— 因为 ③④⑤ 都是两侧同窗的比较,窗错位相消了。",
-   "M3 rms_db 恒返回 −20": "⑤ 分离度 红(被救音 p50 0.0000),EXIT 1。⛔ 加 ⑤ 之前这条**也全绿**:③(自比)与 ④(地板)对一把常数尺子结构上都是绿的。",
-   "M4 起音锚点改回窗起点": "⑦ 锚点钉 红([753] attack_db 14.22 → −38.06),EXIT 1。⛔ 加 ⑦ 之前全绿。",
-   "M5 夹具改一个字节": "① 指纹 红,**EXIT 3(跑不起来)**而不是 1 —— 两者必须分得开(S129 铁律)。",
-   "_honest": "⚠ **③ 与 ④ 至今没有一条【只有它们】能抓到的变异**:③ 是「同一个文件与自己比」的恒等式(它只证明工装没有随机性),④ 的 p50/p90 在上面五条变异下都没漂到闸外。⇒ 别把它们读成硬判据;真正咬人的是 ②⑤⑥⑦ 与 ① 的出口码。",
-   "_tooling": "⚠ 变异工装第一版用**文本模式**写回原文,在 Windows 上把 LF 翻成 CRLF ⇒ 还原自证当场报「不一致」(内容其实完好)。⇒ 还原必须走**二进制拷贝**。"
-  },
-  "_cross_check": "⚠ `sha256` 与后续任何新增的臂之间**没有自动的包含关系断言** —— `selfcheck` 只查这里列出的四件。加新臂时**必须同时把它登进 `sha256`**,否则它会绕过指纹闸(与 `fingerprints.arms` ⊄ `fixtures.sha256` 是同一个洞,S148 侦察指出)。"
- },
- "user_coordinates": {
-  "_why": "⛔ S148 之前,用户报的坐标一律是【小节号】,而 bar→triple 下标的映射**盘上根本不存在** —— 只有 `scratchpad/waveform_lead.py:7` 一句「坐标已核对」的注释担保,而那份 scratchpad 属于另一个 session、随时会被 GC。仓内 `lch_score.json` 与 `probe/mg_lane.json` 都没有小节栏。⇒ 这一块把映射算出来并登记,以后引用「第 N 小节」必须对着它,不许再靠注释。",
-  "_method": "bar ≈ (Σframes[0..k] / 50) / (4 × 60 / tempo) + 1;tempo = 165(lch_score.json),按 4/4。⚠ 实测与用户口径**系统性差约 0.5-1 小节**(用户说 169,算出来 168.1;用户说 189-192,算出来 188.9-191.0)⇒ 这个映射只可用来**定位**,不可用来当判据;判据一律用 triple 下标。",
-  "spots": [
-   {
-    "user": "169 小节的高音爆发",
-    "triples": [
-     685,
-     693
-    ],
-    "lyric": "ぴゃ…に",
-    "top_midi": 83,
-    "shift": -5,
-    "bar_calc": 168.1,
-    "note": "= S147 §10 的 `[685]`,用户「波形甚是诡异」的那一处"
-   },
-   {
-    "user": "189-192 小节 いだあああ",
-    "triples": [
-     787,
-     794
-    ],
-    "lyric": "せ…いだあああ",
-    "top_midi": 83,
-    "shift": -5,
-    "bar_calc": "188.4-191.0"
-   },
-   {
-    "user": "181 小节 と(S147 §10 的辅音脉冲)",
-    "triples": [
-     753,
-     762
-    ],
-    "lyric": "とすばらしくてええ",
-    "top_midi": 85,
-    "shift": -7,
-    "bar_calc": 180.8
-   },
-   {
-    "user": "187 小节长音 あ",
-    "triples": [
-     781,
-     785
-    ],
-    "lyric": "とそんなあ",
-    "top_midi": 85,
-    "shift": -7,
-    "bar_calc": "185.1-186.1",
-    "note": "`[785]` 是这一组的**组尾**(2.18 s 长音),而 `[753]`/`[685]` 是各自组的**组首** ⇒ 「两个坏例都是组的第一个音」那条线索天然覆盖不到它"
-   },
-   {
-    "user": "89-90 小节(对照,用户判正常)",
-    "triples": [
-     481,
-     490
-    ],
-    "lyric": "とびこんんでみいたら",
-    "top_midi": 80,
-    "shift": -2,
-    "bar_calc": 89.0
-   }
+  "predictions": [
+    {
+      "id": "env-neg",
+      "ruler": "envelope_shift",
+      "arm": "arm_raw.wav vs arm_raw.wav",
+      "expect": {
+        "median_st": [
+          -0.05,
+          0.05
+        ],
+        "peak_corr": [
+          0.999,
+          1.001
+        ]
+      },
+      "why_incontestable": "同一个文件与自己比,包络位移只能是 0 —— 不依赖任何关于引擎的假设。"
+    },
+    {
+      "id": "env-pos",
+      "ruler": "envelope_shift",
+      "arm": "arm_k1.wav",
+      "expect": {
+        "median_st": [
+          5.5,
+          6.5
+        ]
+      },
+      "why_incontestable": "κ=1 按代码定义 formant=None = 纯移调(vocal_range.rs:704-709)⇒ 共振峰必然整体上移 +6.00 半音。真值是免费的。队列 §E13 笔 0 写的判据就是这一条(+6.00±0.5)。",
+      "_note_measured_5_50": "实测 +5.50 落在下沿:估计器在 +6 处系统性低估 ~0.5 st。这是尺子的已知偏差,不是引擎的。⇒ 读任何候选的位移时,真值 6.00 那一端要按 5.5 校准。"
+    },
+    {
+      "id": "flux-neg",
+      "ruler": "transient_flux",
+      "arm": "arm_raw.wav vs arm_raw.wav",
+      "expect": {
+        "median_db": [
+          -0.01,
+          0.01
+        ]
+      },
+      "why_incontestable": "同一条通量序列与自己取比,恒 0。"
+    },
+    {
+      "id": "flux-pos",
+      "ruler": "transient_flux",
+      "arm": "smear(arm_raw.wav, 2 ms)",
+      "expect": {
+        "median_db": [
+          -1000.0,
+          -30.0
+        ]
+      },
+      "why_incontestable": "2 ms 移动平均把 2-11 kHz 的陡升物理性地抹掉 ⇒ 正向通量必然坍塌。队列 §E13 笔 0 写的判据是「人为抹平 ≤ −30 dB」。",
+      "_note": "⚠ 平滑核是 **2 ms**。S145 脚本注释写的「20 ms」是错的(代码是 int(sr*0.002));登记的 −33 dB 属于 2 ms 那一档。"
+    },
+    {
+      "id": "hnr-neg",
+      "ruler": "hnr",
+      "arm": "arm_raw.wav vs arm_raw.wav",
+      "expect": {
+        "delta_db": [
+          -0.01,
+          0.01
+        ]
+      },
+      "why_incontestable": "同一段音频的 HNR 与自己相减,恒 0。"
+    },
+    {
+      "id": "hnr-pos",
+      "ruler": "hnr",
+      "arm": "arm_raw.wav + 白噪 @ 20 dB / 10 dB SNR",
+      "expect": {
+        "delta_db_20": [
+          -6.0,
+          -1.5
+        ],
+        "delta_db_10": [
+          -16.0,
+          -6.0
+        ],
+        "monotonic": true
+      },
+      "why_incontestable": "注入已知功率的白噪必然降低谐噪比,且 10 dB SNR 必须比 20 dB 掉得更多。⇒ 尺子的符号与单调性都被钉住。"
+    },
+    {
+      "id": "f0-neg",
+      "ruler": "f0_error",
+      "arm": "arm_raw.wav vs arm_raw.wav @ ratio 2^(6/12)",
+      "expect": {
+        "median_cents": [
+          -620.0,
+          -580.0
+        ]
+      },
+      "why_incontestable": "拿没移调的音频去比『应当上移 6 半音』的期望,误差必然恰好是 −600 cents。⇒ 这条同时证明 f0 尺的符号是对的。"
+    }
   ],
-  "_conflict": "⛔ `utai-dsp/src/psola.rs` 的 S146g 记录写着「bars 169 「たらああ」 at −7」,而按本表:**bar 169 是 `[685]` ぴゃ,位移 −5**;歌词「たらああ」在 `triples[236..239]`(bar≈40)与 `triples[711..714]`(bar≈174),两处都是 −7。⇒ 那句话把**小节号**与**歌词**接错了,至少一半是错的;S146g 的包里到底放的哪一段,从 ANSWER_KEY 看不出来(只有 frac0/frac1 标签)。**未定,别再引用那句话的素材描述**(它的结论 —— 盲测判负 —— 不受影响)。"
- },
- "predictions": [
-  {
-   "id": "env-neg",
-   "ruler": "envelope_shift",
-   "arm": "arm_raw.wav vs arm_raw.wav",
-   "expect": {
-    "median_st": [
-     -0.05,
-     0.05
-    ],
-    "peak_corr": [
-     0.999,
-     1.001
-    ]
-   },
-   "why_incontestable": "同一个文件与自己比,包络位移只能是 0 —— 不依赖任何关于引擎的假设。"
+  "fingerprints": {
+    "_what": "本工装 2026-08-14 在上面那组夹具上量出的数。⛔ 它们不是真值:它们只回答『尺子/夹具有没有从那天漂开』。与 project_v2_session145 §A3 的公开表逐位相同。",
+    "tolerance": {
+      "envelope_st": 0.15,
+      "peak_corr": 0.01,
+      "flux_db": 0.5,
+      "hnr_db": 0.3
+    },
+    "arms": {
+      "arm_raw.wav": {
+        "envelope_shift_st": 0.0,
+        "peak_corr": 1.0,
+        "flux_median_db": 0.0,
+        "hnr_delta_db": 0.0,
+        "voiced_survival": 1.0
+      },
+      "arm_k1.wav": {
+        "envelope_shift_st": 5.5,
+        "peak_corr": 0.951,
+        "flux_median_db": 1.32,
+        "hnr_delta_db": 0.22,
+        "voiced_survival": 1.0
+      },
+      "arm_k0.wav": {
+        "envelope_shift_st": 2.4,
+        "peak_corr": 0.961,
+        "flux_median_db": -5.25,
+        "hnr_delta_db": 1.34,
+        "voiced_survival": 0.9873
+      },
+      "arm_world.wav": {
+        "envelope_shift_st": 0.2,
+        "peak_corr": 0.981,
+        "flux_median_db": 1.26,
+        "hnr_delta_db": 0.87,
+        "voiced_survival": 0.9909
+      },
+      "arm_psola.wav": {
+        "envelope_shift_st": 0.3,
+        "peak_corr": 0.983,
+        "flux_median_db": 0.53,
+        "hnr_delta_db": -1.44,
+        "voiced_survival": 0.9457,
+        "_MISLABEL": "⛔⛔ 这一行是 **praat** 的臂,不是我们的引擎。实证:`arm_psola.wav` 与 `arm_praat_p6.wav` 的 sha256 **逐位相同**(fca51cda…)。我们自己的引擎在**同一口径**下读 **+0.50 / −1.66**(见 utai-dsp/src/psola.rs 头注,S146)。⇒ 拿这一行当「我们引擎的基线」会让下一次换引擎对拍**偏乐观约 0.4 dB**。发版前要么重生成一份真正属于我们的臂并改名,要么把这一行改名为 arm_praat_p6。S146g 侦察发现。"
+      }
+    },
+    "ref_hnr_db": 23.68,
+    "ref_f0_median_hz": 610.0
   },
-  {
-   "id": "env-pos",
-   "ruler": "envelope_shift",
-   "arm": "arm_k1.wav",
-   "expect": {
-    "median_st": [
-     5.5,
-     6.5
+  "known_blind_spots": [
+    {
+      "ruler": "transient_flux",
+      "blind_to": "WORLD 塌清塞音(用户两次耳判「つつまれてきれい 的 き」破/失声)",
+      "evidence": "S145 专门造的这把尺子读 WORLD 只 −0.37 dB 中位 / −1.30 dB 峰值,而它对人为抹平能读 −33 dB。逐 note 电平/浊音率上 WORLD 的き反而略高(−12.5 dB/0.93 vs off −13.0/0.80)。",
+      "rule": "⛔ 该轴唯一仪器是耳朵。不许硬编一条看不见它的判据充数。"
+    },
+    {
+      "ruler": "transient_flux",
+      "blind_to": "跨【共振峰策略】比较时读数被混淆",
+      "evidence": "本工装实测:k0 = −5.25 dB 而 k1 = +1.32 dB。κ=0 把共振峰钉在低位 ⇒ 2-11 kHz 的能量本来就更少 ⇒ 通量比自然更低。这不构成『Signalsmith 抹平了瞬态』的证据。",
+      "rule": "⛔ 瞬态尺只在【共振峰策略相同】的两条臂之间有判决力(例如:我们的 PSOLA vs praat 的 PSOLA)。跨策略读它只能当描述,不能当判据。"
+    },
+    {
+      "ruler": "envelope_shift",
+      "blind_to": "OLA 相位不连续 / 重合成的嗡嗡声",
+      "evidence": "PSOLA 由构造保持共振峰 ⇒ 哪怕合成端相位全错,这把尺子照样读 ~0。2026-07 那份坏实现正是这一形状(音高对、共振峰对、HNR 掉 5.15~8.57 dB)。",
+      "rule": "⇒ 必须与 HNR 尺一起读。"
+    },
+    {
+      "ruler": "f0_error",
+      "blind_to": "音色 / 纹理 / 响度 —— 即用户实际抱怨的一切",
+      "evidence": "2026-07-26 的 psola_ab.rs 只量音高,放行了一份 HNR 掉 5-8 dB 的实现,把一个正确的方向关了四个月。",
+      "rule": "⛔ 永远不许单独出现在任何验收里。"
+    },
+    {
+      "ruler": "*",
+      "blind_to": "「哪个更好听」",
+      "evidence": "S145:放宽 dead 判据那条结论只有耳朵没有仪器 ⇒ 塌了;染色那条有仪器 ⇒ 扛住了盲测。",
+      "rule": "凡结论只有耳朵没有仪器,先标【未定】;而凡结论只有仪器没有耳朵,承重之前要过一次盲测。"
+    },
+    "⛔ **ΔHNR 的量级校准(S146g 盲测,2026-08-16)**:把 PSOLA 的亚样本搬运抖动拿掉,ΔHNR 改善 **+1.05 dB**(生产口径)、f0 p90 从 132 降到 24 cents —— 而**用户在 7 对承重对比上一对都听不出**(三个包、含 3 个空白对照、电平对齐到 ±0.000 dB、两臂喂同一个已渲染 wav;素材含用户自己点名的 169 小节 −7 与 189-192 小节 −5)⚠ S148 复核实盘目录改正:承重对是 **7** 不是 8(`s146g_blind` 三个包 = 3+2+2,另有 G3/K3/CTRL 三个空白对照);`psola.rs` 与本行同批改过。⭐ 该设置有历史正对照:同一听者同一流程在 S146 换引擎时**两个承重组都分对**。⇒ **~1 dB 级的 ΔHNR 变化在这条线上不构成可闻收益**;引用 ΔHNR 改善时必须同时说明它是否越过了这个量级,否则是在拿一个已知听不见的数字做决策。",
+    {
+      "ruler": "hnr",
+      "blind_to": "**深陷波(颗粒相位相消挖掉的坑)** —— 即 S148 查了一整场才看见的那个失效模式",
+      "evidence": "S148,akiko 真素材 7 半音:我们的深陷波率(浊音帧比 PSOLA 输入低 4 dB 以上)4.80% vs praat 0.80%,而**同一处的 ΔHNR 只差 0.39 dB**。坑每个 60-100 ms、平滑进出、位置在不同比值间高度稳定 ⇒ 它不是「噪声变多」,是「被挖掉一块」,而 HNR 答的是前者。⚠ 这把尺子在**亚样本抖动**那条轴上是被盲测标定过的(S146g:+1.05 dB 听不出)—— 一把尺子在轴 A 上有过标定,不构成它在轴 B 上有分辨力。",
+      "rule": "⛔ **HNR 不许再单独当 PSOLA 质量的主判据**;问「有没有被挖掉一块」要用深陷波率(逐帧对 PSOLA 的**输入**做配对差)。⚠ 而深陷波率这条轴**至今没有可闻性刻度**(r4 盲测就是去打第一个刻度的)。",
+      "_todo": "⛔ 每把尺子都欠一次【人工极端样本】标定(造一个该失效模式的极端样本,看尺子给几)。这一步没做,是 S148 绕了一整场的直接原因。"
+    },
+    {
+      "ruler": "f0 (pyworld harvest, f0_ceil=1200)",
+      "blind_to": "**850 Hz 以上的真实音高** —— 它会把干净的高音读成大面积八度/三分之一错",
+      "evidence": "S148 尸检:`notes[785]`(MIDI 83 = 987.8 Hz,2.18 s)在 Aw0 上被 harvest(ceil=1200)读成 |cents| p90 **2208**,杂散值密集落在 f/3;而 dio+stonemask 全程读 979-1005 Hz、自相关 r(T) 0.98-0.99、频谱 f/2 −43~−65 dB ⇒ **音频是干净的,错的是尺子**。",
+      "rule": "⛔ 量 >850 Hz 的音高时,harvest 的 ceil 必须提到 **2400** 并**换一把估计器复核**(dio+stonemask / 自相关 / praat To Pitch (ac));⚠ 复核必须带**阳性对照**(S148 用 W 臂:同一段代码读出 2254 帧低八度 ⇒ 证明尺子有能力看见,不是量程假象)。"
+    }
+  ],
+  "envmod": {
+    "_why": "⑤ envmod —— 「油/晃」那条线(高音共振毛刺)的尺子。预注册分两类,⛔ 不许混着引用:`predictions` = 用户耳判已经背书过的那一对对照(与本工装无关就能知道方向);`fingerprints` = 量出来的指纹,只回答「有没有从今天漂开」。",
+    "_provenance": "S159zy 立(2026-08-23,不为人所知的鹅妈妈童谣 transpose +7 × Sovits4.1 东雪莲),S159zz 用它给 PSOLA 的刀定价。定义与盲区在 envmod.py 的 docstring。",
+    "caliber": {
+      "_why": "口径闸。⛔ 不是「常量等于常量」的空断言:这把尺子的整条结论都挂在带宽选择上 —— 同一批音在 300-800 Hz 上读 −0.47 dB(没动),在 2000-4000 Hz 上读 +5.13 dB(最重)。⇒ 带一改,结论就换了一个,而读数照样漂亮。登记值由 `envmod.caliber()` 自己算出来。",
+      "SR": 44100,
+      "BAND_LO": 2000.0,
+      "BAND_HI": 4000.0,
+      "MOD_LO": 20.0,
+      "MOD_HI": 200.0,
+      "REF_LO": 1.0,
+      "REF_HI": 1000.0,
+      "NPERSEG": 4096,
+      "MIN_SAMPLES": 2048
+    },
+    "fixtures": {
+      "dir_env": "UTAI_ENVMOD_FIXTURES",
+      "dir_default": "D:\\MyDev\\TESTING",
+      "_note": "夹具在仓库外(体积)。指纹不符 ⇒ 退 3【跑不起来】,不许退 1,更不许当通过。",
+      "notes_json": "s159zk\\dx_t7.json",
+      "sha256": {
+        "s159zk\\dx_t7.json": "c69dce5626653101ca3d67689136f6459f0301faa45a2f18e45cd883d749ce6c",
+        "s159zu\\mg_deadonly_lb3_dxl41.wav": "590c4e566769a0a78f374db7dcbd55c9c133ee9fe90a796e19072ca93446b59b",
+        "s159zu\\mg_deadonly_lb5_dxl41.wav": "8abbaf58e1a032aa3c4a4147706b9fc9cbd7b0e072c99f35cf1bd8eb28d6075b"
+      }
+    },
+    "predictions": {
+      "_why": "⭐ 这一对是**用户耳判背书过**的:同一个音[1035]「で」(3:16.080),lb3 那一版用户没抱怨,lb5 那一版用户点名「听起来有点【油】」,并要求「去对比一下这两版的频谱区别」。⇒ 尺子必须把这两版分开,而且方向要对(lb5 更脏 = 读数更高)。⛔ 阴性对照音[971]「て」(3:03.100)**从来没被救过**,而用户明确说它「也有噪声但听起来不奇怪」。",
+      "note_1035_lb3": -14.7,
+      "note_1035_lb5": -0.84,
+      "note_971_lb3": -7.24,
+      "min_separation_db": 13.0,
+      "_separation_why": "两版之差实测 13.86 dB。登记一条 ≥13 的下限,而不是登记差本身 —— 承重的是「分得开」,不是那个具体的数。"
+    },
+    "fingerprints": {
+      "_why": "指纹:只回答有没有漂开,⛔ 不是真值。",
+      "n_notes_ge_0p2s": 331,
+      "lb3_median_db": -7.43,
+      "lb5_median_db": -6.72
+    },
+    "bench_floor": {
+      "_what": "⛔ 先量台面噪声再读任何差(S159zx 立的规矩,起因是一夜四把尺子全废)。整曲**同配置两遍渲染**(同一条命令、同一份计划、同一个 binary)的逐音 |Δ|。",
+      "arm_a": "s159zm\\mg_deadonly_fin_dx_dxl41.wav",
+      "arm_b": "s159zp\\mg_deadonly_f0_dxl41.wav",
+      "n": 331,
+      "abs_delta_p50": 1.01,
+      "abs_delta_p90": 3.0,
+      "_rule": "⇒ 整曲 A/B 上小于 1 dB 的差不算差。⭐ 而**探针**(同一份输入喂 `inverse_probe`,只翻一个旋钮)没有渲染噪声,差就是差 ⇒ 要分辨小刀一律走探针。"
+    },
+    "known_blind_spots": [
+      "不回答「这个音本身脏不脏」—— 只回答「相对同一个音的另一条臂多了多少调制」。⚠ 前面八把标量尺子全栽在这:它们把根本没被救的音排成全曲最脏。",
+      "⛔ 跨音高比较未定:纯音高敏感度**没量干净**,两个估计符号相反(原生渲染跨音符 +0.11 dB/半音,r=0.118,n=137,MIDI 68-79;ratio 臂内 −0.311 dB/半音),**两个都混着「音的身份」**。⇒ 承重的比较一律同音、同目标音高。",
+      "⛔ 不回答「哪个更好听」(README 第 8 条)。今天只有一对耳判背书的对照,没有盲测。",
+      "⛔ 在 donor 转储上取样时,「有内容」不等于「生产会用」—— donor 是按块渲的,块内顺带渲了旁边的音。必须再与 plan.json 的 windows_frames 求交(S159zz 栽过一次)。"
     ]
-   },
-   "why_incontestable": "κ=1 按代码定义 formant=None = 纯移调(vocal_range.rs:704-709)⇒ 共振峰必然整体上移 +6.00 半音。真值是免费的。队列 §E13 笔 0 写的判据就是这一条(+6.00±0.5)。",
-   "_note_measured_5_50": "实测 +5.50 落在下沿:估计器在 +6 处系统性低估 ~0.5 st。这是尺子的已知偏差,不是引擎的。⇒ 读任何候选的位移时,真值 6.00 那一端要按 5.5 校准。"
-  },
-  {
-   "id": "flux-neg",
-   "ruler": "transient_flux",
-   "arm": "arm_raw.wav vs arm_raw.wav",
-   "expect": {
-    "median_db": [
-     -0.01,
-     0.01
-    ]
-   },
-   "why_incontestable": "同一条通量序列与自己取比,恒 0。"
-  },
-  {
-   "id": "flux-pos",
-   "ruler": "transient_flux",
-   "arm": "smear(arm_raw.wav, 2 ms)",
-   "expect": {
-    "median_db": [
-     -1000.0,
-     -30.0
-    ]
-   },
-   "why_incontestable": "2 ms 移动平均把 2-11 kHz 的陡升物理性地抹掉 ⇒ 正向通量必然坍塌。队列 §E13 笔 0 写的判据是「人为抹平 ≤ −30 dB」。",
-   "_note": "⚠ 平滑核是 **2 ms**。S145 脚本注释写的「20 ms」是错的(代码是 int(sr*0.002));登记的 −33 dB 属于 2 ms 那一档。"
-  },
-  {
-   "id": "hnr-neg",
-   "ruler": "hnr",
-   "arm": "arm_raw.wav vs arm_raw.wav",
-   "expect": {
-    "delta_db": [
-     -0.01,
-     0.01
-    ]
-   },
-   "why_incontestable": "同一段音频的 HNR 与自己相减,恒 0。"
-  },
-  {
-   "id": "hnr-pos",
-   "ruler": "hnr",
-   "arm": "arm_raw.wav + 白噪 @ 20 dB / 10 dB SNR",
-   "expect": {
-    "delta_db_20": [
-     -6.0,
-     -1.5
-    ],
-    "delta_db_10": [
-     -16.0,
-     -6.0
-    ],
-    "monotonic": true
-   },
-   "why_incontestable": "注入已知功率的白噪必然降低谐噪比,且 10 dB SNR 必须比 20 dB 掉得更多。⇒ 尺子的符号与单调性都被钉住。"
-  },
-  {
-   "id": "f0-neg",
-   "ruler": "f0_error",
-   "arm": "arm_raw.wav vs arm_raw.wav @ ratio 2^(6/12)",
-   "expect": {
-    "median_cents": [
-     -620.0,
-     -580.0
-    ]
-   },
-   "why_incontestable": "拿没移调的音频去比『应当上移 6 半音』的期望,误差必然恰好是 −600 cents。⇒ 这条同时证明 f0 尺的符号是对的。"
   }
- ],
- "fingerprints": {
-  "_what": "本工装 2026-08-14 在上面那组夹具上量出的数。⛔ 它们不是真值:它们只回答『尺子/夹具有没有从那天漂开』。与 project_v2_session145 §A3 的公开表逐位相同。",
-  "tolerance": {
-   "envelope_st": 0.15,
-   "peak_corr": 0.01,
-   "flux_db": 0.5,
-   "hnr_db": 0.3
-  },
-  "arms": {
-   "arm_raw.wav": {
-    "envelope_shift_st": 0.0,
-    "peak_corr": 1.0,
-    "flux_median_db": 0.0,
-    "hnr_delta_db": 0.0,
-    "voiced_survival": 1.0
-   },
-   "arm_k1.wav": {
-    "envelope_shift_st": 5.5,
-    "peak_corr": 0.951,
-    "flux_median_db": 1.32,
-    "hnr_delta_db": 0.22,
-    "voiced_survival": 1.0
-   },
-   "arm_k0.wav": {
-    "envelope_shift_st": 2.4,
-    "peak_corr": 0.961,
-    "flux_median_db": -5.25,
-    "hnr_delta_db": 1.34,
-    "voiced_survival": 0.9873
-   },
-   "arm_world.wav": {
-    "envelope_shift_st": 0.2,
-    "peak_corr": 0.981,
-    "flux_median_db": 1.26,
-    "hnr_delta_db": 0.87,
-    "voiced_survival": 0.9909
-   },
-   "arm_psola.wav": {
-    "envelope_shift_st": 0.3,
-    "peak_corr": 0.983,
-    "flux_median_db": 0.53,
-    "hnr_delta_db": -1.44,
-    "voiced_survival": 0.9457,
-    "_MISLABEL": "⛔⛔ 这一行是 **praat** 的臂,不是我们的引擎。实证:`arm_psola.wav` 与 `arm_praat_p6.wav` 的 sha256 **逐位相同**(fca51cda…)。我们自己的引擎在**同一口径**下读 **+0.50 / −1.66**(见 utai-dsp/src/psola.rs 头注,S146)。⇒ 拿这一行当「我们引擎的基线」会让下一次换引擎对拍**偏乐观约 0.4 dB**。发版前要么重生成一份真正属于我们的臂并改名,要么把这一行改名为 arm_praat_p6。S146g 侦察发现。"
-   }
-  },
-  "ref_hnr_db": 23.68,
-  "ref_f0_median_hz": 610.0
- },
- "known_blind_spots": [
-  {
-   "ruler": "transient_flux",
-   "blind_to": "WORLD 塌清塞音(用户两次耳判「つつまれてきれい 的 き」破/失声)",
-   "evidence": "S145 专门造的这把尺子读 WORLD 只 −0.37 dB 中位 / −1.30 dB 峰值,而它对人为抹平能读 −33 dB。逐 note 电平/浊音率上 WORLD 的き反而略高(−12.5 dB/0.93 vs off −13.0/0.80)。",
-   "rule": "⛔ 该轴唯一仪器是耳朵。不许硬编一条看不见它的判据充数。"
-  },
-  {
-   "ruler": "transient_flux",
-   "blind_to": "跨【共振峰策略】比较时读数被混淆",
-   "evidence": "本工装实测:k0 = −5.25 dB 而 k1 = +1.32 dB。κ=0 把共振峰钉在低位 ⇒ 2-11 kHz 的能量本来就更少 ⇒ 通量比自然更低。这不构成『Signalsmith 抹平了瞬态』的证据。",
-   "rule": "⛔ 瞬态尺只在【共振峰策略相同】的两条臂之间有判决力(例如:我们的 PSOLA vs praat 的 PSOLA)。跨策略读它只能当描述,不能当判据。"
-  },
-  {
-   "ruler": "envelope_shift",
-   "blind_to": "OLA 相位不连续 / 重合成的嗡嗡声",
-   "evidence": "PSOLA 由构造保持共振峰 ⇒ 哪怕合成端相位全错,这把尺子照样读 ~0。2026-07 那份坏实现正是这一形状(音高对、共振峰对、HNR 掉 5.15~8.57 dB)。",
-   "rule": "⇒ 必须与 HNR 尺一起读。"
-  },
-  {
-   "ruler": "f0_error",
-   "blind_to": "音色 / 纹理 / 响度 —— 即用户实际抱怨的一切",
-   "evidence": "2026-07-26 的 psola_ab.rs 只量音高,放行了一份 HNR 掉 5-8 dB 的实现,把一个正确的方向关了四个月。",
-   "rule": "⛔ 永远不许单独出现在任何验收里。"
-  },
-  {
-   "ruler": "*",
-   "blind_to": "「哪个更好听」",
-   "evidence": "S145:放宽 dead 判据那条结论只有耳朵没有仪器 ⇒ 塌了;染色那条有仪器 ⇒ 扛住了盲测。",
-   "rule": "凡结论只有耳朵没有仪器,先标【未定】;而凡结论只有仪器没有耳朵,承重之前要过一次盲测。"
-  },
-  "⛔ **ΔHNR 的量级校准(S146g 盲测,2026-08-16)**:把 PSOLA 的亚样本搬运抖动拿掉,ΔHNR 改善 **+1.05 dB**(生产口径)、f0 p90 从 132 降到 24 cents —— 而**用户在 7 对承重对比上一对都听不出**(三个包、含 3 个空白对照、电平对齐到 ±0.000 dB、两臂喂同一个已渲染 wav;素材含用户自己点名的 169 小节 −7 与 189-192 小节 −5)⚠ S148 复核实盘目录改正:承重对是 **7** 不是 8(`s146g_blind` 三个包 = 3+2+2,另有 G3/K3/CTRL 三个空白对照);`psola.rs` 与本行同批改过。⭐ 该设置有历史正对照:同一听者同一流程在 S146 换引擎时**两个承重组都分对**。⇒ **~1 dB 级的 ΔHNR 变化在这条线上不构成可闻收益**;引用 ΔHNR 改善时必须同时说明它是否越过了这个量级,否则是在拿一个已知听不见的数字做决策。",
-  {
-   "ruler": "hnr",
-   "blind_to": "**深陷波(颗粒相位相消挖掉的坑)** —— 即 S148 查了一整场才看见的那个失效模式",
-   "evidence": "S148,akiko 真素材 7 半音:我们的深陷波率(浊音帧比 PSOLA 输入低 4 dB 以上)4.80% vs praat 0.80%,而**同一处的 ΔHNR 只差 0.39 dB**。坑每个 60-100 ms、平滑进出、位置在不同比值间高度稳定 ⇒ 它不是「噪声变多」,是「被挖掉一块」,而 HNR 答的是前者。⚠ 这把尺子在**亚样本抖动**那条轴上是被盲测标定过的(S146g:+1.05 dB 听不出)—— 一把尺子在轴 A 上有过标定,不构成它在轴 B 上有分辨力。",
-   "rule": "⛔ **HNR 不许再单独当 PSOLA 质量的主判据**;问「有没有被挖掉一块」要用深陷波率(逐帧对 PSOLA 的**输入**做配对差)。⚠ 而深陷波率这条轴**至今没有可闻性刻度**(r4 盲测就是去打第一个刻度的)。",
-   "_todo": "⛔ 每把尺子都欠一次【人工极端样本】标定(造一个该失效模式的极端样本,看尺子给几)。这一步没做,是 S148 绕了一整场的直接原因。"
-  },
-  {
-   "ruler": "f0 (pyworld harvest, f0_ceil=1200)",
-   "blind_to": "**850 Hz 以上的真实音高** —— 它会把干净的高音读成大面积八度/三分之一错",
-   "evidence": "S148 尸检:`notes[785]`(MIDI 83 = 987.8 Hz,2.18 s)在 Aw0 上被 harvest(ceil=1200)读成 |cents| p90 **2208**,杂散值密集落在 f/3;而 dio+stonemask 全程读 979-1005 Hz、自相关 r(T) 0.98-0.99、频谱 f/2 −43~−65 dB ⇒ **音频是干净的,错的是尺子**。",
-   "rule": "⛔ 量 >850 Hz 的音高时,harvest 的 ceil 必须提到 **2400** 并**换一把估计器复核**(dio+stonemask / 自相关 / praat To Pitch (ac));⚠ 复核必须带**阳性对照**(S148 用 W 臂:同一段代码读出 2254 帧低八度 ⇒ 证明尺子有能力看见,不是量程假象)。"
-  }
- ]
 }

@@ -210,6 +210,87 @@ def tier_b(rulers, reg):
             ok(f"{k:<10} {field}", got[field], want[field] - t, want[field] + t, "")
 
 
+def tier_envmod(reg):
+    """⑤ envmod —— 「油/晃」那条线的尺子(S159zy 立,S159zz 定价)。
+
+    ⛔ 三件分开报(S129:一条闸的红必须能被归因):
+    ⑴ **口径闸** —— 尺子的带宽还是不是登记的那一套。这里它**不是空断言**:同一批音在
+       300-800 Hz 上读 −0.47 dB(没动),在 2000-4000 Hz 上读 +5.13 dB(最重)⇒
+       带一改结论就换一个,而读数照样漂亮。
+    ⑵ **预注册真值** —— 用户耳判背书过的那一对必须被分开,而且方向要对。
+    ⑶ **指纹** —— 只回答有没有从 2026-08-23 漂开。
+    """
+    print("\n=== envmod 档:「油/晃」那条线的尺子 ===")
+    try:
+        import envmod as EM
+    except Exception as e:
+        UNRUNNABLE.append(f"envmod 导不进来:{e!r}")
+        return
+    reg_e = reg.get("envmod")
+    if not reg_e:
+        UNRUNNABLE.append("registry.json 里没有 envmod 段")
+        return
+
+    # ⑴ 口径闸 —— 登记值由判据自己那条路径算出来(README 第 5 条)
+    got, want = EM.caliber(), reg_e["caliber"]
+    for k, v in want.items():
+        if k.startswith("_"):
+            continue
+        if k not in got:
+            FAILS.append(f"envmod 口径缺 {k}")
+        elif got[k] != v:
+            FAILS.append(f"envmod 口径 {k} 被动过:登记 {v},实际 {got[k]}")
+    for k in got:
+        if k not in want:
+            FAILS.append(f"envmod 多了一个没登记的口径 {k}")
+    print(f"  [{'PASS' if not FAILS else 'FAIL'}] 口径闸({len(got)} 个)")
+
+    d = pathlib.Path(os.environ.get(reg_e["fixtures"]["dir_env"],
+                                    reg_e["fixtures"]["dir_default"]))
+    if not d.is_dir():
+        UNRUNNABLE.append(f"envmod 夹具目录不存在:{d}")
+        return
+    for name, w in reg_e["fixtures"]["sha256"].items():
+        p = d / name
+        if not p.is_file():
+            UNRUNNABLE.append(f"缺 envmod 夹具 {p}")
+        elif hashlib.sha256(p.read_bytes()).hexdigest() != w:
+            UNRUNNABLE.append(f"envmod 夹具指纹不符 {name}")
+    if UNRUNNABLE:
+        return
+
+    sp = EM.note_spans(str(d / reg_e["fixtures"]["notes_json"]))
+    seg = {k: (lo, hi) for k, _n, lo, hi in sp}
+    pr = reg_e["predictions"]
+    import soundfile as sf
+    read = {}
+    for arm in ("lb3", "lb5"):
+        x, _sr = sf.read(str(d / f"s159zu\\mg_deadonly_{arm}_dxl41.wav"))
+        x = x.mean(axis=1) if x.ndim > 1 else x
+        read[arm] = EM.score(x, sp)
+        for k in (1035, 971):
+            key = f"note_{k}_{arm}"
+            if key in pr:
+                lo, hi = seg[k]
+                ok(f"envmod {arm} 音[{k}]", EM.modulation_db(x[lo:hi]),
+                   pr[key] - 0.10, pr[key] + 0.10, " dB")
+
+    # ⑵ 承重的是「分得开」,不是那个具体的数
+    ok("envmod 用户那一对必须分得开", abs(read["lb5"][1035] - read["lb3"][1035]),
+       pr["min_separation_db"], 1e3, " dB")
+    # ⛔ 阴性对照:从没被救过的音,两版之间不许出现同量级的差
+    ok("envmod 阴性对照 音[971] 两版之差", abs(read["lb5"][971] - read["lb3"][971]),
+       -1e3, pr["min_separation_db"] / 2.0, " dB")
+
+    # ⑶ 指纹
+    fp = reg_e["fingerprints"]
+    ok("envmod 打分音数", float(len(read["lb3"])),
+       fp["n_notes_ge_0p2s"] - 0.5, fp["n_notes_ge_0p2s"] + 0.5, "")
+    for arm in ("lb3", "lb5"):
+        ok(f"envmod {arm} 全曲中位", float(np.median(list(read[arm].values()))),
+           fp[f"{arm}_median_db"] - 0.05, fp[f"{arm}_median_db"] + 0.05, " dB")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-fixtures", action="store_true", help="只跑 A 档")
@@ -233,6 +314,7 @@ def main():
     tier_a(R)
     if not a.no_fixtures:
         tier_b(R, reg)
+        tier_envmod(reg)
     else:
         print("\n=== B 档:按 --no-fixtures 跳过 ===")
         print("  ⚠ 只跑 A 档 = 只证明了尺子自洽,**没有**证明它还能复现真素材上的读数。")
