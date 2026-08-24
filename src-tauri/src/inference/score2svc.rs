@@ -417,6 +417,85 @@ fn parse_fill1(v: Option<&str>) -> bool {
 /// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
 const FILL_ISOLATED_UV_DEFAULT: bool = true;
 
+/// ⚙ 出厂默认 = 1 —— 夹在浊音之间的无声洞,**最多填多长**(帧)。`UTAI_MG_FILL_MAX=<n>`。
+///
+/// # ⛔⛔ 判负(S159zzr 实测)—— 旋钮留着只为把下面那张洞长分布表留在原地
+///
+/// 放宽到 2 / 4 帧,用户点名的四处 lb3 咔哒**谷深几乎不动**
+/// (1:07.053 −52.1 → −52.7 → −52.1 · 1:36.448 −17.6 → −16.3 → −15.4 ·
+/// 3:33.193 −13.8 → −13.3 → **−15.5** · 3:33.749 −15.8 → −18.5 → −18.6)。
+///
+/// ⭐ **为什么没用(这条比读数值钱)**:[`zero_voiceless_frames`] 只把 **f0** 置零,
+/// 而**音素序列里那个清音辅音还在** —— 模型照样把 /s/ 渲出来。
+/// S159zp 那一刀之所以有效,是因为**单帧** f0 = 0 会让 NSF 激励打嗝;
+/// 而 2-4 帧的洞里,**真正在响的是辅音本身**。
+/// ⇒ 那四处的「咔哒」是 **`consonant_preroll`(用户可见选项,出厂 `true`)把下一个音的辅音
+/// 提前放进上一个音正中间**的结果 —— 在 120-140 ms 的快音上它吃掉一大截,听起来就是个断口。
+/// **那是设计意图(让元音落在拍点上),不是 DSP 伪影** ⇒ 要动只能动 preroll 的时序策略,
+/// 而那有音乐上的后果(元音会偏离拍点)。⛔ **别再从 f0 那一侧修它。**
+///
+/// ## ⛔ 为什么它需要是个旋钮而不是一个常数
+///
+/// S159zp 定 1 的理由是「**两帧及以上是真辅音的长度**」。但 S159zzq 里用户点名的四处 lb3 咔哒
+/// (**1:07.053 / 1:36.448 / 3:33.193 / 3:33.749**)转储出来是 **4 / 2 / 3 / 2 帧**的洞 ——
+/// 全部**夹在浊音之间**、全部由 [`zero_voiceless_frames`] 打出、全部落在 120-140 ms 的快音上,
+/// 而且三处的**下一个音都以清音辅音开头**(す / し / す)⇒ 正是 `consonant_preroll` 那条链。
+///
+/// ⭐ 洞长是 `z = round(d × permille/1000)` —— **音素自己时长的一个比例**,
+/// 所以「2 帧 = 真辅音」并不自动成立:快音上它就是量化落点。
+/// 实测(本曲 8 遍 donor 的 f0 轨,**夹在浊音之间**的洞按长度):
+/// **1 帧 32 · 2 帧 832 · 3 帧 248 · 4 帧 184 · 5 帧 80 · 6 帧 64 · 7 帧 376 · ≥8 帧 616**。
+/// ⇒ **2 帧那一桶是 1 帧的 26 倍** —— 这个悬殊本身就说明它是量化落点而不是辅音长度。
+///
+/// ⚠ 但「填到几帧算过头」**只有耳朵能裁**:填多了会把真辅音吃掉。⇒ 出厂保持 **1**(逐位不变)。
+const FILL_MAX_FRAMES_DEFAULT: usize = 1;
+
+fn fill_max_frames() -> usize {
+    std::env::var("UTAI_MG_FILL_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| (1..=6).contains(v))
+        .unwrap_or(FILL_MAX_FRAMES_DEFAULT)
+}
+
+/// 把 `note_hz` 里**长度 ≤ `max_len`**、两侧都是浊音的 0 段填成两侧的线性插值。
+///
+/// ⛔ `max_len == 1` 时与 [`fill_isolated_uv`] **逐位相同**(单帧的线性插值就是两侧均值)——
+/// 那条判据仍然钉在 `fill_isolated_uv` 上,这里不许绕过它。
+/// ⛔ 先收集再写:边扫边写会让连续的 0 被逐个「补」成浊音,越过 `max_len` 这条界。
+fn fill_isolated_uv_max(note_hz: &mut [f32], max_len: usize) -> usize {
+    let n = note_hz.len();
+    if n < 3 || max_len == 0 {
+        return 0;
+    }
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 1usize;
+    while i < n - 1 {
+        if note_hz[i] == 0.0 {
+            let mut j = i;
+            while j + 1 < n - 1 && note_hz[j + 1] == 0.0 {
+                j += 1;
+            }
+            if j - i + 1 <= max_len && note_hz[i - 1] > 0.0 && note_hz[j + 1] > 0.0 {
+                runs.push((i, j));
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    let filled: usize = runs.iter().map(|(a, b)| b - a + 1).sum();
+    for (a, b) in runs {
+        let (lo, hi) = (note_hz[a - 1], note_hz[b + 1]);
+        let steps = (b - a + 2) as f32;
+        for (t, f) in note_hz[a..=b].iter_mut().enumerate() {
+            *f = lo + (hi - lo) * ((t + 1) as f32 / steps);
+        }
+    }
+    filled
+}
+
+
 /// 把 `note_hz` 里**只有一帧**、而且两侧都是浊音的 0 填成两侧的均值。
 ///
 /// ⛔ 只填**长度恰好 1** 的段。见 [`fill_isolated_unvoiced`] 的 doc:两帧及以上是真辅音的长度,
@@ -893,7 +972,7 @@ pub fn render_score_sovits(
     zero_voiceless_frames(&mut note_hz_full, &arr);
     // S159zp —— 见 [`fill_isolated_unvoiced`]:帧量化 + 辅音前置在快音上造出来的孤立单帧 0。
     if fill_isolated_unvoiced() {
-        let k = fill_isolated_uv(&mut note_hz_full);
+        let k = fill_isolated_uv_max(&mut note_hz_full, fill_max_frames());
         if k > 0 {
             tracing::info!("score2svc: filled {k} isolated single-frame unvoiced holes");
         }
@@ -1163,7 +1242,7 @@ pub fn render_score_rvc(
     zero_voiceless_frames(&mut note_hz_full, &arr);
     // S159zp —— 见 [`fill_isolated_unvoiced`]:帧量化 + 辅音前置在快音上造出来的孤立单帧 0。
     if fill_isolated_unvoiced() {
-        let k = fill_isolated_uv(&mut note_hz_full);
+        let k = fill_isolated_uv_max(&mut note_hz_full, fill_max_frames());
         if k > 0 {
             tracing::info!("score2svc: filled {k} isolated single-frame unvoiced holes");
         }
