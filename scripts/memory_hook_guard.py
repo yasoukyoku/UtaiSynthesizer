@@ -256,15 +256,31 @@ def render_flight(reason, live, conf):
     return "\n".join(lines)
 
 
+def split_must_read(entry):
+    """`must_read` 一条 = `<文件名>` 或 `<文件名> —— <为什么要读它>`。
+
+    ⛔ S160 查出来的真缺陷:S159 起往这里加了带说明的条目,而两处消费点都拿**整串**当文件名
+    ⇒ 自检报「登记的必读文件不在」,而**渲染出来的钩子会对那两份最重要的交接文档打
+    「⚠ 这份不在了,去 MEMORY.md 找它搬去哪了」**。这块的存在意义就是在动手那一刻把名单打出来 ——
+    名单指着不存在的文件,比没有名单更坏。⇒ 说明留着(它有用),解析这一侧认它。
+    ⚠ 分隔符只认全角破折号 `——`,前后各一个空格;文件名里不会有它。
+    """
+    if isinstance(entry, str) and " —— " in entry:
+        name, why = entry.split(" —— ", 1)
+        return name.strip(), why.strip()
+    return (entry or "").strip(), ""
+
+
 def render(area, memory_dir):
     lines = []
     lines.append("⛔ 记忆钩子 [%s] —— %s" % (area["id"], area.get("headline", "")))
     lines.append("")
     lines.append("**动这块之前必读**(路径是绝对的,直接 Read):")
     for f in area.get("must_read", []):
-        p = os.path.join(memory_dir, f)
+        name, why = split_must_read(f)
+        p = os.path.join(memory_dir, name)
         mark = "" if os.path.isfile(p) else "   ⚠ 这份不在了,去 MEMORY.md 找它搬去哪了"
-        lines.append("  · %s%s" % (p, mark))
+        lines.append("  · %s%s%s" % (p, ("  —— " + why) if why else "", mark))
     rules = area.get("hard_rules", [])
     if rules:
         lines.append("")
@@ -364,7 +380,7 @@ def _selftest():
     md = conf["memory_dir"]
     for a in areas:
         for f in a["must_read"]:
-            p = os.path.join(md, f)
+            p = os.path.join(md, split_must_read(f)[0])
             if not os.path.isfile(p):
                 fails.append("[%s] 登记的必读文件不在:%s" % (a["id"], p))
     print("  ok   全部登记的必读文件都在场" if not any("必读文件不在" in x for x in fails)
