@@ -1844,6 +1844,30 @@ pub fn cover_dead_plan(
     cover_dead_plan_with(f0_hz, fps, range, CoverGrouping::today())
 }
 
+/// S160e —— cover **拆组**的收益门槛(**ms·半音**,与谱面轨 [`SPLIT_MIN_COST_DEFAULT`] 同一种货币)。
+///
+/// ## 它治的是什么(用户 2026-08-24 点名的 4:34.544「失声」)
+/// 那一处 **100% 在救援段内、附近没有段边**;音[789]「か」·86 / [790]「い」·84 落在一个
+/// **5.15 s / 深度 −17** 的大段里,而它自己只需要 **−7 度** ⇒ **陪绑过深 10 度**。
+/// 同一处的剂量测试(只换深度,阴性对照在同一句):深度 −11 ⇒ 该段电平比源低 **5.3 dB**;
+/// 深度 −17 ⇒ 低 **11.4-11.7 dB**;而紧邻前面**响**的半句在两条臂上都是 **+0.5 / +1.1 dB**。
+/// ⇒ **越深掉得越多,而且只掉在弱音上。**
+///
+/// ## 为什么只在【清音连段的正中】下刀
+/// S159k 的结论:cover 的边界落在长音中间会造出音色台阶(那正是用户听到的「炸」)。
+/// ⇒ 拆组**只许**把缝放进清音,而且放在清音连段的**正中**(离两侧唱音都最远)。
+/// 这样拆一刀几乎不付缝的钱,买到的是「浅的那半不再被深的那半拖下去」。
+///
+/// ## 定价(货币 = ms·半音 = 少染多少帧 × 少深多少度)
+/// 3000 相当于「一个 300 ms 的音少被拖 10 度」。
+/// 与谱面轨 `SPLIT_MIN_COST_DEFAULT` 同名同币但**不是同一个常量**:
+/// 两条车道的帧率、分组方式、缝的代价都不一样。`0` = 关掉拆组。
+const COVER_SPLIT_MIN_GAIN: f32 = 3000.0;
+
+/// S160e —— 拆出来的每一半至少这么长(毫秒)。
+/// 它不是品味:拆出太短的一半 = 又造回「碎片 + 两条边」,而碎片正是 S160c 那一族缺陷的来源。
+const COVER_SPLIT_MIN_PART_MS: f32 = 250.0;
+
 /// S160c —— [`cover_dead_plan`] 的分组两个门槛做成**参数**。
 ///
 /// ⛔ **为什么是参数不是 env**(S151 笔1 / `dead_only_plan_with` 同一条):走进程环境的判据
@@ -1864,6 +1888,10 @@ pub struct CoverGrouping {
     pub gap_tol_ms: f32,
     /// 门槛:一组里的**浊死帧**至少要这么久才成区(毫秒)。
     pub min_violation_ms: f32,
+    /// S160e —— **拆组**收益门槛(ms·半音)。0 = 关。见 [`COVER_SPLIT_MIN_GAIN`]。
+    pub split_gain: f32,
+    /// S160e —— 拆出来的每一半至少这么长(毫秒)。
+    pub split_min_part_ms: f32,
 }
 
 impl CoverGrouping {
@@ -1882,10 +1910,33 @@ impl CoverGrouping {
         Self {
             gap_tol_ms: ev("UTAI_COVER_GAP_TOL_MS", GAP_TOL_MS),
             min_violation_ms: ev("UTAI_COVER_MIN_VIOLATION_MS", MIN_VIOLATION_MS),
+            // ⛔ 收益的单位是 **ms·半音**,不是毫秒 —— 别套上面那个 [0,5000] 的范围
+            //   (第一版套了,于是 6000/12000 两条臂静默变成 3000,而**臂的标签在撒谎**;
+            //    是「把实际生效值打出来」那一行抓到的)。
+            split_gain: std::env::var("UTAI_COVER_SPLIT_GAIN")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|x| x.is_finite() && *x >= 0.0 && *x <= 1.0e7)
+                .unwrap_or(COVER_SPLIT_MIN_GAIN),
+            split_min_part_ms: ev("UTAI_COVER_SPLIT_MIN_PART_MS", COVER_SPLIT_MIN_PART_MS),
         }
     }
     pub fn new(gap_tol_ms: f32, min_violation_ms: f32) -> Self {
-        Self { gap_tol_ms, min_violation_ms }
+        Self {
+            gap_tol_ms,
+            min_violation_ms,
+            split_gain: COVER_SPLIT_MIN_GAIN,
+            split_min_part_ms: COVER_SPLIT_MIN_PART_MS,
+        }
+    }
+    /// 判据用:把四个旋钮全部钉死(⛔ 判据不许读进程环境)。
+    pub fn pinned(
+        gap_tol_ms: f32,
+        min_violation_ms: f32,
+        split_gain: f32,
+        split_min_part_ms: f32,
+    ) -> Self {
+        Self { gap_tol_ms, min_violation_ms, split_gain, split_min_part_ms }
     }
 }
 
@@ -2054,10 +2105,116 @@ pub fn cover_dead_plan_with(
             out.push(DeadJob { shift: s, start: a as i64, end: (b + 1) as i64 });
         }
     };
+    // S160e —— 拆组(见 COVER_SPLIT_MIN_GAIN)。只在清音连段的正中下刀。
+    let min_part = frames_for(grouping.split_min_part_ms, fps).max(1) as usize;
+    let cut_points = |a: usize, b: usize| -> Vec<usize> {
+        // 候选切点 = 每条 >= 3 帧(30 ms)清音连段的正中。不许在唱音上切(S159k)。
+        let mut out = Vec::new();
+        let mut run = 0usize;
+        for i in a..=b {
+            if !voiced(i) {
+                run += 1;
+            } else {
+                if run >= 3 {
+                    out.push(i - 1 - run / 2);
+                }
+                run = 0;
+            }
+        }
+        if run >= 3 {
+            out.push(b - run / 2);
+        }
+        out
+    };
+    let ms_per = 1000.0 / fps;
+    let top = range.usable.1.round() as i64;
+    let paint_cost = |a: usize, b: usize, sh: i64| -> f32 {
+        // 一段的「染色账」= 每个浊帧被【多】拖的度数 x 它的时长(ms·半音)。
+        idx.iter()
+            .zip(midi.iter())
+            .filter(|(&i, _)| i >= a && i <= b)
+            .map(|(_, &m)| {
+                let need = (m.round() as i64 - top).max(0);
+                ((sh.abs() - need).max(0) as f32) * ms_per
+            })
+            .sum()
+    };
+
     for (ea, eb, orig) in spans {
         let (pitches, dead) = collect(ea, eb);
         match minimal_rescue_shift(&dead, &pitches, range, None) {
-            Some(s) => push(s, ea, eb),
+            Some(s) => {
+                let mut parts: Vec<(usize, usize, i64)> = Vec::new();
+                if grouping.split_gain > 0.0 {
+                    let shift_of = |x: usize, y: usize| -> Option<i64> {
+                        let (p, d) = collect(x, y);
+                        // 拆出来的这一半里没有死音 => 它不需要被救;但它仍然在窗里(拼接器按窗贴),
+                        // 给它 0 会让拼接器贴一段没移调的 donor —— 那不是「不救」,是贴错东西。
+                        // => 判它不可拆。
+                        if d.is_empty() {
+                            return None;
+                        }
+                        minimal_rescue_shift(&d, &p, range, None)
+                    };
+                    // 迭代式拆(不用递归闭包):每轮挑收益最大的一刀,直到没有一刀过门槛。
+                    parts.push((ea, eb, s));
+                    for _round in 0..4 {
+                        let mut best: Option<(usize, usize, f32, usize, i64, i64)> = None;
+                        for (k, &(a, b, sh)) in parts.iter().enumerate() {
+                            if b < a + 2 * min_part {
+                                continue;
+                            }
+                            let c0 = paint_cost(a, b, sh);
+                            for p in cut_points(a, b) {
+                                if p < a + min_part || p + min_part > b {
+                                    continue;
+                                }
+                                let (Some(sl), Some(sr)) = (shift_of(a, p), shift_of(p + 1, b))
+                                else {
+                                    continue;
+                                };
+                                let g = c0 - paint_cost(a, p, sl) - paint_cost(p + 1, b, sr);
+                                if best.map_or(true, |(_, _, bg, _, _, _)| g > bg) {
+                                    best = Some((k, p, g, p, sl, sr));
+                                }
+                            }
+                        }
+                        // 「臂开着但没做事」必须可查(S129 铁律):每一轮都报最好的那一刀与它的收益。
+                        // ⛔ debug 级 —— 一首歌几十段 x 四轮,info 会把审计行淹掉;
+                        //    但它**必须存在**:S160e 第一版就是靠它发现「旋钮根本没送到」的
+                        //    (两条臂跑出逐字相同的计划,而臂的标签在撒谎)。
+                        tracing::debug!(
+                            "range-extend(cover/split): {:.2}s..{:.2}s round {_round}: best {:?}",
+                            ea as f32 / fps, eb as f32 / fps,
+                            best.map(|(k, p, g, _, sl, sr)| (k, p as f32 / fps, g, sl, sr))
+                        );
+                        match best {
+                            Some((k, p, g, _, sl, sr)) if g >= grouping.split_gain => {
+                                let (a, b, _) = parts[k];
+                                parts.splice(k..=k, [(a, p, sl), (p + 1, b, sr)]);
+                            }
+                            _ => break,
+                        }
+                    }
+                    if parts.len() > 1 {
+                        tracing::info!(
+                            "range-extend(cover): split {:.2}s..{:.2}s ({s:+} st) into {} part(s): {:?}",
+                            ea as f32 / fps,
+                            eb as f32 / fps,
+                            parts.len(),
+                            parts
+                                .iter()
+                                .map(|&(x, y, t)| (x as f32 / fps, y as f32 / fps, t))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                } else {
+                    parts.push((ea, eb, s));
+                }
+                for (x, y, t) in parts {
+                    push(t, x, y);
+                }
+            }
             None => {
                 // 外扩把乘客拖得太低 ⇒ 这一整条岛没有落点。**退回未外扩的原始组**:边会落回
                 // 长音中间(今天的行为),但至少不比今天差。⛔ 必须响 —— 这是降级不是正常路径。
@@ -4371,6 +4528,57 @@ mod tests {
                 "job {j:?} 盖住了无解区间 ({ua},{ub}) —— 审计行会说『原样渲坏』而实际不是"
             );
         }
+    }
+
+    /// S160e —— **拆组**:一段里深浅需求差得多时,在**清音连段的正中**拆开,
+    /// 免得只需要浅位移的那一半被深的那一半拖下去(用户 2026-08-24 点名的 4:34.544「失声」)。
+    #[test]
+    fn cover_split_puts_the_seam_in_the_unvoiced_run_and_only_when_it_pays() {
+        // usable 顶 77 = 用户那份 yachiyo sidecar 今天的值。
+        // ⛔ 第一个元组是 **usable**(第二个是 comfort)—— 第一版写反了,于是 MIDI 80
+        //   变成「唱得动」、根本不进死音组,判据当场红。usable 顶 77 = 用户那份
+        //   yachiyo sidecar 今天的值。
+        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 75.0));
+        // 左边 0.6 s 的 MIDI 80(只需 −3),右边 0.6 s 的 MIDI 91(需 −14),
+        // 中间夹 0.08 s 清音(8 帧 ⇒ 过得了「≥3 帧」这一条,也过得了 GAP_TOL 150 的桥接)。
+        let mut f0 = Vec::new();
+        f0.extend(std::iter::repeat(0.0).take(20));
+        f0.extend(std::iter::repeat(hz(80.0)).take(60));
+        f0.extend(std::iter::repeat(0.0).take(8));
+        f0.extend(std::iter::repeat(hz(91.0)).take(60));
+        f0.extend(std::iter::repeat(0.0).take(20));
+
+        // ⛔ 先钉「不拆」的样子:整段一个位移,由最深的那一头决定。
+        let g_off = CoverGrouping::pinned(150.0, 250.0, 0.0, 250.0);
+        let (jobs_off, _) = cover_dead_plan_with(&f0, 100.0, &r, g_off);
+        assert_eq!(jobs_off.len(), 1, "拆组关 ⇒ 一段:{jobs_off:?}");
+        let deep = jobs_off[0].shift;
+        assert!(deep <= -14, "整段该被最深的那一头拖到 ≤ −14,实际 {deep}");
+
+        // 拆组开 ⇒ 两段,而且浅的那一半确实浅了。
+        let g_on = CoverGrouping::pinned(150.0, 250.0, 1000.0, 250.0);
+        let (jobs_on, _) = cover_dead_plan_with(&f0, 100.0, &r, g_on);
+        assert_eq!(jobs_on.len(), 2, "拆组开 ⇒ 两段:{jobs_on:?}");
+        assert!(
+            jobs_on[0].shift > deep,
+            "浅的那一半应当比整段浅:{:?} vs {deep}",
+            jobs_on[0].shift
+        );
+        assert!(jobs_on[1].shift <= -14, "深的那一半仍然要够深:{:?}", jobs_on[1].shift);
+
+        // ⭐ 缝必须落在**清音**里:两段的接缝处 f0 == 0。
+        let seam = jobs_on[0].end as usize;
+        assert_eq!(f0[seam - 1], 0.0, "缝的左侧必须是清音(实际 {})", f0[seam - 1]);
+
+        // ⛔ 收益门槛真的挡得住:把门槛抬到天上 ⇒ 回到一段。
+        let g_hi = CoverGrouping::pinned(150.0, 250.0, 1.0e6, 250.0);
+        let (jobs_hi, _) = cover_dead_plan_with(&f0, 100.0, &r, g_hi);
+        assert_eq!(jobs_hi.len(), 1, "门槛够高就不该拆:{jobs_hi:?}");
+
+        // ⛔ 每一半的最小长度也真的挡得住:要求每半 ≥ 1 s ⇒ 拆不动(每半只有 0.6 s)。
+        let g_long = CoverGrouping::pinned(150.0, 250.0, 1000.0, 1000.0);
+        let (jobs_long, _) = cover_dead_plan_with(&f0, 100.0, &r, g_long);
+        assert_eq!(jobs_long.len(), 1, "每半 ≥1 s 的要求该挡住这一刀:{jobs_long:?}");
     }
 
     /// S159n ⑶ —— **按乐句整段救**(`UTAI_COVER_PHRASE_GAP_MS`,出厂 = 0 = 关)。

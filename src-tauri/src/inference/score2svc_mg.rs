@@ -122,8 +122,20 @@ fn mg_model_envs() -> (std::path::PathBuf, std::path::PathBuf, String) {
         .unwrap_or_else(|_| model.with_extension("npy"));
     if let Ok(s) = std::fs::read_to_string(model.with_extension("json")) {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["sample_rate"].as_i64(), Some(48000), "mg probe assumes 48k RVC");
-        assert_eq!(v["features_dim"].as_i64(), Some(768), "mg probe assumes 768-dim RVC");
+        // S160e —— 这道闸原来钉死 48k/768,理由是「探针的 RvcModel 参数钉死 768/48k/v2」。
+        // ⚠ 那句话**今天已经不成立**:`MgRvcRig::load` 是从 sidecar 读 `sample_rate` /
+        // `features_dim` / `min_frames` / `noise_channels` 的(见那里),钉死的只剩这道闸本身。
+        // ⇒ 它把**跨模型验收**挡在门外(yuyuko 是 40k;而 S159u 的验收面规矩要求
+        // 「至少两个模型」)。⭐ 但它**做对了一件事**:yuyuko 那一跑当场 panic 而不是静默错规格。
+        // ⇒ 保留「响亮」这一半,只把支持集放宽,并**把解析出来的规格打出来**。
+        let sr = v["sample_rate"].as_i64().expect("sidecar sample_rate");
+        let dim = v["features_dim"].as_i64().expect("sidecar features_dim");
+        assert!(
+            matches!(sr, 32000 | 40000 | 48000) && sr % 100 == 0,
+            "mg probe: 不认识的 RVC 采样率 {sr}(支持 32k/40k/48k,且必须能被 100 整除 ——              100 fps 的 f0 栅格依赖它)"
+        );
+        assert!(matches!(dim, 256 | 768), "mg probe: 不认识的 features_dim {dim}(支持 256/768)");
+        eprintln!("[mg] model spec from sidecar: {sr} Hz · {dim}-dim");
     }
     let stem = model.file_stem().unwrap().to_string_lossy().to_string();
     let mtag = if stem == "tetoRVC_best" { "teto".to_string() } else { stem };
@@ -1756,13 +1768,26 @@ fn mg_cover_plan() {
             std::env::var(k).ok().and_then(|v| v.trim().parse::<f32>().ok())
                 .filter(|x| x.is_finite() && *x >= 0.0 && *x <= 5000.0).unwrap_or(d)
         };
+        // ⛔⛔ S160e:第一版这里用 `CoverGrouping::new(...)`,而 `new()` 把 `split_gain` /
+        //   `split_min_part_ms` 写成常量 ⇒ **`UTAI_COVER_SPLIT_GAIN` 根本没送到**,
+        //   「拆组关」和「拆组开」两条臂跑出**逐字相同**的计划,而臂的标签在撒谎。
+        //   ⇒ 一律走 `pinned(...)`,四个旋钮全部显式传;下面那行把**实际生效**的四个值打出来。
         let t = super::super::vocal_range::CoverGrouping::today();
-        super::super::vocal_range::CoverGrouping::new(
+        super::super::vocal_range::CoverGrouping::pinned(
             ev("UTAI_COVER_GAP_TOL_MS", t.gap_tol_ms),
             ev("UTAI_COVER_MIN_VIOLATION_MS", t.min_violation_ms),
+            // ⛔ ms·半音,范围与毫秒那三个不同(见 `CoverGrouping::today`)。
+            std::env::var("UTAI_COVER_SPLIT_GAIN").ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|x| x.is_finite() && *x >= 0.0 && *x <= 1.0e7)
+                .unwrap_or(t.split_gain),
+            ev("UTAI_COVER_SPLIT_MIN_PART_MS", t.split_min_part_ms),
         )
     };
-    eprintln!("[cover-plan] grouping: gap_tol {} ms · min_violation {} ms", g.gap_tol_ms, g.min_violation_ms);
+    eprintln!(
+        "[cover-plan] grouping: gap_tol {} ms · min_violation {} ms · split_gain {} · split_min_part {} ms",
+        g.gap_tol_ms, g.min_violation_ms, g.split_gain, g.split_min_part_ms
+    );
     let (jobs, unfix) =
         super::super::vocal_range::cover_dead_plan_with(&f0, 100.0, &range, g);
     let voiced = f0.iter().filter(|v| **v > 0.0).count();
