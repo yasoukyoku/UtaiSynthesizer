@@ -1710,6 +1710,95 @@ fn mg_cover_rvc() {
     eprintln!("[mg] cover -> {out} (+ .f32)");
 }
 
+/// S160 —— **cover 车道的计划台**:跑**生产的** `cover_dead_plan`,只出计划、不碰 ONNX(秒级)。
+///
+/// ⛔ 为什么必须有它:cover 这一侧至今只有整条渲染台(`mg_cover_rvc`,一臂 2.5-7 分钟),
+/// 于是「换一条 f0 / 换一个门限,计划会变成什么样」这种题只能靠渲染去问,贵到没法扫。
+/// ⚠ 而 S158 已经付过一次学费:**别写离线复刻件** —— `TESTING\s157_knives\landing157.py`
+/// 当年四道对拍全过,今天里面那个常量已经陈了,而它长得和对拍那天一模一样。
+/// ⇒ 这台子**调用生产函数本身**,不复刻一行。
+///
+/// ```powershell
+/// $env:UTAI_MG_MODEL="…\yachiyo_runami.onnx"   # 只读同名 .json sidecar,不加载 ONNX
+/// $env:UTAI_COVER_F0="…\cover_f0.f32"          # UTAI_RANGE_DUMP_COVER_F0 落的那一份(裸 f32,100 fps)
+/// $env:UTAI_COVER_PLANOUT="…\plan.txt"         # 可选:落盘「起s 止s 位移」,与 regions*.txt 同格式
+/// cargo test --lib inference::score2svc::mg_tests::mg_cover_plan -- --ignored --nocapture
+/// ```
+/// 旋钮(与生产同一份 env):`UTAI_COVER_PHRASE_GAP_MS`。
+#[test]
+#[ignore = "probe: cover planner on a dumped f0 (needs UTAI_COVER_F0 + a model sidecar)"]
+fn mg_cover_plan() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    let f0p = std::env::var("UTAI_COVER_F0").expect("UTAI_COVER_F0=<裸 f32> required");
+    let bytes = std::fs::read(&f0p).unwrap_or_else(|e| panic!("{f0p:?}: {e}"));
+    assert_eq!(bytes.len() % 4, 0, "{f0p:?} 不是 f32 的整数倍");
+    let f0: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert!(f0.iter().all(|v| v.is_finite() && *v >= 0.0), "f0 里有非有限/负值");
+
+    let model_path = std::path::PathBuf::from(
+        std::env::var("UTAI_MG_MODEL").expect("UTAI_MG_MODEL required"),
+    );
+    let sc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_path.with_extension("json")).unwrap())
+            .unwrap();
+    let cfg: crate::models::ModelConfig =
+        serde_json::from_value(sc).expect("sidecar 解不成 ModelConfig —— 生产读的就是这个类型");
+    let speaker = mg_deadonly_speaker();
+    let range = super::super::vocal_range::speaker_range(&cfg, speaker)
+        .expect("这个模型的 sidecar 里没有可用的 vocal_range 记录");
+
+    let (jobs, unfix) = super::super::vocal_range::cover_dead_plan(&f0, 100.0, &range);
+    let voiced = f0.iter().filter(|v| **v > 0.0).count();
+    let cov: i64 = jobs.iter().map(|j| j.end - j.start).sum();
+    let mut shifts: std::collections::BTreeMap<i64, usize> = Default::default();
+    for j in &jobs {
+        *shifts.entry(j.shift).or_default() += 1;
+    }
+    eprintln!(
+        "[cover-plan] {} 帧 ({:.2}s) · 浊音 {voiced} · usable [{:.0},{:.0}] · phrase_gap {} ms",
+        f0.len(),
+        f0.len() as f32 / 100.0,
+        range.usable.0,
+        range.usable.1,
+        std::env::var("UTAI_COVER_PHRASE_GAP_MS").unwrap_or_else(|_| "0".into()),
+    );
+    eprintln!(
+        "[cover-plan] {} 段 · {} 条边 · 覆盖 {:.2}s ({:.1}%) · 无解 {} 段 · 位移分布 {:?}",
+        jobs.len(),
+        2 * jobs.len(),
+        cov as f32 / 100.0,
+        100.0 * cov as f32 / f0.len() as f32,
+        unfix.len(),
+        shifts
+    );
+    // ⛔ 「两侧都在唱的边」是这条线的主判据(S159k),这里一并算出来,别再靠脚本另算一遍。
+    let voiced_at = |i: i64| matches!(f0.get(i.max(0) as usize), Some(v) if *v > 0.0);
+    let mut both = 0usize;
+    for j in &jobs {
+        if voiced_at(j.start - 1) && voiced_at(j.start) {
+            both += 1;
+        }
+        if voiced_at(j.end - 1) && voiced_at(j.end) {
+            both += 1;
+        }
+    }
+    eprintln!("[cover-plan] 两侧都在唱的边: {both} / {}", 2 * jobs.len());
+    for &(a, b) in &unfix {
+        eprintln!("[cover-plan]   无解 {:.2}s..{:.2}s", a as f32 / 100.0, b as f32 / 100.0);
+    }
+    if let Ok(p) = std::env::var("UTAI_COVER_PLANOUT") {
+        let s: String = jobs
+            .iter()
+            .map(|j| format!("{:.2} {:.2} {}\n", j.start as f32 / 100.0, j.end as f32 / 100.0, j.shift))
+            .collect();
+        std::fs::write(&p, s).unwrap();
+        eprintln!("[cover-plan] -> {p}");
+    }
+}
+
 /// S158 —— **计划台**:同一条决策链、同一批函数,**只出计划、不渲染**(秒级,不碰 ONNX)。
 ///
 /// ⛔ 为什么不复用离线复刻件。S157 写过一份 `minimal_rescue_shift` 的 Python 复刻

@@ -165,6 +165,30 @@ fn cover_donor_pad_ms() -> f32 {
         .unwrap_or(0.0)
 }
 
+/// S160 —— 「我是不是最外层那一遍」。`run_pipeline` 的每个 donor 切片会**自递归**调用它自己
+/// (`range = None`,音频只有零点几秒),所以任何「按整曲时间轴」的探针都必须先问这一句。
+/// ⛔ 出厂路径上没有任何读者 —— 只有 `UTAI_COVER_F0_IN` 用它,不设那个 env 就一个分支都不走。
+mod depth_guard {
+    use std::cell::Cell;
+    thread_local! { static DEPTH: Cell<usize> = const { Cell::new(0) }; }
+    pub struct Scope;
+    impl Scope {
+        pub fn enter() -> Self {
+            DEPTH.with(|d| d.set(d.get() + 1));
+            Scope
+        }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    /// ⚠ 在 `Scope::enter()` **之后**调用:最外层那一遍读到 1。
+    pub fn is_outermost() -> bool {
+        DEPTH.with(|d| d.get()) <= 1
+    }
+}
+
 pub fn run_pipeline(
     m: &RvcModel,
     audio: &AudioBuffer,
@@ -174,6 +198,7 @@ pub fn run_pipeline(
     progress: &dyn Fn(f32),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SynthesisResult> {
+    let _depth = depth_guard::Scope::enter();
     if audio.samples.is_empty() {
         return Err(UtaiError::Audio("AUDIO_EMPTY_INPUT".into()));
     }
@@ -272,7 +297,53 @@ pub fn run_pipeline(
             p_len
         )));
     }
-    let pitchf: Vec<f32> = f0[..p_len].to_vec();
+    let mut pitchf: Vec<f32> = f0[..p_len].to_vec();
+    // S160 探针 —— `UTAI_COVER_F0_IN=<裸 f32 路径>`:**用外部一条 f0 顶掉 RMVPE 那条**。
+    //
+    // ⛔ 为什么需要它:S160 在用户那份 +7 素材上看见 `pitchf`(= RMVPE)在副歌上**成段掉八度**
+    //   (275.25-277.25 s:源是一个 2 秒的 1200 Hz 长音,pitchf 整整两秒停在 600 Hz,而
+    //   `off.wav` 在 600 Hz 上长出了一根源里根本没有的基频)。要判定「这条 f0 是不是那个『炸』」,
+    //   唯一干净的台面是**只换 f0、其它一个字节不动**。
+    // ⚠ 文件的语义 = `UTAI_RANGE_DUMP_COVER_F0` 落的那一份的**同一段**:
+    //   裸 little-endian f32,100 fps,长度 = `out_frames`,对齐**输出时间轴**(即 pitchf 去掉两端 pad)。
+    //   长度对不上就**响亮拒绝**(不许静默截断 —— 那会伪造一条「臂开着但没做事」的阴性臂)。
+    // ⛔ 出厂不设 ⇒ 这一段整个跳过 ⇒ 输出逐位不变。
+    // ⛔⛔ 只作用在**最外层**那一遍。`run_pipeline` 每个 donor 切片会**自递归**调用它自己
+    //   (`:535`,`range = None`),那一遍的 `audio_f` 只有零点几秒 —— 第一版没有这道门,
+    //   于是 donor 递归撞上长度断言当场 panic。⭐ 那条断言是对的:它把「注入口的作用域」
+    //   这件我没想清楚的事**响亮地**顶了出来,而不是静默地把一条错的 f0 塞进 donor。
+    if depth_guard::is_outermost() && std::env::var("UTAI_COVER_F0_IN").is_ok() {
+        let p = std::env::var("UTAI_COVER_F0_IN").unwrap();
+        let want = audio_f.len() / WINDOW;
+        let pad_f = t_pad / WINDOW;
+        let bytes = std::fs::read(&p)
+            .unwrap_or_else(|e| panic!("UTAI_COVER_F0_IN={p:?} 读不了: {e}"));
+        assert_eq!(bytes.len() % 4, 0, "UTAI_COVER_F0_IN={p:?} 不是 f32 的整数倍");
+        let got = bytes.len() / 4;
+        assert_eq!(
+            got, want,
+            "UTAI_COVER_F0_IN={p:?} 帧数 {got} ≠ 期望 {want}(= audio_f.len()/WINDOW,\
+             与 UTAI_RANGE_DUMP_COVER_F0 落的那一份同长)"
+        );
+        let hi = (pad_f + want).min(pitchf.len());
+        let mut changed = 0usize;
+        for (k, i) in (pad_f..hi).enumerate() {
+            let v = f32::from_le_bytes([
+                bytes[4 * k], bytes[4 * k + 1], bytes[4 * k + 2], bytes[4 * k + 3],
+            ]);
+            assert!(v.is_finite() && v >= 0.0, "UTAI_COVER_F0_IN 第 {k} 帧 = {v} —— 不是有限非负数");
+            if (v - pitchf[i]).abs() > 1e-6 {
+                changed += 1;
+            }
+            pitchf[i] = v;
+        }
+        // ⛔ 「臂开着」与「臂做了事」必须分开可查(S129 铁律)。
+        tracing::warn!(
+            "RVC f0 OVERRIDE from {p}: {} of {} frames replaced ({} differ from RMVPE)",
+            hi - pad_f, want, changed
+        );
+    }
+    let pitchf = pitchf;
     let pitch: Vec<i64> = pitchf.iter().map(|&v| f0_to_coarse(v)).collect();
     progress(0.2); // f0 (the one whole-signal RMVPE pass) done
     tracing::info!(
