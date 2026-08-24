@@ -390,12 +390,21 @@ fn narrow_usable_by_level(
     let Some(sc) = semitones else { return usable };
     let level = |m: i64| -> Option<f64> { sc.get(&m.to_string())?.as_array()?.get(2)?.as_f64() };
     let (lo0, hi0) = (usable.0.round() as i64, usable.1.round() as i64);
-    let (mut lo, mut hi) = (lo0, hi0);
+    let (lo, mut hi) = (lo0, hi0);
+    // ⛔⛔ **只收顶,不收底。**第一版两端都收,当场把 yuyuko 从 `[36,82]` 收成 **`[60,79]`** ——
+    //   少了 24 个半音。原因是结构性的:**一个嗓子的低音区天生就比它自己最响的中音区安静**,
+    //   而 `rms_db` 是相对该模型自己的最大值的 ⇒ 两端都会读到很负的值。
+    //   四份装机记录的底部 rms_db(usable 底往上 9 格):
+    //     东雪莲 −5.9…−9.8 · akiko **−19.5…−16.9** · yachiyo −9.4…−6.2 · yuyuko **−16…−10.2**
+    //   ⇒ 两端都收会把 akiko 收成 `[49,76]`、yachiyo `[42,77]`、yuyuko `[60,79]`
+    //     —— **四个里毁三个**;只收顶则四个全对。
+    // ⚠ 而用户报的缺陷**只在顶上**(模型在自己舒服区之上硬撑);底部安静是音乐上正常的,
+    //   而且把低音往**上**搬的代价与往下完全不同(S159k 记过 cover 那条车道的反方向)。
+    // ⛔⛔ 血训:第一版**有**一条判据写着「底不该动」,而它给的是一个**底部 rms 健康的合成夹具**
+    //   ⇒ 那条断言结构上够不着这个坏法。**夹具不真实的判据 = 空判据。**
+    //   现在的判据直接用四份装机记录的**真实底部读数**。
     while hi > lo && level(hi).is_some_and(|d| d < floor_db) {
         hi -= 1;
-    }
-    while lo < hi && level(lo).is_some_and(|d| d < floor_db) {
-        lo += 1;
     }
     if hi <= lo {
         tracing::warn!(
@@ -6575,21 +6584,26 @@ mod tests {
     /// ⛔ 数字来源:各自 sidecar 的 `vocal_range.speakers.0.semitones`(2026-08-24 实测)。
     #[test]
     fn the_level_gate_only_moves_the_model_that_needs_it() {
-        // (名字, usable, 顶往下 5 格的 rms_db —— 从低到高)
-        let cases: &[(&str, i64, i64, [f64; 5], i64)] = &[
-            // 东雪莲:顶 79,rms −0.4 … −6.1 ⇒ 闸在 −8 上够不着它
-            ("dxl", 36, 79, [-0.4, -1.9, -1.6, -2.4, -6.1], 79),
-            ("akiko", 36, 76, [-0.7, -0.5, 0.0, -2.9, -3.0], 76),
-            ("yachiyo", 36, 77, [-2.8, -1.2, 0.0, -2.3, -1.5], 77),
-            // yuyuko:顶 82,80/81/82 是 −9.9 / −13.7 / −16.6 ⇒ 收到 79
-            ("yuyuko", 36, 82, [-2.9, 0.0, -9.9, -13.7, -16.6], 79),
+        // (名字, usable, 顶往下 5 格的 rms_db, **底往上 5 格的 rms_db**, 期望的新顶)
+        // ⛔⛔ 底部那五个数是**真实读数**,不是编的 —— 第一版给的是健康的 −1.0,
+        //   于是「底不该动」那条断言结构上够不着「两端都收」这个坏法(实机上把 yuyuko
+        //   收成了 `[60,79]`)。**夹具不真实的判据 = 空判据。**
+        let cases: &[(&str, i64, i64, [f64; 5], [f64; 5], i64)] = &[
+            ("dxl", 36, 79, [-0.4, -1.9, -1.6, -2.4, -6.1], [-5.9, -7.2, -7.7, -6.5, -7.0], 79),
+            ("akiko", 36, 76, [-0.7, -0.5, 0.0, -2.9, -3.0], [-19.5, -22.9, -19.8, -20.8, -19.7], 76),
+            ("yachiyo", 36, 77, [-2.8, -1.2, 0.0, -2.3, -1.5], [-9.4, -11.5, -9.2, -8.9, -9.7], 77),
+            ("yuyuko", 36, 82, [-2.9, 0.0, -9.9, -13.7, -16.6], [-16.0, -14.4, -15.4, -13.7, -12.6], 79),
         ];
-        for &(name, lo, hi, rms, want) in cases {
+        for &(name, lo, hi, rms, bot, want) in cases {
             let mut semis = serde_json::Map::new();
             for m in lo..=hi {
-                // 顶往下 5 格用实测值,其余给一个健康的 −1.0(那一段本来就不该被闸咬)
-                let k = (m - (hi - 4)) as usize;
-                let db = if m >= hi - 4 { rms[k] } else { -1.0 };
+                let db = if m >= hi - 4 {
+                    rms[(m - (hi - 4)) as usize]
+                } else if m <= lo + 4 {
+                    bot[(m - lo) as usize]
+                } else {
+                    -1.0
+                };
                 semis.insert(m.to_string(), serde_json::json!([1, 1.0, db, 0.10]));
             }
             let got = narrow_usable_by_level(
@@ -6598,7 +6612,8 @@ mod tests {
                 RESCUE_LEVEL_FLOOR_DB,
             );
             assert_eq!(got.1 as i64, want, "{name}: usable 顶应当是 {want},实际 {}", got.1);
-            assert_eq!(got.0 as i64, lo, "{name}: 底不该动");
+            // ⭐ 承重的那一半:**底一格都不许动**,即使它比该模型自己最响的一格低 20 dB。
+            assert_eq!(got.0 as i64, lo, "{name}: 底不该动(实际 {})", got.0);
         }
     }
 
@@ -6622,13 +6637,14 @@ mod tests {
         }
         assert_eq!(narrow_usable_by_level(Some(&all_quiet), (36.0, 82.0), -8.0), (36.0, 82.0));
 
-        // ⑷ 底也会被收(不是只管顶)
+        // ⑷ ⛔ **底【不】会被收** —— 见 `narrow_usable_by_level` 里那段血训:
+        //    低音区安静是音乐上正常的,两端都收会毁掉四个装机记录里的三个。
         let mut low_bad = serde_json::Map::new();
         for m in 36..=82i64 {
             let db = if m <= 38 { -20.0 } else { -1.0 };
             low_bad.insert(m.to_string(), serde_json::json!([1, 1.0, db, 0.10]));
         }
-        assert_eq!(narrow_usable_by_level(Some(&low_bad), (36.0, 82.0), -8.0), (39.0, 82.0));
+        assert_eq!(narrow_usable_by_level(Some(&low_bad), (36.0, 82.0), -8.0), (36.0, 82.0));
     }
 
     /// S159 —— ⛔⛔ **深度上限只在「最浅落点本来就很深」时才咬 —— 所以只扫它一维必然读出一张平表。**
