@@ -2016,6 +2016,126 @@ fn seam_fade(audio: &mut [f32], wav: &mut [f32], sample_rate: u32) {
 /// S159 —— `keep` = 这一遍的 donor 里**会被拼回歌里**的那几段样本(空 = 整条 = 今天)。
 /// 逆变换只在这些段上跑,其余的岛原样透传 —— 因为那些样本在拼接层一个也读不到。
 /// ⛔ 它不在这里从 `DonorCtx.windows` 现算,理由写在 `DonorCtx::keep_samples` 的 doc 里。
+/// S160k —— `UTAI_MG_UVGATE=1`(出厂 **0 = 关 = 逐位不变**):**donor 那一遍**里,把我们已经
+/// 写成 `note_hz == 0` 的那些帧上、模型仍然吐出来的**有调成分**滤掉。`UTAI_MG_UVGATE_K` = 截止
+/// 频率相对参照基频的倍数(默认 1.5)。
+///
+/// ## ⛔ 它治的是什么(用户 2026-08-24 点名的 0:47.229 那声咔哒)
+/// 逐阶段定位(窗 47.200-47.252,喂给 PSOLA 的 `note_hz` 在这 60 ms 上**是 0** ——
+/// ひ 的 /h/ 被 `consonant_preroll` 前置、被 `zero_voiceless_frames` 置零):
+/// | 阶段 | 480-540 Hz(donor 档) |
+/// |---|---|
+/// | `base`(不救) | **0.6 dB** |
+/// | **`donor_pre`(逆变换【前】)** | **23.3 dB @528 Hz** |
+/// | `donor_post`(逆变换后) | 18.6 |
+/// | 成品 | 28.8 |
+/// ⇒ **那个音在 donor 还没进 PSOLA 之前就已经在了** —— 不是拼接、不是 PSOLA、也不是辅音本身。
+/// 它是 S159zzs 结案的那族「**模型把清音辅音渲成半浊化**」。
+///
+/// ## ⭐ 但 S159zzs 的「不可闻」在这里**不成立**,而这条是本场最该记住的
+/// 那次的结论是「不可闻 / 模型侧 / 渲染层修不动」。**在救援窗里它变得可闻了**:
+/// 那个半浊化的音落在 **donor 的音高**上,比目标**低 9-15 个半音**;
+/// 而 `note_hz == 0` 恰恰意味着 PSOLA **结构上不会去抬它**(那些帧在浊音岛之外)。
+/// ⇒ **半浊化 × 深救援 = 一声听得见的咔哒。**
+/// ⛔ 实测两把现成的刀都够不着它:`UTAI_PSOLA_BRIDGE` 30→120→250(28.8 / 29.1 / 29.1)与
+/// `UTAI_MG_VALLEY_ADAPT=1`(28.5)—— 因为它们改的是**怎么搬**,而这个成分**本来就不该在**。
+///
+/// ## 做法与两条硬约束
+/// 对每一段 `note_hz == 0` 的连续帧:截止频率 = `k ×`(该段**最近的浊音帧**的 `note_hz`),
+/// 夹在 `[200, 2500]` Hz;在**该段的样本范围**上做零相位高通(双二阶前向+反向),
+/// 段外一个样本都不碰。
+/// ⛔ **两端必须交叉淡化**(默认 4 ms):硬切换会**造出一声新的咔哒** —— 这一族的解药不许
+///    自己成为同一族的病因。
+/// ⛔ 只在 **donor 那一遍**(`range_shift != 0`)走这条路;base 一个字节不动。
+fn gate_unvoiced_tone(audio: &mut [f32], sample_rate: u32, note_hz: &[f32], k: f32, fade_ms: f32) -> usize {
+    let hop = (sample_rate as usize / 50).max(1);
+    let n = audio.len();
+    let fade = ((fade_ms / 1000.0) * sample_rate as f32) as usize;
+    let mut hit = 0usize;
+    let mut i = 0usize;
+    while i < note_hz.len() {
+        if note_hz[i] != 0.0 {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j + 1 < note_hz.len() && note_hz[j + 1] == 0.0 {
+            j += 1;
+        }
+        // 参照基频:优先取**前**一个浊音帧(那才是正在延续的那个嗓音),没有就取后一个。
+        let prev = (0..i).rev().find(|&t| note_hz[t] > 0.0).map(|t| note_hz[t]);
+        let next = (j + 1..note_hz.len()).find(|&t| note_hz[t] > 0.0).map(|t| note_hz[t]);
+        let Some(f_ref) = prev.or(next) else {
+            i = j + 1;
+            continue;
+        };
+        let cut = (k * f_ref).clamp(200.0, 2500.0);
+        let a = (i * hop).min(n);
+        let b = ((j + 1) * hop).min(n);
+        if b > a + 2 * fade + 8 {
+            highpass_span(audio, sample_rate, a, b, cut, fade);
+            hit += 1;
+        }
+        i = j + 1;
+    }
+    hit
+}
+
+/// 零相位高通(RBJ 双二阶,前向 + 反向),只作用在 `[a, b)`,两端各 `fade` 个样本交叉淡化。
+/// ⛔ 为了不在段边引入瞬态,滤波在 `[a-ctx, b+ctx]` 上跑(`ctx` = 4 个截止周期),
+///    但**只有 `[a, b)` 的样本被写回**。
+fn highpass_span(audio: &mut [f32], sample_rate: u32, a: usize, b: usize, cut: f32, fade: usize) {
+    let sr = sample_rate as f32;
+    let ctx = ((4.0 * sr / cut) as usize).min(a).min(audio.len() - b);
+    let lo = a - ctx;
+    let hi = b + ctx;
+    let src: Vec<f32> = audio[lo..hi].to_vec();
+    // RBJ high-pass, Q = 1/sqrt(2)
+    let w0 = 2.0 * std::f32::consts::PI * cut / sr;
+    let (sn, cs) = (w0.sin(), w0.cos());
+    // Butterworth: Q = 1/sqrt(2) ⇒ alpha = sin(w0) / (2Q)。
+    // ⛔ 第一版写成 `.recip()`(= Q 取了 sqrt(2))⇒ 截止处鼓一个 +3 dB 的包 —— 自查抓到的。
+    let alpha = sn / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
+    let b0 = (1.0 + cs) / 2.0;
+    let b1 = -(1.0 + cs);
+    let b2 = (1.0 + cs) / 2.0;
+    let a0 = 1.0 + alpha;
+    let a1 = -2.0 * cs;
+    let a2 = 1.0 - alpha;
+    let (b0, b1, b2, a1, a2) = (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0);
+    let run = |x: &[f32]| -> Vec<f32> {
+        let (mut x1, mut x2, mut y1, mut y2) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        x.iter()
+            .map(|&v| {
+                let y = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                x2 = x1;
+                x1 = v;
+                y2 = y1;
+                y1 = y;
+                y
+            })
+            .collect()
+    };
+    let f1 = run(&src);
+    let mut rev: Vec<f32> = f1.into_iter().rev().collect();
+    rev = run(&rev);
+    let filt: Vec<f32> = rev.into_iter().rev().collect();
+    for t in a..b {
+        let u = t - lo;
+        // 两端交叉淡化:段内 `fade` 个样本从原始渐变到滤波后的
+        let w = if fade == 0 {
+            1.0
+        } else if t < a + fade {
+            (t - a) as f32 / fade as f32
+        } else if t + fade >= b {
+            (b - t) as f32 / fade as f32
+        } else {
+            1.0
+        };
+        audio[t] = (1.0 - w) * audio[t] + w * filt[u];
+    }
+}
+
 fn apply_range_inverse(
     audio: Vec<f32>,
     sample_rate: u32,
@@ -2030,6 +2150,19 @@ fn apply_range_inverse(
     // note_hz is the FED (already range-shifted) parametric pitch on the 50 fps cv grid — it
     // drives the inverse's streaming formant base (S82b anti-pop; vocal_range folds it into
     // a sticky schedule).
+    // S160k —— 清音帧去调门(见 [`gate_unvoiced_tone`])。出厂关 ⇒ 一个分支都不走。
+    // ⚠ 放在 dump **之前**:那份 dump 的语义是「**PSOLA 实际吃到的东西**」。
+    let mut audio = audio;
+    if matches!(std::env::var("UTAI_MG_UVGATE").as_deref(), Ok("1")) {
+        let k = std::env::var("UTAI_MG_UVGATE_K")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 1.0 && *v <= 6.0)
+            .unwrap_or(1.5);
+        let hit = gate_unvoiced_tone(&mut audio, sample_rate, note_hz, k, 4.0);
+        // 「臂开着」与「臂做了事」必须分开可查(S129 铁律)。
+        tracing::info!("range-extend(donor {range_shift:+}): uv-gate k={k} — {hit} unvoiced span(s) high-passed");
+    }
     dump_donor_buffer("pre", range_shift, &audio, note_hz);
     let out = super::vocal_range::apply_inverse_windowed(
         audio,
@@ -3574,5 +3707,90 @@ mod tests {
             assert!(*len > 0, "{name}: empty render");
         }
         eprintln!("[smoke] ✓ all {} decode branches ran non-silent", results.len());
+    }
+}
+
+#[cfg(test)]
+mod s160k_uvgate_tests {
+    use super::{gate_unvoiced_tone, highpass_span};
+
+    fn tone(n: usize, sr: f32, f: f32) -> Vec<f32> {
+        (0..n).map(|i| (2.0 * std::f32::consts::PI * f * i as f32 / sr).sin()).collect()
+    }
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / x.len() as f64).sqrt() as f32
+    }
+
+    /// S160k —— 高通只作用在 `[a, b)`,而且**段外一个样本都不许动**。
+    #[test]
+    fn the_highpass_touches_only_its_own_span() {
+        let sr = 44100u32;
+        let mut x = tone(sr as usize / 2, sr as f32, 500.0);
+        let before = x.clone();
+        let (a, b) = (8000usize, 12000usize);
+        highpass_span(&mut x, sr, a, b, 1500.0, 200);
+        for t in 0..a {
+            assert_eq!(x[t], before[t], "段前第 {t} 个样本被动了");
+        }
+        for t in b..x.len() {
+            assert_eq!(x[t], before[t], "段后第 {t} 个样本被动了");
+        }
+        // 段【正中】(离交叉淡化远)必须被明显衰减:500 Hz 远在 1500 Hz 截止之下。
+        let mid = &x[a + 1000..b - 1000];
+        let ref_ = &before[a + 1000..b - 1000];
+        let att = 20.0 * (rms(mid) / rms(ref_)).log10();
+        assert!(att < -18.0, "500 Hz 在 1500 Hz 高通下该被压掉 ≥18 dB,实际 {att:.1} dB");
+    }
+
+    /// S160k —— 截止**之上**的成分要基本原样过去(不然它连辅音噪声一起吃掉)。
+    #[test]
+    fn the_highpass_keeps_what_is_above_the_cutoff() {
+        let sr = 44100u32;
+        let mut x = tone(sr as usize / 2, sr as f32, 4000.0);
+        let before = x.clone();
+        let (a, b) = (8000usize, 12000usize);
+        highpass_span(&mut x, sr, a, b, 1500.0, 200);
+        let att = 20.0
+            * (rms(&x[a + 1000..b - 1000]) / rms(&before[a + 1000..b - 1000])).log10();
+        assert!(att > -1.5, "4 kHz 该基本过得去,实际 {att:.1} dB");
+    }
+
+    /// S160k —— 门只碰 `note_hz == 0` 的连续帧,而且**必须有一个浊音参照**才动手。
+    #[test]
+    fn the_gate_only_fires_on_unvoiced_runs_that_have_a_voiced_neighbour() {
+        let sr = 44100u32;
+        let hop = sr as usize / 50;
+        // 20 帧:0-7 浊音 494 Hz,8-11 清音(0),12-19 浊音
+        let mut hz = vec![494.0f32; 20];
+        for t in 8..12 {
+            hz[t] = 0.0;
+        }
+        let mut x = tone(20 * hop, sr as f32, 494.0);
+        let before = x.clone();
+        let hit = gate_unvoiced_tone(&mut x, sr, &hz, 1.5, 4.0);
+        assert_eq!(hit, 1, "只该命中一段");
+        // 清音段正中被压掉(494 Hz 在 1.5×494 = 741 Hz 截止之下)
+        let (a, b) = (8 * hop, 12 * hop);
+        let att = 20.0 * (rms(&x[a + 400..b - 400]) / rms(&before[a + 400..b - 400])).log10();
+        assert!(att < -10.0, "清音段里的 494 Hz 该被压掉,实际 {att:.1} dB");
+        // ⛔ 浊音段一个样本都不许动
+        for t in 0..a {
+            assert_eq!(x[t], before[t], "浊音段(前)第 {t} 个样本被动了");
+        }
+        for t in b..x.len() {
+            assert_eq!(x[t], before[t], "浊音段(后)第 {t} 个样本被动了");
+        }
+
+        // ⛔ 全清音(没有任何浊音参照)⇒ 一个字不动
+        let hz0 = vec![0.0f32; 20];
+        let mut y = before.clone();
+        assert_eq!(gate_unvoiced_tone(&mut y, sr, &hz0, 1.5, 4.0), 0);
+        assert_eq!(y, before);
+
+        // ⛔ 全浊音 ⇒ 一个字不动
+        let hz1 = vec![494.0f32; 20];
+        let mut z = before.clone();
+        assert_eq!(gate_unvoiced_tone(&mut z, sr, &hz1, 1.5, 4.0), 0);
+        assert_eq!(z, before);
     }
 }

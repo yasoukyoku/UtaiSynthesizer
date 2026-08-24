@@ -4053,7 +4053,7 @@ fn parse_env_restore_ms(v: Option<&str>) -> f64 {
 /// must bump `RANGE_ALGO_VERSION` **and** `audition_cache_tag` in the same commit.
 const ENV_RESTORE_MS_DEFAULT: f64 = 0.0;
 
-/// ⚙ 出厂默认 = 30.0 —— 桥接清音 30 ms
+/// ⚙ 出厂默认 = 120.0 —— 桥接清音 120 ms(S160j;30 是 S154 的历史值)
 /// S154 — `UTAI_PSOLA_BRIDGE=<ms>` bridges short unvoiced gaps in the fed f0 so the voiced islands
 /// cover the whole rescued note. **0 = off = byte-for-byte the pre-S154 arm.**
 ///
@@ -4103,7 +4103,43 @@ fn parse_bridge_unvoiced_ms(v: Option<&str>) -> f64 {
 ///
 /// ⚠ Only measured on **akiko × 炉心融解 +7**. yachiyo / 东雪莲 / goose are untested on this arm.
 /// ⚠ 45-60 ms is the next notch if the line ever comes back — it removes the remaining ~20 %.
-const BRIDGE_UNVOICED_MS_DEFAULT: f64 = 30.0;
+/// ⭐⭐ **S160j —— 30 → 120,用户 2026-08-24 耳判后拍板。**
+///
+/// ## 它治的是什么
+/// 用户在东雪莲 × 炉心融解 +7 上点名 **0:46.405** 一声「非常明显」的咔哒。逐处量出来:
+/// 那是一段 **180 ms 的乐句内休止**(音[194]),两侧同一个 −9 的窗;休止里冒出一小段
+/// **624/667/711 Hz = MIDI 75-77** 的有调突发,而该窗 donor 的音高正是 **MIDI 78 = 740 Hz**
+/// ⇒ **donor【未移调】的尾音在 PSOLA 浊音岛之外漏了出来**(30 ms 的桥接够不着 180 ms 的休止)。
+/// ⛔ 这就是为什么它「离辅音很近但不是那个辅音」,也是为什么 **LPC 残差那把咔哒尺子读不出来**
+///    (×1.5,全曲最高 11%)—— 它找的是宽带瞬态,而这是一个**音高错了的有调片段**。
+///
+/// ## 读数(东雪莲 × 炉心融解 +7,同一二进制)
+/// | 臂 | 46.39-46.44 的 donor 档(600-780 Hz) | ✅ な·80 稳态 | ✅ ま·87 稳态 |
+/// |---|---|---|---|
+/// | bridge 30 | **+29.3 dB** | 48.3 | 51.7 |
+/// | **bridge 120** | **−9.4 dB(−38.7)** | 48.9 | 52.4 |
+/// | bridge 250 | −12.3 | — | — |
+/// ⇒ 用户耳判 120 与 250 **听不出区别** ⇒ 按风险取小的那个(与 S154 当年在 30/60 之间的取法同源)。
+///
+/// ## ⛔ 快音谱上的阴性对照(这是翻它之前最该问的一件事)
+/// **鹅妈妈 × 东雪莲 × +7**(1215 个唱音,**73% ≤180 ms**,中位 140 ms)—— 用户原话
+/// 「那玩意快音一堆,如果不被搅成一坨其实就可以」。按休止时长分箱量**休止里的能量**:
+/// | 休止时长 | 条数 | 窗内 30 → 120 | ✅ 窗外(结构上不该被碰) |
+/// |---|---|---|---|
+/// | 60-90 ms | 5 | −15.7 → −15.9(**−0.16**) | −0.21 |
+/// | 90-120 ms | 9 | −18.6 → −18.8(**−0.18**) | −0.16 |
+/// | 120-200 ms | 105 | −14.9 → −15.0(−0.08) | −0.28 |
+/// | 200-400 ms | 53 | −13.2 → −13.2(+0.01) | −0.31 |
+/// ⇒ **窗内的变化全部落在「窗外那一列」= 这条链的复现噪声之内** ⇒ 快音没有被填、没有被搅在一起。
+/// 用户听完:「鹅妈妈 120 我听了,我觉得也没问题」。
+///
+/// ## ⚠ 它够不着的那一半
+/// 同一场里用户点的**另一声**咔哒(0:47.229)桥接**一分没动**(28.8 / 29.1 / 29.1)——
+/// 那一族的成分**在 donor 进 PSOLA 之前就已经在了**(见 `score2svc::gate_unvoiced_tone`)。
+/// ⇒ **别把这一刀当成「咔哒都解决了」。**
+///
+/// S154 原文(30 ms 那一版的出处)保留在下面。
+const BRIDGE_UNVOICED_MS_DEFAULT: f64 = 120.0;
 
 /// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b/S82c streaming base): per
 /// window the voiced (> 20 Hz) median, UNquantized — an earlier semitone quantization (meant
@@ -6743,10 +6779,10 @@ mod tests {
         );
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s159j";
+        const TAG: &str = "s160j";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -7355,19 +7391,24 @@ mod tests {
                    "出厂口径必须是 PerPeriod");
     }
     #[test]
-    fn the_island_dilation_defaults_to_thirty_ms_and_garbage_never_silently_disables_it() {
+    fn the_island_dilation_defaults_to_120_ms_and_garbage_never_silently_disables_it() {
         // ⛔ 与 `parse_phase_lock` / `parse_infrasonic_hp` 同一条规矩:**默认值本身要有判据**。
         // 这一条尤其重要,因为这个臂是**开着**的:没有它,「我们翻了」与「有人把它翻回去了」
         // 在别的每一条测试上长得一模一样。
+        // ⭐ S160j:30 → 120(用户 2026-08-24 耳判拍板)。30 是 S154 的历史值,理由都在
+        //    `BRIDGE_UNVOICED_MS_DEFAULT` 的 doc 上,两段读数都在那里。
         assert_eq!(
             parse_bridge_unvoiced_ms(None),
-            30.0,
-            "生产默认必须是 30 ms —— 改它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
+            120.0,
+            "生产默认必须是 120 ms —— 改它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
         );
         assert_eq!(parse_bridge_unvoiced_ms(None), BRIDGE_UNVOICED_MS_DEFAULT);
         // 显式的 0 必须能关掉它 —— 用户报「新版不对」时要渲得出旧臂(S150 那条)。
         assert_eq!(parse_bridge_unvoiced_ms(Some("0")), 0.0);
         assert_eq!(parse_bridge_unvoiced_ms(Some("60")), 60.0);
+        // ⛔ S160j —— 出厂值钉成字面量(不许写成常量自比,那是恒真)。30 是 S154 的历史值。
+        assert_eq!(BRIDGE_UNVOICED_MS_DEFAULT, 120.0, "出厂桥接 = 120 ms(S160j,用户耳判拍板)");
+        assert_eq!(parse_bridge_unvoiced_ms(Some("30")), 30.0, "S154 那个历史值仍然设得回去");
         assert_eq!(parse_bridge_unvoiced_ms(Some(" 45 ")), 45.0);
         // 垃圾与越界一律退回默认,不许静默改变行为。
         for bad in ["", "nonsense", "-1", "NaN", "501"] {
@@ -7541,9 +7582,15 @@ mod tests {
     fn the_window_reaches_the_engine_and_an_empty_window_is_not_an_error() {
         let sr = 44_100u32;
         let hop = sr as usize / 100;
-        // 两段浊音,中间 0.4 s 真休止(f0 = 0)——「窗切不到任何岛」才有地方落脚。
+        // 两段浊音,中间 **0.9 s** 真休止(f0 = 0)——「窗切不到任何岛」才有地方落脚。
+        // ⛔ S160j:原来是 0.4 s,而 `bridge_unvoiced` 是**膨胀**(每段浊音向外长 `max_ms`,
+        //    空隙在中点劈开、至少留一帧清音)。出厂从 30 翻到 120 之后,0.4 s 的空隙只剩
+        //    0.4 − 2×0.12 = 0.16 s 没被膨胀,而这条判据的窗**恰好落在中点那一帧上**
+        //    ⇒ 它坐在边界上、被一帧的取整推翻。⚠ **这不是行为退化,是夹具本来就脆**:
+        //    「窗落在真休止正中」这件事必须在**任何**合理的膨胀宽度下都成立。
+        //    0.9 s 留下 0.66 s 的未膨胀区间 ⇒ 与膨胀宽度解耦。
         let seg = inverse_probe_tone(sr, 0.30);
-        let gap = vec![0.0f32; (sr as f64 * 0.40) as usize];
+        let gap = vec![0.0f32; (sr as f64 * 0.90) as usize];
         let mut x = seg.clone();
         x.extend_from_slice(&gap);
         let isl2 = x.len();

@@ -1260,7 +1260,9 @@ pub const PROBE_ARM_DEFAULTS: [(&str, f64); 11] = [
     ("UTAI_PSOLA_HP", 1.0),
     ("UTAI_PSOLA_HP_MS", 0.0),
     ("UTAI_PSOLA_ENVFIX", 0.0),
-    ("UTAI_PSOLA_BRIDGE", 30.0),
+    // S160j —— 30 → 120(用户 2026-08-24 耳判拍板)。理由与两段读数在 vocal_range 的
+    // `BRIDGE_UNVOICED_MS_DEFAULT` 的 doc 上。
+    ("UTAI_PSOLA_BRIDGE", 120.0),
     ("UTAI_PSOLA_WIN", 1.0),
     ("UTAI_PSOLA_XGRAIN", 1.0),
     // S157b —— LP-PSOLA 的阶数。⚠ 它是 f64 只因为这张表是 f64;读的时候取整。
