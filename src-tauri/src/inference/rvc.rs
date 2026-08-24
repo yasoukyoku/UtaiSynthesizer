@@ -222,6 +222,38 @@ mod f0_probe {
     }
 }
 
+/// S160d —— 填掉 `pitchf` 里**长度恰好 1 帧**、两侧都是浊音的 0(线性插值 = 两侧均值)。返回填了几个。
+///
+/// ## ⛔ 为什么
+/// 用户 2026-08-24 点名 0:58.052「跟着清辅音一起进的咔哒」。逐处量出来:`pitchf` 在
+/// 58.03/58.05 是 1583/1599 Hz,而 **58.04 恰好是 0** —— 一个孤立单帧洞。后果两条:
+/// ⑴ NSF 被告知那 10 ms 无声 ⇒ 谐波栈断;⑵ PSOLA 的浊音岛被劈成两半,多出两条岛边
+/// (S159zi 机理③:岛边 = 单样本宽带阶跃)。
+///
+/// ## ✅ 实测(LPC 残差尖峰相对源的尖度,同一二进制 `2f68e47670f5`)
+/// 58.050 **×67.1 → ×1.9**;252.950(另一次「そしたら」,同一个假名、同一个洞)**×21.2 → ×1.9**。
+/// ⭐ **同参两跑地板**:那两处两跑差只有 **0.2**,而全曲尖度 >5 的帧两跑 `|Δ|` p90 3.8 / max 49.4
+/// ⇒ 这两处是全曲**唯一**稳稳超过地板的咔哒。⛔ 57.600 那处(51.0 vs 再跑 8.2)是**渲染噪声**,别追。
+///
+/// ## ⭐ 谱面轨早就这么做了
+/// `score2svc.rs` 的 `fill_isolated_uv_max`(S159zp),理由逐字适用于这里:
+/// **真实音频里的清辅音给出的是一串 0(50-120 ms);孤立单帧 0 是跟踪器抖动,不是音位事件。**
+/// 这条路以前从来没被应用到 cover。⚠ 规模:用户那份素材全曲 **19 个**(2 帧 ×25、3 帧 ×31,一个不碰)。
+///
+/// ⛔ **先收集再写**:边扫边写会让连续的 0 被逐个「补」成浊音,越过「长度恰好 1」这条界。
+fn fill_isolated_uv_inplace(pitchf: &mut [f32]) -> usize {
+    if pitchf.len() < 3 {
+        return 0;
+    }
+    let holes: Vec<usize> = (1..pitchf.len() - 1)
+        .filter(|&i| pitchf[i] == 0.0 && pitchf[i - 1] > 0.0 && pitchf[i + 1] > 0.0)
+        .collect();
+    for &i in &holes {
+        pitchf[i] = 0.5 * (pitchf[i - 1] + pitchf[i + 1]);
+    }
+    holes.len()
+}
+
 pub fn run_pipeline(
     m: &RvcModel,
     audio: &AudioBuffer,
@@ -331,6 +363,14 @@ pub fn run_pipeline(
         )));
     }
     let mut pitchf: Vec<f32> = f0[..p_len].to_vec();
+    // ── S160d —— 孤立单帧无声洞:见 [`fill_isolated_uv_inplace`]。
+    // ⛔ 放在 `UTAI_COVER_F0_IN` **之前**:探针注入的那条轨要被逐位照用,不能再被这一刀改。
+    if !matches!(std::env::var("UTAI_COVER_FILL_UV").as_deref(), Ok("0")) {
+        let k = fill_isolated_uv_inplace(&mut pitchf);
+        if k > 0 {
+            tracing::info!("RVC f0: filled {k} isolated single-frame unvoiced hole(s) (S160d)");
+        }
+    }
     // S160 探针 —— `UTAI_COVER_F0_IN=<裸 f32 路径>`:**用外部一条 f0 顶掉 RMVPE 那条**。
     //
     // ⛔ 为什么需要它:S160 在用户那份 +7 素材上看见 `pitchf`(= RMVPE)在副歌上成段
@@ -923,5 +963,40 @@ mod tests {
         };
         assert_eq!(a, a2, "same seed+chunk must reproduce");
         assert_ne!(a, b, "different chunks must differ");
+    }
+}
+
+#[cfg(test)]
+mod s160d_tests {
+    use super::fill_isolated_uv_inplace;
+
+    /// S160d —— 只填**长度恰好 1** 的洞,而且要**先收集再写**。
+    #[test]
+    fn fills_only_isolated_single_frame_holes() {
+        // 单帧洞 ⇒ 填成两侧均值
+        let mut a = [100.0f32, 0.0, 200.0];
+        assert_eq!(fill_isolated_uv_inplace(&mut a), 1);
+        assert_eq!(a[1], 150.0);
+
+        // ⛔ 两帧一个不碰(⚠ 这条是「先收集再写」的判据:边扫边写会把 [1] 补成浊音,
+        //    于是 [2] 就变成「两侧都是浊音的单帧洞」而被一起吃掉)。
+        let mut b = [100.0f32, 0.0, 0.0, 200.0];
+        assert_eq!(fill_isolated_uv_inplace(&mut b), 0);
+        assert_eq!(b, [100.0, 0.0, 0.0, 200.0]);
+
+        // 端点上的 0 不算(没有「两侧」)
+        let mut c = [0.0f32, 100.0, 0.0];
+        assert_eq!(fill_isolated_uv_inplace(&mut c), 0);
+
+        // 全浊音 ⇒ 不动;太短 ⇒ 不动
+        let mut d = [100.0f32, 110.0, 120.0];
+        assert_eq!(fill_isolated_uv_inplace(&mut d), 0);
+        let mut e = [0.0f32, 100.0];
+        assert_eq!(fill_isolated_uv_inplace(&mut e), 0);
+
+        // 多个孤立洞一起填
+        let mut f = [100.0f32, 0.0, 200.0, 0.0, 300.0];
+        assert_eq!(fill_isolated_uv_inplace(&mut f), 2);
+        assert_eq!(f, [100.0, 150.0, 200.0, 250.0, 300.0]);
     }
 }
