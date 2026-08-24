@@ -1722,6 +1722,101 @@ fn mg_cover_rvc() {
     eprintln!("[mg] cover -> {out} (+ .f32)");
 }
 
+/// S160g —— **SoVITS 那条 cover 车道**的离线台子(`sovits::run_pipeline`)。
+///
+/// ⛔ 为什么要补它:用户 2026-08-24 要求「试一遍 akiko」,而 **akiko 是 SoVITS 模型**——
+/// 它走的是 `sovits::run_pipeline`(`sovits.rs` 里 `cover_dead_plan` 的另一个调用点),
+/// **不是** `mg_cover_rvc` 那条。仓里此前**连一个 SoVITS 的 cover 离线入口都没有**
+/// (S159 的记忆里也记着「仓里连 sovits 的 cover 冒烟都没有」)。
+///
+/// ⚠ **两条 cover 车道只共用计划器与引擎**:`cover_dead_plan` / `apply_inverse*` 是同一份,
+/// 但 f0 的来路(RVC 用 `RVC_RMVPE_THRESHOLD` = 0.03,SoVITS 用 `SOVITS_RMVPE_THRESHOLD` = 0.05)、
+/// 特征、拼接器都不同。⇒ **在这里量到的不能直接搬去 RVC,反之亦然。**
+/// ⛔ 另一条必须记住的:S160d 那把「填孤立单帧无声洞」的刀**只加在 `rvc.rs` 上**,
+/// 这条路**还没有**;要不要加,得先在这台子上量。
+///
+/// ```powershell
+/// $env:UTAI_MG_MODEL="…\akiko_320000.onnx"     # sovits onnx,同名 .json 是 sidecar
+/// $env:UTAI_COVER_IN="…\SV_RENDER.wav"
+/// $env:UTAI_COVER_OUT="…\ak_base.wav"
+/// $env:UTAI_COVER_RANGE="1"                     # 1 = 开音域扩展;0 = 关(默认关,与生产同)
+/// $env:UTAI_COVER_F0SHIFT="0"
+/// cargo test --lib inference::score2svc::mg_tests::mg_cover_sovits -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "probe: sovits cover lane on a real wav (needs UTAI_COVER_IN + a sovits model)"]
+fn mg_cover_sovits() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    let inp = std::env::var("UTAI_COVER_IN").expect("UTAI_COVER_IN=<wav> required");
+    let out = std::env::var("UTAI_COVER_OUT").expect("UTAI_COVER_OUT=<wav> required");
+    // ⛔ 解析不了就 panic,不许静默回落(同 `mg_cover_rvc`):
+    //   「臂开着」与「臂做了事」必须可查,而 `UTAI_COVER_RANGE=on` 手滑读成 0 会伪造一条阴性臂。
+    let want_range = match std::env::var("UTAI_COVER_RANGE").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(v) => panic!("UTAI_COVER_RANGE={v:?} —— 只认 0 / 1"),
+    };
+    let f0_shift: f32 = std::env::var("UTAI_COVER_F0SHIFT")
+        .ok()
+        .map(|v| v.parse().unwrap_or_else(|_| panic!("UTAI_COVER_F0SHIFT={v:?} 解析不了")))
+        .unwrap_or(0.0);
+
+    let rig = MgSovitsRig::load();
+    let m = rig.model();
+    let cfg: crate::models::ModelConfig =
+        serde_json::from_value(rig.sidecar.clone()).expect("sidecar 解不成 ModelConfig");
+    let speaker = mg_deadonly_speaker();
+    let range = if want_range {
+        Some(
+            super::super::vocal_range::speaker_range(&cfg, speaker)
+                .expect("开了扩展但 sidecar 里没有 vocal_range 记录"),
+        )
+    } else {
+        None
+    };
+
+    let mut rd = hound::WavReader::open(&inp).expect("open cover input");
+    let spec = rd.spec();
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => rd.samples::<f32>().map(|s| s.unwrap()).collect(),
+        hound::SampleFormat::Int => rd
+            .samples::<i32>()
+            .map(|s| s.unwrap() as f32 / (1i32 << (spec.bits_per_sample - 1)) as f32)
+            .collect(),
+    };
+    let audio = crate::audio::AudioBuffer {
+        samples: raw,
+        sample_rate: spec.sample_rate,
+        channels: spec.channels,
+    };
+    let opts = SovitsOptions {
+        seed: 0,
+        speaker_id: Some(speaker),
+        f0_shift,
+        range_extend: want_range,
+        ..Default::default()
+    };
+    let t0 = Instant::now();
+    let r = sovits::run_pipeline(&m, &audio, &opts, range, &|_| {}, &|| false)
+        .expect("sovits cover pipeline");
+    let peak = r.audio.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    eprintln!(
+        "[mg] cover/sovits: range_extend={want_range} f0_shift={f0_shift:+} · {:.2}s in {:.1}s wall \
+         · sr {} · 峰值 {peak:.4}",
+        r.audio.len() as f32 / r.sample_rate as f32,
+        t0.elapsed().as_secs_f64(),
+        r.sample_rate
+    );
+    write_wav16(std::path::Path::new(&out), &r.audio, r.sample_rate);
+    // ⛔ 16 bit + 归一化会伪造差(S155):要做「加了多少 / 还剩多少」的题就读这份裸 f32。
+    let mut bytes = Vec::with_capacity(r.audio.len() * 4);
+    for v in &r.audio {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(format!("{out}.f32"), &bytes).expect("write raw f32");
+    eprintln!("[mg] cover/sovits -> {out} (+ .f32)");
+}
+
 /// S160 —— **cover 车道的计划台**:跑**生产的** `cover_dead_plan`,只出计划、不碰 ONNX(秒级)。
 ///
 /// ⛔ 为什么必须有它:cover 这一侧至今只有整条渲染台(`mg_cover_rvc`,一臂 2.5-7 分钟),
