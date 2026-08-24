@@ -1750,7 +1750,21 @@ fn mg_cover_plan() {
     let range = super::super::vocal_range::speaker_range(&cfg, speaker)
         .expect("这个模型的 sidecar 里没有可用的 vocal_range 记录");
 
-    let (jobs, unfix) = super::super::vocal_range::cover_dead_plan(&f0, 100.0, &range);
+    // S160c —— 分组门槛的扫描口(**台子专用**;生产走 `CoverGrouping::today()`)。
+    let g = {
+        let ev = |k: &str, d: f32| {
+            std::env::var(k).ok().and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|x| x.is_finite() && *x >= 0.0 && *x <= 5000.0).unwrap_or(d)
+        };
+        let t = super::super::vocal_range::CoverGrouping::today();
+        super::super::vocal_range::CoverGrouping::new(
+            ev("UTAI_COVER_GAP_TOL_MS", t.gap_tol_ms),
+            ev("UTAI_COVER_MIN_VIOLATION_MS", t.min_violation_ms),
+        )
+    };
+    eprintln!("[cover-plan] grouping: gap_tol {} ms · min_violation {} ms", g.gap_tol_ms, g.min_violation_ms);
+    let (jobs, unfix) =
+        super::super::vocal_range::cover_dead_plan_with(&f0, 100.0, &range, g);
     let voiced = f0.iter().filter(|v| **v > 0.0).count();
     let cov: i64 = jobs.iter().map(|j| j.end - j.start).sum();
     let mut shifts: std::collections::BTreeMap<i64, usize> = Default::default();

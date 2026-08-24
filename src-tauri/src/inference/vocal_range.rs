@@ -1841,8 +1841,62 @@ pub fn cover_dead_plan(
     fps: f32,
     range: &SpeakerRange,
 ) -> (Vec<DeadJob>, Vec<(i64, i64)>) {
-    let min_run = frames_for(MIN_VIOLATION_MS, fps);
-    let gap_tol = frames_for(GAP_TOL_MS, fps) + 1;
+    cover_dead_plan_with(f0_hz, fps, range, CoverGrouping::today())
+}
+
+/// S160c —— [`cover_dead_plan`] 的分组两个门槛做成**参数**。
+///
+/// ⛔ **为什么是参数不是 env**(S151 笔1 / `dead_only_plan_with` 同一条):走进程环境的判据
+/// 会随着机器上导出了什么静默改答案,而且**关不掉** —— 判据必须能把旋钮钉在某个值上。
+///
+/// ## ⛔ 它为什么存在(S160c,用户 2026-08-24 点名的两处)
+/// 用户报「そしたら」的「そし」与「気がして」的「し」仍然炸,而**全曲最高的音反而不炸**。
+/// 逐处量出来:那几处 **死浊帧桥接后最长一组只有 120-140 ms**(门槛 250),
+/// 而把它们切碎的正是两侧 **50-80 ms 的清擦音**(/s/ /ɕ/)—— `GAP_TOL_MS = 30 ms` 桥不过去。
+/// 对照:「おもう」的「う」(MIDI 91,全曲最高)那一段**两侧没有清音**,于是与邻音并成一组、
+/// 够到 250 ms、被救,听感正常。
+/// ⇒ **缺陷与音高反相关**:被 /s/ /ɕ/ 夹住的短音节掉出救援,模型被留在那里硬唱高出上限 4-7 度。
+/// ⚠ 这两个常量**只在这个函数里被用**(谱面轨的 `dead_only_plan_with` 走自己的逻辑)
+/// ⇒ 动它结构上够不着谱面轨(用户 2026-08-21:「任何修法不许退化谱面轨」)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoverGrouping {
+    /// 桥接:死帧组之间最多隔这么久还算同一组(毫秒)。
+    pub gap_tol_ms: f32,
+    /// 门槛:一组里的**浊死帧**至少要这么久才成区(毫秒)。
+    pub min_violation_ms: f32,
+}
+
+impl CoverGrouping {
+    /// 今天出厂的那一对,**外加两个探针旋钮**(与 `UTAI_COVER_PHRASE_GAP_MS` 同一种形状):
+    /// `UTAI_COVER_GAP_TOL_MS` / `UTAI_COVER_MIN_VIOLATION_MS`。不设 ⇒ 出厂常量 ⇒ 逐位不变。
+    /// ⛔ **判据不许走这条**:要把门槛钉在某个值上,用 [`CoverGrouping::new`] + [`cover_dead_plan_with`]
+    /// (S151 笔1:走 env 的判据会随着机器上导出了什么静默改答案,而且关不掉)。
+    pub fn today() -> Self {
+        let ev = |k: &str, d: f32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|x| x.is_finite() && *x >= 0.0 && *x <= 5000.0)
+                .unwrap_or(d)
+        };
+        Self {
+            gap_tol_ms: ev("UTAI_COVER_GAP_TOL_MS", GAP_TOL_MS),
+            min_violation_ms: ev("UTAI_COVER_MIN_VIOLATION_MS", MIN_VIOLATION_MS),
+        }
+    }
+    pub fn new(gap_tol_ms: f32, min_violation_ms: f32) -> Self {
+        Self { gap_tol_ms, min_violation_ms }
+    }
+}
+
+pub fn cover_dead_plan_with(
+    f0_hz: &[f32],
+    fps: f32,
+    range: &SpeakerRange,
+    grouping: CoverGrouping,
+) -> (Vec<DeadJob>, Vec<(i64, i64)>) {
+    let min_run = frames_for(grouping.min_violation_ms, fps);
+    let gap_tol = frames_for(grouping.gap_tol_ms, fps) + 1;
     let mut idx: Vec<usize> = Vec::new();
     let mut midi: Vec<f32> = Vec::new();
     for (i, &v) in f0_hz.iter().enumerate() {
