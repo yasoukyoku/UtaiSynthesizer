@@ -132,6 +132,54 @@ pub struct SpeakerRange {
 /// is actually collapsing crosses it.
 const RMS_FREE_DB: f64 = -6.0;
 
+/// S160h —— **死/活那条线的电平闸**:扫描说这一格比该模型自己最响的一格低这么多以上,
+/// 就不算「唱得动」,即使音准完美。
+///
+/// ## ⛔ 它治的是什么(用户 2026-08-24 在 yuyuko 的 MIDI 轨 +7 上点名的三处「哑音 / 失声」)
+/// 4:18.5-4:20.5 · 4:21.44 · 4:46.75 —— 这三处的音是 **MIDI 78/80/82**,全部落在
+/// yuyuko 的 `usable [36,82]` 之内 ⇒ **一个都没被救**。而扫描自己写着:
+/// | MIDI | err | voiced | **rms_db** | low_ratio |
+/// |---|---|---|---|---|
+/// | 72-74 | 1-2 | 1 | **−2.9** | 0.06-0.08 |
+/// | 80 | 2 | 1 | **−9.9** | 0.73 |
+/// | 82 | 1 | 1 | **−16.6** | 0.78 |
+/// ⇒ **音准完美、voiced 恒为 1,但电平低 13.7 dB。**而 `usable` 的契约(本文件头)是
+/// 「f0 err <100¢ & voiced >50%」—— **只看音准和有声率** ⇒ 「唱得准但又哑又糊」被判成唱得动。
+///
+/// ## ⭐ 为什么可以用绝对门槛(而 `low_ratio` 不行)
+/// **`rms_db` 在扫描里已经是按模型自己归一化的** —— 四份装机记录的 `rms_db` 最大值**都恰好是 0.0**
+/// (东雪莲 / akiko / yachiyo / yuyuko)。⇒ 它量的是「比这个模型自己最响的那一格低多少」。
+/// ⛔ 反例:`low_ratio` 是绝对的,四个模型 usable 内的中位是 0.418 / 0.244 / 0.075 / 0.101
+/// (差 5.6 倍)—— 拿它当闸会把**东雪莲**的顶从 79 砍到更低,而那正是谱面轨验收所用的模型。见 [`thin_ref`]。
+///
+/// ## 门槛怎么定(四份装机记录,可从 sidecar 直接复算)
+/// | 门槛 | 东雪莲 79 | akiko 76 | yachiyo 77 | **yuyuko 82** |
+/// |---|---|---|---|---|
+/// | −4 / −6 | **78** ⚠ 退化 | 76 = | 77 = | 79 |
+/// | **−7 … −9** | **79 =** | **76 =** | **77 =** | **→ 79** |
+/// | −10 及以下 | 79 = | 76 = | 77 = | 80(不够) |
+/// ⇒ **−7…−9 是唯一「三个已验收模型一格不动、而 yuyuko 被修好」的窗口**,取中间的 **−8**
+/// (对东雪莲顶那一格的 −6.1 留 1.9 dB 余量)。⭐ yuyuko 修完的 79 **正好是它自己 `comfort` 的顶**。
+/// ⛔ 只在扫描记录带 4 元组(有 `rms_db`)时生效;老记录一个字不动。
+const RESCUE_LEVEL_FLOOR_DB: f64 = -8.0;
+
+/// S160h —— `thin` 的门槛**相对该模型自己的基线**:`该模型 usable 内 low_ratio 的中位 + 这个余量`。
+///
+/// ## ⛔ 为什么必须相对(用户 2026-08-24 提的)
+/// 今天是绝对的 `(low_ratio − 0.55)/0.40`。四份装机记录 usable 内的 `low_ratio` 中位:
+/// **东雪莲 0.418 · akiko 0.244 · yachiyo 0.075 · yuyuko 0.101** —— 差 **5.6 倍**。
+/// ⇒ 同一条绝对线的后果是**系统性的**:`thin > 0` 的格占比 **东雪莲 39% vs 另外三个 7-9%**
+/// —— 它在**惩罚一个天生低频重的嗓子**,同时**放过 yuyuko 顶上那一格**(0.779 只算 0.57 的伤)。
+/// ✅ 改成相对之后四个模型落到 **14-34%** 的同一量级,而 yuyuko 顶那一格的 `thin` **0.57 → 1.00**。
+///
+/// ## 余量为什么是 0.25
+/// 它要大到「一个嗓子自己正常的低频量」不算伤,小到「明显比自己平时糊」算伤。
+/// 0.25 ≈ 四个模型 usable 内 low_ratio 的 (p90 − p50) 的下半段(0.29 / 0.28 / 0.29 / 0.34)。
+/// ⛔ 这是**唯一**一个还没有独立耳判背书的新常量 —— 它改的是**落点选择**,不是死/活线,
+///    所以它的红只会表现为「落点挪了一格」。⚠ 动它之前先看 `damage` 那一族的判据。
+const THIN_REF_MARGIN: f32 = 0.25;
+
+
 impl SpeakerRange {
     /// Bounds-only record (no raw scan) — the pre-S81 shape.
     pub fn bounds(usable: (f32, f32), comfort: (f32, f32)) -> Self {
@@ -269,17 +317,99 @@ impl SpeakerRange {
 /// into a catastrophic -24 whole-song recolour (user log A/B, 2026-07-27 23:24 vs 23:44).
 /// Known cost of the revert: the loudness-tilted-scale mis-shift the cap also fixed (a quiet
 /// low range reading as damage) is back for COVER — queued as part of cover dead-only 化.
-fn damage_from_scan(err_cents: f64, voiced: f64, timbre: Option<(f64, f64)>) -> f32 {
+fn damage_from_scan(err_cents: f64, voiced: f64, timbre: Option<(f64, f64)>, thin_ref: f64) -> f32 {
     let pitch = (((err_cents - 25.0) / 75.0).clamp(0.0, 1.0) as f32) * DAMAGE_MAX;
     let voicing = (((0.95 - voiced) / 0.45).clamp(0.0, 1.0) as f32) * DAMAGE_MAX;
     let (thin, quiet) = match timbre {
         Some((rms_db, low_ratio)) => (
-            (((low_ratio - 0.55) / 0.40).clamp(0.0, 1.0) as f32) * DAMAGE_MAX,
+            // S160h —— 门槛**相对该模型自己的基线**(见 [`THIN_REF_MARGIN`]);
+            // `thin_ref` 由调用点从这份扫描自己算出来,老路径传 0.55 = 逐位同今天。
+            (((low_ratio - thin_ref) / 0.40).clamp(0.0, 1.0) as f32) * DAMAGE_MAX,
             (((RMS_FREE_DB - rms_db) / 12.0).clamp(0.0, 1.0) as f32) * DAMAGE_MAX,
         ),
         None => (0.0, 0.0),
     };
     (pitch + voicing + thin + quiet).min(DAMAGE_MAX)
+}
+
+/// S160h —— 从一份扫描里算出 `thin` 的**相对门槛** = `usable` 内 `low_ratio` 的中位 + [`THIN_REF_MARGIN`]。
+/// ⛔ 只用 `usable` 之内的格:音域之外那些格本来就烂,把它们算进中位会把门槛抬到没有意义。
+/// ⛔ 扫描里没有 4 元组(拿不到 `low_ratio`)⇒ 回落到 0.55 = **逐位同今天**。
+fn thin_ref(semitones: &serde_json::Map<String, serde_json::Value>, usable: (f32, f32)) -> f64 {
+    // ⛔⛔ **出厂关**(`UTAI_RANGE_THIN_REL=1` 打开)。它是对的方向,但**手上只有四个装机记录,
+    //   不足以把这条规则标定安全** —— 落地时它当场照红两条已登记的落点判据,而那两条红
+    //   暴露的是**设计本身的两个失效模式**,不是夹具写错了:
+    //   ⑴ `the_depth_cap_only_bites_once_the_shallowest_landing_is_already_deep` 的夹具是
+    //      **low_ratio 线性斜坡** —— 中位数会跟着斜坡一起动,相对门槛在这种分布上**结构性失效**;
+    //   ⑵ `the_landing_rule_will_not_walk_into_the_basement_for_a_better_score` 的夹具里
+    //      「糊」的那一带占 usable 的 **60%** ⇒ **中位数本身就是糊的那个值**,门槛被抬到 1.10,
+    //      于是整条曲线变平、夹具的前提塌掉。
+    //   ⇒ 换成 p25 可以躲开 ⑵,但那样对**东雪莲**(唯一需要它的模型)又不起作用。
+    //   ⇒ 真正的参照大概应该是「这个嗓子**舒服区**的基线」而不是 usable 的分位,
+    //      但 `comfort` 在两个夹具里恰好等于 usable ⇒ 同样躲不开。**证据不够,先别翻默认。**
+    // ⚠ 它改的是**落点选择**(不是死/活线),而**东雪莲是谱面轨验收所用的模型** ⇒
+    //   翻它之前必须有东雪莲的前后耳判(用户 2026-08-24 点名的硬前置)。
+    if !matches!(std::env::var("UTAI_RANGE_THIN_REL").as_deref(), Ok("1")) {
+        return 0.55;
+    }
+    let mut v: Vec<f64> = semitones
+        .iter()
+        .filter_map(|(k, val)| {
+            let midi: f64 = k.parse().ok()?;
+            if midi < usable.0 as f64 || midi > usable.1 as f64 {
+                return None;
+            }
+            val.as_array()?.get(3)?.as_f64()
+        })
+        .collect();
+    if v.is_empty() {
+        return 0.55;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = v[v.len() / 2];
+    // ⛔⛔ **只放宽,不收紧**(`max`)。第一版是纯相对的 `med + margin`,当场照红两条落点判据 ——
+    //   查出来是设计太激进:对**基线很干净**的模型(yachiyo `low_ratio` 中位 0.075)相对门槛
+    //   会变成 0.325,**比今天的 0.55 还严**,于是一个客观上并不糊的格开始被判糊、落点被推深。
+    //   而用户 2026-08-24 指出的缺陷**只有一个方向**:「天生低频重的嗓子被一条从别人身上抄来的
+    //   绝对线系统性惩罚」(东雪莲 `thin > 0` 的格占 39%,另外三个只有 7-9%)。
+    // ⇒ 取 `max(0.55, med + margin)`:**东雪莲被放宽,另外三个逐位不动**(可从 sidecar 复算)。
+    //   ⚠ yuyuko 顶那几格因此仍然只算 0.57 的伤 —— 不要紧,它们已经被**电平闸**从死/活线里切掉了
+    //   (见 [`RESCUE_LEVEL_FLOOR_DB`]),`thin` 不必再兼这份差事。
+    (med + THIN_REF_MARGIN as f64).max(0.55)
+}
+
+/// S160h —— **死/活线的电平闸**(见 [`RESCUE_LEVEL_FLOOR_DB`])。从 `usable` 的两端往里收,
+/// 直到遇上一格「扫描说它不比该模型自己最响的一格低 `floor` 以上」的。
+/// ⛔ 扫描里没有 4 元组的格**一律放过**(老记录一个字不动:没有读数不等于坏)。
+/// ⛔ 收窄不许把音域收成空的:两端相遇就原样返回并**响亮**报一句 —— 那说明这份扫描本身有问题。
+fn narrow_usable_by_level(
+    semitones: Option<&serde_json::Map<String, serde_json::Value>>,
+    usable: (f32, f32),
+    floor_db: f64,
+) -> (f32, f32) {
+    let Some(sc) = semitones else { return usable };
+    let level = |m: i64| -> Option<f64> { sc.get(&m.to_string())?.as_array()?.get(2)?.as_f64() };
+    let (lo0, hi0) = (usable.0.round() as i64, usable.1.round() as i64);
+    let (mut lo, mut hi) = (lo0, hi0);
+    while hi > lo && level(hi).is_some_and(|d| d < floor_db) {
+        hi -= 1;
+    }
+    while lo < hi && level(lo).is_some_and(|d| d < floor_db) {
+        lo += 1;
+    }
+    if hi <= lo {
+        tracing::warn!(
+            "range-extend: level gate would empty usable [{lo0},{hi0}] — scan looks broken, keeping it"
+        );
+        return usable;
+    }
+    if lo != lo0 || hi != hi0 {
+        tracing::info!(
+            "range-extend: usable narrowed by level gate ({floor_db:+.1} dB): \
+             [{lo0},{hi0}] -> [{lo},{hi}]"
+        );
+    }
+    (lo as f32, hi as f32)
 }
 
 /// Parse the sidecar `vocal_range` record for one speaker id. EXACT id only — an untested
@@ -300,14 +430,24 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
         let hi = v.get(1)?.as_f64()? as f32;
         (lo <= hi).then_some((lo, hi))
     };
-    let usable = pair("usable")?;
+    let scan = sp.get("semitones").and_then(|m| m.as_object());
+    let usable_raw = pair("usable")?;
+    // S160h —— **死/活线的电平闸**(见 [`RESCUE_LEVEL_FLOOR_DB`]):扫描说这一格比该模型自己
+    // 最响的一格低 8 dB 以上 ⇒ 不算「唱得动」,即使音准完美。用户 2026-08-24 在 yuyuko 的
+    // MIDI 轨 +7 上点名的三处「哑音 / 失声」全部是这种格(78/80/82,err 1-5 cents、voiced 1,
+    // 但 rms_db −2.9 → −16.6)。⛔ 三个已验收模型(东雪莲 / akiko / yachiyo)在这道闸上**一格不动**,
+    // 可从 sidecar 直接复算 —— 判据 `the_level_gate_only_moves_the_model_that_needs_it`。
+    let usable = narrow_usable_by_level(scan, usable_raw, RESCUE_LEVEL_FLOOR_DB);
     // S146f: the scan's own bounds. Absent ⇒ = `usable` (a fact for pre-S146e records: nothing
     // could edit it then). ⚠ A hand-poisoned sidecar could hold a `usable_auto` NARROWER than
     // `usable`; union them so the split can only ever widen what the drag check accepts, never
     // secretly narrow it below what today's build already allows.
+    // ⚠ S160h:`reach` 用的是**收窄之前**的 `usable_raw` —— 电平闸只该改「哪些音需要被救」,
+    //   不该连带缩掉「落点够不够得着」。(收窄之后那几格的 `damage` 本来就已经饱和,
+    //   落点搜索不会往那儿去;真要拦它是 `damage` 的活,不是 `reach` 的。)
     let reach = pair("usable_auto")
-        .map(|a| (a.0.min(usable.0), a.1.max(usable.1)))
-        .unwrap_or(usable);
+        .map(|a| (a.0.min(usable_raw.0), a.1.max(usable_raw.1)))
+        .unwrap_or(usable_raw);
     if usable.1 - usable.0 < MIN_COMFORT_SPAN {
         return None;
     }
@@ -327,6 +467,9 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
     // S85: the same pass derives per-slot f0-axes flags for the score dead-only plan.
     let mut flags = [0u8; DAMAGE_SLOTS]; // untested slot = no flags = dead & unlandable
     let mut thin = [255u8; DAMAGE_SLOTS]; // untested slot = maximally thin, never "fine"
+    // S160h —— `thin` 的门槛相对该模型自己的基线(见 [`THIN_REF_MARGIN`])。⛔ 用**收窄之前**的
+    //   `usable_raw`:基线要描述「这个嗓子平时是什么样」,而收窄恰好切掉的是最不正常的那几格。
+    let tref = scan.map_or(0.55, |m| thin_ref(m, usable_raw));
     let damage = sp.get("semitones").and_then(|m| m.as_object()).and_then(|m| {
         let mut d = [255u8; DAMAGE_SLOTS]; // untested slot = fully damaged, never "fine"
         let mut seen = 0usize;
@@ -349,7 +492,7 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
                 (Some(rms_db), Some(low_ratio)) => Some((rms_db, low_ratio)),
                 _ => None,
             };
-            d[slot as usize] = (damage_from_scan(err, voiced, timbre) / DAMAGE_MAX * 255.0)
+            d[slot as usize] = (damage_from_scan(err, voiced, timbre, tref) / DAMAGE_MAX * 255.0)
                 .round()
                 .clamp(0.0, 255.0) as u8;
             if let Some((_, low_ratio)) = timbre {
@@ -6425,6 +6568,69 @@ mod tests {
         assert_eq!(shallow[0].shift, -7, "够得着的组要花满 3 个半音,不然预算这条线是空的");
     }
 
+    /// S160h —— **电平闸只动那个需要它的模型。**
+    ///
+    /// 承重的那句话是「三个已验收模型(东雪莲 / akiko / yachiyo)一格不动」——
+    /// 它不是论证,是**四份装机记录里的读数**,所以这里把那四份的顶几格逐字钉下来。
+    /// ⛔ 数字来源:各自 sidecar 的 `vocal_range.speakers.0.semitones`(2026-08-24 实测)。
+    #[test]
+    fn the_level_gate_only_moves_the_model_that_needs_it() {
+        // (名字, usable, 顶往下 5 格的 rms_db —— 从低到高)
+        let cases: &[(&str, i64, i64, [f64; 5], i64)] = &[
+            // 东雪莲:顶 79,rms −0.4 … −6.1 ⇒ 闸在 −8 上够不着它
+            ("dxl", 36, 79, [-0.4, -1.9, -1.6, -2.4, -6.1], 79),
+            ("akiko", 36, 76, [-0.7, -0.5, 0.0, -2.9, -3.0], 76),
+            ("yachiyo", 36, 77, [-2.8, -1.2, 0.0, -2.3, -1.5], 77),
+            // yuyuko:顶 82,80/81/82 是 −9.9 / −13.7 / −16.6 ⇒ 收到 79
+            ("yuyuko", 36, 82, [-2.9, 0.0, -9.9, -13.7, -16.6], 79),
+        ];
+        for &(name, lo, hi, rms, want) in cases {
+            let mut semis = serde_json::Map::new();
+            for m in lo..=hi {
+                // 顶往下 5 格用实测值,其余给一个健康的 −1.0(那一段本来就不该被闸咬)
+                let k = (m - (hi - 4)) as usize;
+                let db = if m >= hi - 4 { rms[k] } else { -1.0 };
+                semis.insert(m.to_string(), serde_json::json!([1, 1.0, db, 0.10]));
+            }
+            let got = narrow_usable_by_level(
+                Some(&semis),
+                (lo as f32, hi as f32),
+                RESCUE_LEVEL_FLOOR_DB,
+            );
+            assert_eq!(got.1 as i64, want, "{name}: usable 顶应当是 {want},实际 {}", got.1);
+            assert_eq!(got.0 as i64, lo, "{name}: 底不该动");
+        }
+    }
+
+    /// S160h —— 电平闸的三条边界:老记录不动 · 没有读数的格放过 · 不许把音域收成空的。
+    #[test]
+    fn the_level_gate_is_inert_without_a_reading_and_never_empties_the_range() {
+        // ⑴ 没有 semitones ⇒ 一个字不动(pre-S81 的老记录)
+        assert_eq!(narrow_usable_by_level(None, (36.0, 82.0), -8.0), (36.0, 82.0));
+
+        // ⑵ 2 元组(没有 rms_db)⇒ 放过 —— **没有读数不等于坏**
+        let mut two = serde_json::Map::new();
+        for m in 36..=82i64 {
+            two.insert(m.to_string(), serde_json::json!([1, 1.0]));
+        }
+        assert_eq!(narrow_usable_by_level(Some(&two), (36.0, 82.0), -8.0), (36.0, 82.0));
+
+        // ⑶ 整条音域都在闸下 ⇒ 原样返回(那说明扫描坏了,不是音域没了)
+        let mut all_quiet = serde_json::Map::new();
+        for m in 36..=82i64 {
+            all_quiet.insert(m.to_string(), serde_json::json!([1, 1.0, -30.0, 0.10]));
+        }
+        assert_eq!(narrow_usable_by_level(Some(&all_quiet), (36.0, 82.0), -8.0), (36.0, 82.0));
+
+        // ⑷ 底也会被收(不是只管顶)
+        let mut low_bad = serde_json::Map::new();
+        for m in 36..=82i64 {
+            let db = if m <= 38 { -20.0 } else { -1.0 };
+            low_bad.insert(m.to_string(), serde_json::json!([1, 1.0, db, 0.10]));
+        }
+        assert_eq!(narrow_usable_by_level(Some(&low_bad), (36.0, 82.0), -8.0), (39.0, 82.0));
+    }
+
     /// S159 —— ⛔⛔ **深度上限只在「最浅落点本来就很深」时才咬 —— 所以只扫它一维必然读出一张平表。**
     ///
     /// `budget = clamp(extra, LANDING_MAX_EXTRA_DEPTH, max(0, cap − |最浅|))`。
@@ -7029,12 +7235,12 @@ mod tests {
         // S81 (E): a healthy semitone must cost NOTHING — a scan's 1-37 cent wander across a
         // model's good range is inaudible, and charging for it would make the optimizer chase
         // measurement noise and recolour songs that were fine.
-        assert_eq!(damage_from_scan(2.0, 1.00, None), 0.0);
-        assert_eq!(damage_from_scan(24.0, 0.96, None), 0.0);
+        assert_eq!(damage_from_scan(2.0, 1.00, None, 0.55), 0.0);
+        assert_eq!(damage_from_scan(24.0, 0.96, None, 0.55), 0.0);
         // a rejected semitone saturates on pitch alone
-        assert_eq!(damage_from_scan(9999.0, 0.0, None), 3.0);
+        assert_eq!(damage_from_scan(9999.0, 0.0, None, 0.55), 3.0);
         // …and a semitone that keeps perfect pitch while losing voicing is still damaged
-        assert!(damage_from_scan(6.0, 0.63, None) > 2.0);
+        assert!(damage_from_scan(6.0, 0.63, None, 0.55) > 2.0);
     }
 
     #[test]
@@ -7042,16 +7248,16 @@ mod tests {
         // THE case the whole F1 change exists for, using the numbers measured off the probe wav
         // on disk: akiko MIDI 80 stores err=2 cents / voiced=1.00 — a perfect score on both f0
         // axes — while measuring -7.7 dB with 88.7% of its energy below 1.5*f0.
-        assert_eq!(damage_from_scan(2.0, 1.00, None), 0.0, "f0-only is blind here");
+        assert_eq!(damage_from_scan(2.0, 1.00, None, 0.55), 0.0, "f0-only is blind here");
         assert!(
-            damage_from_scan(2.0, 1.00, Some((-7.7, 0.887))) > 2.0,
+            damage_from_scan(2.0, 1.00, Some((-7.7, 0.887)), 0.55) > 2.0,
             "with the audio measured, the same semitone reads as badly damaged"
         );
         // a healthy note is still free WITH the dimension present (akiko MIDI 74)
-        assert_eq!(damage_from_scan(5.0, 1.00, Some((0.0, 0.109))), 0.0);
+        assert_eq!(damage_from_scan(5.0, 1.00, Some((0.0, 0.109)), 0.55), 0.0);
         // lengv2.3's near-pure-sine 75 (0.983) vs its healthy 74 (0.467)
-        assert!(damage_from_scan(6.0, 1.00, Some((-1.2, 0.983))) > 2.0);
-        assert_eq!(damage_from_scan(8.0, 1.00, Some((-8.0, 0.467))), 0.5, "quiet but voiced = graded, not rejected");
+        assert!(damage_from_scan(6.0, 1.00, Some((-1.2, 0.983)), 0.55) > 2.0);
+        assert_eq!(damage_from_scan(8.0, 1.00, Some((-8.0, 0.467)), 0.55), 0.5, "quiet but voiced = graded, not rejected");
         // (S85b: the S83 quiet-cap anchors + escape-valve test were removed with their
         // mechanisms — decision layer back to v0.11.0; the broken-climax case they served is
         // now the score dead-only plan's job, tested in the dead_only_* group below.)
