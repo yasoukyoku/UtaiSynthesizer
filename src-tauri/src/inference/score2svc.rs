@@ -808,6 +808,116 @@ pub(crate) fn rvc_out_len(t50: usize, sample_rate: u32) -> usize {
     t50 * 2 * (sample_rate as usize / 100)
 }
 
+/// S160q —— 把 50 fps 的 `note_hz` **线性**升到 `factor ×` 帧率(出厂关,见 [`score_f0_lerp`])。
+///
+/// ## 它治的是什么
+/// 用户 2026-08-25 在频谱图上看出「我们的谐波线是一格一格的台阶,SV 是光滑曲线」,并且给了
+/// 两条把嫌疑收死的信息:⑴ **3:55.791 那个音根本没进任何救援组** ⇒ PSOLA 不是唯一来源;
+/// ⑵ **同一个模型在翻唱轨上做得到那种平滑** ⇒ 不是模型上限。
+///
+/// 根因:**两条车道用同一个 `sovits_f0_postprocess`,但方向相反。**
+/// | 车道 | 进去的 f0 | 目标 | `torch_interp_nearest` 的后果 |
+/// |---|---|---|---|
+/// | 翻唱 | RMVPE **100 fps**(hop 160 @16k) | 86 fps | **降**采样 ⇒ 不保持 ⇒ 光滑 |
+/// | 谱面 | 我们的 **50 fps** | 86 fps | **升**采样 ⇒ 每值保持 1-2 帧 = **11.6 / 23.2 ms 的台阶** |
+/// RVC 那条更直白:`rvc_feed_100` 里字面上 `pitchf.push(f); pitchf.push(f);` = 20 ms 零阶保持。
+/// ⇒ 先把谱面轨升到 100 fps,它进共用函数时就和翻唱轨**站在同一个起点**上。
+///
+/// ⛔⛔ **只在浊音游程【内部】插值。** 相邻两个源帧只要有一个是 0(清音 / 休止 /
+/// [`zero_voiceless_frames`] 归零的帧),这一段就退回零阶保持 —— 否则会把音高抹进休止,
+/// 破坏「`pitchf == 0` ⇒ NSF 噪声激励 + protect」这条契约(S83 那次哑起音正是它)。
+/// 零帧的**位置与个数**因此逐位可预测:源里每个 0 变成 `factor` 个 0。
+///
+/// ⛔ **别去改 [`super::f0::sovits_f0_postprocess`]** —— 它是与上游 `RMVPEF0Predictor.post_process`
+/// 逐位对齐的孪生,翻唱轨也吃它;改它等于毁掉翻唱轨的对齐。这里改的是**喂给它的东西**。
+pub(crate) fn upsample_note_hz_linear(note_hz: &[f32], factor: usize) -> Vec<f32> {
+    let n = note_hz.len();
+    if factor <= 1 || n == 0 {
+        return note_hz.to_vec();
+    }
+    let mut out = Vec::with_capacity(n * factor);
+    for i in 0..n {
+        let a = note_hz[i];
+        let b = if i + 1 < n { note_hz[i + 1] } else { a };
+        // 两端都浊才插值;任一端为 0 ⇒ 零阶保持(零帧原样复制 factor 份)。
+        let lerp_ok = a > 0.0 && b > 0.0;
+        for k in 0..factor {
+            out.push(if k == 0 || !lerp_ok {
+                a
+            } else {
+                a + (b - a) * (k as f32) / (factor as f32)
+            });
+        }
+    }
+    out
+}
+
+/// ⚙ 出厂默认 = **开**(S160q)。`UTAI_SCORE_F0_LERP=0` 关回零阶保持。
+///
+/// ## 翻它的账(东雪莲/akiko SoVITS + yachiyo/yuyuko RVC,各 hold/lerp,同一二进制 `2f68e47670f5`)
+/// | 模型 | 后端 | 波形 \|Δ\| | >6 dB 的格 | 段/时长 | 最深局部 | 长时谱最大差 |
+/// |---|---|---|---|---|---|---|
+/// | 东雪莲 | SoVITS | +3.15 dB | 0.13% | 20 / 0.24 s | −13.7(音头晚 10 ms)| 0.29 dB |
+/// | akiko | SoVITS | +2.67 | 0.15% | 16 / 0.27 s | **+17.7(救回一个失声的音)** | **0.04 dB** |
+/// | yachiyo | RVC | +2.79 | 0.14% | 23 / 0.26 s | **+13.0(救回一个虚音头)** | 0.24 dB |
+/// | yuyuko | RVC 40k | +3.19 | 0.18% | 27 / 0.32 s | −17.0(音头晚 10-20 ms)| 0.53 dB |
+/// (两跑复现地板 = **−6.29 dB** ⇒ +2.7…+3.2 是真的动了。)
+/// ✅ **计划逐组相同**(80/80 · 90/90 · 95/95 · 82/82)· ✅ **`uv` 掩码逐位不变**
+/// (25073 帧 0 处不同,190 个浊/清边界位移 **0.0 ms** ⇒ **辅音时序一个字节没动**)
+/// · ✅ **零帧位置逐位不变** · ✅ **音头无系统代价**(698 音 × 4 模型,音头 30 ms/稳态 的配对 Δ
+/// 中位 +0.05 / +0.02 / −0.02 / +0.00 dB,变弱 3.0-9.3% vs 变强 4.2-6.5%,**对称**)。
+///
+/// ⛔ **这是这条线上爆炸半径最大的一刀:全曲每一个音都变,不只救援窗**;而且效应**均匀分布**
+///    (窗外 +3.46 / 浅 +3.02 / 中 +3.42 / 深 ≥10 +2.17 dB)⇒ **它不是深救援的解药**,别指望。
+pub(crate) fn score_f0_lerp() -> bool {
+    parse_score_f0_lerp(std::env::var("UTAI_SCORE_F0_LERP").ok().as_deref())
+}
+
+/// ⛔ 纯函数,好让「出厂默认」本身有一条不依赖进程环境的判据(与 `parse_phase_lock` 同规矩)。
+/// 出厂开 ⇒ **只有字面量 `"0"` 关得掉**(垃圾值一律落回出厂,与 `parse_fill1` 同极性)。
+fn parse_score_f0_lerp(v: Option<&str>) -> bool {
+    !matches!(v, Some("0"))
+}
+
+/// S160q —— 这两个是 [`gate_unvoiced_tone`] 的纯函数入口(出厂 **关**;见那段 doc 的
+/// 「为什么 S160k 没有把它翻成出厂」)。做成纯函数只为一件事:**让它进得了指纹**。
+fn parse_uvgate(v: Option<&str>) -> bool {
+    matches!(v, Some("1"))
+}
+fn parse_uvgate_k(v: Option<&str>) -> f32 {
+    v.and_then(|x| x.trim().parse::<f32>().ok()).filter(|k| k.is_finite() && *k > 0.0).unwrap_or(1.5)
+}
+fn parse_valley_adaptive(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "true" | "on" | "yes"))
+}
+fn parse_valley_after(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "true" | "on" | "yes"))
+}
+
+/// ⛔⛔ S160q —— **这个文件里的生产默认,在这之前【完全不在任何指纹里】。**
+///
+/// S157c 立指纹闸的理由是「改了生产默认却没 bump 版本 = 零红,而那不是一个错误、是用户听到
+/// 一条陈缓存」。但那条闸的指纹串**只由 `vocal_range.rs` 的默认拼出来** ⇒ 本文件里
+/// **七个会改音频的旋钮**(含 **出厂就开着的** [`FILL_ISOLATED_UV_DEFAULT`])一个都看不见。
+/// [`FILL_ISOLATED_UV_DEFAULT`] 头上那行注释甚至就在教人做成对 bump —— **而没有闸执行它**。
+/// ⇒ 同一个形状,在隔壁文件里原封不动地又活了一遍。
+///
+/// ⚠ **一个指纹、一条闸、一个版本号**:这里只出串,核对与 bump 仍然由
+/// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
+pub(crate) fn production_defaults_fingerprint() -> String {
+    format!(
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} valadapt={} valafter={}",
+        parse_score_f0_lerp(None),
+        parse_fill1(None),
+        FILL_ISOLATED_UV_DEFAULT,
+        FILL_MAX_FRAMES_DEFAULT,
+        parse_uvgate(None),
+        parse_uvgate_k(None),
+        parse_valley_adaptive(None),
+        parse_valley_after(None),
+    )
+}
+
 /// The SVC net_g input feed for one chunk on the SoVITS hop grid.
 pub struct SovitsFeed {
     /// cv resampled to the hop grid, `[t_tgt, dim]`.
@@ -851,7 +961,15 @@ pub fn resample_to_sovits_grid(
         return Err(UtaiError::Inference("SCORE2SVC_ZERO_FRAMES".into()));
     }
     let cv_rs = repeat_expand_2d(cv, t_tgt, expand_mode)?;
-    let (f0_rs, uv_rs) = super::f0::sovits_f0_postprocess(note_hz, t_tgt, hop, sr);
+    // S160q:先线性升到 100 fps,让这一步变成【降】采样(= 翻唱轨的方向)。出厂关。
+    let hz_up: Vec<f32>;
+    let hz_in: &[f32] = if score_f0_lerp() {
+        hz_up = upsample_note_hz_linear(note_hz, 2);
+        &hz_up
+    } else {
+        note_hz
+    };
+    let (f0_rs, uv_rs) = super::f0::sovits_f0_postprocess(hz_in, t_tgt, hop, sr);
     Ok(SovitsFeed { cv: cv_rs, f0: f0_rs, uv: uv_rs, t_tgt })
 }
 
@@ -1198,11 +1316,16 @@ fn rvc_feed_100(mut cv: Array2<f32>, note_hz: &[f32], min: usize) -> (Array2<f32
         }
         cv = padded;
     }
+    // S160q:出厂仍是零阶保持(逐位不变);`UTAI_SCORE_F0_LERP=1` 换成浊音游程内的线性插值。
+    let at = |k: usize| note_hz.get(k.min(note_hz.len().saturating_sub(1))).copied().unwrap_or(0.0);
+    let lerp = score_f0_lerp();
     let mut pitchf: Vec<f32> = Vec::with_capacity(pad50 * 2);
     for i in 0..pad50 {
-        let f = note_hz.get(i.min(note_hz.len().saturating_sub(1))).copied().unwrap_or(0.0);
+        let f = at(i);
+        let nxt = at(i + 1);
+        let mid = if lerp && f > 0.0 && nxt > 0.0 { 0.5 * (f + nxt) } else { f };
         pitchf.push(f);
-        pitchf.push(f);
+        pitchf.push(mid);
     }
     let pitch: Vec<i64> = pitchf.iter().map(|&f| f0_to_coarse(f)).collect();
     (cv, pitch, pitchf, real_100)
@@ -1812,10 +1935,7 @@ fn apply_coda_lift(
 /// ⛔ 这不是「把刀调浅」:在没移调的渲染上 `measured` 很小 ⇒ `want ≈ target` ⇒ 行为与今天一样。
 ///   它只在**已经过深**的地方收手 —— 也就是深救援窗里的鼻音/浊塞音,正是用户报缺陷的地方。
 fn valley_adaptive() -> bool {
-    matches!(
-        std::env::var("UTAI_MG_VALLEY_ADAPT").ok().as_deref().map(str::trim),
-        Some("1" | "true" | "on" | "yes")
-    )
+    parse_valley_adaptive(std::env::var("UTAI_MG_VALLEY_ADAPT").ok().as_deref())
 }
 
 /// S159zb —— 一个簇里**已经有多深的谷**(2 ms RMS 包络:局部中位 − 谷底,dB)。
@@ -1858,10 +1978,7 @@ fn measured_valley_db(audio: &[f32], s: usize, e: usize) -> f32 {
 }
 
 fn valley_after_inverse() -> bool {
-    matches!(
-        std::env::var("UTAI_MG_VALLEY_AFTER").ok().as_deref().map(str::trim),
-        Some("1" | "true" | "on" | "yes")
-    )
+    parse_valley_after(std::env::var("UTAI_MG_VALLEY_AFTER").ok().as_deref())
 }
 
 /// Chunk-relative CLUSTERS of contiguous depth>0 phones, each member keeping its OWN class depth.
@@ -2185,7 +2302,7 @@ fn apply_range_inverse(
     // S160k —— 清音帧去调门(见 [`gate_unvoiced_tone`])。出厂关 ⇒ 一个分支都不走。
     // ⚠ 放在 dump **之前**:那份 dump 的语义是「**PSOLA 实际吃到的东西**」。
     let mut audio = audio;
-    if matches!(std::env::var("UTAI_MG_UVGATE").as_deref(), Ok("1")) {
+    if parse_uvgate(std::env::var("UTAI_MG_UVGATE").ok().as_deref()) {
         let k = std::env::var("UTAI_MG_UVGATE_K")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
@@ -3252,8 +3369,17 @@ mod tests {
         let (cv_p, pitch, pitchf, real_t) = rvc_feed_100(cv, &[110.0, 220.0, 330.0], 12);
         assert_eq!(real_t, 6, "pre-pad 100fps length = 2·T50");
         assert_eq!((cv_p.nrows(), pitch.len(), pitchf.len()), (6, 12, 12));
-        assert_eq!((pitchf[0], pitchf[1]), (110.0, 110.0), "each note_hz frame repeated 2×");
+        // ⭐ S160q:出厂已从「复制两遍」翻成**浊音游程内的中点插值**。
+        //    这条断言此前钉的是旧行为,翻默认时它按设计红了一次 —— 那正是它的作用。
+        assert_eq!(
+            (pitchf[0], pitchf[1]),
+            (110.0, 165.0),
+            "出厂 = 中点插值(110→220 的中点 165);要看旧的零阶保持臂,见              `parse_score_f0_lerp` 与 `upsample_note_hz_linear` 的判据"
+        );
+        assert_eq!((pitchf[2], pitchf[3]), (220.0, 275.0), "偶数格 = 原采样点,奇数格 = 中点");
         assert_eq!(pitchf[11], 330.0, "padded frames repeat the last note_hz");
+        // ⛔ 末尾那一格没有「下一个采样点」⇒ 必须退回保持,不许外推。
+        assert_eq!((pitchf[4], pitchf[5]), (330.0, 330.0), "最后一个真实帧不外推");
         assert_eq!(cv_p[[5, 0]], 2.0, "padded cv rows repeat the last real row");
         // already ≥ min → not padded
         let (cv2, _, pf, rt) = rvc_feed_100(Array2::zeros((10, 4)), &vec![100.0; 10], 12);
@@ -3824,5 +3950,95 @@ mod s160k_uvgate_tests {
         let mut z = before.clone();
         assert_eq!(gate_unvoiced_tone(&mut z, sr, &hz1, 1.5, 4.0), 0);
         assert_eq!(z, before);
+    }
+}
+
+// ─── S160q:50→100 fps 的 f0 线性升采样 ────────────────────────────────────────────────
+#[cfg(test)]
+mod s160q_f0_lerp_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_is_on_and_only_the_literal_zero_turns_it_off() {
+        // ⛔ S160q 翻成出厂开。没有这条判据,「我们翻了」和「有人翻回去了」在别的每一条
+        //    测试上长得一模一样。四个模型的净账写在 `score_f0_lerp` 的 doc 上。
+        assert!(parse_score_f0_lerp(None), "出厂必须开(S160q;UTAI_SCORE_F0_LERP=0 才关)");
+        assert!(!parse_score_f0_lerp(Some("0")), "字面量 0 必须关得掉");
+        for junk in ["", "true", "yes", "2", "on", " 0", "false"] {
+            assert!(parse_score_f0_lerp(Some(junk)), "垃圾值 {junk:?} 不许静默关掉出厂臂");
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_covers_every_audio_changing_knob_in_this_file() {
+        // ⛔⛔ 这条判据存在的理由:S160q 之前,本文件的生产默认【完全不在任何指纹里】,
+        //     而 `FILL_ISOLATED_UV_DEFAULT` 出厂就是开着的。
+        let fp = production_defaults_fingerprint();
+        for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "valadapt=", "valafter="] {
+            assert!(fp.contains(key), "指纹串缺 {key} —— 少一个默认就少一道成对 bump 的闸:{fp}");
+        }
+    }
+
+    #[test]
+    fn the_upsample_never_moves_a_voiced_boundary() {
+        // ⛔⛔ 硬规矩:辅音时序一个字节不许动。`uv` 是 resize【之后】按 `f0 > 0` 推的,
+        //     所以只要零帧的【图案】被原样放大,浊/清边界就一帧都不会移。
+        //     实测(整曲 25073 帧 @86 fps):0 处不同、190 个边界位移 0.0 ms。
+        for factor in [2usize, 3, 4] {
+            let src = [0.0f32, 0.0, 220.0, 230.0, 0.0, 240.0, 250.0, 0.0, 0.0, 260.0];
+            let up = upsample_note_hz_linear(&src, factor);
+            assert_eq!(up.len(), src.len() * factor);
+            for (i, &v) in src.iter().enumerate() {
+                for k in 0..factor {
+                    let z = up[i * factor + k] == 0.0;
+                    assert_eq!(z, v == 0.0, "factor={factor} 源帧 {i} 的第 {k} 个子帧零性变了");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_voiced_ramp_gets_real_midpoints_and_the_length_is_exact() {
+        let src = [100.0f32, 200.0, 400.0];
+        let got = upsample_note_hz_linear(&src, 2);
+        assert_eq!(got.len(), 6, "长度必须是 n×factor");
+        // 偶数格 = 原采样点;奇数格 = 与下一点的中点;最后一点没有下一点 ⇒ 保持自己。
+        assert_eq!(got, vec![100.0, 150.0, 200.0, 300.0, 400.0, 400.0]);
+        let g4 = upsample_note_hz_linear(&[0.0f32.max(100.0), 200.0], 4);
+        assert_eq!(g4, vec![100.0, 125.0, 150.0, 175.0, 200.0, 200.0, 200.0, 200.0]);
+    }
+
+    #[test]
+    fn a_zero_on_either_side_falls_back_to_hold_and_zeros_stay_exactly_zero() {
+        // ⛔⛔ 这是这把刀唯一会造成灾难的地方:插进休止 = 把音高抹进不该发声的帧,
+        //     破坏「pitchf == 0 ⇒ NSF 噪声激励 + protect」的契约(S83 的哑起音)。
+        let src = [200.0f32, 0.0, 0.0, 300.0, 400.0];
+        let got = upsample_note_hz_linear(&src, 2);
+        assert_eq!(got, vec![200.0, 200.0, 0.0, 0.0, 0.0, 0.0, 300.0, 350.0, 400.0, 400.0]);
+        // 零帧的个数与位置逐位可预测:源里每个 0 变成 factor 个 0。
+        let z_src = src.iter().filter(|v| **v == 0.0).count();
+        let z_out = got.iter().filter(|v| **v == 0.0).count();
+        assert_eq!(z_out, z_src * 2, "零帧个数必须正好 ×factor");
+        assert!(got.iter().all(|v| *v == 0.0 || *v >= 200.0), "不许在零两侧造出中间值");
+    }
+
+    #[test]
+    fn factor_one_and_empty_are_the_identity() {
+        let src = [100.0f32, 0.0, 300.0];
+        assert_eq!(upsample_note_hz_linear(&src, 1), src.to_vec());
+        assert_eq!(upsample_note_hz_linear(&src, 0), src.to_vec());
+        assert!(upsample_note_hz_linear(&[], 2).is_empty());
+    }
+
+    #[test]
+    fn the_upsampled_track_is_what_actually_removes_the_20ms_tread() {
+        // 变异判据:零阶保持时,相邻 100 fps 帧【有一半】完全相等;线性插值之后,
+        // 浊音游程内部不应再有相等的相邻对(单调斜坡上)。
+        let src: Vec<f32> = (0..8).map(|i| 200.0 + 20.0 * i as f32).collect();
+        let hold: Vec<f32> = src.iter().flat_map(|&f| [f, f]).collect();
+        let lerp = upsample_note_hz_linear(&src, 2);
+        let eq = |v: &[f32]| v.windows(2).filter(|w| w[0] == w[1]).count();
+        assert_eq!(eq(&hold), 8, "零阶保持:8 对相等(每个源帧一对)");
+        assert_eq!(eq(&lerp), 1, "线性:只剩末尾那一对(最后一点没有下一点)");
     }
 }
