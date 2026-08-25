@@ -2257,7 +2257,14 @@ fn apply_valley(audio: &mut [f32], clusters: &[ValleyCluster], scale: f32, fade:
                         let k = kf as isize;
                         let a = env[k.clamp(0, VALLEY_ENV_N as isize - 1) as usize];
                         let b = env[(k + 1).clamp(0, VALLEY_ENV_N as isize - 1) as usize];
-                        (a + (b - a) * t).clamp(0.0, 1.0)
+                        let w = (a + (b - a) * t).clamp(0.0, 1.0);
+                        // ⛔⛔ S161e —— **外缘淡化不许省**。模板首格是 0.82,直接铺 ⇒ 簇窗起点是一个
+                        //    **一样本的 ~10 dB 台阶** = 宽带咔哒。实测(鹅妈妈原 key,211 个簇):
+                        //    >16 kHz 在窗**起点**的尖峰 **+27.15 dB**(终点 +4.87),而矩形/窄槽/谷全关
+                        //    都是 −2 dB(没有尖峰)—— 用户在频谱图 16 k 以上一眼看到「一堆细竖线」。
+                        //    ⇒ 与矩形路径同一条外缘斜坡,乘在权重上:窗缘 w=0(增益 1.0,连续)。
+                        let edg = (i - s0).min(e1.saturating_sub(1 + i)) as f32;
+                        w * (edg / fade_f).min(1.0)
                     }
                 };
                 audio[i] *= 10f32.powf(-(d * scale * ramp) / 20.0);
@@ -4249,6 +4256,43 @@ mod s160q_f0_lerp_tests {
         let fp = production_defaults_fingerprint();
         for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "valadapt=", "valafter=", "valhuman=", "valdb=", "valenv="] {
             assert!(fp.contains(key), "指纹串缺 {key} —— 少一个默认就少一道成对 bump 的闸:{fp}");
+        }
+    }
+
+    /// ⛔⛔ S161e —— **谷的增益曲线在簇窗边缘必须连续**。
+    ///
+    /// S161d 的包络路径直接铺模板值(首格 0.82)⇒ 窗起点是**一样本的 ~10 dB 台阶**,
+    /// 而台阶 = 宽带咔哒。实测(鹅妈妈原 key,211 个簇)>16 kHz 在窗起点的尖峰 **+27.15 dB**,
+    /// 矩形 / 窄槽 / 谷全关都是 −2 dB。**用户在频谱图 16 k 以上一眼看到一堆细竖线。**
+    /// ⇒ 这条判据把「逐样本增益的最大跳变」钉住:任何形状、任何深度都不许在边缘跳。
+    #[test]
+    fn the_valley_gain_never_steps_at_a_cluster_edge() {
+        for env in [None, Some(&VALLEY_ENV_VSTOP), Some(&VALLEY_ENV_TAP)] {
+            for depth in [6.0f32, 12.0, 20.0] {
+                let n = 4410usize; // 100 ms @44.1k
+                let mut a = vec![1.0f32; n];
+                let (s, e) = (1000usize, 3000usize);
+                apply_valley(
+                    &mut a,
+                    &[ValleyCluster { win: vec![(s, e, depth)], env }],
+                    1.0,
+                    emphasis_fade_samples(44100),
+                    44100,
+                );
+                assert!((a[s - 1] - 1.0).abs() < 1e-6, "窗外必须原样");
+                assert!((a[e] - 1.0).abs() < 1e-6, "窗外必须原样");
+                // 逐样本增益跳变(dB)。5 ms 斜坡上 20 dB ⇒ 每样本 ~0.09 dB,给 10 倍余量。
+                let mut worst = 0.0f32;
+                for i in (s - 2)..(e + 2).min(n - 1) {
+                    let d = (20.0 * (a[i + 1].max(1e-9) / a[i].max(1e-9)).log10()).abs();
+                    worst = worst.max(d);
+                }
+                assert!(
+                    worst < 1.0,
+                    "env={:?} depth={depth}: 增益逐样本最大跳变 {worst:.2} dB —— 边缘有台阶 = 宽带咔哒",
+                    env.map(|_| "human")
+                );
+            }
         }
     }
 
