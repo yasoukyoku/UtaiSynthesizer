@@ -62,11 +62,31 @@ CONF = os.path.join(HERE, "memory_hooks.json")
 #: ⛔ 只扫**可执行产物**,不扫 `deps/*.o`(本机 17027 个,一次指纹要 5.4 s,而且会被
 #:    完全无关的 crate 抖动)—— 任何一次重编都必然重链接出可执行文件,这一层已经够。
 #:    ⚠ 自检里那三条阳性对照就是钉这句话的:新增文件 / 只改 mtime 都必须读出变化。
+#: ⛔⛔ S161 —— **这几条 glob 以前写死在仓库里的 `src-tauri/target/`,而每一个渲染脚本
+#:    都把 `CARGO_TARGET_DIR` 指到 scratchpad 外面** ⇒ 指纹扫的是一批**渲染根本没碰过的
+#:    陈文件**,于是 `end` 那句「✅ 二进制身份成立 —— 指纹全同」在这条链路上**结构上恒真**。
+#:    实测:仓库里的 `utai.exe` 停在 8-22 05:16,而当天真正在跑的
+#:    `<CARGO_TARGET_DIR>/debug/deps/utai_lib-*.exe` 是 8-25 13:55。
+#:    ⚠ **别把这条读成「以前那条闸没用」** —— 真正抓住 S161 那次渲染中重编的是
+#:    `scan_log` 的 "Compiling" 行;空的是**指纹这一半**(= 跨 run 的可比性那一半)。
+#:    ⇒ 现在按 `CARGO_TARGET_DIR` 解析,且 `n == 0` 直接判红:不许再出现「扫了个空目录还报绿」。
 BIN_GLOBS = [
-    "src-tauri/target/debug/deps/utai*.exe",
-    "src-tauri/target/debug/deps/utai*.dll",
-    "src-tauri/target/debug/utai.exe",
+    "debug/deps/utai*.exe",
+    "debug/deps/utai*.dll",
+    "debug/utai.exe",
 ]
+
+
+def target_root(repo=None):
+    """cargo 实际写产物的目录:`CARGO_TARGET_DIR` 优先,否则 `<repo>/src-tauri/target`。
+
+    ⛔ 这是**这条闸的承重口径**:指纹必须扫 cargo 真正写的那个目录,否则它量的是别人的历史。
+    """
+    env = os.environ.get("CARGO_TARGET_DIR")
+    if env:
+        return os.path.normpath(env)
+    return os.path.join(repo if repo else REPO, "src-tauri", "target")
+
 
 def _conf():
     try:
@@ -100,9 +120,10 @@ def fingerprint(repo=REPO):
     # ⚠ 用 scandir 而不是 glob:`deps/` 本机有 17 k 个文件,每个 glob 都要把整个目录
     #    重列一遍(实测 3 个 glob = 7.1 s,一次渲染要 stamp 六七回)。scandir 的
     #    DirEntry 在 Windows 上自带 stat,一次列举就够。
+    root = target_root(repo)
     bydir = {}
     for g in BIN_GLOBS:
-        d, pat = os.path.split(os.path.join(repo, g.replace("/", os.sep)))
+        d, pat = os.path.split(os.path.join(root, g.replace("/", os.sep)))
         bydir.setdefault(d, []).append(pat)
     rows = []
     for d, pats in bydir.items():
@@ -120,13 +141,13 @@ def fingerprint(repo=REPO):
                     st = e.stat()
                 except OSError:
                     continue
-                rel = os.path.relpath(os.path.join(d, e.name), repo).replace("\\", "/")
+                rel = os.path.relpath(os.path.join(d, e.name), root).replace("\\", "/")
                 rows.append((rel, st.st_size, st.st_mtime_ns))
     rows.sort()
     h = hashlib.sha256()
     for r in rows:
         h.update(("%s|%d|%d\n" % r).encode("utf-8"))
-    return {"sha256": h.hexdigest(), "n": len(rows)}
+    return {"sha256": h.hexdigest(), "n": len(rows), "root": root}
 
 
 def scan_log(path):
@@ -210,6 +231,13 @@ def cmd_stamp(args):
         % (row["tag"], fp["sha256"][:12], fp["n"],
            ("  ⛔ 这条臂里重编了:%s" % row["compiled"]) if row["compiled"] else "")
     )
+    # ⛔ S161:扫了个空目录还报绿 = 这条闸的另一半是空的。见 `BIN_GLOBS` 头上那段。
+    if fp["n"] == 0:
+        sys.stderr.write(
+            "render_guard: ⛔⛔ 指纹目录里一个 utai* 产物都没有:%s\n"
+            "    ⇒ 二进制身份【没有被量过】。CARGO_TARGET_DIR 指对了吗?\n" % fp["root"]
+        )
+        return 8
     return 0
 
 
@@ -240,9 +268,13 @@ def cmd_end(args):
             sys.stderr.write("    %-10s %s\n" % (s["tag"], s["compiled"]))
         rc = 7
     if rc == 0:
+        # ⛔ S161:把**扫的是哪个目录 / 数到几个产物**一起打出来。
+        #    那句「指纹全同」以前扫的是仓库里一批渲染没碰过的陈文件,恒真而没人看得出来。
+        s0 = stamps[0]["fp"]
         sys.stderr.write(
-            "render_guard: ✅ 二进制身份成立 —— %d 个 stamp 指纹全同 (%s),"
-            "没有一条臂重编\n" % (len(stamps), fps[0][:12])
+            "render_guard: ✅ 二进制身份成立 —— %d 个 stamp 指纹全同 (%s),没有一条臂重编\n"
+            "               (指纹目录 %s,%d 个产物)\n"
+            % (len(stamps), fps[0][:12], s0.get("root", "<旧标记,没记目录>"), s0["n"])
         )
     # ⛔ 标记**无论如何**都要撤掉:留一个陈标记会把编辑闸永久钉住,
     #    那种闸第二天一定被人绕过去,然后就再也不是闸了。
@@ -279,6 +311,7 @@ def _selftest():
 
     fails = []
     tmp = tempfile.mkdtemp(prefix="render_guard_selftest_")
+    saved_ctd = os.environ.pop("CARGO_TARGET_DIR", None)
     try:
         # ── ⑴ fingerprint 对 mtime 敏感、对「同内容改名」也敏感 ─────────────────
         fake = os.path.join(tmp, "repo")
@@ -305,7 +338,33 @@ def _selftest():
                 "wb").write(b"\x00")
         if fingerprint(fake)["n"] != 1:
             fails.append("⛔ 指纹把不叫 utai* 的产物也数进来了")
-        print("  ok   fingerprint:稳定 + 三条对照")
+
+        # ── ⛔⛔ S161 阳性对照 ⒞:`CARGO_TARGET_DIR` 必须被跟上 ───────────────────
+        #    这一条是这次翻出来的空判据的**正身**:以前的夹具自己搭出
+        #    `<repo>/src-tauri/target/...` 这个世界,于是「cargo 其实写到别处去了」
+        #    这一类**结构上**测不到 —— 与 S160i 的「夹具不真实的判据 = 空判据」同一族。
+        alt = os.path.join(tmp, "alt_target")
+        os.makedirs(os.path.join(alt, "debug", "deps"))
+        io.open(os.path.join(alt, "debug", "deps", "utai_lib-cccc.exe"), "wb").write(b"\x00" * 32)
+        io.open(os.path.join(alt, "debug", "deps", "utai_dsp-dddd.exe"), "wb").write(b"\x00" * 32)
+        os.environ["CARGO_TARGET_DIR"] = alt
+        try:
+            fa = fingerprint(fake)
+            if fa["n"] != 2:
+                fails.append("⛔⛔ 设了 CARGO_TARGET_DIR,指纹却没跟过去(n=%d,应为 2)" % fa["n"])
+            if os.path.normpath(fa.get("root", "")) != os.path.normpath(alt):
+                fails.append("⛔⛔ 指纹报的目录不是 CARGO_TARGET_DIR:%r" % fa.get("root"))
+            if fa["sha256"] == f1["sha256"]:
+                fails.append("⛔⛔ 换了 target 目录指纹却没变 —— 那正是它恒真的那个形状")
+            # 阴性:目录里没有 utai* 产物时必须数到 0(cmd_stamp 会据此判红)
+            empty = os.path.join(tmp, "empty_target")
+            os.makedirs(os.path.join(empty, "debug", "deps"))
+            os.environ["CARGO_TARGET_DIR"] = empty
+            if fingerprint(fake)["n"] != 0:
+                fails.append("⛔ 空 target 目录竟然数出了产物")
+        finally:
+            os.environ.pop("CARGO_TARGET_DIR", None)
+        print("  ok   fingerprint:稳定 + 五条对照(含 CARGO_TARGET_DIR 跟随 / 空目录)")
 
         # ── ⑵ scan_log 只认真的重编行 ────────────────────────────────────────
         lg = os.path.join(tmp, "arm.log")
@@ -365,6 +424,10 @@ def _selftest():
         print("  ok   标记缺失时 stamp/end 都是非零")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        if saved_ctd is not None:
+            os.environ["CARGO_TARGET_DIR"] = saved_ctd
+        else:
+            os.environ.pop("CARGO_TARGET_DIR", None)
 
     print()
     if fails:

@@ -890,6 +890,54 @@ fn parse_uvgate_k(v: Option<&str>) -> f32 {
 fn parse_valley_adaptive(v: Option<&str>) -> bool {
     matches!(v.map(str::trim), Some("1" | "true" | "on" | "yes"))
 }
+/// S161 —— ⚙ **出厂默认 = 开**(用户 2026-08-25 耳判:「这一刀确实让它听起来变好了 ——
+/// 感觉它把中间有一串连续闭塞音部分的那个怪异的顿挫感解决了」)。`UTAI_VALLEY_HUMAN=0` 关回 S84 的表。
+///
+/// 辅音谷的**类深度**改用【真人差额】,而不是 S84 的「OpenUtau 参照 − 我们的渲染」差额。
+///
+/// ## ⛔ 为什么(S161 逐格量出来的,两根轴)
+///
+/// S84 那把刀的 doc 写着 "scale 1.0 statistically lands the render on the reference",
+/// 而它的 reference 是 `未命名_MixDown.wav`(OpenUtau/UTAU 拼接渲染)。S161 拿
+/// **GTSinger 日语 Control_Group**(832 clip,上游标注 + 数据集自带源音频,
+/// **从没经过我们的对齐器**;英语那半边逐格复现了 `coda_ref_upstream.json`,8/8 PASS)
+/// 重新量了两根轴,**两边窗口定义逐字相同**:
+///
+/// * `dip`   = 辅音窗外两侧各 60 ms 的 4 ms 包络中位 − 窗内最低  ← S84 那把刀**瞄准**的量
+/// * `level` = 辅音整段 RMS − 紧随核音整段 RMS                   ← 这把刀**实际改变**的量
+///
+/// | 60-80 ms 的辅音 | 真人 dip / level | 我们 `UTAI_MG_VALLEY=0` | 我们出厂 |
+/// |---|---|---|---|
+/// | 浊塞音 | 22.3 / −5.4 | 7.9 / −2.5 | 19.8 / **−10.4** |
+/// | **鼻音** | **4.4 / −1.5** | **3.3 / −0.9** | **14.3 / −7.6** |
+/// | 闪音 | 9.6 / −1.8 | 2.8 / −0.1 | 12.9 / −7.4 |
+/// | 清塞音(80-120 ms) | 37.1 / −15.2 | 34.2 / −4.7 | 46.0 / −15.3 |
+///
+/// ⇒ ⭐ **浊塞音/闪音上这把刀是对的**(把 dip 从 7.9 抬到 19.8,真人 22.3);
+/// ⇒ ⛔ **鼻音/边音上它整整多了一个量级**:**关掉它**我们就已经在真人身上(3.3 vs 4.4),
+///   开着它把 dip 打到 14.3(真人的 3.2 倍)、把电平压到 −7.6(真人 −1.5)。
+///   跨语言复现:真人英语 L 2.85 / M 3.06 / N 3.53 / NG 2.21 dB(n=848…5162)。
+/// ⇒ ⚠ 而**每一个浊类的 level 都过冲 5-8 dB** —— 那是「拿平坦增益去买凹陷」的结构性代价,
+///   不是深度调错。要同时命中两根轴得把谷做成**窄槽**,那是另一件事(S161 只记账不做)。
+///
+/// 本旋钮只改**两个桶**,取「真人 dip − 我们自己的 dip」:
+/// 鼻/边 11.4 → [`VALLEY_NASAL_HUMAN_DB`],闪 10.4 → [`VALLEY_TAP_HUMAN_DB`]。
+/// 其余桶一个字节不动 —— 塞音那一格两根轴给出**相反方向**,没有任何一个平坦增益能同时对。
+/// ⛔ 纯函数,好让「出厂默认」本身有一条不依赖进程环境的判据(与 `parse_score_f0_lerp` 同规矩)。
+/// 出厂开 ⇒ **只有字面量 `"0"` 关得掉**(垃圾值一律落回出厂)。
+fn parse_valley_human(v: Option<&str>) -> bool {
+    !matches!(v, Some("0"))
+}
+
+fn valley_human() -> bool {
+    parse_valley_human(std::env::var("UTAI_VALLEY_HUMAN").ok().as_deref())
+}
+
+/// 真人差额(GTSinger ja Control_Group):鼻/边 dip 4.4 − 我们自己的 3.3 ≈ **1.1 dB**。
+pub const VALLEY_NASAL_HUMAN_DB: f32 = 1.1;
+/// 真人差额:闪音 dip 9.6 − 我们自己的 2.8 ≈ **6.8 dB**。
+pub const VALLEY_TAP_HUMAN_DB: f32 = 6.8;
+
 fn parse_valley_after(v: Option<&str>) -> bool {
     matches!(v.map(str::trim), Some("1" | "true" | "on" | "yes"))
 }
@@ -906,7 +954,7 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} valadapt={} valafter={}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} valadapt={} valafter={} valhuman={}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
@@ -915,6 +963,9 @@ pub(crate) fn production_defaults_fingerprint() -> String {
         parse_uvgate_k(None),
         parse_valley_adaptive(None),
         parse_valley_after(None),
+        // S161 —— ⚠ 与 `parse_windowed_inverse` 同款:它进指纹但**出厂关 ⇒ 不改音频**,
+        //    所以加它**不该**触发版本 bump;进指纹的意义是「下一个人翻它之前必须来这里改一行」。
+        parse_valley_human(None),
     )
 }
 
@@ -961,7 +1012,7 @@ pub fn resample_to_sovits_grid(
         return Err(UtaiError::Inference("SCORE2SVC_ZERO_FRAMES".into()));
     }
     let cv_rs = repeat_expand_2d(cv, t_tgt, expand_mode)?;
-    // S160q:先线性升到 100 fps,让这一步变成【降】采样(= 翻唱轨的方向)。出厂关。
+    // S160q:先线性升到 100 fps,让这一步变成【降】采样(= 翻唱轨的方向)。⚙ 出厂 **开**(见 `score_f0_lerp` 的 doc);`UTAI_SCORE_F0_LERP=0` 关回零阶保持。
     let hz_up: Vec<f32>;
     let hz_in: &[f32] = if score_f0_lerp() {
         hz_up = upsample_note_hz_linear(note_hz, 2);
@@ -1316,7 +1367,7 @@ fn rvc_feed_100(mut cv: Array2<f32>, note_hz: &[f32], min: usize) -> (Array2<f32
         }
         cv = padded;
     }
-    // S160q:出厂仍是零阶保持(逐位不变);`UTAI_SCORE_F0_LERP=1` 换成浊音游程内的线性插值。
+    // S160q:⚙ 出厂 **开** = 浊音游程内的线性插值;`UTAI_SCORE_F0_LERP=0` 关回零阶保持(与 S160q 之前逐位相同)。
     let at = |k: usize| note_hz.get(k.min(note_hz.len().saturating_sub(1))).copied().unwrap_or(0.0);
     let lerp = score_f0_lerp();
     let mut pitchf: Vec<f32> = Vec::with_capacity(pad50 * 2);
@@ -1699,6 +1750,17 @@ fn valley_depth_db(p: &str) -> f32 {
     }
 }
 
+/// S161 —— [`valley_depth_db`] 的**真人标定**版本(见 [`parse_valley_human`] 的 doc)。
+/// ⛔ 只有鼻/边与闪两个桶不同;其余每一个分支都必须**逐字**等于 [`valley_depth_db`],
+/// 由 `the_human_table_differs_only_in_the_two_measured_buckets` 对全部 210 个音素逐个盯住。
+fn valley_depth_db_human(p: &str) -> f32 {
+    match p.chars().next() {
+        Some('m' | 'n' | 'ɲ' | 'ŋ' | 'ɴ' | 'l' | 'ʎ' | 'ɫ' | 'ɭ') => VALLEY_NASAL_HUMAN_DB,
+        Some('ɾ' | 'ɽ' | 'r') => VALLEY_TAP_HUMAN_DB,
+        _ => valley_depth_db(p),
+    }
+}
+
 /// Per-phone valley depth (dB; 0.0 = untouched): consonant phones BEFORE the source event's last
 /// nucleus (onsets + medials — voiced AND voiceless, unlike the emphasis flags), but only when the
 /// boundary is CHAIN-INTERNAL — the emitted phone immediately before the consonant cluster belongs
@@ -1707,6 +1769,7 @@ fn valley_depth_db(p: &str) -> f32 {
 /// (词尾顿挫 guard, same as `voiceless_onset_flags`); run key = `arr.evt` (S83 review: pitch-group
 /// anchoring misflags repeated-pitch runs).
 fn boundary_valley_depths(arr: &ScoreArrays) -> Vec<f32> {
+    let human = valley_human();
     let n = arr.phon.len();
     let mut depths = vec![0.0f32; n];
     let mut i = 0usize;
@@ -1738,7 +1801,11 @@ fn boundary_valley_depths(arr: &ScoreArrays) -> Vec<f32> {
                         c0 > 0 && !matches!(arr.phon[c0 - 1], "SP" | "AP")
                     };
                     if chain_internal {
-                        depths[x] = valley_depth_db(arr.phon[x]);
+                        depths[x] = if human {
+                            valley_depth_db_human(arr.phon[x])
+                        } else {
+                            valley_depth_db(arr.phon[x])
+                        };
                     }
                 }
             }
@@ -2761,7 +2828,14 @@ mod tests {
         let r = arr.phon.iter().position(|&p| p == "ɾ").unwrap();
         assert_eq!(d[k], 0.0, "post-rest onset never valleys");
         assert!((d[g] - 11.7).abs() < 1e-6, "chain-internal voiced stop valleys at stop depth");
-        assert!((d[r] - 10.4).abs() < 1e-6, "tap valleys at tap depth");
+        // ⭐ S161:出厂表已换成**真人差额**(闪音 10.4 → 6.8;鼻/边 11.4 → 1.1;塞音**没动**)。
+        //    这条判据当场红过一次,红在 `tap valleys at tap depth` —— 正是它该红的地方。
+        //    ⇒ 两张表都钉住:出厂那张 + `UTAI_VALLEY_HUMAN=0` 回退的那张(S84 的)。
+        assert!((d[r] - VALLEY_TAP_HUMAN_DB).abs() < 1e-6, "出厂(真人表)闪音 = 6.8");
+        assert!((valley_depth_db("ɾ") - 10.4).abs() < 1e-6, "S84 那张表本身不许被改动(回退臂用)");
+        assert!((valley_depth_db("n") - 11.4).abs() < 1e-6, "S84 那张表本身不许被改动(回退臂用)");
+        assert!((valley_depth_db_human("n") - VALLEY_NASAL_HUMAN_DB).abs() < 1e-6, "真人表鼻音 = 1.1");
+        assert!((valley_depth_db_human("ɡ") - valley_depth_db("ɡ")).abs() < 1e-6, "塞音两张表必须一样");
         assert!(
             arr.phon.iter().zip(&d).all(|(&p, &v)| v == 0.0 || !super::super::score2cv::is_nucleus_phone(p)),
             "nuclei never valley"
@@ -3974,9 +4048,103 @@ mod s160q_f0_lerp_tests {
         // ⛔⛔ 这条判据存在的理由:S160q 之前,本文件的生产默认【完全不在任何指纹里】,
         //     而 `FILL_ISOLATED_UV_DEFAULT` 出厂就是开着的。
         let fp = production_defaults_fingerprint();
-        for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "valadapt=", "valafter="] {
+        for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "valadapt=", "valafter=", "valhuman="] {
             assert!(fp.contains(key), "指纹串缺 {key} —— 少一个默认就少一道成对 bump 的闸:{fp}");
         }
+    }
+
+    /// ⛔⛔ S161 —— **把上面那条判据的洞堵上**:它只检查「已知的那几个 key 还在」,
+    /// 于是**加一个新旋钮却不登记进指纹 = 零红**(S161 的 recon 当场指出这个洞)。
+    /// 这条改成**反向**判据:从本文件源码里数出所有被读的 `UTAI_*` 环境变量,
+    /// 除掉登记在案的豁免项,剩下的**个数必须等于**指纹里的字段数。
+    /// ⇒ 加旋钮不加指纹 ⇒ 当场红,而且红的措辞直接告诉他去哪儿加。
+    #[test]
+    fn every_env_knob_in_this_file_is_registered_in_the_fingerprint() {
+        // (env 变量名, 它在指纹里的 key)。⛔ 加旋钮不加这一行 ⇒ 当场红。
+        const MAP: &[(&str, &str)] = &[
+            ("UTAI_SCORE_F0_LERP", "f0lerp="),
+            ("UTAI_MG_FILL1", "fill1="),
+            ("UTAI_MG_FILL_MAX", "fillmax="),
+            ("UTAI_MG_UVGATE", "uvgate="),
+            ("UTAI_MG_UVGATE_K", "uvgatek="),
+            ("UTAI_MG_VALLEY_ADAPT", "valadapt="),
+            ("UTAI_MG_VALLEY_AFTER", "valafter="),
+            ("UTAI_VALLEY_HUMAN", "valhuman="),
+        ];
+        // 只写文件、不改音频的诊断路径(见 `dump_donor_buffer` 的 doc)。
+        const EXEMPT: &[&str] = &["UTAI_RANGE_DUMP_DONOR"];
+        // 指纹里**不由 env 驱动**的格:纯常量默认,没有对应的环境变量。
+        const CONST_ONLY: &[&str] = &["filluv="];
+
+        let src = include_str!("score2svc.rs");
+        let mut found: Vec<&str> = Vec::new();
+        for (i, _) in src.match_indices("env::var(\"UTAI_") {
+            let rest = &src[i + "env::var(\"".len()..];
+            if let Some(end) = rest.find('"') {
+                let name = &rest[..end];
+                if !found.contains(&name) && !EXEMPT.contains(&name) {
+                    found.push(name);
+                }
+            }
+        }
+        for name in &found {
+            assert!(
+                MAP.iter().any(|(n, _)| n == name),
+                "本文件读了 {name},但它既不在指纹映射表里也不在豁免表里。
+                 ⇒ 新旋钮必须同时:①做一个 `parse_*(Option<&str>)` 纯函数                  ②在 `production_defaults_fingerprint()` 里加一格                  ③在本判据的 MAP 里加一行                  ④去 `vocal_range.rs` 的 `changing_a_production_default_forces_a_paired_version_bump`                  补期望串(**若它出厂关 = 不改音频,就不要 bump 版本号**,理由见那里的 S159 注释)。"
+            );
+        }
+        for (name, _) in MAP {
+            assert!(found.contains(name), "MAP 里的 {name} 在本文件里已经没人读了 —— 删旋钮也要删这一行");
+        }
+        let fp = production_defaults_fingerprint();
+        for (_, key) in MAP {
+            assert!(fp.contains(key), "指纹串缺 {key}:{fp}");
+        }
+        let fields = fp.split(' ').filter(|f| f.contains('=')).count();
+        assert_eq!(
+            fields,
+            MAP.len() + CONST_ONLY.len(),
+            "指纹有 {fields} 格,但映射表 {} + 纯常量格 {} 只解释得了 {}:{fp}",
+            MAP.len(),
+            CONST_ONLY.len(),
+            MAP.len() + CONST_ONLY.len()
+        );
+    }
+
+    /// ⛔ S161 —— 人表**只许**在量过的那两个桶上与出厂表不同。
+    /// 走的是与 `valley_depth_db` 那条穷举判据同一份 210 音素词表。
+    #[test]
+    fn the_human_table_differs_only_in_the_two_measured_buckets() {
+        // ⛔ S161 翻成出厂开(用户耳判)。没有这条判据,「我们翻了」和「有人翻回去了」
+        //    在别的每一条测试上长得一模一样。全曲净账写在 `parse_valley_human` 的 doc 上。
+        assert!(parse_valley_human(None), "出厂必须开(S161;UTAI_VALLEY_HUMAN=0 才关)");
+        assert!(!parse_valley_human(Some("0")), "字面量 0 必须关得掉");
+        for junk in ["", "1", "true", "yes", "on", "2", " 0", "false"] {
+            assert!(parse_valley_human(Some(junk)), "垃圾值 {junk:?} 不许静默关掉出厂臂");
+        }
+        use super::super::score2cv_tables::PHONE_TO_ID;
+        let mut moved = 0usize;
+        for (p, _) in PHONE_TO_ID.iter() {
+            let p: &str = p;
+            if matches!(p, "SP" | "AP" | "PAD" | "BOS" | "EOS") || super::super::score2cv::is_nucleus_phone(p) {
+                continue;
+            }
+            let a = valley_depth_db(p);
+            let b = valley_depth_db_human(p);
+            let nasal = matches!(p.chars().next(), Some('m' | 'n' | 'ɲ' | 'ŋ' | 'ɴ' | 'l' | 'ʎ' | 'ɫ' | 'ɭ'));
+            let tap = matches!(p.chars().next(), Some('ɾ' | 'ɽ' | 'r'));
+            if nasal {
+                assert!((b - VALLEY_NASAL_HUMAN_DB).abs() < 1e-6, "{p} 应是鼻/边人表值");
+                moved += 1;
+            } else if tap {
+                assert!((b - VALLEY_TAP_HUMAN_DB).abs() < 1e-6, "{p} 应是闪音人表值");
+                moved += 1;
+            } else {
+                assert!((a - b).abs() < 1e-6, "{p} 不该被人表动到:{a} vs {b}");
+            }
+        }
+        assert!(moved >= 12, "只动到 {moved} 个音素,词表或分支坏了");
     }
 
     #[test]
