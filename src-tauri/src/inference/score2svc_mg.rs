@@ -2269,6 +2269,7 @@ fn mg_render_rvc_oversampled() {
     let vl_onset = voiceless_onset_flags(&arr);
     let emphasis_gain = 10f32.powf(DEFAULT_VOICELESS_ONSET_EMPHASIS_DB / 20.0);
     let valley_depths = boundary_valley_depths(&arr);
+    let valley_shapes = boundary_valley_shapes(&arr);
     let idx_weights = fast_index_weights(&arr);
 
     // ── 放大时长(核 phone ≤4 → inflate;组内重算 note_dur)──
@@ -2381,8 +2382,19 @@ fn mg_render_rvc_oversampled() {
         apply_rest_gate(&mut wav, &sp_wins, rest_gate_fade_samples(m.sample_rate));
         let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
         apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
-        let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end]);
-        apply_valley(&mut wav, &val_cls, DEFAULT_CONSONANT_VALLEY_SCALE, emphasis_fade_samples(m.sample_rate));
+        let val_cls = chunk_valley_clusters(
+            chunk,
+            wav.len(),
+            &valley_depths[chunk.start..chunk.end],
+            &valley_shapes[chunk.start..chunk.end],
+        );
+        apply_valley(
+            &mut wav,
+            &val_cls,
+            DEFAULT_CONSONANT_VALLEY_SCALE,
+            emphasis_fade_samples(m.sample_rate),
+            m.sample_rate,
+        );
         if chunk.hard_seam {
             seam_fade(&mut audio, &mut wav, m.sample_rate);
         }

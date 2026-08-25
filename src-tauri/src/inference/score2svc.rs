@@ -933,10 +933,52 @@ fn valley_human() -> bool {
     parse_valley_human(std::env::var("UTAI_VALLEY_HUMAN").ok().as_deref())
 }
 
+/// S161b —— ⭐ **窄槽**:真人的闭塞是「**窄而深**」——`dip` 20-34 dB,而整段 `level` 只有 −5。
+/// 平坦增益**结构上**做不到这一对(它拿整段电平去买凹陷),窄槽可以。
+///
+/// 形状 = 全深占簇窗的 `frac`,两侧 **8 ms** 边沿,**其余一个字节不动**;槽心相对窗中心
+/// 往**音头方向**偏 `off × 窗长`(真人的槽心也偏后:S84 的参照锚表记「谷心拍点前 24 ms」)。
+///
+/// ## 定标(离线扫参,靶 = 真人日语 Control_Group;台 = 我们**关掉谷**的臂,已排除救援窗)
+/// | 浊塞音 60-80 ms | level | dip | rise(2-8 kHz 10→90%) |
+/// |---|---|---|---|
+/// | **真人** | **−5.1** | **23.6** | **12 ms** |
+/// | 谷全关(模型自己) | −2.5 | 7.5 | 14 |
+/// | 今天的矩形 11.7 | **−11.2** | 19.2 | **23.9** |
+/// | **窄槽 20 dB × 0.20 × 偏 0.12** | **−4.8** | **25.5** | **11.0** |
+/// (80-120 ms 桶同时:真人 −6.5/33.9/11 ← 窄槽 −4.8/34.1/15.5;三轴代价 13.5 → **2.6**)
+///
+/// | 闪音 40-60 / 60-80 | 真人 | 今天的矩形 6.8 | **窄槽 8 dB × 0.12 × 偏 0.24** |
+/// |---|---|---|---|
+/// | level | −1.5 / −1.8 | −6.0 / −5.8 | **−2.4 / −1.3** |
+/// | dip | 9.0 / 9.6 | 9.1 / 9.0 | **8.6 / 8.4** |
+/// | rise | 12 / 10 ms | 15 / 18 | **8.0 / 8.5** |
+///
+/// ⛔ **只给这两族**:鼻/边的矩形 1.1 已经三轴全中(S161),清塞音的 `level` 也已经正好
+/// (−15.3 vs 真人 −15.5),给它们开槽会把已经对上的轴推走。
+const VALLEY_STOP_TROUGH: (f32, f32) = (0.20, 0.12);
+const VALLEY_TAP_TROUGH: (f32, f32) = (0.12, 0.24);
+/// 槽的边沿(秒)——与 [`emphasis_fade_samples`] 的 5 ms 同一族,略长一点是为了 20 dB 的落差。
+const VALLEY_TROUGH_EDGE_MS: f32 = 8.0;
+
+/// 每个音素的谷**形状**:`(全深占比, 槽心偏移)`。`(1.0, 0.0)` = 今天的整窗矩形。
+/// ⛔ 只有**浊**塞音/塞擦(b d ɡ ɟ 起头,含 bʲ dʑ dz)与闪音开槽;清塞音(p t k c q ʈ ʔ)
+/// 一个都不在这里 —— 它们的首字符与浊的不重叠,所以这条分支天然只吃浊的。
+fn valley_shape_human(p: &str) -> (f32, f32) {
+    match p.chars().next() {
+        Some('b' | 'd' | 'ɡ' | 'ɟ' | 'ɢ') => VALLEY_STOP_TROUGH,
+        Some('ɾ' | 'ɽ' | 'r') => VALLEY_TAP_TROUGH,
+        _ => (1.0, 0.0),
+    }
+}
+
 /// 真人差额(GTSinger ja Control_Group):鼻/边 dip 4.4 − 我们自己的 3.3 ≈ **1.1 dB**。
 pub const VALLEY_NASAL_HUMAN_DB: f32 = 1.1;
-/// 真人差额:闪音 dip 9.6 − 我们自己的 2.8 ≈ **6.8 dB**。
-pub const VALLEY_TAP_HUMAN_DB: f32 = 6.8;
+/// 真人差额(**窄槽**版,见 [`valley_shape_human`] 的定标表):闪音 **8.0 dB**。
+pub const VALLEY_TAP_HUMAN_DB: f32 = 8.0;
+/// 真人差额(**窄槽**版):浊塞音/浊塞擦 **20.0 dB**。⚠ 它比今天的 11.7 深,**但只在 20% 的窗上**,
+/// 所以整段电平反而从 −11.2 回到 −4.8(真人 −5.1)。⛔ 别把这个数字与矩形深度相提并论。
+pub const VALLEY_VSTOP_HUMAN_DB: f32 = 20.0;
 
 fn parse_valley_after(v: Option<&str>) -> bool {
     matches!(v.map(str::trim), Some("1" | "true" | "on" | "yes"))
@@ -954,7 +996,7 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} valadapt={} valafter={} valhuman={}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} valadapt={} valafter={} valhuman={} valdb={}/{}/{} valtrough={},{}/{},{}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
@@ -966,6 +1008,16 @@ pub(crate) fn production_defaults_fingerprint() -> String {
         // S161 —— ⚠ 与 `parse_windowed_inverse` 同款:它进指纹但**出厂关 ⇒ 不改音频**,
         //    所以加它**不该**触发版本 bump;进指纹的意义是「下一个人翻它之前必须来这里改一行」。
         parse_valley_human(None),
+        // ⛔⛔ S161b —— **类深度与槽形也进指纹**。S161 只登记了旋钮,而这一场改的是**常量**
+        //    (浊塞音 11.7 → 20 窄槽、闪音 6.8 → 8):旋钮没动、指纹没动、音频却变了 ⇒ 又是零红。
+        //    ⇒ 凡是这几个常量被改,这条闸当场红,红的措辞会指到那三处版本字面量。
+        VALLEY_NASAL_HUMAN_DB,
+        VALLEY_TAP_HUMAN_DB,
+        VALLEY_VSTOP_HUMAN_DB,
+        VALLEY_STOP_TROUGH.0,
+        VALLEY_STOP_TROUGH.1,
+        VALLEY_TAP_TROUGH.0,
+        VALLEY_TAP_TROUGH.1,
     )
 }
 
@@ -1167,6 +1219,7 @@ pub fn render_score_sovits(
     };
     // S84 C 刀: chain-internal consonant valley (scale 0/invalid = stage skipped, bit-exact no-op)
     let valley_depths = boundary_valley_depths(&arr);
+    let valley_shapes = boundary_valley_shapes(&arr);
     let coda_lifts = phrase_final_coda_lifts(&arr);
     let valley_scale = if shaping.consonant_valley_scale.is_finite() && shaping.consonant_valley_scale > 0.0 {
         shaping.consonant_valley_scale.min(2.0)
@@ -1176,7 +1229,7 @@ pub fn render_score_sovits(
     // S159zb —— **donor 那一遍**把辅音谷推迟到逆变换之后(见 `valley_after_inverse`)。
     // ⛔ `range_shift == 0` 时不推迟 ⇒ 未开扩展的渲染逐位不变。
     let defer_valley = range_shift != 0 && valley_after_inverse();
-    let mut deferred_valley: Vec<Vec<(usize, usize, f32)>> = Vec::new();
+    let mut deferred_valley: Vec<ValleyCluster> = Vec::new();
     let n_chunks = chunks.len().max(1);
     let has_diff = m.diffusion.is_some();
     let p_vits = if has_diff { 0.5 } else { 0.95 };
@@ -1267,17 +1320,19 @@ pub fn render_score_sovits(
         apply_coda_lift(&mut wav, chunk, &coda_lifts, emphasis_fade_samples(m.sample_rate));
         // S84 C 刀: carve the chain-internal syllable-boundary valleys (measured class depths × scale)
         if valley_scale > 0.0 {
-            let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end]);
+            let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end], &valley_shapes[chunk.start..chunk.end]);
             if defer_valley {
                 // S159zb —— 攒起来,等 `apply_range_inverse` 之后再刻(见 `valley_after_inverse`)。
                 // ⛔ 偏移取**扩展之前**的 `audio.len()`:`seam_fade` 只做淡化、不改两侧长度,
                 //    而 TD-PSOLA 不改时长 ⇒ 绝对下标在逆变换之后仍然有效。
                 let base = audio.len();
-                deferred_valley.extend(val_cls.into_iter().map(|cl| {
-                    cl.into_iter().map(|(a, b, d)| (base + a, base + b, d)).collect::<Vec<_>>()
+                deferred_valley.extend(val_cls.into_iter().map(|c| ValleyCluster {
+                    win: c.win.into_iter().map(|(a, b, d)| (base + a, base + b, d)).collect(),
+                    frac: c.frac,
+                    off: c.off,
                 }));
             } else {
-                apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate));
+                apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate), m.sample_rate);
             }
         }
         if chunk.hard_seam {
@@ -1309,18 +1364,24 @@ pub fn render_score_sovits(
             // S159zb ⑵ —— **量了再补差额**(与 `apply_coda_lift` 同一条;见 `valley_adaptive`)。
             deferred_valley
                 .iter()
-                .map(|cl| {
-                    let (s0, e1) = (cl[0].0, cl[cl.len() - 1].1);
+                .map(|c| {
+                    let (s0, e1) = (c.win[0].0, c.win[c.win.len() - 1].1);
                     let have = measured_valley_db(&audio, s0, e1);
-                    cl.iter()
-                        .map(|&(a, b, d)| (a, b, (d - have / valley_scale.max(1e-6)).clamp(0.0, d)))
-                        .collect::<Vec<_>>()
+                    ValleyCluster {
+                        win: c
+                            .win
+                            .iter()
+                            .map(|&(a, b, d)| (a, b, (d - have / valley_scale.max(1e-6)).clamp(0.0, d)))
+                            .collect(),
+                        frac: c.frac,
+                        off: c.off,
+                    }
                 })
                 .collect::<Vec<_>>()
         } else {
             deferred_valley.clone()
         };
-        apply_valley(&mut audio, &cls, valley_scale, emphasis_fade_samples(m.sample_rate));
+        apply_valley(&mut audio, &cls, valley_scale, emphasis_fade_samples(m.sample_rate), m.sample_rate);
     }
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
@@ -1437,6 +1498,7 @@ pub fn render_score_rvc(
     };
     // S84 C 刀: chain-internal consonant valley (scale 0/invalid = stage skipped, bit-exact no-op)
     let valley_depths = boundary_valley_depths(&arr);
+    let valley_shapes = boundary_valley_shapes(&arr);
     let coda_lifts = phrase_final_coda_lifts(&arr);
     let valley_scale = if shaping.consonant_valley_scale.is_finite() && shaping.consonant_valley_scale > 0.0 {
         shaping.consonant_valley_scale.min(2.0)
@@ -1446,7 +1508,7 @@ pub fn render_score_rvc(
     // S159zb —— **donor 那一遍**把辅音谷推迟到逆变换之后(见 `valley_after_inverse`)。
     // ⛔ `range_shift == 0` 时不推迟 ⇒ 未开扩展的渲染逐位不变。
     let defer_valley = range_shift != 0 && valley_after_inverse();
-    let mut deferred_valley: Vec<Vec<(usize, usize, f32)>> = Vec::new();
+    let mut deferred_valley: Vec<ValleyCluster> = Vec::new();
     let n_chunks = chunks.len().max(1);
     let sid = options.speaker_id.unwrap_or(0) as i64;
     // ①c: a genuine multi-speaker RVC export takes a dense spk_mix blend in place of scalar sid.
@@ -1525,17 +1587,19 @@ pub fn render_score_rvc(
         apply_coda_lift(&mut wav, chunk, &coda_lifts, emphasis_fade_samples(m.sample_rate));
         // S84 C 刀: carve the chain-internal syllable-boundary valleys (measured class depths × scale)
         if valley_scale > 0.0 {
-            let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end]);
+            let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end], &valley_shapes[chunk.start..chunk.end]);
             if defer_valley {
                 // S159zb —— 攒起来,等 `apply_range_inverse` 之后再刻(见 `valley_after_inverse`)。
                 // ⛔ 偏移取**扩展之前**的 `audio.len()`:`seam_fade` 只做淡化、不改两侧长度,
                 //    而 TD-PSOLA 不改时长 ⇒ 绝对下标在逆变换之后仍然有效。
                 let base = audio.len();
-                deferred_valley.extend(val_cls.into_iter().map(|cl| {
-                    cl.into_iter().map(|(a, b, d)| (base + a, base + b, d)).collect::<Vec<_>>()
+                deferred_valley.extend(val_cls.into_iter().map(|c| ValleyCluster {
+                    win: c.win.into_iter().map(|(a, b, d)| (base + a, base + b, d)).collect(),
+                    frac: c.frac,
+                    off: c.off,
                 }));
             } else {
-                apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate));
+                apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate), m.sample_rate);
             }
         }
         if chunk.hard_seam {
@@ -1579,18 +1643,24 @@ pub fn render_score_rvc(
             // S159zb ⑵ —— **量了再补差额**(与 `apply_coda_lift` 同一条;见 `valley_adaptive`)。
             deferred_valley
                 .iter()
-                .map(|cl| {
-                    let (s0, e1) = (cl[0].0, cl[cl.len() - 1].1);
+                .map(|c| {
+                    let (s0, e1) = (c.win[0].0, c.win[c.win.len() - 1].1);
                     let have = measured_valley_db(&audio, s0, e1);
-                    cl.iter()
-                        .map(|&(a, b, d)| (a, b, (d - have / valley_scale.max(1e-6)).clamp(0.0, d)))
-                        .collect::<Vec<_>>()
+                    ValleyCluster {
+                        win: c
+                            .win
+                            .iter()
+                            .map(|&(a, b, d)| (a, b, (d - have / valley_scale.max(1e-6)).clamp(0.0, d)))
+                            .collect(),
+                        frac: c.frac,
+                        off: c.off,
+                    }
                 })
                 .collect::<Vec<_>>()
         } else {
             deferred_valley.clone()
         };
-        apply_valley(&mut audio, &cls, valley_scale, emphasis_fade_samples(m.sample_rate));
+        apply_valley(&mut audio, &cls, valley_scale, emphasis_fade_samples(m.sample_rate), m.sample_rate);
     }
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
@@ -1757,6 +1827,7 @@ fn valley_depth_db_human(p: &str) -> f32 {
     match p.chars().next() {
         Some('m' | 'n' | 'ɲ' | 'ŋ' | 'ɴ' | 'l' | 'ʎ' | 'ɫ' | 'ɭ') => VALLEY_NASAL_HUMAN_DB,
         Some('ɾ' | 'ɽ' | 'r') => VALLEY_TAP_HUMAN_DB,
+        Some('b' | 'd' | 'ɡ' | 'ɟ' | 'ɢ') => VALLEY_VSTOP_HUMAN_DB,
         _ => valley_depth_db(p),
     }
 }
@@ -2048,27 +2119,60 @@ fn valley_after_inverse() -> bool {
     parse_valley_after(std::env::var("UTAI_MG_VALLEY_AFTER").ok().as_deref())
 }
 
+/// S161b —— 一个簇 = 一个闭塞动作 + **它的形状**。`frac == 1.0` ⇒ 今天的整窗矩形。
+/// ⚠ 一个簇只有一套形状:取**深度最大的那个成员**的形状(单成员簇 = 精确;
+/// 混合簇如 EN `[k w]` 由最深的那个说了算,与「一个簇一个动作」的既有契约一致)。
+#[derive(Clone, Debug)]
+pub(crate) struct ValleyCluster {
+    pub win: Vec<(usize, usize, f32)>,
+    pub frac: f32,
+    pub off: f32,
+}
+
+/// 逐音素的谷形状,与 [`boundary_valley_depths`] 并列。出厂开时走 [`valley_shape_human`]。
+fn boundary_valley_shapes(arr: &ScoreArrays) -> Vec<(f32, f32)> {
+    let human = valley_human();
+    arr.phon.iter().map(|p| if human { valley_shape_human(p) } else { (1.0, 0.0) }).collect()
+}
+
 /// Chunk-relative CLUSTERS of contiguous depth>0 phones, each member keeping its OWN class depth.
 /// One cluster = one closure gesture: apply_valley ramps only at the cluster's outer edges and
 /// blends depth ACROSS internal junctions — per-phone windows would ramp a gain BUMP back to unity
 /// at the junction (the valley-polarity twin of the S83 emphasis review bug), while a single
 /// max-depth window would over-carve the shallower member (an EN [k w] cluster must not sink the
 /// 1.4 dB glide to the stop's 11.7 — S84 review, per-class calibration is the stage's contract).
-fn chunk_valley_clusters(chunk: &Chunk, out_len: usize, depths: &[f32]) -> Vec<Vec<(usize, usize, f32)>> {
+fn chunk_valley_clusters(
+    chunk: &Chunk,
+    out_len: usize,
+    depths: &[f32],
+    shapes: &[(f32, f32)],
+) -> Vec<ValleyCluster> {
     let t = chunk.t.max(1);
-    let mut clusters: Vec<Vec<(usize, usize, f32)>> = Vec::new();
+    let mut clusters: Vec<ValleyCluster> = Vec::new();
+    let mut deepest: Vec<f32> = Vec::new();
     let mut cursor: i64 = 0;
     for (i, &d) in chunk.phone_dur.iter().enumerate() {
         let d = d.max(0);
         let depth = depths.get(i).copied().unwrap_or(0.0);
+        let (frac, off) = shapes.get(i).copied().unwrap_or((1.0, 0.0));
         if d > 0 && depth > 0.0 {
             let s = (cursor as f64 / t as f64 * out_len as f64).round() as usize;
             let e = ((((cursor + d) as f64) / t as f64) * out_len as f64).round() as usize;
             let e = e.min(out_len);
             if e > s {
-                match clusters.last_mut() {
-                    Some(cl) if cl.last().map(|w| w.1) == Some(s) => cl.push((s, e, depth)),
-                    _ => clusters.push(vec![(s, e, depth)]),
+                let joins = clusters.last().map(|cl| cl.win.last().map(|w| w.1) == Some(s)).unwrap_or(false);
+                if joins {
+                    let last = clusters.last_mut().expect("joins implies non-empty");
+                    last.win.push((s, e, depth));
+                    // 形状由最深的成员说了算(见 `ValleyCluster` 的 doc)。
+                    if depth > *deepest.last().expect("parallel to clusters") {
+                        last.frac = frac;
+                        last.off = off;
+                        *deepest.last_mut().expect("parallel") = depth;
+                    }
+                } else {
+                    clusters.push(ValleyCluster { win: vec![(s, e, depth)], frac, off });
+                    deepest.push(depth);
                 }
             }
         }
@@ -2081,28 +2185,57 @@ fn chunk_valley_clusters(chunk: &Chunk, out_len: usize, depths: &[f32]) -> Vec<V
 /// linearly blended (dB domain) across internal junctions over `fade` samples centered on the
 /// junction (no step-click, no unity bump), then scaled by the cluster-outer edge ramp (0→plateau
 /// over `fade`). `scale` multiplies depth in the dB domain.
-fn apply_valley(audio: &mut [f32], clusters: &[Vec<(usize, usize, f32)>], scale: f32, fade: usize) {
+fn apply_valley(audio: &mut [f32], clusters: &[ValleyCluster], scale: f32, fade: usize, sample_rate: u32) {
     let fade_f = fade.max(1) as f32;
     let half = (fade.max(1) / 2).max(1);
-    for cl in clusters {
+    let edge = ((VALLEY_TROUGH_EDGE_MS / 1000.0) * sample_rate as f32).round().max(1.0) as usize;
+    for c in clusters {
+        let cl = &c.win;
         let Some(&(s0, ..)) = cl.first() else { continue };
         let Some(&(.., e1, _)) = cl.last() else { continue };
         let e1 = e1.min(audio.len());
+        if e1 <= s0 {
+            continue;
+        }
+        // S161b —— 窄槽:全深 `frac × 簇窗`,两侧 `edge` 边沿,其余**权重 0**(= 一个字节不动)。
+        // `frac >= 1.0` 时退回今天的整窗矩形(外缘 `fade` 斜坡),**逐位相同**。
+        let n = e1 - s0;
+        let trough = if c.frac < 0.999 {
+            let full = ((c.frac * n as f32).round() as usize).max(1);
+            let mid = ((0.5 + c.off) * n as f32).round() as isize;
+            let a0 = (mid - (full as isize) / 2).max(0) as usize;
+            let b0 = (a0 + full).min(n);
+            Some((a0, b0))
+        } else {
+            None
+        };
         for (wi, &(s, e, depth)) in cl.iter().enumerate() {
             let e = e.min(audio.len());
             for i in s..e {
                 let mut d = depth;
                 if wi > 0 && (i - s) < half {
-                    // leading half of the junction blend zone: prev depth → own depth
                     let w = 0.5 + (i - s) as f32 / fade_f;
                     d = cl[wi - 1].2 * (1.0 - w) + depth * w;
                 } else if wi + 1 < cl.len() && (e - 1 - i) < half {
-                    // trailing half: own depth → next depth
                     let w = 0.5 + (e - 1 - i) as f32 / fade_f;
                     d = cl[wi + 1].2 * (1.0 - w) + depth * w;
                 }
-                let edge = (i - s0).min(e1.saturating_sub(1 + i)) as f32;
-                let ramp = (edge / fade_f).min(1.0);
+                let ramp = match trough {
+                    None => {
+                        let edg = (i - s0).min(e1.saturating_sub(1 + i)) as f32;
+                        (edg / fade_f).min(1.0)
+                    }
+                    Some((a0, b0)) => {
+                        let k = i - s0;
+                        if k >= a0 && k < b0 {
+                            1.0
+                        } else if k < a0 {
+                            1.0 - ((a0 - k) as f32 / edge as f32).min(1.0)
+                        } else {
+                            1.0 - ((k + 1 - b0) as f32 / edge as f32).min(1.0)
+                        }
+                    }
+                };
                 audio[i] *= 10f32.powf(-(d * scale * ramp) / 20.0);
             }
         }
@@ -2827,7 +2960,9 @@ mod tests {
         let g = arr.phon.iter().position(|&p| p == "ɡ").unwrap();
         let r = arr.phon.iter().position(|&p| p == "ɾ").unwrap();
         assert_eq!(d[k], 0.0, "post-rest onset never valleys");
-        assert!((d[g] - 11.7).abs() < 1e-6, "chain-internal voiced stop valleys at stop depth");
+        // ⭐ S161b:出厂表的浊塞音换成**窄槽** 20 dB(只在 20% 的窗上,整段电平反而更接近真人)。
+        assert!((d[g] - VALLEY_VSTOP_HUMAN_DB).abs() < 1e-6, "出厂(真人表)浊塞音 = 20(窄槽)");
+        assert!((valley_depth_db("ɡ") - 11.7).abs() < 1e-6, "S84 那张表本身不许被改动(回退臂用)");
         // ⭐ S161:出厂表已换成**真人差额**(闪音 10.4 → 6.8;鼻/边 11.4 → 1.1;塞音**没动**)。
         //    这条判据当场红过一次,红在 `tap valleys at tap depth` —— 正是它该红的地方。
         //    ⇒ 两张表都钉住:出厂那张 + `UTAI_VALLEY_HUMAN=0` 回退的那张(S84 的)。
@@ -2835,7 +2970,15 @@ mod tests {
         assert!((valley_depth_db("ɾ") - 10.4).abs() < 1e-6, "S84 那张表本身不许被改动(回退臂用)");
         assert!((valley_depth_db("n") - 11.4).abs() < 1e-6, "S84 那张表本身不许被改动(回退臂用)");
         assert!((valley_depth_db_human("n") - VALLEY_NASAL_HUMAN_DB).abs() < 1e-6, "真人表鼻音 = 1.1");
-        assert!((valley_depth_db_human("ɡ") - valley_depth_db("ɡ")).abs() < 1e-6, "塞音两张表必须一样");
+        // ⭐ S161b:**清**塞音两张表必须一样(它的 level 已经正好);**浊**塞音必须不一样。
+        for p in ["k", "t", "p", "c", "ts", "tɕ", "ʔ"] {
+            assert!((valley_depth_db_human(p) - valley_depth_db(p)).abs() < 1e-6, "{p} 清塞音两张表必须一样");
+            assert!((valley_shape_human(p).0 - 1.0).abs() < 1e-6, "{p} 清塞音必须是矩形");
+        }
+        for p in ["ɡ", "b", "d", "dʑ", "dz", "bʲ"] {
+            assert!(valley_depth_db_human(p) > valley_depth_db(p), "{p} 浊塞音人表必须更深(窄槽)");
+            assert!(valley_shape_human(p).0 < 0.999, "{p} 浊塞音必须开槽");
+        }
         assert!(
             arr.phon.iter().zip(&d).all(|(&p, &v)| v == 0.0 || !super::super::score2cv::is_nucleus_phone(p)),
             "nuclei never valley"
@@ -3020,11 +3163,25 @@ mod tests {
             lang_id: 2,
             hard_seam: false,
         };
-        let cls = chunk_valley_clusters(&chunk, 2000, &[0.0, 11.7, 10.4, 0.0]);
-        assert_eq!(cls, vec![vec![(500, 750, 11.7), (750, 1000, 10.4)]]);
+        let flat = [(1.0f32, 0.0f32); 4];
+        let cls = chunk_valley_clusters(&chunk, 2000, &[0.0, 11.7, 10.4, 0.0], &flat);
+        assert_eq!(cls.len(), 1);
+        assert_eq!(cls[0].win, vec![(500, 750, 11.7), (750, 1000, 10.4)]);
         // a gap (unflagged phone) splits clusters:
-        let cls2 = chunk_valley_clusters(&chunk, 2000, &[11.7, 0.0, 10.4, 0.0]);
-        assert_eq!(cls2, vec![vec![(0, 500, 11.7)], vec![(750, 1000, 10.4)]]);
+        let cls2 = chunk_valley_clusters(&chunk, 2000, &[11.7, 0.0, 10.4, 0.0], &flat);
+        assert_eq!(cls2.len(), 2);
+        assert_eq!(cls2[0].win, vec![(0, 500, 11.7)]);
+        assert_eq!(cls2[1].win, vec![(750, 1000, 10.4)]);
+        // ⛔ S161b —— 一个簇只有一套形状,由**最深的成员**说了算(见 `ValleyCluster` 的 doc)。
+        //    这里第二个成员更浅却带着窄槽形状 ⇒ 簇必须仍然是矩形。
+        let shapes = [(1.0, 0.0), (1.0, 0.0), (0.20, 0.12), (1.0, 0.0)];
+        let cls3 = chunk_valley_clusters(&chunk, 2000, &[0.0, 11.7, 10.4, 0.0], &shapes);
+        assert_eq!(cls3.len(), 1);
+        assert!((cls3[0].frac - 1.0).abs() < 1e-6, "最深的成员是矩形 ⇒ 整簇矩形");
+        // 反过来:最深的成员带槽 ⇒ 整簇带槽。
+        let shapes2 = [(1.0, 0.0), (0.20, 0.12), (1.0, 0.0), (1.0, 0.0)];
+        let cls4 = chunk_valley_clusters(&chunk, 2000, &[0.0, 11.7, 10.4, 0.0], &shapes2);
+        assert!((cls4[0].frac - 0.20).abs() < 1e-6, "最深的成员带槽 ⇒ 整簇带槽");
     }
 
     /// ★S97 ②a — WHO the phrase-final coda restore fires on. Four arms, deliberately different:
@@ -3105,20 +3262,23 @@ mod tests {
 
     #[test]
     fn apply_valley_shape_scale_junction_and_outside() {
+        fn rect(win: Vec<(usize, usize, f32)>) -> ValleyCluster {
+            ValleyCluster { win, frac: 1.0, off: 0.0 }
+        }
         let mut a = vec![1.0f32; 300];
-        apply_valley(&mut a, &[vec![(20, 120, 20.0)]], 1.0, 10);
+        apply_valley(&mut a, &[rect(vec![(20, 120, 20.0)])], 1.0, 10, 44100);
         assert_eq!(a[19], 1.0, "outside untouched");
         assert!((a[20] - 1.0).abs() < 0.11, "edge starts near unity");
         assert!((a[60] - 0.1).abs() < 1e-3, "plateau at −20 dB");
         assert!((a[119] - 1.0).abs() < 0.11, "far edge back near unity");
         // scale halves the dB depth (not the linear gain): −10 dB plateau.
         let mut b = vec![1.0f32; 300];
-        apply_valley(&mut b, &[vec![(20, 120, 20.0)]], 0.5, 10);
+        apply_valley(&mut b, &[rect(vec![(20, 120, 20.0)])], 0.5, 10, 44100);
         assert!((b[60] - 10f32.powf(-0.5)).abs() < 1e-3, "scale is in dB domain");
         // mixed-depth cluster: each member plateaus at its OWN depth; the junction crossfades in
         // the dB domain (≈ −15 dB at the boundary) with NO unity bump anywhere inside the cluster.
         let mut c = vec![1.0f32; 300];
-        apply_valley(&mut c, &[vec![(20, 120, 20.0), (120, 220, 10.0)]], 1.0, 10);
+        apply_valley(&mut c, &[rect(vec![(20, 120, 20.0), (120, 220, 10.0)])], 1.0, 10, 44100);
         assert!((c[60] - 0.1).abs() < 1e-3, "member 1 plateaus at its own −20 dB");
         assert!((c[170] - 10f32.powf(-0.5)).abs() < 1e-3, "member 2 plateaus at its own −10 dB");
         let j = c[120];
@@ -4048,7 +4208,7 @@ mod s160q_f0_lerp_tests {
         // ⛔⛔ 这条判据存在的理由:S160q 之前,本文件的生产默认【完全不在任何指纹里】,
         //     而 `FILL_ISOLATED_UV_DEFAULT` 出厂就是开着的。
         let fp = production_defaults_fingerprint();
-        for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "valadapt=", "valafter=", "valhuman="] {
+        for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "valadapt=", "valafter=", "valhuman=", "valdb=", "valtrough="] {
             assert!(fp.contains(key), "指纹串缺 {key} —— 少一个默认就少一道成对 bump 的闸:{fp}");
         }
     }
@@ -4074,7 +4234,7 @@ mod s160q_f0_lerp_tests {
         // 只写文件、不改音频的诊断路径(见 `dump_donor_buffer` 的 doc)。
         const EXEMPT: &[&str] = &["UTAI_RANGE_DUMP_DONOR"];
         // 指纹里**不由 env 驱动**的格:纯常量默认,没有对应的环境变量。
-        const CONST_ONLY: &[&str] = &["filluv="];
+        const CONST_ONLY: &[&str] = &["filluv=", "valdb=", "valtrough="];
 
         let src = include_str!("score2svc.rs");
         let mut found: Vec<&str> = Vec::new();
@@ -4112,10 +4272,10 @@ mod s160q_f0_lerp_tests {
         );
     }
 
-    /// ⛔ S161 —— 人表**只许**在量过的那两个桶上与出厂表不同。
+    /// ⛔ S161/S161b —— 人表**只许**在量过的那三个桶上与出厂表不同(鼻/边 · 闪 · 浊塞)。
     /// 走的是与 `valley_depth_db` 那条穷举判据同一份 210 音素词表。
     #[test]
-    fn the_human_table_differs_only_in_the_two_measured_buckets() {
+    fn the_human_table_differs_only_in_the_measured_buckets() {
         // ⛔ S161 翻成出厂开(用户耳判)。没有这条判据,「我们翻了」和「有人翻回去了」
         //    在别的每一条测试上长得一模一样。全曲净账写在 `parse_valley_human` 的 doc 上。
         assert!(parse_valley_human(None), "出厂必须开(S161;UTAI_VALLEY_HUMAN=0 才关)");
@@ -4134,11 +4294,20 @@ mod s160q_f0_lerp_tests {
             let b = valley_depth_db_human(p);
             let nasal = matches!(p.chars().next(), Some('m' | 'n' | 'ɲ' | 'ŋ' | 'ɴ' | 'l' | 'ʎ' | 'ɫ' | 'ɭ'));
             let tap = matches!(p.chars().next(), Some('ɾ' | 'ɽ' | 'r'));
+            let vstop = matches!(p.chars().next(), Some('b' | 'd' | 'ɡ' | 'ɟ' | 'ɢ'));
+            // ⛔ 形状表必须与深度表**同步**:开槽的正好是「深度被改大了」的那一族。
+            let (frac, _off) = valley_shape_human(p);
+            assert_eq!(frac < 0.999, tap || vstop, "{p} 的形状与深度表对不上");
             if nasal {
                 assert!((b - VALLEY_NASAL_HUMAN_DB).abs() < 1e-6, "{p} 应是鼻/边人表值");
                 moved += 1;
             } else if tap {
                 assert!((b - VALLEY_TAP_HUMAN_DB).abs() < 1e-6, "{p} 应是闪音人表值");
+                moved += 1;
+            } else if vstop {
+                assert!((b - VALLEY_VSTOP_HUMAN_DB).abs() < 1e-6, "{p} 应是浊塞音人表值");
+                // ⛔ 清塞音一个都不许进来(首字符不重叠 —— 这条就是钉那句话的)
+                assert!(!super::super::score2cv::is_voiceless_phone(p), "{p} 是清音,不该走浊塞分支");
                 moved += 1;
             } else {
                 assert!((a - b).abs() < 1e-6, "{p} 不该被人表动到:{a} vs {b}");

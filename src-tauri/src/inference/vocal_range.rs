@@ -6784,10 +6784,10 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=false uvgatek=1.5 valadapt=false valafter=false valhuman=true",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=false uvgatek=1.5 valadapt=false valafter=false valhuman=true valdb=1.1/8/20 valtrough=0.2,0.12/0.12,0.24",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s161";
+        const TAG: &str = "s161b";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
