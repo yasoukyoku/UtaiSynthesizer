@@ -974,11 +974,43 @@ fn valley_shape_human(p: &str) -> (f32, f32) {
 
 /// 真人差额(GTSinger ja Control_Group):鼻/边 dip 4.4 − 我们自己的 3.3 ≈ **1.1 dB**。
 pub const VALLEY_NASAL_HUMAN_DB: f32 = 1.1;
-/// 真人差额(**窄槽**版,见 [`valley_shape_human`] 的定标表):闪音 **8.0 dB**。
-pub const VALLEY_TAP_HUMAN_DB: f32 = 8.0;
-/// 真人差额(**窄槽**版):浊塞音/浊塞擦 **20.0 dB**。⚠ 它比今天的 11.7 深,**但只在 20% 的窗上**,
-/// 所以整段电平反而从 −11.2 回到 −4.8(真人 −5.1)。⛔ 别把这个数字与矩形深度相提并论。
-pub const VALLEY_VSTOP_HUMAN_DB: f32 = 20.0;
+/// ⛔⛔ S161c —— **槽深必须随辅音【时长】变,常数是错的。**
+///
+/// S161b 给了浊塞音一个常数 20 dB —— 而 S161 自己刚记过这条血训(「S84 标定用的正是快段,
+/// 真人在那儿凹得最浅,而刀是常数」),**然后我又造了一把常数刀**。用户 2026-08-25 当场点名
+/// 1:19.444 / 1:20.706 / 1:21.080 / 1:21.264 四处「可能是硬挖出来的」——**四处全是 3 帧的浊塞音**。
+///
+/// 真人日语 Control_Group 的 **10 ms 细分**(浊塞音 dip):
+/// 20-40 ms **2.1** · 40-50 **13.5** · 50-60 13.4 · 60-70 **21.1** · 70-80 28.6 · 80-100 32.2 · 100+ 36-39。
+/// 而我们**自己的** dip(谷全关)是 2 帧 2.9 / 3 帧 7.5 / 4 帧 17.8 ⇒ **差额本身就随时长变**。
+///
+/// 逐格扫参(两份素材一起:炉心融解 3/4 帧多 + 鹅妈妈 2 帧多,已排除救援窗):
+///
+/// | 类 | 帧 | n | 定出的深度 | 得到 level / dip | 真人 |
+/// |---|---|---|---|---|---|
+/// | 浊塞音 | 2 | 21 | **13.0** | −3.18 / 13.35 | −4.02 / 13.50 |
+/// | 浊塞音 | 3 | 107 | **16.0** | −4.52 / 20.75 | −5.04 / 21.07 |
+/// | 浊塞音 | ≥4 | 8 | **18.0** | −4.74 / 32.14 | −6.51 / 32.19 |
+/// | 闪音 | 2 | 152 | **7.0** | −1.46 / 7.35 | −1.48 / 7.74 |
+/// | 闪音 | ≥3 | 19 | **10.0** | −1.50 / 10.33 | −1.84 / 10.45 |
+///
+/// ⚠ ≥4 帧那一格 n=8,**小样本**;更长的辅音真人还在继续加深(100-130 ms → 36.4),
+///   这里**故意封顶在 18**,不外推到没量过的区间。
+fn valley_vstop_human_db(frames: i64) -> f32 {
+    match frames {
+        i64::MIN..=2 => 13.0,
+        3 => 16.0,
+        _ => 18.0,
+    }
+}
+
+fn valley_tap_human_db(frames: i64) -> f32 {
+    if frames <= 2 {
+        7.0
+    } else {
+        10.0
+    }
+}
 
 fn parse_valley_after(v: Option<&str>) -> bool {
     matches!(v.map(str::trim), Some("1" | "true" | "on" | "yes"))
@@ -996,7 +1028,7 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} valadapt={} valafter={} valhuman={} valdb={}/{}/{} valtrough={},{}/{},{}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} valadapt={} valafter={} valhuman={} valdb={}/{},{},{}/{},{} valtrough={},{}/{},{}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
@@ -1012,8 +1044,11 @@ pub(crate) fn production_defaults_fingerprint() -> String {
         //    (浊塞音 11.7 → 20 窄槽、闪音 6.8 → 8):旋钮没动、指纹没动、音频却变了 ⇒ 又是零红。
         //    ⇒ 凡是这几个常量被改,这条闸当场红,红的措辞会指到那三处版本字面量。
         VALLEY_NASAL_HUMAN_DB,
-        VALLEY_TAP_HUMAN_DB,
-        VALLEY_VSTOP_HUMAN_DB,
+        valley_vstop_human_db(2),
+        valley_vstop_human_db(3),
+        valley_vstop_human_db(4),
+        valley_tap_human_db(2),
+        valley_tap_human_db(3),
         VALLEY_STOP_TROUGH.0,
         VALLEY_STOP_TROUGH.1,
         VALLEY_TAP_TROUGH.0,
@@ -1823,11 +1858,11 @@ fn valley_depth_db(p: &str) -> f32 {
 /// S161 —— [`valley_depth_db`] 的**真人标定**版本(见 [`parse_valley_human`] 的 doc)。
 /// ⛔ 只有鼻/边与闪两个桶不同;其余每一个分支都必须**逐字**等于 [`valley_depth_db`],
 /// 由 `the_human_table_differs_only_in_the_two_measured_buckets` 对全部 210 个音素逐个盯住。
-fn valley_depth_db_human(p: &str) -> f32 {
+fn valley_depth_db_human(p: &str, frames: i64) -> f32 {
     match p.chars().next() {
         Some('m' | 'n' | 'ɲ' | 'ŋ' | 'ɴ' | 'l' | 'ʎ' | 'ɫ' | 'ɭ') => VALLEY_NASAL_HUMAN_DB,
-        Some('ɾ' | 'ɽ' | 'r') => VALLEY_TAP_HUMAN_DB,
-        Some('b' | 'd' | 'ɡ' | 'ɟ' | 'ɢ') => VALLEY_VSTOP_HUMAN_DB,
+        Some('ɾ' | 'ɽ' | 'r') => valley_tap_human_db(frames),
+        Some('b' | 'd' | 'ɡ' | 'ɟ' | 'ɢ') => valley_vstop_human_db(frames),
         _ => valley_depth_db(p),
     }
 }
@@ -1873,7 +1908,7 @@ fn boundary_valley_depths(arr: &ScoreArrays) -> Vec<f32> {
                     };
                     if chain_internal {
                         depths[x] = if human {
-                            valley_depth_db_human(arr.phon[x])
+                            valley_depth_db_human(arr.phon[x], arr.phone_dur[x].max(0))
                         } else {
                             valley_depth_db(arr.phon[x])
                         };
@@ -2961,23 +2996,38 @@ mod tests {
         let r = arr.phon.iter().position(|&p| p == "ɾ").unwrap();
         assert_eq!(d[k], 0.0, "post-rest onset never valleys");
         // ⭐ S161b:出厂表的浊塞音换成**窄槽** 20 dB(只在 20% 的窗上,整段电平反而更接近真人)。
-        assert!((d[g] - VALLEY_VSTOP_HUMAN_DB).abs() < 1e-6, "出厂(真人表)浊塞音 = 20(窄槽)");
+        // ⛔ 用**该 token 自己的帧数**去取靶,别把帧数写死 —— 写死就成了「夹具决定答案」。
+        assert!((d[g] - valley_vstop_human_db(arr.phone_dur[g])).abs() < 1e-6,
+                "出厂(真人表)浊塞音按时长取深度(该 token {} 帧)", arr.phone_dur[g]);
         assert!((valley_depth_db("ɡ") - 11.7).abs() < 1e-6, "S84 那张表本身不许被改动(回退臂用)");
         // ⭐ S161:出厂表已换成**真人差额**(闪音 10.4 → 6.8;鼻/边 11.4 → 1.1;塞音**没动**)。
         //    这条判据当场红过一次,红在 `tap valleys at tap depth` —— 正是它该红的地方。
         //    ⇒ 两张表都钉住:出厂那张 + `UTAI_VALLEY_HUMAN=0` 回退的那张(S84 的)。
-        assert!((d[r] - VALLEY_TAP_HUMAN_DB).abs() < 1e-6, "出厂(真人表)闪音 = 6.8");
+        assert!((d[r] - valley_tap_human_db(arr.phone_dur[r])).abs() < 1e-6,
+                "出厂(真人表)闪音按时长取深度(该 token {} 帧)", arr.phone_dur[r]);
         assert!((valley_depth_db("ɾ") - 10.4).abs() < 1e-6, "S84 那张表本身不许被改动(回退臂用)");
         assert!((valley_depth_db("n") - 11.4).abs() < 1e-6, "S84 那张表本身不许被改动(回退臂用)");
-        assert!((valley_depth_db_human("n") - VALLEY_NASAL_HUMAN_DB).abs() < 1e-6, "真人表鼻音 = 1.1");
+        for fr in [1i64, 2, 3, 5] {
+            assert!((valley_depth_db_human("n", fr) - VALLEY_NASAL_HUMAN_DB).abs() < 1e-6, "真人表鼻音 = 1.1,且不随时长变");
+        }
         // ⭐ S161b:**清**塞音两张表必须一样(它的 level 已经正好);**浊**塞音必须不一样。
         for p in ["k", "t", "p", "c", "ts", "tɕ", "ʔ"] {
-            assert!((valley_depth_db_human(p) - valley_depth_db(p)).abs() < 1e-6, "{p} 清塞音两张表必须一样");
+            for fr in [1i64, 2, 3, 5, 20] {
+                assert!((valley_depth_db_human(p, fr) - valley_depth_db(p)).abs() < 1e-6,
+                        "{p} 清塞音两张表必须一样(且不随时长变),帧={fr}");
+            }
             assert!((valley_shape_human(p).0 - 1.0).abs() < 1e-6, "{p} 清塞音必须是矩形");
         }
         for p in ["ɡ", "b", "d", "dʑ", "dz", "bʲ"] {
-            assert!(valley_depth_db_human(p) > valley_depth_db(p), "{p} 浊塞音人表必须更深(窄槽)");
+            assert!(valley_depth_db_human(p, 3) > valley_depth_db(p), "{p} 浊塞音人表必须更深(窄槽)");
             assert!(valley_shape_human(p).0 < 0.999, "{p} 浊塞音必须开槽");
+            // ⛔⛔ S161c —— **槽深必须随时长单调不减**;常数刀就是这一条的反例。
+            let (d2, d3, d4) = (valley_depth_db_human(p, 2), valley_depth_db_human(p, 3), valley_depth_db_human(p, 5));
+            assert!(d2 < d3 && d3 < d4, "{p} 槽深必须随时长加深:{d2}/{d3}/{d4}");
+        }
+        for p in ["ɾ", "r"] {
+            let (d2, d3) = (valley_depth_db_human(p, 2), valley_depth_db_human(p, 4));
+            assert!(d2 < d3, "{p} 闪音槽深也必须随时长加深:{d2}/{d3}");
         }
         assert!(
             arr.phon.iter().zip(&d).all(|(&p, &v)| v == 0.0 || !super::super::score2cv::is_nucleus_phone(p)),
@@ -4291,7 +4341,7 @@ mod s160q_f0_lerp_tests {
                 continue;
             }
             let a = valley_depth_db(p);
-            let b = valley_depth_db_human(p);
+            let b = valley_depth_db_human(p, 3);
             let nasal = matches!(p.chars().next(), Some('m' | 'n' | 'ɲ' | 'ŋ' | 'ɴ' | 'l' | 'ʎ' | 'ɫ' | 'ɭ'));
             let tap = matches!(p.chars().next(), Some('ɾ' | 'ɽ' | 'r'));
             let vstop = matches!(p.chars().next(), Some('b' | 'd' | 'ɡ' | 'ɟ' | 'ɢ'));
@@ -4302,10 +4352,10 @@ mod s160q_f0_lerp_tests {
                 assert!((b - VALLEY_NASAL_HUMAN_DB).abs() < 1e-6, "{p} 应是鼻/边人表值");
                 moved += 1;
             } else if tap {
-                assert!((b - VALLEY_TAP_HUMAN_DB).abs() < 1e-6, "{p} 应是闪音人表值");
+                assert!((b - valley_tap_human_db(3)).abs() < 1e-6, "{p} 应是闪音人表值");
                 moved += 1;
             } else if vstop {
-                assert!((b - VALLEY_VSTOP_HUMAN_DB).abs() < 1e-6, "{p} 应是浊塞音人表值");
+                assert!((b - valley_vstop_human_db(3)).abs() < 1e-6, "{p} 应是浊塞音人表值");
                 // ⛔ 清塞音一个都不许进来(首字符不重叠 —— 这条就是钉那句话的)
                 assert!(!super::super::score2cv::is_voiceless_phone(p), "{p} 是清音,不该走浊塞分支");
                 moved += 1;
