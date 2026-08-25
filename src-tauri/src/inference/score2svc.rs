@@ -1374,9 +1374,8 @@ pub fn render_score_sovits(
                 apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate), m.sample_rate);
             }
         }
-        if chunk.hard_seam {
-            seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
-        }
+        // S161f —— **每一条接缝都淡化**(以前只 hard_seam;见 `seam_fade` 的 doc)。
+        seam_fade(&mut audio, &mut wav, m.sample_rate);
         audio.extend_from_slice(&wav);
         cv_cursor += chunk.t;
         progress((ci + 1) as f32 / n_chunks as f32);
@@ -1639,9 +1638,8 @@ pub fn render_score_rvc(
                 apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate), m.sample_rate);
             }
         }
-        if chunk.hard_seam {
-            seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
-        }
+        // S161f —— **每一条接缝都淡化**(以前只 hard_seam;见 `seam_fade` 的 doc)。
+        seam_fade(&mut audio, &mut wav, m.sample_rate);
         audio.extend_from_slice(&wav);
         cv_cursor += chunk.t;
         progress((ci + 1) as f32 / n_chunks as f32);
@@ -2337,11 +2335,29 @@ fn apply_rest_gate(audio: &mut [f32], windows: &[(usize, usize)], fade: usize) {
     }
 }
 
-/// Micro-fade a HARD chunk seam (a mid-voiced LANGUAGE cut, S58): linearly fade the tail of the
-/// accumulated audio and the head of the incoming chunk over ~5 ms each. Sample counts are untouched
-/// (never an overlap-shift — the stem must stay tick-aligned to the DAW timeline); the fades only mask
-/// the waveform discontinuity of two independently decoded chunks. SP seams are silence and skip this.
+/// Micro-fade a chunk seam: linearly fade the tail of the accumulated audio and the head of the
+/// incoming chunk over ~5 ms each. Sample counts are untouched (never an overlap-shift — the stem
+/// must stay tick-aligned to the DAW timeline); the fades only mask the waveform discontinuity of
+/// two independently decoded chunks.
+///
+/// ⛔⛔ S161f —— **以前只在 `hard_seam` 上跑,而那条注释里的「SP seams are silence and skip this」
+/// 是错的**。`chunk_at_sp` 切在一个完整 SP **之后**,两侧是**两次独立解码**的缓冲,直接
+/// `extend_from_slice` 硬拼 —— 休止里不是数字静音,是两段**不同的**极低电平信号,拼接处
+/// 就是一个波形台阶 = 宽带咔哒。
+///
+/// 实测(鹅妈妈原 key,>18 kHz 盲搜全曲,突出度 >20 dB 的瞬变 32 个):**84-87% 落在 SP 边
+/// 20 ms 以内**,而且**把辅音谷整个关掉读数一模一样** ⇒ 与谷无关,是这条接缝。
+/// 用户在频谱图 18 kHz 以上看到的「一堆细竖线」的主体就是它。
+///
+/// ⇒ 现在**每一条 chunk 接缝都跑**。代价:接缝落在休止里 ⇒ 淡化的是两段 −60…−80 dBFS 的信号;
+/// `hard_seam`(语言切,落在浊音正中)行为与以前**逐位相同**(同一个函数、同一个 5 ms)。
 fn seam_fade(audio: &mut [f32], wav: &mut [f32], sample_rate: u32) {
+    // ⛔ S161g —— **第一块没有左侧 ⇒ 那不是接缝**。S161f 把这个函数改成无条件调用之后,
+    //    ci==0 上 `audio` 还是空的,而下面 `wav` 那半段照跑 ⇒ **整首歌的头 5 ms 被淡入**。
+    //    以前只在 `hard_seam` 上跑,结构上碰不到这一格;判据 `the_first_chunk_is_never_faded_in`。
+    if audio.is_empty() {
+        return;
+    }
     let k = (sample_rate as usize / 200).max(1); // ≈5 ms
     let n = audio.len();
     let ka = k.min(n);
@@ -4257,6 +4273,55 @@ mod s160q_f0_lerp_tests {
         for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "valadapt=", "valafter=", "valhuman=", "valdb=", "valenv="] {
             assert!(fp.contains(key), "指纹串缺 {key} —— 少一个默认就少一道成对 bump 的闸:{fp}");
         }
+    }
+
+    /// ⛔⛔ S161f/g —— **接缝淡化必须无条件跑**,而且**只在真有接缝时**跑。
+    ///
+    /// 这是一条**没有旋钮的行为改动** ⇒ `production_defaults_fingerprint()` 结构上盖不住它,
+    /// 谁把 `if chunk.hard_seam` 加回去,别的每一条测试都还是绿的(S161 的血训:
+    /// 「只登记旋钮 ⇒ 改类常量零红」的同一族)。所以这里同时钉住**源码调用点**与**行为**。
+    ///
+    /// 读数(鹅妈妈原 key,>18 kHz 盲搜全曲,突出度 >20 dB 的瞬变):
+    /// 谷全关 30 · S161e 硬拼接缝 32 · **S161f 接缝淡化 5**;用户点的四处 43.9/38.9/40.1/35.4 dB
+    /// 全部消失;残留的 5 个 **100% 落在救援窗内**(窗只覆盖全曲 6% ⇒ 不是空判据)。
+    #[test]
+    fn the_seam_fade_runs_on_every_chunk_seam() {
+        let src = include_str!("score2svc.rs");
+        let call = concat!("seam_", "fade(&mut audio, &mut wav, m.sample_rate);");
+        let n = src.matches(call).count();
+        assert_eq!(n, 2, "两条渲染链(SoVITS/RVC)各要有一个接缝淡化调用点,现在有 {n} 个");
+        for (i, _) in src.match_indices(call) {
+            // ⛔ 剥掉行注释再查 —— 否则调用点上那句「以前只 hard_seam」的注释自己就把判据点红了
+            //    (第一次跑就是这么红的:红对了位置、红错了原因)。
+            let before: String = src[i.saturating_sub(400)..i]
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("
+");
+            assert!(
+                !before.contains("hard_seam"),
+                "接缝淡化又被 `hard_seam` 圈起来了 —— S161f 的结论是 **SP 接缝才是主体**
+                 (SP 两侧是两次独立解码的缓冲,硬拼 = 波形台阶 = 宽带咔哒;
+                  实测 >20 dB 的 >18 kHz 瞬变 84-87% 落在 SP 边 20 ms 内,且把辅音谷全关读数一模一样)"
+            );
+        }
+    }
+
+    /// ⛔ S161g —— 上面那一刀的**边界**:第一块没有左侧,那不是接缝。
+    /// 阴性对照就在同一条判据里:有左侧时**必须**淡。
+    #[test]
+    fn the_first_chunk_is_never_faded_in() {
+        let mut empty: Vec<f32> = Vec::new();
+        let mut head = vec![1.0f32; 4410];
+        seam_fade(&mut empty, &mut head, 44100);
+        assert!(head.iter().all(|&v| (v - 1.0).abs() < 1e-9), "整首歌的头 5 ms 不许被淡入");
+        // 阴性对照:真有左侧 ⇒ 两侧都必须动,否则这条判据是空的。
+        let mut tail = vec![1.0f32; 4410];
+        let mut head2 = vec![1.0f32; 4410];
+        seam_fade(&mut tail, &mut head2, 44100);
+        assert!(tail[4409] < 0.01 && head2[0] < 0.01, "真接缝上两侧都要淡到近零");
+        assert!((tail[0] - 1.0).abs() < 1e-9 && (head2[4409] - 1.0).abs() < 1e-9, "只许动接缝那 5 ms");
     }
 
     /// ⛔⛔ S161e —— **谷的增益曲线在簇窗边缘必须连续**。
