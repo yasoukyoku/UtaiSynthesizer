@@ -2885,6 +2885,219 @@ pub fn match_rescued_note_levels(
     hits
 }
 
+/// ⚙ 出厂默认 = -3.0 / +2.0 dB(压 / 抬的上限)。`UTAI_RANGE_PHRASE_LEVEL=0` 关掉,
+/// `<cut>/<lift>` 改上限。见 [`match_phrase_group_levels`]。
+pub fn phrase_level_limits() -> (f32, f32) {
+    parse_phrase_level(std::env::var("UTAI_RANGE_PHRASE_LEVEL").ok().as_deref())
+}
+
+fn parse_phrase_level(v: Option<&str>) -> (f32, f32) {
+    let s = match v {
+        None => return (PHRASE_LEVEL_CUT_DB, PHRASE_LEVEL_LIFT_DB),
+        Some(s) => s.trim(),
+    };
+    if s == "0" {
+        return (0.0, 0.0);
+    }
+    let mut it = s.split('/');
+    let cut = it.next().and_then(|t| t.trim().parse::<f32>().ok());
+    let lift = it.next().and_then(|t| t.trim().parse::<f32>().ok());
+    match (cut, lift) {
+        (Some(c), Some(l)) if c.is_finite() && l.is_finite() && c >= 0.0 && l >= 0.0 && c <= 24.0 && l <= 24.0 => (c, l),
+        _ => (PHRASE_LEVEL_CUT_DB, PHRASE_LEVEL_LIFT_DB),
+    }
+}
+
+/// ⭐⭐ S162 —— **乐句内跨组的电平对齐:一个乐句由几次【独立渲染】拼成时,把各段的整体偏置拉齐。**
+///
+/// ## ⛔ 它治的是什么(用户 2026-08-26 听出来的)
+/// 「就算是出厂后 为什么东雪莲炉心融解的 4:32-4:36.334(那句里深救援那半段)
+/// 和 4:36.334 到句尾 4:37.7 的响度区别那么大」——实测同一乐句内:
+/// `[791]だ`(2.36 s 长音,shift **−12**)= −17.35 dB,`[794]あ`(1.28 s,shift **−5**)= −14.62
+/// ⇒ **深的那半段轻 2.7 dB**,而这条轴的可闻刻度正是「~2.7 dB 听得出 / ≤0.46 听不出」,
+/// 逐音电平的渲染噪声底只有 **0.74 dB** ⇒ **3.6 倍,不是噪声**。
+///
+/// ## ⛔⛔ 为什么 [`match_rescued_note_levels`] 管不了它
+/// 那把刀的参照是**没被救的邻居**,而这两个音周围 ±16 里只有 **2 个**(门槛 [`LEVEL_MATCH_MIN_REF`] = 4)
+/// ⇒ **整段跳过,一个音没碰**。**密集救援的乐句正好就是没有非救援邻居的地方** ——
+/// 它在最需要它的地方结构上失效。
+///
+/// ## ⭐ 结构性原因(用户指出,数据证实)
+/// 「拆组硬把很多次渲染一片又一片地拼在一起,那就真会把整个乐句拼烂」:
+/// **24-44% 的乐句被切成 ≥2 段 donor**(最多 7 段;乐句内深度跨度中位 3-5 半音、最大 12),
+/// 而**每一段来自一次独立的渲染**(而整曲渲染跨 run 不可复现 —— 见 `engine.rs` 的
+/// `ort_determinism`)。实测乐句内跨组的长音电平台阶中位 **2.61 dB** / p90 5.49、
+/// **46% 超过可闻门槛**;同组内相邻只有 20%(中位 1.76)。
+///
+/// ## 做法与它的边界
+/// * 参照 = 乐句内 **|shift| 最小**的那一段(**没被救**的段 |shift| 记 0 ⇒ 它优先当参照)。
+///   ⭐ 浅救援是好的,也是用户认可的那一半(「另一部分正常」)。
+/// * **只去掉每段一个标量** —— 段内的强弱起伏一个字不动(判据里有逐位对照)。
+/// * ⛔ **非对称限幅 [`PHRASE_LEVEL_CUT_DB`] / [`PHRASE_LEVEL_LIFT_DB`] = −3 / +2**:
+///   抬更危险(它把面状伪影一起抬 —— S162 的「抬轻的被救音」已经为这件事判负过一次),所以给得少。
+///   离线扫描:段偏差中位 **1.89 → 0.00 dB**、偏差 >2.7 dB 的 **53 → 15**、
+///   长音跨组台阶 **2.52 → 0.96**(可闻 6 → 2)。
+///   ⚠ 剩下的 15 段要 >3 dB 才拉得平 —— **故意不修**:那么大的增益比那个台阶更危险。
+/// * ⛔ 段要够长才估电平([`PHRASE_LEVEL_MIN_SUSTAIN`]),否则一两个短音会给出 20 dB 的假增益
+///   (未加门槛时实测 max **20.25 dB**)。
+/// * ⚠ **只在谱面轨**:cover 车道没有音符表,这把刀在那里结构上跑不起来。
+///
+/// 返回**被施加了增益的段数**。
+pub fn match_phrase_group_levels(
+    audio: &mut [f32],
+    sample_rate: u32,
+    total_frames: i64,
+    jobs: &[DeadJob],
+    notes: &[(i64, i64, bool)],
+    cut_db: f32,
+    lift_db: f32,
+) -> usize {
+    if (cut_db <= 0.0 && lift_db <= 0.0) || total_frames <= 0 || audio.is_empty() {
+        return 0;
+    }
+    let alen = audio.len();
+    let spf = alen as f64 / total_frames as f64;
+    let span = move |f0: i64, n: i64| -> (usize, usize) {
+        let a = ((f0 as f64) * spf).round().max(0.0) as usize;
+        let b = (((f0 + n) as f64) * spf).round().max(0.0) as usize;
+        (a.min(alen), b.min(alen))
+    };
+    // ── 逐音:电平 + 这个音属于哪一段(= 覆盖它最多的那个 job 的 shift;没被救 = None)──
+    let mut lv: Vec<f32> = Vec::with_capacity(notes.len());
+    let mut seg: Vec<Option<i64>> = Vec::with_capacity(notes.len());
+    for &(f0, n, sung) in notes {
+        let (a, b) = span(f0, n);
+        let mut best: (i64, Option<i64>) = (0, None);
+        for j in jobs {
+            let ov = ((f0 + n).min(j.end) - f0.max(j.start)).max(0);
+            if ov > best.0 {
+                best = (ov, Some(j.shift));
+            }
+        }
+        // ⛔ 覆盖不到一半就不算这一段的成员(半覆盖的音归属含糊,拿它估电平会污染两段)
+        seg.push(if best.0 * 2 >= n { best.1 } else { None });
+        if !sung || n < PHRASE_LEVEL_MIN_NOTE || b <= a + 256 {
+            lv.push(f32::NAN);
+            continue;
+        }
+        // 掐掉起音 40 ms 与收尾 40 ms,只量稳态
+        let pad = ((sample_rate as usize) / 25).min((b - a) / 4);
+        let e: f64 = audio[a + pad..b - pad]
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum::<f64>()
+            / ((b - pad) - (a + pad)).max(1) as f64;
+        lv.push(if e > 1e-14 { (10.0 * e.log10()) as f32 } else { f32::NAN });
+    }
+    // ── 乐句 = 连续的唱音串(遇到不唱的音就断)──────────────────────
+    let mut hits = 0usize;
+    let mut i = 0usize;
+    while i < notes.len() {
+        if !notes[i].2 {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < notes.len() && notes[i].2 {
+            i += 1;
+        }
+        let e = i; // [s, e)
+        // ── 乐句内按段切 ─────────────────────────────────────────
+        let mut runs: Vec<(Option<i64>, usize, usize)> = Vec::new();
+        let mut k = s;
+        while k < e {
+            let cur = seg[k];
+            let a = k;
+            while k < e && seg[k] == cur {
+                k += 1;
+            }
+            runs.push((cur, a, k));
+        }
+        if runs.len() < 2 {
+            continue;
+        }
+        // ── 每段:稳态时长够不够 + 电平中位 ──────────────────────
+        let mut est: Vec<Option<(f32, i64)>> = Vec::with_capacity(runs.len());
+        for &(_, a, b) in &runs {
+            let mut v: Vec<f32> = (a..b).filter(|&j| lv[j].is_finite()).map(|j| lv[j]).collect();
+            let sus: i64 = (a..b).filter(|&j| lv[j].is_finite()).map(|j| notes[j].1).sum();
+            if v.is_empty() || sus < PHRASE_LEVEL_MIN_SUSTAIN {
+                est.push(None);
+                continue;
+            }
+            v.sort_by(f32::total_cmp);
+            est.push(Some((v[v.len() / 2], sus)));
+        }
+        let cand: Vec<usize> = (0..runs.len()).filter(|&j| est[j].is_some()).collect();
+        if cand.len() < 2 {
+            continue;
+        }
+        // 参照 = |shift| 最小的那一段;平手取稳态最长的
+        let refi = *cand
+            .iter()
+            .min_by_key(|&&j| (runs[j].0.unwrap_or(0).abs(), -est[j].unwrap().1))
+            .expect("cand 非空");
+        let refl = est[refi].unwrap().0;
+        for &j in &cand {
+            if j == refi {
+                continue;
+            }
+            let g = (refl - est[j].unwrap().0).clamp(-cut_db, lift_db);
+            if g.abs() < 0.05 {
+                continue;
+            }
+            let (_, a, b) = runs[j];
+            let (x0, _) = span(notes[a].0, notes[a].1);
+            let (_, x1) = span(notes[b - 1].0, notes[b - 1].1);
+            if x1 <= x0 {
+                continue;
+            }
+            // 整段一个常数增益,两端各 10 ms 淡化(⛔ 不许逐音淡化 —— 那会在段内每个
+            // 音符边界上刻出一串幅度凹口)
+            let fade = ((sample_rate as usize) / 100).max(2).min((x1 - x0) / 2);
+            let mul = 10f32.powf(g / 20.0);
+            for t in x0..x1 {
+                let r = if fade == 0 {
+                    1.0
+                } else if t < x0 + fade {
+                    (t - x0) as f32 / fade as f32
+                } else if t + fade >= x1 {
+                    (x1 - t) as f32 / fade as f32
+                } else {
+                    1.0
+                };
+                audio[t] *= 1.0 + (mul - 1.0) * r;
+            }
+            hits += 1;
+        }
+    }
+    hits
+}
+
+/// ⚙ 出厂默认 = true(**开**)。`UTAI_PSOLA_TAILFADE=0` 关掉。
+///
+/// **缓冲区末尾被截断的那半个岛,不许原样透传。**
+/// 用户 2026-08-26:「歌曲结尾也会造出一个很明显的竖条纹伪影」。
+/// 归因(同一次 run 的转储逐层比,零渲染噪声):`donor_post` 的末尾 **232 样本(5.26 ms)
+/// 与 `donor_pre` 逐位相同**(shift −4 那一遍 259 样本 / 5.87 ms)⇒ **PSOLA 完全没碰它**;
+/// 包络 −35 → **−24**,成品上 −25 → **−13**;盲搜读到 4:51.100 处 **5/7 带、峰 18.6 dB**(16k 独大),
+/// 而同一次 run 的 `base` 里**没有**。
+/// ⛔ 透传的是**没被移调的原音高**(低 12 个半音)—— 不只是电平台阶。
+/// 机理与三条硬门在 `utai_dsp::psola::psola_shift_edge` 的函数体里。
+pub fn tail_fade() -> bool {
+    !matches!(std::env::var("UTAI_PSOLA_TAILFADE").ok().as_deref(), Some("0"))
+}
+
+/// 乐句内跨组对齐:**压**的上限(dB)。见 [`match_phrase_group_levels`]。
+const PHRASE_LEVEL_CUT_DB: f32 = 3.0;
+/// 乐句内跨组对齐:**抬**的上限(dB)。⛔ 比压小 —— 抬会把面状伪影一起抬起来。
+const PHRASE_LEVEL_LIFT_DB: f32 = 2.0;
+/// 一段至少要有这么多帧的**可测稳态**才参与(50 fps ⇒ 15 帧 = 0.30 s)。
+/// ⛔ 没有它时实测出现过 **20.25 dB** 的假增益(一两个短音估出来的)。
+const PHRASE_LEVEL_MIN_SUSTAIN: i64 = 15;
+/// 单个音至少这么长才拿来估段电平(50 fps ⇒ 10 帧 = 0.20 s)。短音被辅音/起音主导。
+const PHRASE_LEVEL_MIN_NOTE: i64 = 10;
+
 /// 参与匹配的最短音(帧)。短于它的音测不出稳定电平。
 const LEVEL_MATCH_MIN_FRAMES: i64 = 8;
 /// 参照窗:前后各看这么多个唱音。
@@ -4599,6 +4812,8 @@ pub fn apply_inverse_windowed_with(
                 // cover 上一个读数都没有(而 cover 的深救援反而更重:|s|≥8 占救援总时长
                 // 78.1%,最深 −18 已超出表的范围)⇒ 谱面轨传 `range_tilt()`,cover 传 0。
                 tilt,
+                // S162 —— 结尾裸透传的淡化(出厂开)。见 `tail_fade`。
+                tail_fade(),
             );
             // ⛔⛔ S159 —— 判据是 `islands_seen`(窗过滤**之前**的候选岛数),不是 `islands`。
             // 加了窗之后 `islands == 0` 多了一个**正常**的来源:这一遍的窗全落在休止里。
@@ -7246,6 +7461,99 @@ mod tests {
         assert!(
             win.contains("range_tilt()"),
             "谱面轨那一条没接 `range_tilt()` —— 那这把刀出厂就是空的。实际:\n{win}"
+        );
+    }
+
+    /// ⭐⭐ S162 —— **乐句内跨组的电平对齐:只去掉每段一个标量,段内起伏一个字不动。**
+    ///
+    /// ## ⛔ 它治的是什么
+    /// 用户 2026-08-26 整曲耳判:同一乐句里 `[791]だ`(shift −12)比 `[794]あ`(shift −5)
+    /// **轻 2.7 dB**,而这条轴的可闻刻度就是「~2.7 dB 听得出」、逐音电平的渲染噪声底只有 0.74。
+    /// ⛔ 而 [`match_rescued_note_levels`] 对它**结构上失效**:那把刀要 ≥4 个**没被救**的邻居,
+    /// 而密集救援的乐句正好一个都没有(实测那两个音周围 ±16 里只有 2 个)。
+    ///
+    /// ## 这条钉四件
+    /// ⑴ 跨组的整体偏置被拉平;⑵ ⛔ **段内的相对起伏逐位不变**(否则它就不是「去偏置」);
+    /// ⑶ ⛔ **阴性对照**:乐句里只有一段时**逐位不变**;⑷ ⛔ **限幅**:大偏差只给到上限。
+    #[test]
+    fn the_phrase_level_alignment_only_removes_the_cross_group_offset() {
+        let sr = 44100u32;
+        let nf = 20i64; // 每个音 20 帧
+        let total = 10 * nf;
+        let spf = 441usize; // 每帧 441 样本 ⇒ 每个音 8820 样本
+        let n = (total as usize) * spf;
+        // 音表:[休止] + 8 个唱音 + [休止]
+        let mut notes: Vec<(i64, i64, bool)> = Vec::new();
+        for i in 0..10i64 {
+            notes.push((i * nf, nf, !(i == 0 || i == 9)));
+        }
+        // 前 4 个唱音 = shift −4,后 4 个 = shift −12
+        let jobs = vec![
+            DeadJob { shift: -4, start: nf, end: 5 * nf },
+            DeadJob { shift: -12, start: 5 * nf, end: 9 * nf },
+        ];
+        // 素材:段 A 基准 1.0,段 B 基准 0.5(= −6.02 dB);⭐ 两段内部都带同样的起伏
+        let ripple = [1.0f32, 1.30, 0.80, 1.10];
+        let build = |gain_b: f32| -> Vec<f32> {
+            let mut x = vec![0.0f32; n];
+            for i in 1..9usize {
+                let base = if i < 5 { 1.0 } else { gain_b };
+                let amp = base * ripple[(i - 1) % 4];
+                let (a, b) = ((i as i64 * nf) as usize * spf, ((i as i64 + 1) * nf) as usize * spf);
+                for (t, v) in x[a..b].iter_mut().enumerate() {
+                    *v = amp * ((t as f32) * 0.05).sin();
+                }
+            }
+            x
+        };
+        let rms = |x: &[f32], i: usize| -> f32 {
+            let (a, b) = ((i as i64 * nf) as usize * spf, ((i as i64 + 1) * nf) as usize * spf);
+            // ⛔ 掐掉两端 —— 施加时有 10 ms 淡化,量稳态才读得到那个标量
+            let pad = sr as usize / 20;
+            let s = &x[a + pad..b - pad];
+            10.0 * (s.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
+                / s.len() as f64
+                + 1e-20)
+                .log10() as f32
+        };
+
+        // ⑴ + ⑵ —— 1.5 dB 的偏差(在限幅之内)
+        let g = 10f32.powf(-1.5 / 20.0);
+        let mut y = build(g);
+        let before = rms(&y, 6) - rms(&y, 2);
+        let hit = match_phrase_group_levels(&mut y, sr, total, &jobs, &notes, 3.0, 2.0);
+        assert_eq!(hit, 1, "该对齐一段");
+        let after = rms(&y, 6) - rms(&y, 2);
+        assert!(
+            before < -1.0 && after.abs() < 0.35,
+            "跨组偏置该被拉平:{before:.2} dB → {after:.2} dB"
+        );
+        // ⛔ 段内的相对起伏必须一个字不动
+        let within = rms(&y, 6) - rms(&y, 5);
+        let base_x = build(g);
+        let want = rms(&base_x, 6) - rms(&base_x, 5);
+        assert!(
+            (within - want).abs() < 0.02,
+            "段内起伏被改了:{within:.3} vs {want:.3} —— 这把刀只许去掉每段一个标量"
+        );
+
+        // ⑶ ⛔ 阴性对照:乐句里只有一段 ⇒ 逐位不变
+        let one = vec![DeadJob { shift: -4, start: nf, end: 9 * nf }];
+        let mut z = build(g);
+        let z0 = z.clone();
+        let h2 = match_phrase_group_levels(&mut z, sr, total, &one, &notes, 3.0, 2.0);
+        assert_eq!(h2, 0, "只有一段时不该动手");
+        assert_eq!(z, z0, "只有一段时必须逐位不变");
+
+        // ⑷ ⛔ 限幅:10 dB 的偏差只许给到 +2
+        let mut w = build(10f32.powf(-10.0 / 20.0));
+        let b0 = rms(&w, 6) - rms(&w, 2);
+        match_phrase_group_levels(&mut w, sr, total, &jobs, &notes, 3.0, 2.0);
+        let b1 = rms(&w, 6) - rms(&w, 2);
+        assert!(
+            (b1 - b0 - 2.0).abs() < 0.25,
+            "抬的上限是 +2 dB,实际抬了 {:.2}(⛔ 抬会把面状伪影一起抬)",
+            b1 - b0
         );
     }
 

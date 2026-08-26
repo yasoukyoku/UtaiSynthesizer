@@ -2100,6 +2100,22 @@ pub async fn render_vocal_segment(
                                 (f0, n.frames.max(0), n.note_num > 0)
                             }).collect()
                         };
+                        // ⭐⭐ S162 —— **乐句内跨组的电平对齐**,排在逐音那把刀【之前】:
+                        // 先把**段的整体偏置**拉平,逐音那把再去压离群值。
+                        // 治用户 2026-08-26 听出来的「同一乐句里深救援那半段比浅的轻 2.7 dB」
+                        // ——而逐音那把刀对它**结构上失效**(它要 ≥4 个没被救的邻居,
+                        // 而密集救援的乐句正好一个都没有)。见 `match_phrase_group_levels` 的 doc。
+                        {
+                            let (cut, lift) =
+                                crate::inference::vocal_range::phrase_level_limits();
+                            let n = crate::inference::vocal_range::match_phrase_group_levels(
+                                &mut result.audio, sr, total_frames, &range_windows, &notes, cut,
+                                lift,
+                            );
+                            tracing::info!(
+                                "range: phrase-level -{cut}/+{lift} dB — {n} segment(s) aligned"
+                            );
+                        }
                         let t = crate::inference::vocal_range::level_match_db();
                         let hit = crate::inference::vocal_range::match_rescued_note_levels(
                             &mut result.audio, sr, total_frames, &range_windows, &notes, t,
@@ -2237,6 +2253,22 @@ pub async fn render_vocal_segment(
                                 (f0, n.frames.max(0), n.note_num > 0)
                             }).collect()
                         };
+                        // ⭐⭐ S162 —— **乐句内跨组的电平对齐**,排在逐音那把刀【之前】:
+                        // 先把**段的整体偏置**拉平,逐音那把再去压离群值。
+                        // 治用户 2026-08-26 听出来的「同一乐句里深救援那半段比浅的轻 2.7 dB」
+                        // ——而逐音那把刀对它**结构上失效**(它要 ≥4 个没被救的邻居,
+                        // 而密集救援的乐句正好一个都没有)。见 `match_phrase_group_levels` 的 doc。
+                        {
+                            let (cut, lift) =
+                                crate::inference::vocal_range::phrase_level_limits();
+                            let n = crate::inference::vocal_range::match_phrase_group_levels(
+                                &mut result.audio, sr, total_frames, &range_windows, &notes, cut,
+                                lift,
+                            );
+                            tracing::info!(
+                                "range: phrase-level -{cut}/+{lift} dB — {n} segment(s) aligned"
+                            );
+                        }
                         let t = crate::inference::vocal_range::level_match_db();
                         let hit = crate::inference::vocal_range::match_rescued_note_levels(
                             &mut result.audio, sr, total_frames, &range_windows, &notes, t,

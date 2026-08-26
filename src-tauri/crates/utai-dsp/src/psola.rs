@@ -50,6 +50,9 @@
 /// What the shift could not do cleanly, reported instead of hidden.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PsolaDiagnostics {
+    /// S162 —— 缓冲区末尾被淡化掉的**裸透传**样本数(0 = 这一刀没触发)。
+    /// ⛔ 读数无条件存在,好让「它有没有真的动手」在日志里可查(S152 那条规矩)。
+    pub tail_fade_samples: usize,
     /// Voiced islands that carried at least three marks.
     pub islands: usize,
     /// Total analysis marks placed.
@@ -371,6 +374,10 @@ fn sinc_read_strided(x: &[f32], pos: f64, stride: f64) -> f64 {
         acc
     }
 }
+
+/// S162 —— 缓冲区末尾「裸透传」最多淡化这么长(ms)。真的清音/静音尾巴远长于它;
+/// 实测这个缺陷只有 **5.3 / 5.9 ms**。见 `psola_shift_win` 里那一段。
+const TAIL_FADE_MAX_MS: f64 = 30.0;
 
 /// S162 —— **谱倾斜还原**用的频带中心(Hz)。表与它一一对应。
 const TILT_F: [f32; 9] = [300.0, 550.0, 950.0, 1600.0, 2600.0, 4100.0, 6500.0, 10000.0, 14000.0];
@@ -2536,7 +2543,9 @@ pub fn psola_shift_win(
     psola_shift_edge(
         x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
         phase_lock, infrasonic, env_restore_ms, bridge_unvoiced_ms, win_periods, xgrain, lpc_order,
-        keep, false, 0.0, 0.0,
+        // ⛔ 最后一个 `false` = `tail_fade`:这个老的公开口**逐位不变**(测试在用)。
+        // 生产走的是 `psola_shift_edge`,那边由 `vocal_range::tail_fade()` 决定。
+        keep, false, 0.0, 0.0, false,
     )
 }
 
@@ -2595,6 +2604,13 @@ pub fn psola_shift_edge(
     dejitter: f64,
     // S162 —— 谱倾斜还原的强度(0…1)。`0.0` = 关 = **逐位不变**。见 [`TILT_TABLE`]。
     tilt: f64,
+    // ⛔⛔ S162 —— **缓冲区末尾被截断的那半个岛,不许原样透传**(`false` = 关 = 逐位不变)。
+    // 用户 2026-08-26:「歌曲结尾也会造出一个很明显的竖条纹伪影」。
+    // 归因(同一次 run 的转储逐层比):`donor_post` 的末尾 **232 样本(5.26 ms)与 `donor_pre`
+    // 逐位相同** ⇒ PSOLA 完全没碰它 ⇒ 那 5 ms 是**没被移调的原音高**(低 12 个半音),
+    // 而它顶在文件末尾、前面是低 10 dB 的合成音 ⇒ 阶跃 + 错音高 = 那条竖线。
+    // 详细机理与三条硬门见函数体里那一段。
+    tail_fade: bool,
 ) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
@@ -3066,6 +3082,38 @@ pub fn psola_shift_edge(
             *o = x[i] + s[i];
         }
     }
+    // ⛔⛔ S162 —— **缓冲区末尾被截断的那半个岛,不许原样透传。**
+    //
+    // 上面那条 `out[i] = acc[i] + (1 − w) * carry[i]` 里,「岛外原样透传」靠的是**窗和的爬坡**
+    // 当交叉淡化 —— 而那个爬坡需要**另一侧有钟**。在**缓冲区末尾**没有下一颗钟 ⇒ `w = 0`
+    // ⇒ 全额透传 ⇒ 硬台阶,而且透传的是**没被移调的原音高**(实测低 12 个半音)。
+    //
+    // 用户 2026-08-26:「歌曲结尾也会造出一个很明显的竖条纹伪影」。
+    // 同一次 run 的转储逐层比(零渲染噪声):`donor_post` 的末尾 **232 样本(5.26 ms)与
+    // `donor_pre` 逐位相同**(−4 那一遍 259 样本 / 5.87 ms)⇒ PSOLA 完全没碰它;
+    // 包络 −35 → **−24**,成品上 −25 → **−13**;盲搜读到 4:51.100 处 5/7 带、峰 18.6 dB(16k 独大)。
+    // ⚠ `base` 同处完全正常 ⇒ 不是解码的锅。(与 S154 那次「岛边裸接」同族 ——
+    //    那次靠**膨胀浊音岛**解决,而在缓冲末尾没地方可膨胀。)
+    //
+    // ⛔ 三条硬门,少一条这一刀就会去碰**正常的**透传(岛间的清辅音本来就该原样过):
+    //  ⑴ 这一段必须**顶到缓冲末尾**;⑵ 必须**紧接在 covered 之后**;
+    //  ⑶ 长度 ≤ `TAIL_FADE_MAX_MS` —— 真的清音/静音尾巴远长于它。
+    if tail_fade {
+        let cap = ((TAIL_FADE_MAX_MS * f64::from(sample_rate) / 1000.0) as usize).max(1);
+        let mut a = n;
+        while a > 0 && !covered[a - 1] {
+            a -= 1;
+        }
+        let run = n - a;
+        if run > 0 && run <= cap && a > 0 && covered[a - 1] {
+            for (k, i) in (a..n).enumerate() {
+                let t = (k as f64) / (run as f64);
+                let w = 0.5 * (1.0 + (std::f64::consts::PI * t).cos());
+                out[i] = (f64::from(out[i]) * w) as f32;
+            }
+            diag.tail_fade_samples = run;
+        }
+    }
     // S154 —— **振幅包络守恒**。读数无条件算(S152 那条规矩),修法由 `env_restore_ms` 控。
     // ⛔ 顺序:排在次声之前,因为次声那一刀是全缓冲的线性滤波,而这一刀只动岛内 ——
     //    反过来做会让次声读数里混进这一刀改的那部分。
@@ -3343,7 +3391,7 @@ mod tests {
         let f0t = flat_f0(x.len(), hop, f0 as f32);
         let run = |st: f64, tilt: f64| {
             psola_shift_edge(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off,
-                             0.0, 0.0, 1.0, 0.0, 0, &[], false, 0.0, tilt).0
+                             0.0, 0.0, 1.0, 0.0, 0, &[], false, 0.0, tilt, false).0
         };
         // ⑴ tilt = 0 ⇒ 逐位同今天(出厂)
         for st in [2.0f64, 8.0, 14.0] {
@@ -3379,6 +3427,65 @@ mod tests {
         for i in 0..9 {
             assert!((half[i] - c14[i] * 0.5).abs() < 1e-9, "strength 必须线性");
         }
+    }
+
+    /// ⛔⛔ S162 —— **缓冲区末尾被截断的那半个岛,不许原样透传。**
+    ///
+    /// 用户 2026-08-26:「歌曲结尾也会造出一个很明显的竖条纹伪影」。归因(同一次 run 的转储):
+    /// `donor_post` 的末尾 **232 样本(5.26 ms)与 `donor_pre` 逐位相同** ⇒ PSOLA 完全没碰它,
+    /// 而那 5 ms 是**没被移调的原音高**(低 12 个半音),顶在文件末尾、前面是低 10 dB 的合成音
+    /// ⇒ 阶跃 + 错音高 = 那条竖线。
+    ///
+    /// 这条钉三件:⑴ 关着 = **逐位不变**;⑵ 开着时**只动最末尾那一小段**;
+    /// ⑶ ⛔ **阴性对照**:末尾是**长段静音/清音**(不是被截断的岛)时,开关两边**逐位相同**。
+    #[test]
+    fn the_tail_fade_only_touches_a_truncated_island_at_the_very_end() {
+        let sr = 44100u32;
+        let hop = sr as usize / 100;
+        // 一条一直唱到最后一个样本的浊音 ⇒ 末尾的岛必然被缓冲边界截断
+        let x = voiced(sr, 0.5, 220.0);
+        let f0 = flat_f0(x.len(), hop, 220.0);
+        let run = |tf: bool| {
+            psola_shift_edge(&x, sr, -6.0, 0.0, &f0, hop, false, 0.0, 0.0, Infrasonic::Off,
+                             0.0, 0.0, 1.0, 0.0, 0, &[], false, 0.0, 0.0, tf).0
+        };
+        let a = run(false);
+        let b = run(true);
+        assert_eq!(a.len(), b.len());
+        // ⑵ 只动最末尾:第一个不同的样本必须落在最后 30 ms 之内
+        let first_diff = (0..a.len()).find(|&i| a[i] != b[i]);
+        let i = first_diff.expect("⛔ tail_fade 开着却什么都没动 —— 那这条判据是空的");
+        let cap = (30 * sr as usize) / 1000;
+        assert!(
+            a.len() - i <= cap,
+            "只许动最后 30 ms,实际从末尾前 {} 个样本({:.1} ms)就开始动了",
+            a.len() - i,
+            (a.len() - i) as f32 / sr as f32 * 1000.0
+        );
+        // 末尾必须被压下去(淡到 0)
+        assert!(
+            b[b.len() - 1].abs() <= a[a.len() - 1].abs() * 0.25 + 1e-6,
+            "末尾该被淡到接近 0:{} vs {}",
+            b[b.len() - 1],
+            a[a.len() - 1]
+        );
+        // ⑶ ⛔ 阴性对照:末尾接一大段静音(不是被截断的岛)⇒ 两边逐位相同
+        let mut y = x.clone();
+        y.extend(std::iter::repeat(0.0f32).take(sr as usize / 4));
+        let f0b = flat_f0(y.len(), hop, 220.0);
+        let mut f0b2 = f0b.clone();
+        for v in f0b2.iter_mut().skip(x.len() / hop) {
+            *v = 0.0; // 后面那段是清音/静音
+        }
+        let run2 = |tf: bool| {
+            psola_shift_edge(&y, sr, -6.0, 0.0, &f0b2, hop, false, 0.0, 0.0, Infrasonic::Off,
+                             0.0, 0.0, 1.0, 0.0, 0, &[], false, 0.0, 0.0, tf).0
+        };
+        assert_eq!(
+            run2(false),
+            run2(true),
+            "⛔ 末尾是长段静音时不该动手 —— 那是正常的透传,不是被截断的岛"
+        );
     }
 
     /// ⭐⭐⭐ S162 —— **κ 的染色是【线性插值】造成的,不是 κ 这个想法有问题。**
@@ -4018,7 +4125,9 @@ mod tests {
         let run = |st: f64, win: f64, fill: bool| {
             psola_shift_edge(
                 &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, win, 0.0, 0,
-                &[], fill, 0.0, 0.0,
+                // ⛔ 最后一个 `false` = `tail_fade`:这两条判据钉的是别的东西,
+                //    让新刀不许改变它们的读数(它自己有专门的判据)。
+                &[], fill, 0.0, 0.0, false,
             )
         };
 

@@ -1633,6 +1633,14 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
                 (f0, t.frames.max(0), t.note_num > 0)
             }).collect()
         };
+        // ⭐⭐ S162 —— 乐句内跨组的电平对齐,排在逐音那把刀之前。见 `match_phrase_group_levels`。
+        {
+            let (cut, lift) = super::super::vocal_range::phrase_level_limits();
+            let n = super::super::vocal_range::match_phrase_group_levels(
+                &mut result.audio, sr, total_frames, &jobs, &notes, cut, lift,
+            );
+            eprintln!("[mg] phrase-level -{cut}/+{lift} dB — {n} segment(s) aligned");
+        }
         let t = super::super::vocal_range::level_match_db();
         let hit = super::super::vocal_range::match_rescued_note_levels(
             &mut result.audio, sr, total_frames, &jobs, &notes, t,
