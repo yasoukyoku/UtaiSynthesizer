@@ -125,6 +125,78 @@ pub fn harmonic_energy_fraction_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> O
     Some(v[v.len() / 2])
 }
 
+
+/// 谐波**梳深**(dB):`[COMB_LO, COMB_HI)` 里,谐波峰的中位 − 谐波**中点**的中位。
+///
+/// 「谐波之间有没有起雾」——大 = 谐波清晰,小 = 谐波间被噪声填满。
+/// ⛔ 它与 [`harmonic_energy_fraction_db`] **测的不是一件事**,而且在真实缺陷上方向相反:
+/// 实测 yuyuko 的「卡痰」那个音梳深 **−0.4**(谐波间填满)而谐波占比 −0.10(看起来没问题);
+/// 而 akiko 的「ぴゃ」梳深 **40.6**(谐波很清晰)却 H2−H1 = −44.8(只剩一根)。
+/// ⇒ **两根轴都要有。**
+pub fn comb_depth_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> Option<f32> {
+    const COMB_LO: f32 = 2000.0;
+    const COMB_HI: f32 = 8000.0;
+    let sr = sample_rate as f32;
+    if !f0_hz.is_finite() || f0_hz <= 40.0 || f0_hz >= sr * 0.25 || x.len() < FRAME {
+        return None;
+    }
+    let hi = COMB_HI.min(sr * 0.45);
+    if hi <= COMB_LO + f0_hz {
+        return None;
+    }
+    let win: Vec<f32> = (0..FRAME)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / FRAME as f32).cos())
+        .collect();
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(FRAME);
+    let mut buf = vec![Complex::new(0.0f32, 0.0); FRAME];
+    let bin = sr / FRAME as f32;
+    let tol = 0.12 * f0_hz;
+    let mut vals: Vec<f32> = Vec::new();
+    let mut off = 0usize;
+    while off + FRAME <= x.len() {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = Complex::new(x[off + i] * win[i], 0.0);
+        }
+        fft.process(&mut buf);
+        let p = |j: usize| -> f64 {
+            f64::from(buf[j].re) * f64::from(buf[j].re) + f64::from(buf[j].im) * f64::from(buf[j].im)
+        };
+        let mut peaks: Vec<f64> = Vec::new();
+        let mut valleys: Vec<f64> = Vec::new();
+        let mut k = (COMB_LO / f0_hz).ceil() as usize;
+        while (k as f32) * f0_hz < hi {
+            for (c, out) in [((k as f32) * f0_hz, true), (((k as f32) + 0.5) * f0_hz, false)] {
+                let a = (((c - tol) / bin).ceil().max(0.0)) as usize;
+                let b = (((c + tol) / bin).floor()).min((FRAME / 2) as f32) as usize;
+                if b <= a {
+                    continue;
+                }
+                if out {
+                    peaks.push((a..=b).map(&p).fold(0.0f64, f64::max));
+                } else {
+                    let mut v: Vec<f64> = (a..=b).map(&p).collect();
+                    v.sort_by(f64::total_cmp);
+                    valleys.push(v[v.len() / 2]);
+                }
+            }
+            k += 1;
+        }
+        if peaks.len() >= 3 && valleys.len() >= 3 {
+            peaks.sort_by(f64::total_cmp);
+            valleys.sort_by(f64::total_cmp);
+            let (pm, vm) = (peaks[peaks.len() / 2], valleys[valleys.len() / 2]);
+            vals.push((10.0 * ((pm + 1e-30) / (vm + 1e-30)).log10()) as f32);
+        }
+        off += HOP;
+    }
+    if vals.is_empty() {
+        return None;
+    }
+    vals.sort_by(f32::total_cmp);
+    Some(vals[vals.len() / 2])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +291,53 @@ mod tests {
         assert!(harmonic_energy_fraction_db(&x, sr, 30.0).is_none());
         assert!(harmonic_energy_fraction_db(&x, sr, sr as f32 * 0.3).is_none());
         assert!(harmonic_energy_fraction_db(&[], sr, 440.0).is_none());
+    }
+
+
+    /// ⛔⛔ S163 —— **梳深与谐波占比测的不是一件事**,而且在真实缺陷上方向相反。
+    /// ⑴ 谐波堆 + 谐波之间填噪声 ⇒ **梳深塌而谐波占比几乎不动**(= 用户说的「卡痰」);
+    /// ⑵ 只留 H1 一根 ⇒ **梳深仍然高**(= 「ぴゃ」);
+    /// ⑶ 音高问错 ⇒ 塌;⑷ 与电平无关。
+    #[test]
+    fn comb_depth_and_harmonic_fraction_measure_different_things() {
+        let sr = 44100;
+        let clean = stack(440.0, sr, 0.6, 12, 0.2);
+        let c0 = comb_depth_db(&clean, sr, 440.0).unwrap();
+        let h0 = harmonic_energy_fraction_db(&clean, sr, 440.0).unwrap();
+        // ⑴ 谐波之间填噪声(带通到 2-8 kHz 的白噪,幅度只有谐波的 1/8)
+        let nz = noise(clean.len(), 3, 0.025);
+        let fogged: Vec<f32> = clean.iter().zip(nz.iter()).map(|(a, b)| a + b).collect();
+        let c1 = comb_depth_db(&fogged, sr, 440.0).unwrap();
+        let h1 = harmonic_energy_fraction_db(&fogged, sr, 440.0).unwrap();
+        assert!(c0 - c1 > 6.0, "起雾之后梳深必须塌:{c0:.1} → {c1:.1}");
+        assert!(h0 - h1 < c0 - c1, "谐波占比不该比梳深更敏感:{h0:.2} → {h1:.2}");
+        // ⑵ ⭐ 「ぴゃ」那一类:H1 极强、H2 以上**弱 40 dB 但仍然存在**
+        //    ⇒ 梳深仍然很高(它看的是谐波**位置** vs 谐波**中点**,不是谐波有多强)。
+        //    ⛔ 第一版夹具写成「只留 H1 一根」,那样 2-8 kHz 里根本没有谐波,
+        //    量到的是本底(读 7.1)—— 而真实的「ぴゃ」在 2-8 kHz 里是有谐波的(梳深 40.6)。
+        let n2 = (sr as f32 * 0.6) as usize;
+        let mut one = vec![0.0f32; n2];
+        for (i, v) in one.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            let mut y = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            for k in 2..=12usize {
+                y += (0.01 / k as f32)
+                    * (2.0 * std::f32::consts::PI * 440.0 * k as f32 * t).sin();
+            }
+            *v = 0.2 * y;
+        }
+        let c2 = comb_depth_db(&one, sr, 440.0).unwrap();
+        assert!(c2 > 20.0, "谐波很弱但存在时梳深不该塌({c2:.1})—— 那是另一根轴的事");
+        // ⛔ 而**谐波占比**在同一份素材上必须**也没事**(它看的是能量在不在谐波上)
+        let h2v = harmonic_energy_fraction_db(&one, sr, 440.0).unwrap();
+        assert!(h2v > -3.0, "谐波占比在「只剩基频」上不该塌({h2v:.2})—— 这正是它的盲区");
+        // ⑶ 问错音高 ⇒ 塌
+        let c3 = comb_depth_db(&clean, sr, 660.0).unwrap();
+        assert!(c0 - c3 > 6.0, "问错音高梳深该塌:{c0:.1} → {c3:.1}");
+        // ⑷ ⛔ 与电平无关
+        let quiet: Vec<f32> = clean.iter().map(|v| v * 0.1).collect();
+        let c4 = comb_depth_db(&quiet, sr, 440.0).unwrap();
+        assert!((c0 - c4).abs() < 0.05, "梳深被响度影响了:{c0:.2} vs {c4:.2}");
     }
 
     /// ⒢ 确定性:同一份输入两次逐位相同(⛔ 判据里要拿它当零噪声口径)。
