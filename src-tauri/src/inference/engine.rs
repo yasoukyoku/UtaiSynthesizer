@@ -1128,11 +1128,62 @@ impl OnnxEngine {
     }
 }
 
+/// ⚙ 出厂默认 = **关**(逐位不变)。`UTAI_ORT_DETERMINISTIC=1` 打开 ORT 的确定性内核,
+/// `UTAI_ORT_INTRA_THREADS=<n>` 固定 intra-op 线程数(`1` = 浮点求和顺序固定,最硬也最慢)。
+///
+/// ## ⛔ 它治的是什么(S162 实测)
+/// **整曲渲染不是可复现的**:同一个二进制、同一条命令、**同一个批次**里跑两遍,
+/// 拼接前 / 归一化前的台身 `base.f32` **哈希就不同**
+/// (幅度谱 |Δ| 中位 **0.28-0.94 dB** / p90 1.9-6.8,波形残差 −7…−16 dB)。
+/// 我们自己的 RNG 是种子化的(`chunk_rng(seed, chunk_idx)`,判据钉着)⇒ 动态来源只剩 ORT。
+/// ⚠ 而 mg 台子四个 session **全是 `device=Cpu`** ⇒ 这是 **CPU EP** 的多线程归约顺序,
+/// 不是 cuDNN 的算法搜索(那条假说当场被日志否掉了)。
+///
+/// ## ⛔⛔ 两个旋钮**都已实测无效** —— 留着只是为了别再试一遍
+/// 同一批次、同一二进制、命令逐字相同,`base.f32` 的哈希:
+/// * **阴性对照**(不开旋钮)`51cc6843…` ≠ `53e6054f…` ⇒ 确认当天确实不复现;
+/// * `UTAI_ORT_DETERMINISTIC=1` ⇒ `038a9324…` ≠ `fed7c440…`,wall 也一模一样
+///   (280.2 / 279.5 vs 279.8)⇒ **连代码路径都没换**;
+/// * `UTAI_ORT_INTRA_THREADS=1` ⇒ `8d14a7f9…` ≠ `058e88ae…`,而且**慢 2.5 倍**
+///   (714.0 / 708.8 s)。
+/// ⇒ 根因**仍然开着**。下一个嫌疑:**`with_memory_pattern(false)`**(语音模型走这一支)——
+///   关掉内存模式 ⇒ 每次分配地址不同 ⇒ SIMD 对齐不同 ⇒ 不同的向量化路径 ⇒ 不同舍入;
+///   ⚠ 而那条 doc 说关它是为了 **VRAM**,mg 台子却全在 **CPU** 上,那个理由在这里不适用。
+///
+/// ## ⇒ 后果(这条已经有实用答案,不必等根因)
+/// **整曲跨臂比较有一层噪声底**,而且⛔**噪声底不是一个数,是【每把尺子 × 每个测量层】
+/// 各自一个数**:竖线盲搜计数在 `base`(纯解码)上是 ±1.5%,而在**成品**上是 **±10%**
+/// (救援与拼接把它放大 6 倍);逐 bin 幅度差是 ~1 dB。
+/// ⇒ 验收一律走**同一次 run 内的转储**或**同一份缓冲进出的探针**;整曲臂**只用来听**。
+///
+/// ⛔ S23 硬规矩:任何新 EP / session 选项必须**在真模型上 A/B 跑过**才许出厂。
+fn ort_determinism(
+    b: ort::session::builder::SessionBuilder,
+) -> Result<ort::session::builder::SessionBuilder> {
+    let mut b = b;
+    if std::env::var("UTAI_ORT_DETERMINISTIC").map(|v| v.trim() == "1").unwrap_or(false) {
+        b = b
+            .with_deterministic_compute(true)
+            .map_err(|e| UtaiError::Inference(format!("Deterministic compute: {}", e)))?;
+    }
+    if let Some(n) = std::env::var("UTAI_ORT_INTRA_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+    {
+        b = b
+            .with_intra_threads(n)
+            .map_err(|e| UtaiError::Inference(format!("Intra threads: {}", e)))?;
+    }
+    Ok(b)
+}
+
 fn base_builder(mem_pattern: bool) -> Result<ort::session::builder::SessionBuilder> {
     let builder = Session::builder()
         .map_err(|e| UtaiError::Inference(format!("Session builder: {}", e)))?
         .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
         .map_err(|e| UtaiError::Inference(format!("Optimization: {}", e)))?;
+    let builder = ort_determinism(builder)?;
     if !mem_pattern {
         // Dynamic-shape models (voice: T varies per chunk / per song) make ORT's memory-pattern
         // planner reserve for the largest-seen shape and HOLD it — the runtime log showed 249 MB

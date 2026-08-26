@@ -723,7 +723,10 @@ fn mg_cv_cond_grid() {
         let _ = bld.commit();
     }
     let engine = OnnxEngine::new();
-    engine.set_device(DeviceConfig::Cpu); // deterministic + no GPU setup in a test
+    engine.set_device(DeviceConfig::Cpu); // no GPU setup in a test
+    // ⛔ S162:这里原本写着「deterministic」—— **那是假的**。实测同一条命令跑两遍,
+    // 拼接前的台身 `base.f32` 哈希就不同(幅度谱 |Δ| 中位 0.28-0.94 dB)。
+    // 要真的复现,开 `UTAI_ORT_DETERMINISTIC=1` / `UTAI_ORT_INTRA_THREADS=1`(见 `engine.rs`)。
     let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
     let s2cv = engine.load_model_with(&aux.join("score2cv_768.onnx"), false).unwrap();
     const DIM: usize = 768;
@@ -894,7 +897,10 @@ fn mg_render_rvc() {
         let _ = bld.commit();
     }
     let engine = OnnxEngine::new();
-    engine.set_device(DeviceConfig::Cpu); // deterministic + no GPU setup in a test
+    engine.set_device(DeviceConfig::Cpu); // no GPU setup in a test
+    // ⛔ S162:这里原本写着「deterministic」—— **那是假的**。实测同一条命令跑两遍,
+    // 拼接前的台身 `base.f32` 哈希就不同(幅度谱 |Δ| 中位 0.28-0.94 dB)。
+    // 要真的复现,开 `UTAI_ORT_DETERMINISTIC=1` / `UTAI_ORT_INTRA_THREADS=1`(见 `engine.rs`)。
 
     let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
     let s2cv768 = engine.load_model_with(&aux.join("score2cv_768.onnx"), false).unwrap();

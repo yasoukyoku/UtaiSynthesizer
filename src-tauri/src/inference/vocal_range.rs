@@ -2732,18 +2732,32 @@ const RESCUE_LEVEL_MATCH_RATIO: f32 = 6.0;
 /// 单个音的最大压低量(dB)。⛔ 防止一个坏参照把音推到荒谬处。
 const RESCUE_LEVEL_MATCH_CAP: f32 = 12.0;
 
-/// ⚙ 出厂默认 = `0.0`(= 关 = **逐位不变**)。`UTAI_RANGE_TILT=<0..1>` 打开;`1.0` = 全额还原。
+/// ⚙ 出厂默认 = 1.0(**开**,见 [`RANGE_TILT_DEFAULT`])。`UTAI_RANGE_TILT=0` 关掉;
+/// `<0..1>` 取中间强度。
 ///
-/// **深救援的「虚/弱」是一条谱【倾斜】,靶子是实测的 `base`。**
-/// 表、机理与「为什么这不是开 EQ」全在 `utai_dsp::psola::TILT_TABLE` 的 doc 上。
-/// ⛔ `|s| ≤ 6` 一个字节不动(浅救援今天是好的)。
+/// **深救援的「虚/弱」是一条谱【倾斜】,而靶子是【浅救援】——
+/// 也就是用户说的「另一部分正常」那一半。**
+/// 表、机理、为什么靶子不是 `base`、为什么这不是开 EQ:全在
+/// `utai_dsp::psola::TILT_TABLE` 的 doc 上。
+/// ⛔ `|s| ≤ 6` 一个字节不动(表的第一行按构造全 0)。
+///
+/// ## 翻默认的证据(S162)
+/// * **留出验证**(用**另一首谱**拟的表纠正本谱):形状距离**降 26-46%**,
+///   逼近「自己拟自己」的上界;⛔ 旧靶子(相对 `base`)在 −10 上反而更差 3.14 → 3.57。
+/// * **跨模型零噪声验收**(5 组 × 2 档,同一份 donor 缓冲进出只翻这一个旋钮):
+///   **面状/次基频 10/10 改善**(−0.58…−2.30 dB)· **梳深 10/10 不劣化** ·
+///   **电平 −0.00…+0.00**(逐帧等响)。
+/// * ⛔ 判负:**逐元音的表**(改善只有 0.0-0.5 dB,还有两格更差)。
 pub fn range_tilt() -> f64 {
     std::env::var("UTAI_RANGE_TILT")
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-        .unwrap_or(0.0)
+        .unwrap_or(RANGE_TILT_DEFAULT)
 }
+
+/// ⚙ 出厂默认强度。整份理由与读数在 [`range_tilt`] 头上。
+const RANGE_TILT_DEFAULT: f64 = 1.0;
 
 /// 出厂门的读取口(env `UTAI_RANGE_LEVEL_MATCH`)。见 [`RESCUE_LEVEL_MATCH_DB`]。
 pub fn level_match_db() -> f32 {
@@ -7015,7 +7029,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -7040,6 +7054,9 @@ mod tests {
             parse_close_sliver(None),
             // S162 —— 同款:进指纹但**出厂 = 今天** ⇒ 不该触发版本 bump。
             parse_landing_tie_thin(None),
+            // S162 —— 谱倾斜还原。⛔ 这一个**改音频**(出厂 1.0),所以它进指纹的同时
+            //    `RANGE_ALGO_VERSION` 与 audition cache tag 都跟着 bump 到 `s162b`。
+            range_tilt(),
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -7048,10 +7065,10 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s162";
+        const TAG: &str = "s162b";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -7106,6 +7123,7 @@ mod tests {
             ("FORMANT_KNEE_DEFAULT", "pub fn formant_knee("),
             ("DEJITTER_DEFAULT", "pub fn dejitter("),
             ("CLOSE_SLIVER_FRAMES_DEFAULT", "fn parse_close_sliver("),
+            ("RANGE_TILT_DEFAULT", "pub fn range_tilt("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
