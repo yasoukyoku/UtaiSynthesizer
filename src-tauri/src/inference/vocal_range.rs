@@ -179,7 +179,6 @@ const RESCUE_LEVEL_FLOOR_DB: f64 = -8.0;
 ///    所以它的红只会表现为「落点挪了一格」。⚠ 动它之前先看 `damage` 那一族的判据。
 const THIN_REF_MARGIN: f32 = 0.25;
 
-
 impl SpeakerRange {
     /// Bounds-only record (no raw scan) — the pre-S81 shape.
     pub fn bounds(usable: (f32, f32), comfort: (f32, f32)) -> Self {
@@ -611,7 +610,6 @@ pub fn validate_range_record(record: &serde_json::Value) -> Result<(), String> {
 
 // NOTE: "which speaker governs a blend" = the existing ①c `crate::inference::dominant_speaker`
 // (max-weight entry, else speaker_id) — reused, NOT re-implemented here (NO-dup).
-
 
 /// Median-of-5 over the voiced MIDI sequence (edge windows clamp) — kills the classic 1-2
 /// frame rmvpe octave flips before any range judgement sees them.
@@ -1169,7 +1167,6 @@ pub fn dead_only_plan_with_alts(
     (out, unfixable, alts)
 }
 
-
 /// ⭐ S163 —— 一个组的定案:**三层**,每一层都只在**同一个音**上比。
 ///
 /// ⓪ **塌陷否决**:某个候选把一个唱音唱成了 ≥`repair_ms` 的静音,而另一个没有 ⇒ 剔掉它。
@@ -1186,6 +1183,8 @@ fn decide_group(
     harm_eps: f32,
     repair_ms: f32,
     comb_floor: f32,
+    // ⭐ S163 —— 谱峰宽度的**倍数**门限（≤ 1 = 关）。见 [`landing_width_eps`]。
+    width_eps: f32,
 ) -> Vec<usize> {
     let mut mine: Vec<usize> = (0..cand.len()).filter(|&c| cand[c].0 == ji).collect();
     if mine.len() < 2 {
@@ -1205,6 +1204,35 @@ fn decide_group(
             mine.iter().copied().filter(|&c| cand[c].4.worst_comb() >= comb_floor).collect();
         if !ok.is_empty() && ok.len() < mine.len() {
             mine = ok;
+        }
+    }
+    // ⓐ 3 ⭐⭐⭐ S163 —— **谱峰宽度否决**：某候选把谐波自身糊成一片
+    //    （峰宽比另一个差过 `width_eps` 倍）⇒ 剔掉它。
+    //    ⛔ 与上面三根**都不是一件事**：实测 yuyuko 4:36 接缝两侧峰宽
+    //    **12.33 vs 0.99（差 12 倍）**，而填充度读到 −18 vs −29（**方向还反**）。
+    //    ⭐ 它为什么在候选之间有效：短音的 `donor_pre` 峰宽按落点是
+    //    **77 → 3.50 而 78 → 11.88**（只差 1 个半音，正好在候选范围内）；
+    //    ⛔ 而 sidecar 的 `low_ratio` 在同两格上是 **77 → 0.616（最差）/ 79 → 0.129（好）**
+    //    —— **与峰宽完全相反**，而 S157 那条排序用的就是 `low_ratio`。
+    //    ⚠ 只在**同一个音的两个候选**之间比（同 f0）—— 跨音高不可比。
+    if width_eps > 1.0 && mine.len() > 1 {
+        let best = mine
+            .iter()
+            .map(|&c| cand[c].4.worst_width())
+            .filter(|v| *v > 0.0)
+            .fold(f32::INFINITY, f32::min);
+        if best.is_finite() {
+            let ok: Vec<usize> = mine
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    let w = cand[c].4.worst_width();
+                    w <= 0.0 || w <= best * width_eps
+                })
+                .collect();
+            if !ok.is_empty() && ok.len() < mine.len() {
+                mine = ok;
+            }
         }
     }
     if harm_eps > 0.0 && mine.len() > 1 {
@@ -3702,6 +3730,47 @@ fn parse_landing_repair(v: Option<&str>) -> f32 {
 /// ⚙ 出厂默认。见 [`landing_repair_ms`]。
 const LANDING_REPAIR_MS_DEFAULT: f32 = 200.0;
 
+/// ⚙ 出厂默认 = 0.0（= 关 = 逐位不变）—— **谱峰宽度否决**的倍数门限
+/// （`UTAI_RANGE_WIDTH_EPS`）。候选里峰宽最小的那个乘上它，超过的候选被剔掉。
+///
+/// ## 它量的是另一件事（四根轴都要有）
+/// 实测 yuyuko **4:36 接缝两侧**（用户 2026-08-27 报「本来应该是连着的长音，
+/// 结果在这个位置炸了」）：谱峰宽度 **12.33 vs 0.99（差 12 倍）**，
+/// 而谐波间填充度读到 −18 vs −29 —— **方向还反了**；谐波占比与梳深也都看不见。
+///
+/// ## 为什么它在候选之间有效
+/// yuyuko 短音（<250 ms）的 `donor_pre` 峰宽按**落点**：
+/// **77 → 3.50 而 78 → 11.88**（差 **3.4 倍**，而两者只差 **1 个半音**）
+/// ⇒ 正好在落点候选范围内。
+/// ⛔ 而 sidecar 的 `low_ratio` 在同两格上是 **77 → 0.616（最差）/ 79 → 0.129（好）**
+/// —— **与峰宽完全相反**，而 S157 那条排序用的就是 `low_ratio`，
+/// 所以它会**主动避开 77、选中 79**。
+///
+/// ## ⭐⭐ 为什么它对「卡痰」那一族重要
+/// 逐层归因（同一次 run 的转储）：短音（<250 ms）的峰宽
+/// `base` **11.77** → `donor_pre` **7.91** → `donor_post` 5.94 → 成品 6.28；
+/// 而长音（≥250 ms）是 7.26 → **1.32** → 1.18 → 1.18。
+/// ⇒ **差别全在 `donor_pre`**（模型解码层，PSOLA 只动了 2 dB、拼接没动），
+/// 而用户点名的卡痰段是 **5 秒 23 个音 ≈ 每个 200 ms** —— **全是短音**。
+/// ⭐ 成品峰宽的 p75 在用户的三档对照上**严格单调**：
+/// 最怪 **14.40** > 次怪 11.89 > 全曲 10.33 > 不怪 **5.84**（三档音长都是 180 ms）。
+/// ⛔ **中位数不单调**（次怪比最怪还糊）—— 同一条旧训：长尾上用中位数会造假的非单调。
+///
+/// ⚠ 只在**同一个音的两个候选**之间比（同 f0）—— 跨音高时谐波密度不同，读数不可比。
+pub fn landing_width_eps() -> f32 {
+    parse_landing_width(std::env::var("UTAI_RANGE_WIDTH_EPS").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+fn parse_landing_width(v: Option<&str>) -> f32 {
+    v.and_then(|v| v.trim().parse().ok())
+        .filter(|v: &f32| v.is_finite() && *v >= 0.0 && *v <= 20.0)
+        .unwrap_or(LANDING_WIDTH_EPS_DEFAULT)
+}
+
+/// ⚙ 出厂默认 = 0.0 —— 见 [`landing_width_eps`]。
+const LANDING_WIDTH_EPS_DEFAULT: f32 = 0.0;
+
 /// ⚙ 出厂默认 = 6.0(**dB**,见 [`COMB_FLOOR_DB_DEFAULT`])。`UTAI_RANGE_COMB_FLOOR=0` 关掉。
 ///
 /// ## ⭐⭐ 「像嗓子里卡着痰」——**谐波之间起雾**
@@ -3716,6 +3785,23 @@ const LANDING_REPAIR_MS_DEFAULT: f32 = 200.0;
 /// 525 个被救音在 `donor_post` 上的梳深:中位 **41.8-53.1** · p05 17.1-34.3 ·
 /// **< 6 dB 的只有 1 个** —— 正是 `[500]「に」`。⇒ **选择性 1/525。**
 /// ⭐ 它只用 `donor_post`(渲染层手上就有),不需要 `donor_pre`、不需要跨音高参照。
+/// ⚙ 出厂默认 = 0.0（关）—— **谱峰宽度否决**的倍数门限（`UTAI_RANGE_WIDTH_EPS`）。
+///
+/// 候选里峰宽最小的那个乘上它，超过的候选被剔掉。`≤ 1.0` = 关 = 逐位不变。
+///
+/// ## 它量的是另一件事（三根轴都要有）
+/// 实测 yuyuko **4:36 接缝两侧**：谱峰宽度 **12.33 vs 0.99（差 12 倍）**，
+/// 而谐波间填充度读到 −18 vs −29 —— **方向还反了**；谐波占比与梳深也都看不见。
+///
+/// ## 为什么它在候选之间有效
+/// yuyuko 短音（<250 ms）的 `donor_pre` 峰宽按**落点**：
+/// **77 → 3.50 而 78 → 11.88**（差 **3.4 倍**，而两者只差 **1 个半音**）
+/// ⇒ 正好在落点候选范围内。
+/// ⛔ 而 sidecar 的 `low_ratio` 在同两格上是 **77 → 0.616（最差）/ 79 → 0.129（好）**
+/// —— **与峰宽完全相反**，而 S157 那条排序用的就是 `low_ratio`，
+/// 所以它会**主动避开 77、选中 79**。
+///
+/// ⚠ 只在**同一个音的两个候选**之间比（同 f0）—— 跨音高读数不可比。
 pub fn comb_floor_db() -> f32 {
     parse_comb_floor(std::env::var("UTAI_RANGE_COMB_FLOOR").ok().as_deref())
 }
@@ -3876,6 +3962,12 @@ struct CandScore {
     /// ⭐ S163 —— (音下标, 谐波梳深 dB)。**不需要参照**,而且与谐波占比**测的不是一件事**:
     /// 用户点名的「卡痰」那个音梳深 **−0.4**(谐波间被填满)而谐波占比 −0.10(看起来没问题)。
     comb: Vec<(usize, f32)>,
+    /// ⭐⭐⭐ S163 —— (音下标, 谐波谱峰宽度 % of f0)。**不需要参照**，
+    /// 而且与上面三根都不是一件事：它量的是**每一根谐波自己糊不糊**。
+    /// 实测（yuyuko 4:36 接缝两侧）：峰宽 **12.33 vs 0.99（差 12 倍）**，
+    /// 而填充度读到 −18 vs −29 —— **方向还反了**。
+    /// ⭐ 短音的 `donor_pre` 峰宽按落点：**77 → 3.50 而 78 → 11.88**（3.4 倍，只差 1 个半音）。
+    width: Vec<(usize, f32)>,
 }
 
 impl CandScore {
@@ -3897,6 +3989,11 @@ impl CandScore {
     }
 
     /// 这一组里**最糊**的那个音的梳深(没量到 ⇒ `INFINITY`,即「没有证据说它糊」)。
+    /// ⭐ S163 —— 组内**最糊**的那一个音的峰宽（越大越差）。
+    fn worst_width(&self) -> f32 {
+        self.width.iter().map(|&(_, w)| w).fold(0.0f32, f32::max)
+    }
+
     fn worst_comb(&self) -> f32 {
         self.comb.iter().map(|&(_, v)| v).fold(f32::INFINITY, f32::min)
     }
@@ -4162,6 +4259,7 @@ pub fn apply_dead_only_windows_alts(
         landing_harm_eps(),
         landing_repair_ms(),
         comb_floor_db(),
+        landing_width_eps(),
         handover_deficit_db(),
         tied_xfade_ms(),
         donor_render,
@@ -4194,6 +4292,8 @@ pub fn apply_dead_only_windows_with(
     // ⭐ S163 —— 梳深地板(dB);`0.0` = 关。见 [`comb_floor_db`]。
     comb_floor: f32,
     // ⭐ S163 —— 交接点体检的门限(dB);`0.0` = 关。见 [`handover_deficit_db`]。
+    // S163 - peak-width veto multiplier; <= 1.0 disables. See `landing_width_eps`.
+    width_eps: f32,
     handover_db: f32,
     // ⭐ S163 —— 长音延续处的交叉淡化(ms);`0.0` = 关。见 [`tied_xfade_ms`]。
     tied_xf_ms: f64,
@@ -4376,7 +4476,15 @@ pub fn apply_dead_only_windows_with(
         }
     };
     for ji in 0..jobs.len() {
-        let mine = decide_group(&cand, ji, jobs[ji].shift, harm_eps, repair_ms, comb_floor);
+        let mine = decide_group(
+            &cand,
+            ji,
+            jobs[ji].shift,
+            harm_eps,
+            repair_ms,
+            comb_floor,
+            width_eps,
+        );
         log_pick(&cand, &mine, ji, jobs);
         chosen[ji] = mine.first().copied();
     }
@@ -4485,6 +4593,17 @@ pub fn apply_dead_only_windows_with(
                                 sc.gone.push((ni, g));
                             }
                             if nd.hz > 0.0 {
+                                    if let Some(w) =
+                                        utai_dsp::harmonicity::harmonic_peak_width_pct(
+                                            seg,
+                                            sample_rate,
+                                            nd.hz,
+                                        )
+                                    {
+                                        sc.width.push((ni, w));
+                                    }
+                                }
+                                if nd.hz > 0.0 {
                                 if let Some(c) =
                                     utai_dsp::harmonicity::comb_depth_db(seg, sample_rate, nd.hz)
                                 {
@@ -4497,7 +4616,15 @@ pub fn apply_dead_only_windows_with(
                 }
             }
             for &ji in &need {
-                let mine = decide_group(&cand, ji, jobs[ji].shift, harm_eps, repair_ms, comb_floor);
+                let mine = decide_group(
+                    &cand,
+                    ji,
+                    jobs[ji].shift,
+                    harm_eps,
+                    repair_ms,
+                    comb_floor,
+                    width_eps,
+                );
                 if let Some(&c) = mine.first() {
                     tracing::info!(
                         "range: group[{}..{}] repair — {:?} ⇒ kept {:+} (silence {:.0} ms)",
@@ -4618,7 +4745,6 @@ fn parse_seam_align(v: Option<&str>) -> f64 {
         .filter(|x: &f64| x.is_finite() && *x >= 0.0 && *x <= 20.0)
         .unwrap_or(SEAM_ALIGN_MS_DEFAULT)
 }
-
 
 /// ⭐⭐⭐ S163 —— 交接点体检:**进来的那条 donor 静音时,把交接往后挪**。
 ///
@@ -6680,7 +6806,6 @@ mod tests {
 
     // ── 共享拼接器(两轨+audition 唯一执行点;审查 S85d:搬家丢测已补钉)──
 
-
     /// ⭐⭐⭐ S159zm —— **拼接前先对齐**:缝两侧其实是同一条波形,只是错开了零点几毫秒。
     ///
     /// 机理与实测在 [`SEAM_ALIGN_MS_DEFAULT`] 的 doc(30 条 donor↔donor 的缝:
@@ -6879,6 +7004,7 @@ mod tests {
             false,
             join_rests_enabled(),
             0, // ⛔ 关掉对齐:见上面那段
+            0.0,
             0.0,
             0.0,
             0.0,
@@ -7139,7 +7265,7 @@ mod tests {
         let (base0, left, right) = join_fixture(n);
         let run = |join: bool| {
             let mut b = base0.clone();
-            apply_dead_only_windows_with(&mut b, sr, total, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, |s, _| {
+            apply_dead_only_windows_with(&mut b, sr, total, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, |s, _| {
                 Ok(if s == -9 { left.clone() } else { right.clone() })
             })
             .unwrap();
@@ -7224,7 +7350,7 @@ mod tests {
         };
         for join in [false, true] {
             let mut base = vec![0.02f32; base_len]; // −34 dBFS 的底,好让「洞」量得出来
-            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, |s, own| {
+            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, |s, own| {
                 // ⭐ 生产走的就是 `donor_keep_samples` 这一个函数,判据不许自己再拼一遍公式。
                 let keep = donor_keep_samples_with(own, base_len, TOTAL_FRAMES, true);
                 let mut d = vec![-1.0f32; base_len];
@@ -7254,7 +7380,7 @@ mod tests {
             // ⛔ 阴性对照 ②:余量给不够时会怎样 —— 而**两条臂的答案不一样,那正是这条判据的重点**。
             let mut tight = vec![0.02f32; base_len];
             apply_dead_only_windows_with(
-                &mut tight, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                &mut tight, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 |s, own| Ok(paint(own, 0, s)),
             )
             .expect("splice");
@@ -7489,7 +7615,6 @@ mod tests {
         )
         .unwrap()
     }
-
 
     #[test]
     fn dead_only_rescues_the_climax_note_minimally() {
@@ -8095,7 +8220,6 @@ mod tests {
         // 落到 **80** —— `slot_reachable` 判**能**、`slot_singable` 判**不能**。
         // ⇒ 把 [`dead_group_windows_raw`] 里的 `slot_reachable` 换成 `slot_singable`,这里当场红。
 
-
         // ⑴ 阴性对照 A —— 便宜的那一刀不许拆,而且**门就在 2000 这个位置**。
         // ⚠ S159zi:门从 6000 降到 3000 之后,原来那个 `[83, 81, 81]`(差 2 度 = 4000)
         //    **够得着了** ⇒ 阴性对照会当场失效。
@@ -8637,7 +8761,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -8695,6 +8819,9 @@ mod tests {
             // S163 —— `tied` 的音高容差。⛔ **改音频**(同歌词但音高跳 >2 半音不再算延续音)
             //    ⇒ 与它一起 bump 到 `s163g`。
             2,
+            // S163 —— 谱峰宽度否决。⚠ **出厂 0 = 逐位不变** ⇒ 加它**不该**触发版本 bump;
+            //    进指纹的意义是「下一个人翻它的时候必须来这里改一行」。
+            parse_landing_width(None),
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -8703,7 +8830,7 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -8775,6 +8902,7 @@ mod tests {
             ("LANDING_HARM_EPS_DEFAULT", "pub fn landing_harm_eps("),
             ("LANDING_REPAIR_MS_DEFAULT", "pub fn landing_repair_ms("),
             ("COMB_FLOOR_DB_DEFAULT", "pub fn comb_floor_db("),
+            ("LANDING_WIDTH_EPS_DEFAULT", "pub fn landing_width_eps("),
             ("HANDOVER_DEFICIT_DB_DEFAULT", "pub fn handover_deficit_db("),
             ("TIED_XFADE_MS_DEFAULT", "pub fn tied_xfade_ms("),
         ];
@@ -8838,7 +8966,6 @@ mod tests {
             );
         }
     }
-
 
     /// ⛔⛔ S162 —— **谱倾斜只走谱面轨;cover 那两条车道传 `0.0`。**
     ///
@@ -9240,7 +9367,7 @@ mod tests {
         let run = |notes: &[NoteSpan]| -> usize {
             let mut base = vec![0.0f32; n];
             apply_dead_only_windows_with(
-                &mut base, SR, TF, &jobs, &[], notes, false, false, 0, 0.0, 0.0, 0.0, 0.0,
+                &mut base, SR, TF, &jobs, &[], notes, false, false, 0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 TIED_XFADE_MS_DEFAULT,
                 |_s, own| {
                     let mut d = vec![0.0f32; n];
@@ -9356,6 +9483,7 @@ mod tests {
                 0.0, // ⛔ 谐波否决关掉 —— 这一条只钉【粒度】那根轴
                 0.0, // ⛔ 修补遍也关掉
                 0.0, // ⛔ 梳深否决也关掉
+                0.0, // ⛔ 谱峰宽度否决也关掉
                 0.0, // ⛔ 交接点体检也关掉
                 0.0, // ⛔ 长音淡化也关掉
                 |s, _| Ok(if s == -8 { mk([-2.0, -2.0, -2.0]) } else { mk([0.5, 0.5, collapse]) }),
@@ -9423,7 +9551,7 @@ mod tests {
         let run = |eps: f32| -> Vec<f32> {
             let mut b = base0.clone();
             apply_dead_only_windows_with(
-                &mut b, 44100, total, &jobs, &alts, &notes, false, false, 0, eps, 0.0, 0.0, 0.0, 0.0,
+                &mut b, 44100, total, &jobs, &alts, &notes, false, false, 0, eps, 0.0, 0.0, 0.0, 0.0, 0.0,
                 |s, _| {
                     Ok(if s == -8 {
                         stack(440.0, 0.0537, base0.len())
@@ -9504,7 +9632,7 @@ mod tests {
             calls.borrow_mut().clear();
             let mut b = base0.clone();
             apply_dead_only_windows_with(
-                &mut b, 44100, total, &jobs, &[], &notes, false, false, 0, 0.0, repair_ms, 0.0, 0.0, 0.0,
+                &mut b, 44100, total, &jobs, &[], &notes, false, false, 0, 0.0, repair_ms, 0.0, 0.0, 0.0, 0.0,
                 |s, _| {
                     calls.borrow_mut().push(s);
                     Ok(if s == -8 && broken {
@@ -9628,7 +9756,7 @@ mod tests {
             let (left, right) = make(hole_ms);
             let mut b = vec![0.0f32; n];
             apply_dead_only_windows_with(
-                &mut b, SR, total, &jobs, &[], &[], false, false, 0, 0.0, 0.0, 0.0, db, 0.0,
+                &mut b, SR, total, &jobs, &[], &[], false, false, 0, 0.0, 0.0, 0.0, 0.0, db, 0.0,
                 |s, _| Ok(if s == -5 { left.clone() } else { right.clone() }),
             )
             .unwrap();
@@ -9704,7 +9832,7 @@ mod tests {
             let nd = spans(tied);
             let mut b = vec![0.0f32; n];
             apply_dead_only_windows_with(
-                &mut b, SR, total, &jobs, &[], &nd, false, false, 0, 0.0, 0.0, 0.0, 0.0, xf_ms,
+                &mut b, SR, total, &jobs, &[], &nd, false, false, 0, 0.0, 0.0, 0.0, 0.0, 0.0, xf_ms,
                 |s, _| Ok(if s == -4 { loud.clone() } else { soft.clone() }),
             )
             .unwrap();
@@ -10218,8 +10346,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn damage_from_scan_is_perceptual_not_linear() {
         // S81 (E): a healthy semitone must cost NOTHING — a scan's 1-37 cent wander across a
@@ -10252,8 +10378,6 @@ mod tests {
         // mechanisms — decision layer back to v0.11.0; the broken-climax case they served is
         // now the score dead-only plan's job, tested in the dead_only_* group below.)
     }
-
-
 
     #[test]
     fn the_phase_lock_is_on_by_default_and_an_explicit_zero_still_turns_it_off() {
@@ -11028,7 +11152,6 @@ mod tests {
             t.shift, w.shift
         );
 
-
         // …and the knob is not merely inert: at the tight ceiling 78 IS dead, at the wide one it
         // is not. Without this half the test would pass on a build that ignored the knob entirely.
         assert!(wide.slot_singable(78) && !tight.slot_singable(78), "the knob must still bite");
@@ -11488,7 +11611,6 @@ mod tests {
         }
     }
 
-
     /// S159zm —— **只跑拼接**的探针:同一份 base + donor 缓冲,只翻对齐旋钮。
     ///
     /// ⛔ 为什么必须有它:「渲两遍整曲再比」被 donor 路径的**跨进程不可复现性**淹没 ——
@@ -11533,7 +11655,7 @@ mod tests {
         let sr: u32 = plan["sample_rate"].as_u64().unwrap() as u32;
         eprintln!("[splice] {} jobs · base {} · sr {sr} · UTAI_RANGE_SEAM_ALIGN = {} ms",
                   jobs.len(), base.len(), seam_align_ms());
-        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, &[], &[], false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, landing_harm_eps(), landing_repair_ms(), comb_floor_db(), handover_deficit_db(), tied_xfade_ms(), |s, _own| {
+        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, &[], &[], false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, landing_harm_eps(), landing_repair_ms(), comb_floor_db(), landing_width_eps(), handover_deficit_db(), tied_xfade_ms(), |s, _own| {
             Ok(rd(&dir.join(format!("donor_post_{s:+}.f32"))))
         })
         .unwrap();

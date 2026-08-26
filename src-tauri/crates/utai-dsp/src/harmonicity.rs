@@ -133,6 +133,90 @@ pub fn harmonic_energy_fraction_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> O
 /// 实测 yuyuko 的「卡痰」那个音梳深 **−0.4**(谐波间填满)而谐波占比 −0.10(看起来没问题);
 /// 而 akiko 的「ぴゃ」梳深 **40.6**(谐波很清晰)却 H2−H1 = −44.8(只剩一根)。
 /// ⇒ **两根轴都要有。**
+/// ⭐⭐⭐ S163 —— **谐波谱峰的宽度**（相对 f0 的 %，越大 = 谐波越糊）。
+///
+/// ## 它量的是另一件事
+/// [`harmonic_energy_fraction_db`] 量「能量在不在谐波上」，
+/// [`comb_depth_db`] 量「谐波与谐波之间差多少」，
+/// 而这一根量的是**每一根谐波自己糊不糊** —— 频率抖动 / 相位噪声会把谱峰展宽，
+/// 而前两根轴对它都是瞎的（实测：4:36 接缝两侧峰宽 12.33 vs 0.99（**差 12 倍**），
+/// 而填充度读到 −18 vs −29——**方向还反了**）。
+///
+/// ## 为什么它值钱
+/// yuyuko 短音的 `donor_pre` 峰宽按落点：**77 → 3.50 而 78 → 11.88**（差 **3.4 倍**），
+/// 而两者只差 **1 个半音** ⇒ 正好在落点候选范围内。
+/// ⛔ 而 sidecar 的 `low_ratio` 在同两格上是 **77 → 0.616（最差）/ 79 → 0.129（好）**
+/// —— **与峰宽完全相反**，而 S157 那条排序用的就是 `low_ratio`。
+///
+/// ## 口径
+/// 长窗（8192）保证频率分辨率远高于谐波间隔，才量得到**峰宽**而不是窗宽；
+/// 取 H3..H8 的 −6 dB 宽度中位，归一化到 f0。
+/// ⚠ 它需要 ≥ 4096 个样本（≈ 100 ms @40k）；更短返回 `None`。
+/// ⛔ **只在同一个音的两个候选之间比**（同 f0）—— 跨音高时谐波密度不同，读数不可比。
+pub fn harmonic_peak_width_pct(x: &[f32], sample_rate: u32, f0_hz: f32) -> Option<f32> {
+    const KLO: usize = 3;
+    const KHI: usize = 8;
+    const HALF: f64 = 0.25; // −6 dB
+    if !(f0_hz.is_finite() && f0_hz > 20.0) {
+        return None;
+    }
+    let n = if x.len() >= 8192 {
+        8192usize
+    } else if x.len() >= 4096 {
+        4096
+    } else {
+        return None;
+    };
+    let win: Vec<f64> = (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos())
+        .collect();
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(n);
+    let mut acc = vec![0.0f64; n / 2 + 1];
+    let mut frames = 0usize;
+    let mut pos = 0usize;
+    while pos + n <= x.len() {
+        let mut buf: Vec<Complex<f64>> = (0..n)
+            .map(|i| Complex::new(f64::from(x[pos + i]) * win[i], 0.0))
+            .collect();
+        fft.process(&mut buf);
+        for (k, a) in acc.iter_mut().enumerate() {
+            *a += buf[k].norm_sqr();
+        }
+        frames += 1;
+        pos += n / 2;
+    }
+    if frames == 0 {
+        return None;
+    }
+    let df = f64::from(sample_rate) / n as f64;
+    let f0 = f64::from(f0_hz);
+    let nyq = f64::from(sample_rate) * 0.45;
+    let mut ws: Vec<f64> = Vec::new();
+    for k in KLO..=KHI {
+        let c = f0 * k as f64;
+        if c > nyq {
+            break;
+        }
+        let lo = ((c - f0 * 0.4) / df).floor().max(0.0) as usize;
+        let hi = (((c + f0 * 0.4) / df).ceil() as usize).min(acc.len() - 1);
+        if hi <= lo + 6 {
+            continue;
+        }
+        let peak = acc[lo..=hi].iter().copied().fold(0.0f64, f64::max);
+        if peak <= 0.0 {
+            continue;
+        }
+        let wide = acc[lo..=hi].iter().filter(|v| **v >= peak * HALF).count();
+        ws.push(wide as f64 * df / f0 * 100.0);
+    }
+    if ws.len() < 3 {
+        return None;
+    }
+    ws.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(ws[ws.len() / 2] as f32)
+}
+
 pub fn comb_depth_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> Option<f32> {
     const COMB_LO: f32 = 2000.0;
     const COMB_HI: f32 = 8000.0;
@@ -298,6 +382,69 @@ mod tests {
     /// ⑴ 谐波堆 + 谐波之间填噪声 ⇒ **梳深塌而谐波占比几乎不动**(= 用户说的「卡痰」);
     /// ⑵ 只留 H1 一根 ⇒ **梳深仍然高**(= 「ぴゃ」);
     /// ⑶ 音高问错 ⇒ 塌;⑷ 与电平无关。
+    /// ⭐⭐⭐ S163 —— [`harmonic_peak_width_pct`] 量的是**每一根谐波自己糊不糊**，
+    /// 而另外两根轴对它都是瞎的。三件：
+    /// ① 干净的谐波串 ⇒ 峰宽小；② 加频率抖动 ⇒ 峰宽变大（对照组）；
+    /// ③ **与电平无关**（同一份波形 × 0.01 读数不变）。
+    /// ⛔ ② 是承重那一格：没有它，“峰宽总是小”也能让 ① 绿。
+    #[test]
+    fn peak_width_sees_frequency_smear_that_the_other_two_axes_miss() {
+        let sr = 44_100u32;
+        let f0 = 440.0f32;
+        let n = (sr as f32 * 0.40) as usize;
+        // ① 干净：H1..H8 固定频率
+        let clean: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let mut y = 0.0f32;
+                for k in 1..=8u32 {
+                    y += (1.0 / k as f32)
+                        * (2.0 * std::f32::consts::PI * f0 * k as f32 * t).sin();
+                }
+                0.2 * y
+            })
+            .collect();
+        // ② 同一批谐波，但 f0 带 3% 的慢抖动（相位积分）
+        let smeared: Vec<f32> = {
+            let mut ph = 0.0f32;
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / sr as f32;
+                    let inst = f0 * (1.0 + 0.03 * (2.0 * std::f32::consts::PI * 7.0 * t).sin());
+                    ph += 2.0 * std::f32::consts::PI * inst / sr as f32;
+                    let mut y = 0.0f32;
+                    for k in 1..=8u32 {
+                        y += (1.0 / k as f32) * (ph * k as f32).sin();
+                    }
+                    0.2 * y
+                })
+                .collect()
+        };
+        let wc = harmonic_peak_width_pct(&clean, sr, f0).expect("clean");
+        let ws = harmonic_peak_width_pct(&smeared, sr, f0).expect("smeared");
+        assert!(wc < 3.0, "干净谐波串的峰宽应该很小（读到 {wc:.2}）");
+        assert!(
+            ws > wc * 2.0,
+            "频率抖动必须把峰宽拉开（干净 {wc:.2} vs 抖动 {ws:.2}）——              否则上一格测的是「峰宽总是小」"
+        );
+        // ③ 与电平无关
+        let quiet: Vec<f32> = clean.iter().map(|v| v * 0.01).collect();
+        let wq = harmonic_peak_width_pct(&quiet, sr, f0).expect("quiet");
+        assert!(
+            (wq - wc).abs() < 0.51,
+            "峰宽必须与电平无关（{wc:.2} vs {wq:.2}）"
+        );
+        // ⛔ 另外两根轴在同一份对照上**看不见**这件事——这才是它存在的理由
+        let hc = harmonic_energy_fraction_db(&clean, sr, f0).unwrap_or(0.0);
+        let hs = harmonic_energy_fraction_db(&smeared, sr, f0).unwrap_or(0.0);
+        assert!(
+            (hs - hc).abs() < (ws - wc) / 2.0,
+            "谐波占比对频率展宽的反应必须远小于峰宽本身（             占比 Δ{:.2} vs 峰宽 Δ{:.2}）",
+            hs - hc,
+            ws - wc
+        );
+    }
+
     #[test]
     fn comb_depth_and_harmonic_fraction_measure_different_things() {
         let sr = 44100;
