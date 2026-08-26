@@ -1574,7 +1574,9 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
 
     // ⛔ 候选对齐到**窗**(见 `dead_group_windows_alts`)。
     let (jobs, plan_alts) =
-        super::super::vocal_range::dead_group_windows_alts(&nn, &fr, &plan, &plan_alts0);
+        super::super::vocal_range::dead_group_windows_alts(
+            &nn, &fr, &plan, &plan_alts0, &range, transpose,
+        );
     let total_frames: i64 = fr.iter().map(|f| (*f).max(0)).sum();
 
     // ── 执行层:base 一遍 + 每个 distinct shift 一遍 donor,拼接由库函数编排 ──

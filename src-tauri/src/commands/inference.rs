@@ -1899,7 +1899,7 @@ pub async fn render_vocal_segment(
                 // ⛔ 候选必须对齐到**窗**,不是组:`dead_group_windows` 会合并窗
                 //    ⇒ 按组下标传会张冠李戴(见 `dead_group_windows_alts` 的 doc)。
                 let (jobs_, alts_) = crate::inference::vocal_range::dead_group_windows_alts(
-                    &nn, &fr, &plan, &plan_alts,
+                    &nn, &fr, &plan, &plan_alts, &r, options.transpose,
                 );
                 range_alts =
                     if crate::inference::vocal_range::landing_pick() { alts_ } else { Vec::new() };

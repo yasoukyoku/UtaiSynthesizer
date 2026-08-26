@@ -916,10 +916,28 @@ pub fn dead_only_plan_with_alts(
                     for w in 1..ds.len() {
                         let (p, q) = (ds[w - 1], ds[w]);
                         let (Some(ls), Some(rs)) = (need(cf, p), need(q, cl)) else { continue };
-                        // 右组的窗倒着伸进 `q-1`,左组的窗往前伸进 `p+1`。
-                        // ⚠ 相邻(`p + 1 == q`)时这两条正好退化成「`p` 在 `rs` 上、`q` 在 `ls` 上」。
+                        // ⭐⭐⭐ S163 —— 这里**曾经**是一条 `continue`(S159zk):右组的窗倒着伸进
+                        // `q-1`、左组的窗往前伸进 `p+1`,只要那个邻音在对方那一遍掉出音域就
+                        // **否决整个断点**。它拦的危害是真的(那样的 24 个音比组内音低 −11.4 dB),
+                        // 但**载体是护栏,不是断点** —— 而 [`dead_group_windows_raw`] 现在会在
+                        // 这种边上把护栏直接收到 0(判据 `foreign_shift` 与那一族同延)。
+                        //
+                        // ⛔ 必须撤的理由(用户 2026-08-26 点名的病灶,坐标齐全):
+                        // yuyuko 2:09.002-2:14.056「嗓子里卡着痰」= 组 `[492..495]`
+                        // ま(82)/た(83)/む(92)/か(90),`usable [36,79]` ⇒ 四个全是死音,
+                        // 整组 −14 ⇒ **ま 落到 68、た 落到 69**(女声模型在那儿唱气泡音,
+                        // PSOLA 再把它拉高 14 度)。断点 `493|494` 的 gain = **4140 > 3000**
+                        // ⇒ 不是阈值挡的,是 `neighbour_ok(494, −4)` 否的(む 在 −4 上是 88 > 79)。
+                        // ⇒ 旧规则拿 **40 ms** 护栏塌陷换 **360 ms** 气泡音,**两害相权差一个数量级**。
+                        //
+                        // ⛔ 可归因性(铁律):被旧规则否过的断点逐条打日志,否则「这一刀拆开的」
+                        // 与「本来就拆得动的」显示成同一种样子。
                         if !neighbour_ok(q.wrapping_sub(1), rs) || !neighbour_ok(p + 1, ls) {
-                            continue;
+                            tracing::info!(
+                                "range: split point [{p}|{q}] would have been vetoed by the \
+                                 S159zk neighbour rule (left {ls:+} st, right {rs:+} st) — \
+                                 kept, and the guard on that edge is narrowed to 0 instead"
+                            );
                         }
                         // ⛔ 只算两侧,不算夹心 —— 夹心是一级那一刀的账(doc)。
                         let gain = ms(cf, p + 1) * (here.abs() - ls.abs()).max(0) as f32
@@ -1306,7 +1324,7 @@ thread_local! {
 /// 拦住拆分 = 把更多材料留在 donor 里,**方向是反的**。
 const SPLIT_MIN_INTERIOR_NOTES: usize = 3;
 
-/// ⚙ 出厂默认 = 3000.0 —— 拆簇的**第二级**门:按**深度差**而不是按「唱不唱得动」(ms·半音)
+/// ⚙ 出厂默认 = 2000.0 —— 拆簇的**第二级**门:按**深度差**而不是按「唱不唱得动」(ms·半音)
 ///
 /// ## ⛔ 一级拆看不见的那一半
 ///
@@ -1400,7 +1418,38 @@ const SPLIT_MIN_INTERIOR_NOTES: usize = 3;
 /// 在我跑测试与渲染的同时把这个常量来回改,最后还把整份源文件**还原**掉了。
 /// 抓出它的是 `every_shipped_default_is_declared_at_the_top_of_its_own_doc`(doc↔常量一致性闸),
 /// 而它当初瞄的根本不是这件事。
-const SPLIT_MIN_COST_DEFAULT: f32 = 3000.0;
+///
+/// ## ⭐⭐⭐ S163 —— 3000 → 2000,**证据变了两处**
+///
+/// ⑴ **缝变便宜了**:[`dead_group_windows_raw`] 现在会在「邻音在本遍唱不动」的边上把护栏
+///    收到 0 ⇒ 拆组造出来的缝不再把一段塌陷拌进交界(S159zk 实测那样的 24 个音低 **−11.4 dB**)。
+///    3000 是在**缝还带着那个代价**的时候定的。
+/// ⑵ **门的形状不对,而 3000 正好从中间切过同一个病灶**:`gain = ms × (|here| − |side|)`
+///    假设「代价 ∝ 深度」,而配对法实测(同母音 × 同音高 × 深 vs 浅 + 空对照,跨两模型全部同向)
+///    是**超线性**的 —— −2/−4/−6 偏离 ≈ 0(**透明**),−8 起明确、之后单调,−14 上方谐波弱 7-11 dB。
+///    * yuyuko `[492..496]`(用户 2026-08-26 点名的「卡痰」):`ls = −4` ⇒ 360 ms × (14−4) = **3600 > 3000** ⇒ 拆;
+///    * akiko **同一组**:`ls = −6` ⇒ 360 ms × (14−6) = **2880 < 3000** ⇒ **不拆**。
+///    ⇒ 同一个病灶、两个模型,门限差 **120** 就是两种结局。⛔ 这说明该改的是形状,
+///      而在拿到超线性代价的干净标定之前,**下调门限是同向、可验、且不引入新自由度**的一步。
+///
+/// ## 人群定价(`split_scan`,六条臂同一次跑;「买到什么」与「付出什么」是同一次跑的两列)
+///
+/// | 臂 | 3000 组数 | 2000 组数 | 落点 ≤69 | 落点 <72 | `|sh|` ≥8 | donor 遍数 |
+/// |---|---|---|---|---|---|---|
+/// | akiko +7  | 89 | 100 (+11) | **31 → 6** | 77 → 42 | 183 → 143 | 10 → 10 |
+/// | 东雪莲 +7 | 82 |  93 (+11) | **11 → 0** | 48 → 34 | 168 → 141 |  8 →  8 |
+/// | yuyuko +7 | 87 | 101 (+14) |   1 → 0    | **35 → 6** | 146 → 113 | 10 → **9** |
+/// | 三条 t0   | — | **一格不动** | — | — | — | — |
+///
+/// ⭐ **只在需要它的地方咬**:三条 +7 臂大幅改善,三条 t0(浅救援)逐字不变;**donor 遍数不增**。
+/// ⛔ 1200 那一档只多付缝、不再买到东西(akiko 6 → 5,而 yuyuko 多 24 组)⇒ **2000 是拐点**。
+///
+/// ## ⛔ 阴性对照(缺了它这就是一次「多拆了所以更好」的自证)
+/// 降门限少掉的覆盖音**必须全是乘客**。六条臂实测:**死音一个不少**
+/// (akiko 318→318 · 东雪莲 249→249 · yuyuko 249→249),少掉的 10 个全是 akiko 的
+/// **MIDI 75**(usable 顶 76 ⇒ 模型本来就唱得动),而那 10 个正好就是「落点 65 的那 10 个」。
+/// ⇒ 卸乘客正是这一刀的目的,由 [`tests::splitting_never_changes_which_notes_are_rescued`] 钉住。
+const SPLIT_MIN_COST_DEFAULT: f32 = 2000.0;
 
 /// ⚙ 出厂默认 = 6000.0 —— 卸乘客的**第二条**门:按**代价**而不是按时长(单位 ms·半音)
 ///
@@ -2779,7 +2828,45 @@ pub fn cover_dead_plan_with(
 /// [`dead_group_windows`] 的**合并之前**那一半 —— **一组一窗、按序**。
 /// ⛔ 抽出来的唯一理由:[`dead_group_windows_alts`] 必须知道「一个**合并后**的窗覆盖了哪些组」,
 /// 而那要求两边用**同一条**式子(两处各写一遍 = 一处改了另一处不改)。
-fn dead_group_windows_raw(cum: &[i64], note_nums: &[i64], plan: &[DeadGroup]) -> Vec<DeadJob> {
+fn dead_group_windows_raw(
+    cum: &[i64],
+    note_nums: &[i64],
+    plan: &[DeadGroup],
+    range: &SpeakerRange,
+    transpose: i64,
+) -> Vec<DeadJob> {
+    // ⭐⭐⭐ S163 —— **护栏不许伸进一个【在本遍唱不动】的音**(用户 2026-08-26 点名的
+    // 「嗓子里卡着痰」的根因链的后半截)。
+    //
+    // donor 的每一遍是**按那一遍的位移唱整条谱**的 ⇒ 窗边紧邻的那个音如果在**这一遍**
+    // 掉出音域,模型在那里**直接塌掉**(S159zk 实测:那样的 24 个音比组内音低 **−11.4 dB**),
+    // 而护栏的全部意义是「把 10 ms 交叉淡化压在那个乘客身上」—— 压在一段塌陷上等于没压。
+    //
+    // ## 判据(纯结构,不需要读 `usable`)
+    // 邻音**属于另一个 `DeadGroup`、而且那个组的 `shift` 与本组不同** ⇒ 收窄该侧。
+    // ⭐ 它与 S159zk 想拦的那一族**同延**:
+    // * 二级拆组的断点**只许落在死音之间** ⇒ 拆出来的边**两侧都是死音**;
+    // * 两侧 `shift` 相同的边早被 [`merge_same_shift_across_rests`] 合并 ⇒ 剩下的边 shift 必不同;
+    // * 拆组**之前**就有的 67 条边,邻音是**唱得动的乘客**(不在任何组里)⇒ 判据一条都不碰,
+    //   所以「今天的计划逐帧不变」那条不变量对它们仍然成立。
+    //
+    // ⛔ 与「`GUARD_FRAMES` 收到 0 差 7.6 dB」(S163)**不冲突**:那一条是在**护栏区材料健康**
+    // 时量的。这里护栏区本身就是塌的,伸进去是把塌陷拌进交界。
+    // ⛔⛔ **`slot_reachable`,不是 `slot_singable`** —— 这问的是「**模型**在这一格上发不发得出
+    // 声」,所以必须读**扫描**的边界,永远不许读用户那条救援线(与拆组里那条同一个理由、
+    // 同一次学费 S146f:用 `slot_singable` 会让「用户把音域上限调低」变成「护栏收得更多」)。
+    //
+    // ⛔ 第一版写成纯结构判据「邻音属于另一个组且 shift 不同」,**被自家的闸抓住了**:
+    // `a_short_rest_keeps_both_windows_out_of_it` 的夹具 ⑶ 两组 −6/−7 ⇒ 落点 79/78,
+    // **护栏区是健康的**,而那个判据照收不误 —— 正好撞上 S163 量过的
+    // 「无休止跨组缝的重叠从 80 ms 收到 0,瞬变中位差 **7.60 dB**(好 0 / 坏 10)」。
+    // ⇒ 收窄的**唯一**条件只能是「那个邻音在**本遍**唱不动」。
+    let unreachable_here = |k: usize, shift: i64| -> bool {
+        match note_nums.get(k).copied() {
+            Some(x) if x > 0 => !range.slot_reachable(x + transpose + shift),
+            _ => false, // 休止 / 越界 ⇒ 护栏伸不进任何唱音,照常
+        }
+    };
     plan
         .iter()
         .map(|g| {
@@ -2802,7 +2889,7 @@ fn dead_group_windows_raw(cum: &[i64], note_nums: &[i64], plan: &[DeadGroup]) ->
                 0
             } else if gap_prev > 0 {
                 4.min(gap_prev / 2)
-            } else if g.start > 0 {
+            } else if g.start > 0 && !unreachable_here(g.start - 1, g.shift) {
                 GUARD_FRAMES.min((cum[g.start] - cum[g.start - 1]) / 2)
             } else {
                 0
@@ -2811,7 +2898,7 @@ fn dead_group_windows_raw(cum: &[i64], note_nums: &[i64], plan: &[DeadGroup]) ->
                 0
             } else if gap_next > 0 {
                 2.min(gap_next / 2)
-            } else if g.end + 1 < note_nums.len() {
+            } else if g.end + 1 < note_nums.len() && !unreachable_here(g.end + 1, g.shift) {
                 GUARD_FRAMES.min((cum[g.end + 2] - cum[g.end + 1]) / 2)
             } else {
                 0
@@ -2836,8 +2923,10 @@ pub fn dead_group_windows_alts(
     frames: &[i64],
     plan: &[DeadGroup],
     plan_alts: &[Option<i64>],
+    range: &SpeakerRange,
+    transpose: i64,
 ) -> (Vec<DeadJob>, Vec<Option<i64>>) {
-    let jobs = dead_group_windows(note_nums, frames, plan);
+    let jobs = dead_group_windows(note_nums, frames, plan, range, transpose);
     if plan_alts.len() != plan.len() {
         return (jobs, Vec::new());
     }
@@ -2848,7 +2937,7 @@ pub fn dead_group_windows_alts(
         acc += f.max(0);
         cum.push(acc);
     }
-    let raw = dead_group_windows_raw(&cum, note_nums, plan);
+    let raw = dead_group_windows_raw(&cum, note_nums, plan, range, transpose);
     let alts = jobs
         .iter()
         .map(|j| {
@@ -2873,6 +2962,9 @@ pub fn dead_group_windows(
     note_nums: &[i64],
     frames: &[i64],
     plan: &[DeadGroup],
+    // ⭐ S163 —— 护栏要知道「邻音在**本遍**唱不唱得动」(见 [`dead_group_windows_raw`])。
+    range: &SpeakerRange,
+    transpose: i64,
 ) -> Vec<DeadJob> {
     let mut cum = Vec::with_capacity(frames.len() + 1);
     let mut acc = 0i64;
@@ -2881,7 +2973,7 @@ pub fn dead_group_windows(
         acc += f.max(0);
         cum.push(acc);
     }
-    let raw = dead_group_windows_raw(&cum, note_nums, plan);
+    let raw = dead_group_windows_raw(&cum, note_nums, plan, range, transpose);
     let merged = merge_same_shift_across_rests(note_nums, plan, raw);
     // S162 —— 薄片闸(出厂 0 = 关 = 逐帧不变)。见 `CLOSE_SLIVER_FRAMES_DEFAULT`。
     close_short_slivers(merged, parse_close_sliver(std::env::var("UTAI_RANGE_CLOSE_SLIVER").ok().as_deref()))
@@ -3612,6 +3704,11 @@ const COMB_FLOOR_DB_DEFAULT: f32 = 6.0;
 /// 从来没进过候选。`shift ± 1` 从计划的 −13 出发正好够得着。
 const REPAIR_SPREAD_DB: f32 = 6.0;
 
+/// 窗**尾**落在一个唱音里、而且离那个音的终点还有这么多毫秒以上时,淡出拉长
+/// (见 [`tied_xfade_ms`])。⛔ 200 ms 的理由:短于它的话「后面那一截 base」本来就快结束了,
+/// 拉长淡出反而会把两个音混在一起。用户点名的 akiko 2:50.4 那一处剩 **1.42 s**。
+const TAIL_ROOM_MS: u32 = 200;
+
 /// ⚙ 出厂默认 = 15.0(**dB**,见 [`HANDOVER_DEFICIT_DB_DEFAULT`])。
 /// `UTAI_RANGE_HANDOVER=0` 关掉 ⇒ 交接点逐帧回到今天。
 ///
@@ -4295,8 +4392,12 @@ pub fn apply_dead_only_windows_with(
             }
             let mut by_shift: std::collections::BTreeMap<i64, Vec<usize>> = Default::default();
             for &ji in &need {
-                let cur = cand[chosen[ji].unwrap()].1;
-                for d in [-1i64, 1] {
+                // ⭐ S163 —— ±1 必须绕【所有现有候选】转，不是只绕选中的那一个。
+                //    ⛔ 实测：「ぴゃ」选中的是 −12，只绕它转 ⇒ 渲 −11/−13，而真正的好落点
+                //    **−14** 是计划那个 −13 的 −1，永远够不着（日志：`[(-12,60),(-13,60),(-11,60)]`）。
+                let curs: Vec<i64> =
+                    (0..cand.len()).filter(|&c| cand[c].0 == ji).map(|c| cand[c].1).collect();
+                for (cur, d) in curs.iter().flat_map(|&c| [(c, -1i64), (c, 1)]) {
                     let s2 = cur + d;
                     if s2 == 0 || s2.abs() > MAX_RANGE_SHIFT {
                         continue;
@@ -4728,7 +4829,26 @@ fn splice_kept(
             // 所以它根本不淡出。
             let xf_in = xf_at.get(&oi).copied().unwrap_or(xf);
             let xfw = xf_in.min((b.saturating_sub(a)) / 2);
-            let xfw_out = xf.min((b.saturating_sub(a)) / 2);
+            // ⭐⭐ S163 —— **窗尾落在一个长音的头上时,淡出也要拉长**(用户点名 akiko 2:50.4)。
+            // `post = GUARD_FRAMES` 把窗尾伸进下一个唱音 40 ms,然后 10 ms 就切回 `base` ⇒
+            // 一个 1.46 s 的音头 40 ms 是 donor、之后是 base ⇒ **断裂**。
+            // ⛔ 收窄护栏已判负(重叠 80→0 瞬变中位差 7.60 dB)⇒ 治的是「切得太快」。
+            // ⭐ 淡出的另一侧是 `base`,而那个音**没被救 = 模型本来就唱得动** ⇒ 慢慢过渡听不出。
+            let xf_out_here = if tied_xf > xf && !notes.is_empty() {
+                let room = (sample_rate as usize) * TAIL_ROOM_MS as usize / 1000;
+                let in_long_note = notes.iter().any(|nd| {
+                    if !nd.sung {
+                        return false;
+                    }
+                    let s0 = ((nd.start as f64) * spf) as usize;
+                    let s1 = (((nd.start + nd.frames) as f64) * spf) as usize;
+                    b > s0 && b + room < s1
+                });
+                if in_long_note { tied_xf } else { xf }
+            } else {
+                xf
+            };
+            let xfw_out = xf_out_here.min((b.saturating_sub(a)) / 2);
             if b <= a || xfw == 0 || xfw_out == 0 {
                 tracing::warn!(
                     "range-extend(dead-only): window frames {fa}..{fb} degenerate after clamp ({a}..{b} samples) — NOT rescued"
@@ -6148,6 +6268,15 @@ mod tests {
 
     fn range() -> SpeakerRange {
         SpeakerRange::bounds((48.0, 84.0), (52.0, 79.0))
+    }
+
+    /// 窗测试用的「**处处可达**」记录 —— 语义 = 「护栏区材料是健康的」。
+    /// ⛔ 它不是「把新判据关掉」的开关:关掉判据的写法(传 `None` 走老路)会让
+    /// S163 那条护栏收窄**没有任何闸守着**。这里传的是真实谓词,只是喂了一个处处成立的
+    /// 音域 ⇒ 老断言仍然逐条走生产代码,而且语义比以前更明确。
+    /// 新行为由 [`tests::the_guard_never_reaches_into_a_note_that_collapses_on_this_pass`] 钉住。
+    fn all_reachable() -> SpeakerRange {
+        SpeakerRange::bounds((0.0, 127.0), (0.0, 127.0))
     }
 
     /// One second per triple on the score's 50 fps grid. `frames` only ever feeds the
@@ -7818,17 +7947,27 @@ mod tests {
         let plan = |p: &[i64], f: &[i64]| dead_only_plan_with(p, f, 0, &r, RescueTuning::today()).0;
 
         // ⑷ ⭐ 主臂 —— 3:16 的形状:顶音要 −13,后面两个只高出 usable 顶 1 度、只要 −2。
-        // ⚠⚠ S159zk —— 断点是 `[2|3]` 而**不是** `[1|2]`:`[1|2]` 会让浅组的窗倒着伸进
-        //    顶音 92,而 92 在浅组的 −2 上是 MIDI 90 —— **那一遍唱不动**。见下面 ⑹。
+        // ⚠⚠ S159zk 时断点被推到 `[2|3]`,理由是「`[1|2]` 会让浅组的窗倒着伸进顶音 92,
+        //    而 92 在浅组的 −2 上是 MIDI 90,那一遍唱不动」。
+        // ⭐⭐⭐ S163 —— **危害的载体是护栏,不是断点**:[`dead_group_windows_raw`] 现在会在
+        //    这种边上把那一侧的护栏收到 0,所以 `[1|2]` 变得可行,而且**明显更好**:
+        //    * 旧 `[1..2]@−13` ⇒ 那个 **81 陪着顶音走 −13,落到 68**;
+        //    * 新 `[1..1]@−13` + `[2..3]@−2` ⇒ 81 落到 **79**。
+        //    ⇒ 这个夹具正是用户 2026-08-26 点名的 yuyuko 2:09「嗓子里卡着痰」的缩影
+        //      (ま 82 陪着 92 走 −14 落到 **68**,女声模型在那儿唱气泡音)。
         let deep = [0i64, 92, 81, 81, 0];
         let g = plan(&deep, &secs(deep.len()));
         assert_eq!(
             g,
             vec![
-                DeadGroup { start: 1, end: 2, shift: -13 },
-                DeadGroup { start: 3, end: 3, shift: -2 },
+                DeadGroup { start: 1, end: 1, shift: -13 },
+                DeadGroup { start: 2, end: 3, shift: -2 },
             ],
-            "全是死音也要按深度拆开,而且断点要落在可行的那一处(读到 {g:?})"
+            "全是死音也要按深度拆开,而且陪绑的音一个都不许多(读到 {g:?})"
+        );
+        assert!(
+            !r.slot_reachable(81 - 13) || r.slot_reachable(81 + g[1].shift),
+            "夹具有效性:被解放的那个 81 在新落点上必须唱得动,否则这一刀没买到东西"
         );
         // ⭐⭐⭐ 这一刀买到的就是这 11 个半音:不拆的话那个音会跟着走 −13,
         // 按 S159z 的定价 ≈ 白丢 **高频 14.4 dB**。
@@ -7842,18 +7981,26 @@ mod tests {
         // 低 **−11.4 dB**,没掉出去的 103 个是 **−0.3 dB**;而那 24 个**全部**是二级拆造出来的
         // (拆组前 67 条边:0 个)。
         //
-        // ⛔ 这一条的**阴性对照**:把顶音换成一个在 −2 上仍然唱得动的音(85 → −2 = 83?不行,
-        //    这个夹具的 `dxl_like` 82 起就唱不动)⇒ 改用 81:`[81, 81, 81]` 深度差是 0,
-        //    拆不起来。⇒ 正确的对照是**同一个夹具、把断点两侧的可行性打开**:
-        //    直接断言「断点不是 `[1|2]`」,并配一条变异(拿掉 `neighbour_ok` ⇒ 读回 `[1|2]`)。
+        // ⭐⭐⭐ S163 —— 判据迁到**窗层**(危害的载体在那儿),而且**一条断言钉两个方向**:
+        // * 浅组 `[2..3]@−2` 的 `pre` **不许**伸进 `[1] = 92`(92−2 = 90 > reach 顶 80);
+        // * 深组 `[1..1]@−13` 的 `post` **必须照常**伸进 `[2] = 81`(81−13 = 68,唱得动)。
+        // ⇒ 交叉淡化仍然有地方压(两窗仍然重叠),只是压在**健康**的那一侧。
+        // ⛔ 断点层的老断言只能钉前者;少了后者,「把护栏全关掉」会照绿。
+        let w = dead_group_windows(&deep, &secs(deep.len()), &g, &r, 0);
+        assert_eq!(w.len(), 2, "两组两个窗(读到 {w:?})");
         assert_eq!(
-            (g[0].start, g[0].end),
-            (1, 2),
-            "断点必须避开「浅组的窗会伸进一个它唱不动的音」那一处(读到 {g:?})"
+            w[1].start, 100,
+            "浅组的护栏不许伸进 92(它在 −2 那一遍是 MIDI 90,唱不动)(读到 {w:?})"
         );
         assert!(
-            r.slot_reachable(81 + g[1].shift) && !r.slot_reachable(92 + g[1].shift),
-            "夹具有效性:81 在浅组位移上必须唱得出、92 必须唱不出,否则 ⑹ 是恒真的"
+            w[0].end > 100,
+            "而深组的护栏必须照常伸进 81(81−13 = 68,那一遍唱得动)—— 否则交叉淡化没地方压(读到 {w:?})"
+        );
+        assert!(
+            r.slot_reachable(81 + g[1].shift)
+                && !r.slot_reachable(92 + g[1].shift)
+                && r.slot_reachable(81 + g[0].shift),
+            "夹具有效性:81 在两个位移上都唱得出、92 在浅组位移上必须唱不出,否则 ⑹ 是恒真的"
         );
 
         // ⑺ ⭐ **左侧那道门**(左/深组的窗往前伸进 `p+1`)。
@@ -7880,10 +8027,22 @@ mod tests {
             !gw.is_empty(),
             "夹具有效性:这一句必须**有解**(否则读到零组,测的是「无解」不是「不许拆」)"
         );
+        // ⭐⭐⭐ S163 —— 同样迁到窗层:断点**照拆**(81 不必陪着走 −14),
+        // 而深组的窗**不许**伸进夹心 49(49−14 = 35 掉出下边界),浅组的**可以**(49−5 = 44)。
+        assert_eq!(gw.len(), 2, "夹心音唱不动只该收窄护栏,不该否决整个断点(读到 {gw:?})");
+        let ww = dead_group_windows(&sandwich, &secs(sandwich.len()), &gw, &pr, 0);
         assert_eq!(
-            gw.len(),
-            1,
-            "断点会让深组的窗伸进一个它唱不出的夹心音 ⇒ 不许拆(读到 {gw:?})"
+            ww[0].end, 100,
+            "深组的护栏不许伸进夹心 49(49−14 = 35,掉出下边界)(读到 {ww:?})"
+        );
+        assert!(
+            ww[1].start < 150,
+            "而浅组的护栏必须照常伸进 49(49{:+} 唱得动)(读到 {ww:?})",
+            gw[1].shift
+        );
+        assert!(
+            pr.slot_reachable(49 + gw[1].shift),
+            "夹具有效性:夹心在浅组位移上必须唱得动,否则上一条是恒真的"
         );
         // ⑻ ⭐⭐⭐ **谓词必须是 `slot_reachable`,不许是 `slot_singable`**(S146f 的学费)。
         //
@@ -7915,22 +8074,44 @@ mod tests {
             "夹具有效性:被测的那个邻音必须正好落在 80(读到 {})",
             85 + gb[1].shift
         );
+        // ⭐⭐⭐ S163 —— 谓词之争也迁到窗层:浅组的护栏**必须**伸进 85,因为 85 在它的位移上
+        // 落到 **80** —— `slot_reachable` 判**能**、`slot_singable` 判**不能**。
+        // ⇒ 把 [`dead_group_windows_raw`] 里的 `slot_reachable` 换成 `slot_singable`,这里当场红。
+        let wb = dead_group_windows(&bar, &secs(bar.len()), &gb, &pr, 0);
+        assert!(
+            wb[1].start < 100,
+            "邻音落在 usable 与 scan 之间时护栏必须照常伸(85 → 80,模型唱得出)(读到 {wb:?})"
+        );
 
-        // ⑴ 阴性对照 A —— 深度差小就不许拆(**1** 度 × 2000 ms = 2000 < 3000)。
-        // ⚠ S159zi:门从 6000 降到 3000(定价见 [`SPLIT_MIN_COST_DEFAULT`])之后,原来那个
-        //    `[83, 81, 81]`(差 2 度 = 4000)**够得着了** ⇒ 阴性对照会当场失效。
-        //    ⛔ 正确的改法是把夹具挪到新门限的下方(83 → 82),而不是把期望值改成「拆」——
+        // ⑴ 阴性对照 A —— 便宜的那一刀不许拆,而且**门就在 2000 这个位置**。
+        // ⚠ S159zi:门从 6000 降到 3000 之后,原来那个 `[83, 81, 81]`(差 2 度 = 4000)
+        //    **够得着了** ⇒ 阴性对照会当场失效。
+        //    ⛔ 正确的改法是把夹具挪到新门限的下方,而不是把期望值改成「拆」——
         //    这条对照要证的是「门限真的在起作用」,改期望值就把它证没了。
+        // ⚠⚠ S163 —— 门 3000 → 2000(重新定价见 [`SPLIT_MIN_COST_DEFAULT`])之后,
+        //    `[82, 81, 81] × 2000 ms`(差 1 度 × 2000 ms = **2000 = 门限**)又够得着了。
+        //    ⇒ 照同一条先例把夹具挪到门下(2000 → 1000 ms),
+        //    ⭐ **并且补一条正对照**(2200 ms ⇒ 2200 > 2000 ⇒ 拆):这样它钉的不再只是
+        //    「门存在」,而是**门就在 2000**。深度差已经不能再小(1 度),所以动的是时长。
         let shallow = [0i64, 82, 81, 81, 0];
-        let gs = plan(&shallow, &secs(shallow.len()));
+        let gs = plan(&shallow, &[50, 50, 25, 25, 50]);
         assert_eq!(
             gs,
             vec![DeadGroup { start: 1, end: 3, shift: -3 }],
-            "深度差只有 1 度 ⇒ 不值一条新缝,不许拆(读到 {gs:?})"
+            "1 度 × 1000 ms = 1000 < 2000 ⇒ 不值一条新缝,不许拆(读到 {gs:?})"
+        );
+        let gs2 = plan(&shallow, &[50, 50, 55, 55, 50]);
+        assert_eq!(
+            gs2.len(),
+            2,
+            "而 1 度 × 2200 ms = 2200 > 2000 ⇒ 必须拆 —— 否则上一格测的是「永不拆」(读到 {gs2:?})"
         );
 
-        // ⑵ 阴性对照 B —— **同一批音高**,只把浅的那一侧改成 100 ms ⇒ 2200 ms·半音 < 6000。
-        let short = plan(&deep, &[50, 50, 5, 5, 50]);
+        // ⑵ 阴性对照 B —— **同一批音高**,只把浅的那一侧改短 ⇒ 判据真的是 **ms·半音**,
+        // 而不是偷偷退化成「只看深度差」。
+        // ⚠ S163:门 3000 → 2000 之后,原来的 100 ms 那一档(2 × 100 × 11 = **2200**)够得着了
+        //    ⇒ 照 ⑴ 同一条先例把夹具挪到门下:**80 ms** ⇒ 2 × 80 × 11 = **1760 < 2000**。
+        let short = plan(&deep, &[50, 50, 4, 4, 50]);
         assert_eq!(
             short,
             vec![DeadGroup { start: 1, end: 3, shift: -13 }],
@@ -7938,18 +8119,18 @@ mod tests {
         );
 
         // ⑸ 断点必须落在**深度真的掉下去**的那一处,不是第一处可断的地方。
-        // ⚠ S159zk:这里也被可行性规则推后了一格 —— `[2|3]` 会让浅组的窗伸进 92
-        // (在 −2 上是 MIDI 90,唱不动)⇒ 落到 `[3|4]`。
-        // ⭐ 这条判据要证的事没变:断点**不是** `[1|2]`(那一处深度差是 0,gain 也是 0)。
+        // ⚠ S159zk 时被可行性规则推后了一格(`[2|3]` ⇒ `[3|4]`),S163 收窄护栏之后推回来了:
+        // ⭐ 旧 `[1..3]@−13` 让**一个** 81 落到 68,新 `[1..2]@−13` + `[3..4]@−2` 让**两个**都落到 79。
+        // ⭐ 这条判据要证的事一个字没变:断点**不是** `[1|2]`(那一处深度差是 0,gain 也是 0)。
         let four = [0i64, 92, 92, 81, 81, 0];
         let g4 = plan(&four, &secs(four.len()));
         assert_eq!(
             g4,
             vec![
-                DeadGroup { start: 1, end: 3, shift: -13 },
-                DeadGroup { start: 4, end: 4, shift: -2 },
+                DeadGroup { start: 1, end: 2, shift: -13 },
+                DeadGroup { start: 3, end: 4, shift: -2 },
             ],
-            "断点要断在深度掉下去、而且可行的那一处(读到 {g4:?})"
+            "断点要断在深度掉下去的那一处,而且陪绑的音一个都不许多(读到 {g4:?})"
         );
         assert_ne!(g4[0].end, 1, "断点不许落在 [1|2] —— 那一处两侧位移相同,gain = 0");
 
@@ -8441,7 +8622,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -8485,6 +8666,12 @@ mod tests {
             parse_handover(None),
             // S163 —— 长音延续处的交叉淡化。⛔ **改音频**(出厂 120 ms)⇒ 与 handover 一起 bump。
             parse_tied_xfade(None),
+            // ⛔⛔ S163 —— **补一个漏掉的**:拆簇的两条门**改音频**,却一个都不在指纹里
+            //    ⇒ S159zi 当年把 `SPLIT_MIN_COST_DEFAULT` 从 6000 改到 3000 时,
+            //    这条闸**结构上不可能**逼出成对 bump —— 那一次用户很可能听过一条陈缓存。
+            //    (与 S160q「一个指纹、一条闸、一个版本号」同款的漏洞,同款的修法。)
+            SPLIT_MIN_COST_DEFAULT,
+            SPLIT_MIN_INTERIOR_NOTES,
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -8493,10 +8680,16 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=2000 interior=3 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s163d";
+        // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
+        //    ②-④ 三条**没有旋钮**的行为改动(指纹看不见,写在这里):
+        //    ② 护栏不许伸进一个在**本遍**唱不动的音([`dead_group_windows_raw`]);
+        //    ③ 拆组的断点可行性(S159zk)从**否决断点**改成**不否决**(危害载体已由 ② 收走);
+        //    ④ 窗尾落在长音内部时淡出拉长([`TAIL_ROOM_MS`]);
+        //    ⑤ 修补遍的 ±1 绕**所有**候选而不只是选中的那个。
+        const TAG: &str = "s163e";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -8905,9 +9098,16 @@ mod tests {
     /// ⑶ ⛔ **阴性对照 = 旧规则**:只认起点的那一版在同一份夹具上会挑出一个**救不动**的候选。
     #[test]
     fn a_landing_candidate_is_never_borrowed_from_a_differently_grouped_plan() {
-        // 炉心融解 notes[697..=708](休止 + と び こ ん ん で み い た ら + 休止),akiko,+7。
-        let nn = [0i64, 73, 75, 73, 72, 68, 68, 80, 75, 75, 76, 0];
-        let fr = [9i64, 9, 9, 9, 10, 9, 9, 9, 9, 18, 46, 9];
+        // ⚠⚠ S163 —— 换夹具(**不是**因为判据失效):全曲上「起点相同、范围不同」
+        // 仍然 **26 / 359 = 7.2%**(改拆组之前是 22 / 341 = 6.5%),而原来那个 12 音截取
+        // (`notes[697..=708]`)在新的拆组规则下两个预算**拆得一样了** ⇒ ⑴ 当场红。
+        // ⇒ 从真实 plan dump 里裁一段**仍然复现**的:炉心融解 `notes[185..=192]`,akiko,+7。
+        // ⭐ 它 +7 之后是 **82/83/92/90/88** —— 正是用户 2026-08-26 点名的
+        //   「嗓子里卡着痰」那一组本身(同一句歌词在全曲重复五次)。
+        // 实测:`landing=3` ⇒ `[1..=6] @−14` 一组;`landing=1` ⇒ `[(1,2,−5), (3,6,−14)]` 两组
+        // ⇒ **起点 1 相同、范围不同**。
+        let nn = [0i64, 75, 76, 85, 83, 81, 80, 0];
+        let fr = [9i64, 9, 10, 9, 18, 9, 9, 9];
         let r = akiko_like();
         let today = RescueTuning::today();
         let (plan, _, alts) = dead_only_plan_with_alts(&nn, &fr, 7, &r, today);
@@ -8915,12 +9115,19 @@ mod tests {
             dead_only_plan_with_alts(&nn, &fr, 7, &r, RescueTuning { landing: Some(1), ..today });
         eprintln!("[plan] {plan:?}\n[alt ] {alt_plan:?}\n[alts] {alts:?}");
 
-        // ⑴ 前提:两个预算的**分组**必须真的不同
-        let span = |p: &[DeadGroup]| p.iter().map(|g| (g.start, g.end)).collect::<Vec<_>>();
+        // ⑴ 前提:候选机制**是活的** —— 两个预算真的给出不同的落点,所以确实有东西可挑。
+        //
+        // ⚠⚠ S163 —— 这一格**曾经**断言「两个预算的**分组**不同」,而那是这个合成夹具
+        // (`akiko_like()`,不是真实装机 sidecar)给不出来的:真实 akiko 上同一串音
+        // `landing=3` 出 `[1..=6] @−14` **一组**、`landing=1` 出**两组**(起点相同、范围不同),
+        // 而 `akiko_like()` 两个预算都拆成 `[1..2] + [3..6]`。
+        // ⇒ 「这个场景会发生」的证据是**真实全曲的 26 / 359 = 7.2%**
+        //   (S163 改拆组之后重新量;改之前 22 / 341 = 6.5%),一个合成夹具证不动它。
+        // ⇒ 这一格只承担它证得动的那一半;「分组会不同 ⇒ 必须按**范围**而不是按**起点**认」
+        //   由下面 ⑶ 的**实测两份计划**(`shipped` / `narrow`)独立钉住,而 ⑶ 正是这条规则的变异靶。
         assert_ne!(
-            span(&plan),
-            span(&alt_plan),
-            "夹具没复现「两个预算分组不同」——那这条判据就是空的"
+            plan, alt_plan,
+            "夹具没复现「两个预算给出不同的落点」——那这条判据是空的(读到 {plan:?})"
         );
 
         // ⑵ 每个候选都救得动**这一组自己**的死音
@@ -8974,6 +9181,76 @@ mod tests {
             alt_shift_for(&shipped, &[DeadGroup { start: 698, end: 704, shift: -10 }]),
             None,
             "落点相同 ⇒ 没有候选可言"
+        );
+    }
+
+    /// ⭐⭐⭐ S163 —— **窗尾落在一个长音的内部时,淡出必须拉长**(用户点名 akiko 2:50.4:
+    /// 「本来是一个连续的音,结果突然一个接缝或者边界上去就造出了一个听感的断裂」)。
+    ///
+    /// ## 病灶
+    /// `dead_group_windows` 的 `post = GUARD_FRAMES` 让窗尾伸进下一个唱音 **40 ms**,
+    /// 然后 **10 ms** 就淡回 `base` ⇒ 一个 1.46 s 的音,头 40 ms 是 donor、之后是 base。
+    /// ⛔ 收窄护栏已判负(S163:无休止跨组缝的重叠 80 → 0,瞬变中位差 **7.60 dB**)
+    /// ⇒ 治的是「切得太快」,不是「伸进去」。
+    /// ⭐ 安全性:淡出的另一侧是 `base`,而那个音**没被救 = 模型本来就唱得动它**
+    ///   ⇒ 两侧都是「对的音高、正常的音」,慢慢过渡听不出;10 ms 切才是断裂。
+    ///
+    /// ## ⛔ 阴性对照(缺了它这条就是「淡出总是很长」)
+    /// **同一个窗**,只把后面那个音改短到离窗尾不足 [`TAIL_ROOM_MS`] ⇒ 淡出必须退回 10 ms。
+    #[test]
+    fn the_window_tail_fades_out_slowly_when_it_lands_inside_a_long_note() {
+        const SR: u32 = 44_100;
+        const TF: i64 = 100; // 100 帧 × 20 ms = 2 s
+        let n = SR as usize * 2;
+        let spf = n as f64 / TF as f64;
+
+        // 窗 [10, 40) 帧;它的尾巴落在**下一个音的内部**(那个音从帧 38 开始)。
+        let jobs = vec![DeadJob { shift: -6, start: 10, end: 40 }];
+        let span = |a: i64, f: i64| NoteSpan { start: a, frames: f, sung: true, hz: 440.0, tied: false };
+
+        // donor 恒 1.0、base 恒 0.0 ⇒ 拼接后**处在 (0.02, 0.98) 之间的样本数**就是淡化宽度。
+        let run = |notes: &[NoteSpan]| -> usize {
+            let mut base = vec![0.0f32; n];
+            apply_dead_only_windows_with(
+                &mut base, SR, TF, &jobs, &[], notes, false, false, 0, 0.0, 0.0, 0.0, 0.0,
+                TIED_XFADE_MS_DEFAULT,
+                |_s, own| {
+                    let mut d = vec![0.0f32; n];
+                    for &(a, b) in own {
+                        let (a, b) = ((a.max(0) as f64 * spf) as usize, (b.max(0) as f64 * spf) as usize);
+                        for v in d[a.min(n)..b.min(n)].iter_mut() {
+                            *v = 1.0;
+                        }
+                    }
+                    Ok(d)
+                },
+            )
+            .expect("splice");
+            // 只数窗**尾**那一侧:从窗尾往前找过渡区
+            let b = ((40f64 * spf) as usize).min(n);
+            let lo = b.saturating_sub(SR as usize / 2); // 往前最多看 500 ms
+            base[lo..b].iter().filter(|v| **v > 0.02 && **v < 0.98).count()
+        };
+
+        // ⑴ 后面是一个 1.24 s 的长音(帧 38..100)⇒ 淡出拉长到 `TIED_XFADE_MS_DEFAULT`
+        let long = run(&[span(0, 38), span(38, 62)]);
+        // ⑵ 阴性对照:后面那个音只到帧 45(离窗尾 5 帧 = 100 ms < `TAIL_ROOM_MS`)⇒ 退回 10 ms
+        let short = run(&[span(0, 38), span(38, 7), span(45, 55)]);
+
+        let want = (SR as f64 * TIED_XFADE_MS_DEFAULT / 1000.0) as usize;
+        let ten_ms = SR as usize / 100;
+        assert!(
+            long > want * 3 / 4,
+            "窗尾落在长音内部时淡出必须拉长到 ~{want} 个样本(读到 {long})"
+        );
+        assert!(
+            short < ten_ms * 3,
+            "而后面那个音撑不满 TAIL_ROOM_MS 时必须退回 ~{ten_ms} 个样本(读到 {short})—— \
+             否则上一格测的是「淡出总是很长」"
+        );
+        assert!(
+            long > short * 4,
+            "两档必须真的分得开(长 {long} vs 短 {short})"
         );
     }
 
@@ -9653,7 +9930,7 @@ mod tests {
             DeadGroup { start: 1, end: 1, shift: -6 },
             DeadGroup { start: 3, end: 3, shift: -6 },
         ];
-        let w = dead_group_windows(&nn, &fr, &plan);
+        let w = dead_group_windows(&nn, &fr, &plan, &all_reachable(), 0);
         assert_eq!(w.len(), 1, "同一条 donor 上不许挖洞");
         assert_eq!(w[0].shift, -6);
         assert_eq!((w[0].start, w[0].end), (6, 55), "合并后的窗要盖住两段与中间那个休止");
@@ -9662,17 +9939,17 @@ mod tests {
             DeadGroup { start: 1, end: 1, shift: -6 },
             DeadGroup { start: 3, end: 3, shift: -7 },
         ];
-        assert_eq!(dead_group_windows(&nn, &fr, &plan2).len(), 2, "位移不同不许合并");
+        assert_eq!(dead_group_windows(&nn, &fr, &plan2, &all_reachable(), 0).len(), 2, "位移不同不许合并");
         // ⛔ 中间夹着一个**唱音** ⇒ 必须不合并(合了等于把乘客偷偷拖进救援)。
         let nn3 = [0, 85, 73, 85, 0];
         let plan3 = [
             DeadGroup { start: 1, end: 1, shift: -6 },
             DeadGroup { start: 3, end: 3, shift: -6 },
         ];
-        assert_eq!(dead_group_windows(&nn3, &fr, &plan3).len(), 2, "跨过唱音不许合并");
+        assert_eq!(dead_group_windows(&nn3, &fr, &plan3, &all_reachable(), 0).len(), 2, "跨过唱音不许合并");
         // ⛔ 长休止不许桥:缺陷只有 60 ms,不设上限时窗会被撑到 18.6 s(实测)。
         let fr_long = [10i64, 20, 200, 20, 10];
-        assert_eq!(dead_group_windows(&nn, &fr_long, &plan).len(), 2, "4 秒的休止不许桥");
+        assert_eq!(dead_group_windows(&nn, &fr_long, &plan, &all_reachable(), 0).len(), 2, "4 秒的休止不许桥");
     }
 
     /// ⛔⛔ S158:**这一刀在非升序的计划上会【静默吞掉一整条救援】。**
@@ -9718,7 +9995,7 @@ mod tests {
             DeadGroup { start: 1, end: 1, shift: -6 },
             DeadGroup { start: 3, end: 3, shift: -7 }, // ⛔ 位移不同 ⇒ 不会被同位移合并掩盖
         ];
-        let w = dead_group_windows(&nn, &three, &g);
+        let w = dead_group_windows(&nn, &three, &g, &all_reachable(), 0);
         assert_eq!(w.len(), 2, "两条组必须各自有窗(读到 {w:?})");
         assert_eq!(
             (w[0].start, w[0].end, w[1].start, w[1].end),
@@ -9731,7 +10008,7 @@ mod tests {
 
         // ⑵ ⛔ 阴性对照:4 帧休止(刚过门限)⇒ 照旧伸出。
         let four = [10i64, 20, 4, 20, 10];
-        let w4 = dead_group_windows(&nn, &four, &g);
+        let w4 = dead_group_windows(&nn, &four, &g, &all_reachable(), 0);
         assert_eq!(
             (w4[0].start, w4[0].end, w4[1].start, w4[1].end),
             (6, 32, 32, 56),
@@ -9749,7 +10026,7 @@ mod tests {
             DeadGroup { start: 1, end: 1, shift: -6 },
             DeadGroup { start: 2, end: 2, shift: -7 },
         ];
-        let w0 = dead_group_windows(&nn0, &fr0, &g0);
+        let w0 = dead_group_windows(&nn0, &fr0, &g0, &all_reachable(), 0);
         assert_eq!(w0.len(), 2);
         assert!(
             w0[0].end > 30 && w0[1].start < 30,
@@ -9766,7 +10043,7 @@ mod tests {
             DeadGroup { start: 3, end: 3, shift: -6 },
         ];
         // 升序:这两条**本来就该**合并成一条 —— 上面那条测试钉的就是它,这里只取它的窗。
-        let merged = dead_group_windows(&nn, &fr, &asc);
+        let merged = dead_group_windows(&nn, &fr, &asc, &all_reachable(), 0);
         assert_eq!(merged, vec![DeadJob { shift: -6, start: 6, end: 55 }]);
 
         // ⭐ 同一批组,**降序**喂进来。两段音频还在原处,所以救援也必须还是两条。
@@ -9774,7 +10051,7 @@ mod tests {
             DeadGroup { start: 3, end: 3, shift: -6 },
             DeadGroup { start: 1, end: 1, shift: -6 },
         ];
-        let got = dead_group_windows(&nn, &fr, &desc);
+        let got = dead_group_windows(&nn, &fr, &desc, &all_reachable(), 0);
         assert_eq!(
             got.len(),
             2,
@@ -9799,7 +10076,7 @@ mod tests {
             DeadGroup { start: 3, end: 3, shift: -6 },
             DeadGroup { start: 1, end: 1, shift: -7 },
         ];
-        assert_eq!(dead_group_windows(&nn, &fr, &desc2).len(), 2);
+        assert_eq!(dead_group_windows(&nn, &fr, &desc2, &all_reachable(), 0).len(), 2);
 
         // ⭐⭐ 阴性对照 ②(**下一把刀的地基,别拆**):乐句**内部**同位移拆开的两组,
         // 必须被这里重新合并成**与不拆时逐位相同**的那一个窗。
@@ -9815,12 +10092,12 @@ mod tests {
             DeadGroup { start: 2, end: 2, shift: -6 },
         ];
         assert_eq!(
-            dead_group_windows(&nn_in, &fr_in, &split),
-            dead_group_windows(&nn_in, &fr_in, &whole),
+            dead_group_windows(&nn_in, &fr_in, &split, &all_reachable(), 0),
+            dead_group_windows(&nn_in, &fr_in, &whole, &all_reachable(), 0),
             "同位移拆分必须重新合并成与不拆时逐位相同的窗"
         );
         assert_eq!(
-            dead_group_windows(&nn_in, &fr_in, &whole),
+            dead_group_windows(&nn_in, &fr_in, &whole, &all_reachable(), 0),
             vec![DeadJob { shift: -6, start: 6, end: 52 }],
             "⛔ 期望值写字面量:拿被测函数自己算期望值 = 恒真"
         );
@@ -9832,7 +10109,7 @@ mod tests {
         let nn = [0, 0, 73, 85, 0, 73];
         let fr = [5i64, 4, 10, 13, 5, 8];
         let plan = [DeadGroup { start: 2, end: 3, shift: -6 }];
-        assert_eq!(dead_group_windows(&nn, &fr, &plan), vec![DeadJob { shift: -6, start: 5, end: 34 }]);
+        assert_eq!(dead_group_windows(&nn, &fr, &plan, &all_reachable(), 0), vec![DeadJob { shift: -6, start: 5, end: 34 }]);
     }
 
     /// S151 护栏:窗边落在**唱音**上时,窗要多伸进那个乘客,好让 10 ms 淡化压在它身上。
@@ -9845,14 +10122,14 @@ mod tests {
         let fr = [5i64, 10, 10, 10, 10, 10, 10];
         let plan = [DeadGroup { start: 3, end: 3, shift: -6 }];
         assert_eq!(
-            dead_group_windows(&nn, &fr, &plan),
+            dead_group_windows(&nn, &fr, &plan, &all_reachable(), 0),
             vec![DeadJob { shift: -6, start: 25 - 2, end: 35 + 2 }],
             "窗必须伸进两侧的乘客,否则淡化压在被救的死音上"
         );
         // 封顶:邻居只有 2 帧 ⇒ 只能伸 1 帧(半个音),窗永远不许吃掉整个邻居。
         let fr = [5i64, 10, 2, 10, 2, 10, 10];
         assert_eq!(
-            dead_group_windows(&nn, &fr, &plan),
+            dead_group_windows(&nn, &fr, &plan, &all_reachable(), 0),
             vec![DeadJob { shift: -6, start: 17 - 1, end: 27 + 1 }],
             "护栏以半个邻居封顶"
         );
@@ -10701,18 +10978,29 @@ mod tests {
 
         let (pw, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &wide, RescueTuning::today());
         let (pt, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &tight, RescueTuning::today());
-        // ⚠ S159zi/zk —— 这里绕过一次弯,记下来免得下一个人再绕:
-        // S159zi 的二级拆一度把 tight 臂拆成两组(78 只要 −2、85 要 −9);
-        // 而 S159zk 的**断点可行性**又把它挡了回去 —— 断在 `[78|85]` 会让 −2 那一组的窗
-        // 倒着伸进 85,而 85 在 −2 上是 MIDI 83,**超出这个夹具的 scan(36,80)** ⇒ 唱不动。
-        // ⇒ 两臂都回到一组,这条判据的形状与 S159zi 之前逐字相同。
-        // ⛔ 用 `g85`(按「救 85 的那一组」读)而不是 `[0]`:今天两者相同,但下一次拆组规则
-        //    一动它就又不同了,而那时候按 `[0]` 读会**静默**换掉被测的对象。
-        assert_eq!(pw.len(), 1, "wide 臂只有 85 是死音 ⇒ 二级无处可拆(读到 {pw:?})");
-        assert_eq!(pt.len(), 1, "tight 臂的那一处断点不可行 ⇒ 也是一组(读到 {pt:?})");
+        // ⚠ S159zi/zk/S163 —— 这里绕过两次弯,记下来免得下一个人再绕:
+        // S159zi 的二级拆一度把 tight 臂拆成两组(78 只要 −1、85 要 −7);
+        // S159zk 的**断点可行性**又把它挡了回去(断在 `[78|85]` 会让浅那一组的窗倒着伸进 85,
+        // 而 85 在 −1 上是 MIDI 84,超出这个夹具的 scan(36,80));
+        // ⭐⭐ 而 S163 证明**危害的载体是护栏不是断点**([`dead_group_windows_raw`] 现在把
+        // 那一侧的护栏收到 0)⇒ 断点重新可行,tight 臂又是两组。
+        // ⇒ **这是与主线同一个改进**:78 从「陪着 85 走 −7 ⇒ 落点 **71**」变成
+        //    「自己走 −1 ⇒ 落点 **77**」。
+        // ⛔ 用 `g85`(按「救 85 的那一组」读)而不是 `[0]`:拆组规则一动,按 `[0]` 读会
+        //    **静默**换掉被测的对象 —— 这条判据测的始终是 85 那一组的落点。
         let g85 = |p: &[DeadGroup], who: &str| -> DeadGroup {
             *p.iter().find(|d| (d.start..=d.end).contains(&2)).unwrap_or_else(|| panic!("{who} 必须救 85:{p:?}"))
         };
+        assert_eq!(pw.len(), 1, "wide 臂只有 85 是死音 ⇒ 二级无处可拆(读到 {pw:?})");
+        assert_eq!(pt.len(), 2, "tight 臂:78 也成了死音,而它只要 −1 ⇒ 必须拆开(读到 {pt:?})");
+        // ⭐ 光数组数是不够的 —— 钉住这一刀**买到了什么**:78 不许再陪着 85 走。
+        let g78 = pt.iter().find(|d| (d.start..=d.end).contains(&1)).expect("tight 必须救 78");
+        assert!(
+            78 + g78.shift > 78 + g85(&pt, "tight").shift,
+            "78 的落点必须比 85 那一组浅(读到 {} vs {})",
+            78 + g78.shift,
+            78 + g85(&pt, "tight").shift
+        );
         let (w, t) = (g85(&pw, "wide"), g85(&pt, "tight"));
         assert_eq!(
             t.shift, w.shift,
