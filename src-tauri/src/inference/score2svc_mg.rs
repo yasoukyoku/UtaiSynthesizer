@@ -45,6 +45,19 @@ const WORK: &str = r"D:\MyDev\TESTING\不为人所知的鹅妈妈童谣";
 /// 就是这个坑的产物)⇒ 一场一目录既是给人看的,也顺带把「拿错臂」的面积缩小。
 ///
 /// ⚠ 只作用在**写**上。`load_score()` / `mg_notes.json` 等读侧仍固定在 `probe\`。
+/// ⭐ S162 —— 台子跑在哪个 EP 上。出厂 `Cpu`(与今天逐位相同);`UTAI_MG_DEVICE=cuda|auto` 换。
+///
+/// ⛔ 原来那行注释写着「deterministic + no GPU setup in a test」——**「deterministic」是假的**
+/// (S162 实测:同一条命令跑两遍,拼接前的 `base.f32` 哈希就不同)。剩下的理由只有
+/// 「测试里不想拉 GPU」,而**迭代一条整曲臂在 CPU 上要 5-7 分钟**,那是查一个缺陷的主要成本。
+fn mg_device() -> DeviceConfig {
+    match std::env::var("UTAI_MG_DEVICE").ok().as_deref().map(str::trim) {
+        Some("cuda") => DeviceConfig::Cuda { device_id: 0 },
+        Some("auto") => DeviceConfig::Auto,
+        _ => DeviceConfig::Cpu,
+    }
+}
+
 fn mg_out_dir() -> std::path::PathBuf {
     match std::env::var("UTAI_MG_OUTDIR") {
         Ok(s) if !s.trim().is_empty() => {
@@ -725,7 +738,7 @@ fn mg_cv_cond_grid() {
         let _ = bld.commit();
     }
     let engine = OnnxEngine::new();
-    engine.set_device(DeviceConfig::Cpu); // no GPU setup in a test
+    engine.set_device(mg_device()); // no GPU setup in a test
     // ⛔ S162:这里原本写着「deterministic」—— **那是假的**。实测同一条命令跑两遍,
     // 拼接前的台身 `base.f32` 哈希就不同(幅度谱 |Δ| 中位 0.28-0.94 dB)。
     // 要真的复现,开 `UTAI_ORT_DETERMINISTIC=1` / `UTAI_ORT_INTRA_THREADS=1`(见 `engine.rs`)。
@@ -899,7 +912,7 @@ fn mg_render_rvc() {
         let _ = bld.commit();
     }
     let engine = OnnxEngine::new();
-    engine.set_device(DeviceConfig::Cpu); // no GPU setup in a test
+    engine.set_device(mg_device()); // no GPU setup in a test
     // ⛔ S162:这里原本写着「deterministic」—— **那是假的**。实测同一条命令跑两遍,
     // 拼接前的台身 `base.f32` 哈希就不同(幅度谱 |Δ| 中位 0.28-0.94 dB)。
     // 要真的复现,开 `UTAI_ORT_DETERMINISTIC=1` / `UTAI_ORT_INTRA_THREADS=1`(见 `engine.rs`)。
@@ -1075,7 +1088,7 @@ impl MgSovitsRig {
             let _ = bld.commit();
         }
         let engine = OnnxEngine::new();
-        engine.set_device(DeviceConfig::Cpu);
+        engine.set_device(mg_device());
         let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
         let s2cv = engine
             .load_model_with(
@@ -1446,7 +1459,7 @@ impl MgRvcRig {
             let _ = bld.commit();
         }
         let engine = OnnxEngine::new();
-        engine.set_device(DeviceConfig::Cpu);
+        engine.set_device(mg_device());
         let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
         let s2cv = engine
             .load_model_with(
@@ -1522,6 +1535,14 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
     let fr: Vec<i64> = triples.iter().map(|t| t.frames).collect();
     let (auto_plan, unfixable) =
         super::super::vocal_range::dead_only_plan(&nn, &fr, transpose, &range);
+    // ⭐ S162 —— 台子也走候选,否则离线读数与生产不是同一条链。
+    let (_, _, plan_alts0) = super::super::vocal_range::dead_only_plan_with_alts(
+        &nn,
+        &fr,
+        transpose,
+        &range,
+        super::super::vocal_range::RescueTuning::from_env(),
+    );
     let plan = match std::env::var("UTAI_MG_PLAN") {
         Ok(spec) if !spec.trim().is_empty() => mg_parse_plan_override(&spec, &nn),
         _ => auto_plan.clone(),
@@ -1551,7 +1572,9 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
         );
     }
 
-    let jobs = super::super::vocal_range::dead_group_windows(&nn, &fr, &plan);
+    // ⛔ 候选对齐到**窗**(见 `dead_group_windows_alts`)。
+    let (jobs, plan_alts) =
+        super::super::vocal_range::dead_group_windows_alts(&nn, &fr, &plan, &plan_alts0);
     let total_frames: i64 = fr.iter().map(|f| (*f).max(0)).sum();
 
     // ── 执行层:base 一遍 + 每个 distinct shift 一遍 donor,拼接由库函数编排 ──
@@ -1595,11 +1618,13 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
         }
         let _ = std::fs::write(dir.join("total_frames.txt"), total_frames.to_string());
     }
-    super::super::vocal_range::apply_dead_only_windows(
+    super::super::vocal_range::apply_dead_only_windows_alts(
         &mut result.audio,
         sr,
         total_frames,
         &jobs,
+        // ⭐ S162 —— 台子也走落点候选,否则离线读数与生产不是同一条链。
+        if super::super::vocal_range::landing_pick() { &plan_alts } else { &[] },
         false, // 与生产同:donor 共用 base 的归一前峰 ⇒ 不需要 active-RMS 猜台阶
         |s, own| {
             // S159 —— 与生产同一条:保留区间由**拥有帧→样本地图的人**算,闭包只把 `own` 传进去。
@@ -2290,7 +2315,7 @@ fn mg_render_rvc_oversampled() {
         let _ = bld.commit();
     }
     let engine = OnnxEngine::new();
-    engine.set_device(DeviceConfig::Cpu);
+    engine.set_device(mg_device());
     let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
     let s2cv768 = engine.load_model_with(&aux.join("score2cv_768.onnx"), false).unwrap();
     let cv768 = engine.load_model_with(&aux.join("contentvec_768l12.onnx"), false).unwrap();
@@ -2502,7 +2527,7 @@ fn mg_cover_range_replay() {
         let _ = bld.commit();
     }
     let engine = OnnxEngine::new();
-    engine.set_device(DeviceConfig::Cpu);
+    engine.set_device(mg_device());
     let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
     let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
     let rmvpe_mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
@@ -2573,7 +2598,7 @@ fn mg_cover_deadonly_smoke() {
         let _ = bld.commit();
     }
     let engine = OnnxEngine::new();
-    engine.set_device(DeviceConfig::Cpu);
+    engine.set_device(mg_device());
     let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
     let cv768 = engine.load_model_with(&aux.join("contentvec_768l12.onnx"), false).unwrap();
     let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
@@ -2680,7 +2705,7 @@ fn mg_render_cover() {
         let _ = bld.commit();
     }
     let engine = OnnxEngine::new();
-    engine.set_device(DeviceConfig::Cpu);
+    engine.set_device(mg_device());
     let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
     let cv768 = engine.load_model_with(&aux.join("contentvec_768l12.onnx"), false).unwrap();
     let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();

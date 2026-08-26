@@ -771,6 +771,28 @@ pub fn dead_only_plan_with(
     range: &SpeakerRange,
     tune: RescueTuning,
 ) -> (Vec<DeadGroup>, Vec<(usize, usize)>) {
+    let (a, b, _) = dead_only_plan_with_alts(note_nums, frames, transpose, range, tune);
+    (a, b)
+}
+
+/// ⭐ S162 —— [`dead_only_plan_with`],外加每组的**落点候选**(`t1` 里最浅的那个;
+/// 与 pick 相同时为 `None`)。
+///
+/// ## ⛔ 它为什么存在
+/// 用户 2026-08-26:「akiko 的 ぴゃ 之前是达到过的」——**查实了,是退化**:
+/// `land_scan` 实测 **落点关(S157c 之前)⇒ ぴゃ 落 78(好)**,**落点=3(今天)⇒ 落 77(坏)**。
+/// ⛔ 但翻回旧默认会毁掉 S157c 的实质作用(薄区死音 akiko 30%→12% / yachiyo 34%→3%,
+///    两把独立尺子 + Fisher p=0.0026);换全局破法也判负(241 个音:thin 赢 63 / shallow 赢 29,
+///    塌掉 6→9)。⇒ **只能自适应:两个候选都渲,按实测选。**
+/// ⭐ akiko 的 ぴゃ:`t1 = {−12,−13,−14}`,pick = −13,**候选 = −12 = 正确答案**。
+/// ⭐ 代价已量:akiko 多 **3 个浅 shift**;yuyuko / 东雪莲 / yachiyo **多 0 个**。
+pub fn dead_only_plan_with_alts(
+    note_nums: &[i64],
+    frames: &[i64],
+    transpose: i64,
+    range: &SpeakerRange,
+    tune: RescueTuning,
+) -> (Vec<DeadGroup>, Vec<(usize, usize)>, Vec<Option<i64>>) {
     let trim = tune.trim;
     let eff = |n: i64| (n + transpose).clamp(1, 127); // mirror transpose_note_pitch's clamp
     let ms = |from: usize, to: usize| -> f32 {
@@ -778,6 +800,7 @@ pub fn dead_only_plan_with(
         f as f32 * 1000.0 / super::score2svc::CV_FPS as f32
     };
     let mut out = Vec::new();
+    let mut alts: Vec<Option<i64>> = Vec::new();
     let mut unfixable = Vec::new();
     let mut i = 0usize;
     while i < note_nums.len() {
@@ -1051,12 +1074,52 @@ pub fn dead_only_plan_with(
                     "range: phrase notes[{i}..={j}] split into {n_clusters} groups — this one is                      [{a}..={b}] at {shift:+} st (the whole phrase would have been {whole_shift:+})"
                 );
             }
+            // ⭐ S162 —— **落点候选**:`t1` 里最浅的那个(= 关掉 `thinner` 那一层会选到的)。
+            // 与 pick 不同时才带出来;渲染时两个都渲、按实测选(见
+            // `apply_dead_only_windows_with` 的 `alts`)。
+            // ⛔ 它**不改今天的 pick** —— 这一笔对音频逐位不变,只是多算一个数。
+            alts.push(None); // ⭐ 候选在函数末尾统一填(见那一段)
             out.push(DeadGroup { start: a, end: b, shift });
             }
         }
         i = j + 1;
     }
-    (out, unfixable)
+    // ⭐⭐ S162 —— **落点候选 = 「S157c 放宽预算之前那条规则」整份计划的落点**,按组的
+    // **起始音**对齐取。
+    //
+    // ⛔ 为什么必须整份重跑,而不是逐组重算:逐组重算拿不到同样的上下文(相同的
+    //    `dead` / 簇边界 / `whole_shift` 继承路径),实测给出过 **−3** 这种**根本救不了
+    //    MIDI 90** 的候选 —— 而日志把它和「没有候选」显示成同一种样子,卡了我两轮。
+    // ⛔ 为什么是这个候选:`land_scan` 实测 **落点关 ⇒ akiko 的「ぴゃ」落 −12(rel −0.2)**、
+    //    **落点=3 ⇒ −13(rel −12.6)**,而用户说「之前是达到过的」——就是这一格。
+    //    ⭐ 而且**不用把 S157c 翻回去**:它的业绩(薄区死音 30%→12%)一个字不动,
+    //    只是多给一个候选,由**实测**去裁。
+    // ⚠ 递归安全:重跑那一份传 `landing: None`,它自己算候选时**不再重跑**(下面那个哨兵)。
+    if tune.landing.is_some() && !ALT_PLAN_REENTRY.with(|f| f.get()) {
+        ALT_PLAN_REENTRY.with(|f| f.set(true));
+        // ⛔⛔ S162 —— 候选用 **`landing = Some(1)`**(最窄的那一档),**不是 `None`**。
+        //    我先写了 `None`,而那条路在 akiko 的「ぴゃ」上给出 **−3** —— 一个**根本救不了
+        //    MIDI 90** 的废值(日志把它和「没有候选」显示成同一种样子,卡了我三轮)。
+        //    根因是我把 `land_scan` 读错了:那 6 档是 `landing = 1,3,5,7,9,12`,**没有「关」**;
+        //    给出好落点(−12,rel −0.2)的是 **`landing=1`**,今天出厂的 `Some(3)` 给 −13(−12.6)。
+        let alt_tune = RescueTuning { landing: Some(1), ..tune };
+        let (alt_plan, _, _) =
+            dead_only_plan_with_alts(note_nums, frames, transpose, range, alt_tune);
+        ALT_PLAN_REENTRY.with(|f| f.set(false));
+        for (gi, g) in out.iter().enumerate() {
+            if let Some(a) = alt_plan.iter().find(|x| x.start == g.start) {
+                if a.shift != g.shift {
+                    alts[gi] = Some(a.shift);
+                }
+            }
+        }
+    }
+    (out, unfixable, alts)
+}
+
+thread_local! {
+    /// ⛔ 防止「算候选」自己再去算候选(那会指数爆炸)。见 `dead_only_plan_with_alts` 末尾。
+    static ALT_PLAN_REENTRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// S159z —— **句内拆组**:一段夹在两个死音【之间】的可唱音,至少这么多个音才值得把组拆开。
@@ -1520,6 +1583,37 @@ fn minimal_rescue_shift_capped(
     landing: Option<i64>,
     ratio_two_cap: i64,
 ) -> Option<i64> {
+    minimal_rescue_shift_capped_tie(
+        dead,
+        all,
+        range,
+        landing,
+        ratio_two_cap,
+        parse_landing_tie_thin(std::env::var("UTAI_RANGE_LANDING_TIE").ok().as_deref()),
+        true,
+    )
+}
+
+/// ⭐ S162 —— [`minimal_rescue_shift_capped`],但 `thinner` 那一层由**参数**给。
+///
+/// ⛔ 存在的理由不是好看:落点的**候选**必须能在**不读进程环境**的前提下算出来 ——
+/// 渲染时要同时拿到「今天的 pick」与「关掉 `thinner` 会选到的那个」,
+/// 而两者若都走 env,就没法在同一次调用里分别求。
+/// (与 `dead_only_plan_with` / `apply_dead_only_windows_with` 同一条规矩。)
+#[allow(clippy::too_many_arguments)]
+fn minimal_rescue_shift_capped_tie(
+    dead: &[i64],
+    all: &[i64],
+    range: &SpeakerRange,
+    landing: Option<i64>,
+    ratio_two_cap: i64,
+    tie_thin: bool,
+    // ⭐ S162 —— 乘客 damage 那一把。`false` ⇒ 直接在 `t1`(只过了**死音** damage 的集合)里取最浅。
+    // ⛔ 这一层才是挡住 akiko「ぴゃ」的那一层:S157 已经查实「挡住 ぴゃ 的是 `worst()` 对
+    //    **死音 ∪ 乘客**取 max(两个乘客落在 MIDI 54/61)」—— 不是 `thinner`。
+    //    我第一版只关了 `thinner`,于是那一组**根本没生成候选**(实测:覆盖它的窗只有一个)。
+    tie_passenger: bool,
+) -> Option<i64> {
     let above = dead.iter().any(|&p| p as f32 > range.usable.1);
     let below = dead.iter().any(|&p| (p as f32) < range.usable.0);
     let candidates: Vec<i64> = if above && below {
@@ -1735,16 +1829,19 @@ fn minimal_rescue_shift_capped(
     let best_dead = pool.iter().map(|&s| worst_dead(s)).fold(f32::INFINITY, f32::min);
     let t1: Vec<i64> =
         pool.into_iter().filter(|&s| worst_dead(s) <= best_dead + LANDING_DAMAGE_EPS).collect();
-    // S162 —— 这一层可以被 `UTAI_RANGE_LANDING_TIE=shallow` 整层跳过(出厂**不跳**)。
+    // S162 —— 这一层由参数控(出厂 `true` = 不跳)。
     //   见 [`parse_landing_tie_thin`] 的 doc:akiko 的 ぴゃ 是它的第一个决定性反例。
-    let t2: Vec<i64> = if parse_landing_tie_thin(
-        std::env::var("UTAI_RANGE_LANDING_TIE").ok().as_deref(),
-    ) {
+    //   ⭐ 传 `false` 得到的就是**落点候选**(`t1` 里最浅的那个)。
+    let t2: Vec<i64> = if tie_thin {
         let best_thin = t1.iter().copied().map(thinner).fold(f32::INFINITY, f32::min);
         t1.into_iter().filter(|&s| thinner(s) <= best_thin + LANDING_THIN_EPS).collect()
     } else {
         t1
     };
+    // ⭐ S162 —— 候选那一路在这里收工:`t1` 里最浅的那个(乘客那一把不参与)。
+    if !tie_passenger {
+        return t2.into_iter().min_by_key(|s| s.abs());
+    }
     // 乘客的 damage 仍然在,只是降到最后一把:同样干净的落点之间,选对乘客更友善的那个。
     let best_all = t2.iter().copied().map(worst).fold(f32::INFINITY, f32::min);
     t2.into_iter().filter(|&s| worst(s) <= best_all + LANDING_DAMAGE_EPS).min_by_key(|s| s.abs())
@@ -2479,19 +2576,11 @@ pub fn cover_dead_plan_with(
 /// S85: dead-group 短语窗(50fps 帧域)——短语区间的帧窗向两侧休止扩展(pre ≤4 帧吃借帧
 /// 辅音、post ≤2 帧吃释放,各以半个间隙为上限=与相邻唱段/拼接窗永不重叠)。
 /// 采样换算与交叉淡化在音频域(本文件 apply_dead_only_windows)。
-pub fn dead_group_windows(
-    note_nums: &[i64],
-    frames: &[i64],
-    plan: &[DeadGroup],
-) -> Vec<DeadJob> {
-    let mut cum = Vec::with_capacity(frames.len() + 1);
-    let mut acc = 0i64;
-    cum.push(0);
-    for &f in frames {
-        acc += f.max(0);
-        cum.push(acc);
-    }
-    let raw: Vec<DeadJob> = plan
+/// [`dead_group_windows`] 的**合并之前**那一半 —— **一组一窗、按序**。
+/// ⛔ 抽出来的唯一理由:[`dead_group_windows_alts`] 必须知道「一个**合并后**的窗覆盖了哪些组」,
+/// 而那要求两边用**同一条**式子(两处各写一遍 = 一处改了另一处不改)。
+fn dead_group_windows_raw(cum: &[i64], note_nums: &[i64], plan: &[DeadGroup]) -> Vec<DeadJob> {
+    plan
         .iter()
         .map(|g| {
             let mut k = g.start;
@@ -2529,7 +2618,70 @@ pub fn dead_group_windows(
             };
             DeadJob { shift: g.shift, start: cum[g.start] - pre, end: cum[g.end + 1] + post }
         })
+        .collect()
+}
+
+/// ⭐⭐ S162 —— [`dead_group_windows`],并把**逐组的落点候选**对齐到**窗**上。
+///
+/// ## ⛔ 为什么需要它 —— 这是一个正确性 bug 的修法
+/// `dead_group_windows` 末尾会 `merge_same_shift_across_rests` **把窗合并**
+/// ⇒ **窗表与组表不是一一对应**。我第一版按**组下标**把候选交给渲染层,结果**张冠李戴**:
+/// akiko 的「ぴゃ」拿到的候选是 **−3**(一个根本救不了 MIDI 90 的值),
+/// 而日志把「拿错候选」与「没有候选」显示成同一种样子,卡了三轮。
+///
+/// 对齐规则:一个窗覆盖哪些组,就看那些组的候选;
+/// ⛔ **只有它们全都相同才带出来**,否则 `None`(合并窗的两半想去不同落点 = 没有单一答案)。
+pub fn dead_group_windows_alts(
+    note_nums: &[i64],
+    frames: &[i64],
+    plan: &[DeadGroup],
+    plan_alts: &[Option<i64>],
+) -> (Vec<DeadJob>, Vec<Option<i64>>) {
+    let jobs = dead_group_windows(note_nums, frames, plan);
+    if plan_alts.len() != plan.len() {
+        return (jobs, Vec::new());
+    }
+    let mut cum = Vec::with_capacity(frames.len() + 1);
+    let mut acc = 0i64;
+    cum.push(0);
+    for &f in frames {
+        acc += f.max(0);
+        cum.push(acc);
+    }
+    let raw = dead_group_windows_raw(&cum, note_nums, plan);
+    let alts = jobs
+        .iter()
+        .map(|j| {
+            let mut seen: Option<Option<i64>> = None;
+            for (gi, r) in raw.iter().enumerate() {
+                if r.shift != j.shift || r.end <= j.start || r.start >= j.end {
+                    continue;
+                }
+                match seen {
+                    None => seen = Some(plan_alts[gi]),
+                    Some(v) if v == plan_alts[gi] => {}
+                    Some(_) => return None,
+                }
+            }
+            seen.flatten()
+        })
         .collect();
+    (jobs, alts)
+}
+
+pub fn dead_group_windows(
+    note_nums: &[i64],
+    frames: &[i64],
+    plan: &[DeadGroup],
+) -> Vec<DeadJob> {
+    let mut cum = Vec::with_capacity(frames.len() + 1);
+    let mut acc = 0i64;
+    cum.push(0);
+    for &f in frames {
+        acc += f.max(0);
+        cum.push(acc);
+    }
+    let raw = dead_group_windows_raw(&cum, note_nums, plan);
     let merged = merge_same_shift_across_rests(note_nums, plan, raw);
     // S162 —— 薄片闸(出厂 0 = 关 = 逐帧不变)。见 `CLOSE_SLIVER_FRAMES_DEFAULT`。
     close_short_slivers(merged, parse_close_sliver(std::env::var("UTAI_RANGE_CLOSE_SLIVER").ok().as_deref()))
@@ -3096,6 +3248,18 @@ pub fn tail_fade() -> bool {
     !matches!(std::env::var("UTAI_PSOLA_TAILFADE").ok().as_deref(), Some("0"))
 }
 
+/// ⚙ 出厂默认 = true(**开**,见 [`LANDING_PICK_DEFAULT`])。`UTAI_RANGE_LANDING_PICK=0` 关掉
+/// ⇒ 逐位回到今天。
+///
+/// **渲染时按实测选落点**:计划器带出的第二个候选也渲一遍,逐组挑 `|rel|` 更小的那个。
+/// 整份理由与读数在 [`apply_dead_only_windows_alts`] 头上。
+pub fn landing_pick() -> bool {
+    !matches!(std::env::var("UTAI_RANGE_LANDING_PICK").ok().as_deref(), Some("0"))
+}
+
+/// ⚙ 出厂默认。见 [`landing_pick`]。
+const LANDING_PICK_DEFAULT: bool = true;
+
 /// 乐句内跨组对齐:**压**的上限(dB)。见 [`match_phrase_group_levels`]。
 const PHRASE_LEVEL_CUT_DB: f32 = 3.0;
 /// 乐句内跨组对齐:**抬**的上限(dB)。⛔ 比压小 —— 抬会把面状伪影一起抬起来。
@@ -3302,11 +3466,47 @@ pub fn apply_dead_only_windows(
     match_levels: bool,
     donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
+    apply_dead_only_windows_alts(
+        base, sample_rate, total_frames, jobs, &[], match_levels, donor_render,
+    )
+}
+
+/// ⭐⭐ S162 —— [`apply_dead_only_windows`],外加**逐组的落点候选**:两个都渲,
+/// 按**实测**挑 `|rel|` 更小的那个(`rel` = 该组 donor 片段的电平 − 邻近**窗外** base 的电平)。
+///
+/// ## ⛔ 它治的是什么
+/// 用户 2026-08-26:「akiko 的 ぴゃ 之前是达到过的」——**查实了,是退化**:
+/// `land_scan` 实测 **落点关(S157c 之前)⇒ 落 78(好)**,**落点=3(今天)⇒ 落 77(坏,rel −12.6)**。
+/// ⛔ 翻回旧默认会毁掉 S157c 的实质作用(薄区死音 akiko 30%→12% / yachiyo 34%→3%);
+///    换全局破法也判负(241 个音:thin 赢 63 / shallow 赢 29,塌掉 6→9)。⇒ **只能自适应。**
+///
+/// ## ⛔ 为什么判据是 `|rel|` 而不是「更响」
+/// 两头都要挡:**akiko 的 ぴゃ 塌了(−12.6)**、**yuyuko 的 ぴゃ 炸了(+9.0)**。
+/// ⛔ 而扫描表管不了:`low_ratio` 在 ぴゃ 上**单调递减** = 与实测完全不相关
+/// (它测的是 **400 ms 稳态「あ」**,看不见 1440 ms 的 /pʲa/)。
+/// ⭐ 判据的出处:`donor_pre` 的 rel 与**成品** rel 的 Pearson **+0.48…+0.81**。
+///
+/// ## 代价
+/// 候选的 shift 大多**已经在渲**:实测 akiko 多 **3 个浅 shift**,
+/// **yuyuko / 东雪莲 / yachiyo 多 0 个**。
+///
+/// `alts` 为空 ⇒ **逐位回到 [`apply_dead_only_windows`]**。
+#[allow(clippy::too_many_arguments)]
+pub fn apply_dead_only_windows_alts(
+    base: &mut [f32],
+    sample_rate: u32,
+    total_frames: i64,
+    jobs: &[DeadJob],
+    alts: &[Option<i64>],
+    match_levels: bool,
+    donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
+) -> crate::Result<()> {
     apply_dead_only_windows_with(
         base,
         sample_rate,
         total_frames,
         jobs,
+        alts,
         match_levels,
         join_rests_enabled(),
         // S159zm —— env 只在这一个入口读一次(见 [`seam_align_ms`])。
@@ -3324,6 +3524,9 @@ pub fn apply_dead_only_windows_with(
     sample_rate: u32,
     total_frames: i64,
     jobs: &[DeadJob],
+    // ⭐ S162 —— 逐组的落点候选(与 `jobs` 平行;`None` = 没有候选)。
+    //    空切片 ⇒ **逐位回到今天**。见 [`apply_dead_only_windows_alts`]。
+    alts: &[Option<i64>],
     match_levels: bool,
     join_enabled: bool,
     // S159zm —— 拼接前的对齐半径(**样本**)。⛔ 与 `join_enabled` 同一条理由:
@@ -3337,19 +3540,73 @@ pub fn apply_dead_only_windows_with(
     let spf = base.len() as f64 / total_frames as f64;
     let xf = (sample_rate as usize / 100).max(2); // 10 ms
     let base_rms = if match_levels { active_rms(base, sample_rate) } else { None };
+    // ⭐ S162 —— 候选的 shift 一起进来。`alts` 空 ⇒ 与今天逐位相同。
     let mut shifts: Vec<i64> = jobs.iter().map(|j| j.shift).collect();
+    for (i, a) in alts.iter().enumerate() {
+        if let (Some(s), true) = (*a, i < jobs.len()) {
+            shifts.push(s);
+        }
+    }
     shifts.sort_unstable();
     shifts.dedup();
+    // ⛔ 参照电平 = **窗外**的 base(那些样本与 base 逐位相同 ⇒ 参照固定,一步到位;
+    //    含被救邻居的版本 S162 实测**迭代不收敛**)。
+    let outside: Vec<bool> = {
+        let mut m = vec![true; base.len()];
+        for j in jobs {
+            let (a, b) = (
+                ((j.start as f64) * spf).round().max(0.0) as usize,
+                ((j.end as f64) * spf).round().max(0.0) as usize,
+            );
+            for v in m.iter_mut().take(b.min(base.len())).skip(a.min(base.len())) {
+                *v = false;
+            }
+        }
+        m
+    };
+    let ref_db = |a: usize, b: usize| -> Option<f64> {
+        // 窗前后各 2 秒里的**窗外** base
+        let w = (sample_rate as usize) * 2;
+        let lo = a.saturating_sub(w);
+        let hi = (b + w).min(base.len());
+        let mut e = 0.0f64;
+        let mut n = 0usize;
+        for t in lo..hi {
+            if outside[t] {
+                e += f64::from(base[t]) * f64::from(base[t]);
+                n += 1;
+            }
+        }
+        if n < sample_rate as usize / 2 {
+            return None;
+        }
+        let m = e / n as f64;
+        if m > 1e-14 {
+            Some(10.0 * m.log10())
+        } else {
+            None
+        }
+    };
     // S152 —— 每一遍 donor 在**它自己的窗 ± 余量**上的样本,留到全部渲完之后再拼。
     // ⛔ 为什么要留:窗边该放在休止的哪一点,只有**同时看得见两侧那两条 donor** 才决定得了
     // (见 `join_rests`)。留的是片段不是整条:全曲窗覆盖约 56 %,实测这首歌约 30 MB。
     let mut kept: Vec<(i64, usize, Vec<f32>)> = Vec::new();
+    // ⭐ S162 —— (组下标, shift, lo, 片段, |rel| 打分)。`alts` 空时每组只有一项 ⇒ 逐位同今天。
+    let mut cand: Vec<(usize, i64, usize, Vec<f32>, Option<f64>)> = Vec::new();
     for s in shifts {
         // 这一遍**自己**的窗。⛔ 同一个 filter 下面 :896 还要用一次(音频域拼接),两处必须
         // 是同一个谓词 —— 那正是 S147 hotfix 的形状:闭包那一侧漏了它,拼接这一侧没漏,
         // 于是「渲多了但拼对了」= 功能正确、收益减半。
-        let own: Vec<(i64, i64)> =
-            jobs.iter().filter(|j| j.shift == s).map(|j| (j.start, j.end)).collect();
+        // ⭐ S162 —— 这一遍要渲的窗 = 「shift 等于 s 的组」∪「候选等于 s 的组」。
+        let mine = |ji: usize, j: &DeadJob| -> bool {
+            j.shift == s || alts.get(ji).copied().flatten() == Some(s)
+        };
+        let own: Vec<(i64, i64)> = jobs
+            .iter()
+            .enumerate()
+            .filter(|(ji, j)| mine(*ji, j))
+            .map(|(_, j)| (j.start, j.end))
+            .collect();
         let mut donor = donor_render(s, &own)?;
         if donor.len().abs_diff(base.len()) > spf.ceil() as usize {
             tracing::warn!(
@@ -3369,11 +3626,75 @@ pub fn apply_dead_only_windows_with(
         // 因为窗边最远只会挪到相邻休止的另一头。
         // S159 —— 区间的算法搬进 [`donor_read_span`],因为「窗内逆变换」要用**同一个**公式:
         // 那一刀保住的样本区间必须 ⊇ 这里切走的片段,而两处各写一遍 = 一处改了另一处不改。
-        for (ji, j) in jobs.iter().enumerate().filter(|(_, j)| j.shift == s) {
+        for (ji, j) in jobs.iter().enumerate().filter(|(ji, j)| mine(*ji, j)) {
             if let Some((lo, hi)) = donor_read_span(j, spf, n, MERGE_BRIDGE_FRAMES) {
-                kept.push((ji as i64, lo, donor[lo..hi].to_vec()));
+                // ⭐ 打分:窗**正身**上的电平相对邻近窗外 base 的电平
+                let (wa, wb) = (
+                    ((j.start as f64) * spf).round().max(0.0) as usize,
+                    ((j.end as f64) * spf).round().max(0.0) as usize,
+                );
+                let score = ref_db(wa, wb).and_then(|r| {
+                    let (a, b) = (wa.max(lo).min(hi), wb.min(hi));
+                    if b <= a + 256 {
+                        return None;
+                    }
+                    let m: f64 = donor[a..b]
+                        .iter()
+                        .map(|&v| f64::from(v) * f64::from(v))
+                        .sum::<f64>()
+                        / (b - a) as f64;
+                    if m > 1e-14 {
+                        Some((10.0 * m.log10() - r).abs())
+                    } else {
+                        None
+                    }
+                });
+                cand.push((ji, s, lo, donor[lo..hi].to_vec(), score));
             }
         }
+    }
+    // ⭐ S162 —— 逐组定案:有候选的组挑 `|rel|` 更小的那个;没有候选的组原样。
+    for ji in 0..jobs.len() {
+        let mut mine: Vec<usize> =
+            (0..cand.len()).filter(|&c| cand[c].0 == ji).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        if mine.len() > 1 {
+            // ⛔ 打分拿不到时(邻域里窗外样本太少)**退回今天的 pick**,不许瞎猜。
+            mine.sort_by(|&x, &y| {
+                let sx = cand[x].4.unwrap_or(f64::INFINITY);
+                let sy = cand[y].4.unwrap_or(f64::INFINITY);
+                sx.partial_cmp(&sy).unwrap_or(std::cmp::Ordering::Equal).then_with(|| {
+                    (cand[x].1 != jobs[ji].shift).cmp(&(cand[y].1 != jobs[ji].shift))
+                })
+            });
+            let pick = cand[mine[0]].1;
+            // ⛔ S129 铁律:「臂开着」与「臂做了事」必须**分开**可查。
+            //    第一版只在 pick 改变时才打 ⇒ 「候选没生成」与「候选生成了但没赢」
+            //    读起来一模一样,而那正是 akiko 的「ぴゃ」卡了两轮的原因。
+            tracing::info!(
+                "range: group[{}..{}] landing candidates {:?} — kept {:+}",
+                jobs[ji].start,
+                jobs[ji].end,
+                mine.iter().map(|&c| (cand[c].1, cand[c].4)).collect::<Vec<_>>(),
+                pick
+            );
+            if pick != jobs[ji].shift {
+                tracing::info!(
+                    "range: group[{}..{}] landing re-picked {:+} → {:+} by measurement \
+                     (|rel| {:.1} vs {:.1} dB)",
+                    jobs[ji].start,
+                    jobs[ji].end,
+                    jobs[ji].shift,
+                    pick,
+                    cand[mine[0]].4.unwrap_or(f64::NAN),
+                    cand[mine[1]].4.unwrap_or(f64::NAN)
+                );
+            }
+        }
+        let c = &cand[mine[0]];
+        kept.push((ji as i64, c.2, c.3.clone()));
     }
     splice_kept(base, sample_rate, spf, jobs, &kept, xf, join_enabled, align)
 }
@@ -5539,6 +5860,7 @@ mod tests {
             sr,
             total,
             &jobs,
+            &[],
             false,
             join_rests_enabled(),
             0, // ⛔ 关掉对齐:见上面那段
@@ -5797,7 +6119,7 @@ mod tests {
         let (base0, left, right) = join_fixture(n);
         let run = |join: bool| {
             let mut b = base0.clone();
-            apply_dead_only_windows_with(&mut b, sr, total, &jobs, false, join, 0, |s, _| {
+            apply_dead_only_windows_with(&mut b, sr, total, &jobs, &[], false, join, 0, |s, _| {
                 Ok(if s == -9 { left.clone() } else { right.clone() })
             })
             .unwrap();
@@ -5882,7 +6204,7 @@ mod tests {
         };
         for join in [false, true] {
             let mut base = vec![0.02f32; base_len]; // −34 dBFS 的底,好让「洞」量得出来
-            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, false, join, 0, |s, own| {
+            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, &[], false, join, 0, |s, own| {
                 // ⭐ 生产走的就是 `donor_keep_samples` 这一个函数,判据不许自己再拼一遍公式。
                 let keep = donor_keep_samples_with(own, base_len, TOTAL_FRAMES, true);
                 let mut d = vec![-1.0f32; base_len];
@@ -5912,7 +6234,7 @@ mod tests {
             // ⛔ 阴性对照 ②:余量给不够时会怎样 —— 而**两条臂的答案不一样,那正是这条判据的重点**。
             let mut tight = vec![0.02f32; base_len];
             apply_dead_only_windows_with(
-                &mut tight, SR, TOTAL_FRAMES, &jobs, false, join, 0,
+                &mut tight, SR, TOTAL_FRAMES, &jobs, &[], false, join, 0,
                 |s, own| Ok(paint(own, 0, s)),
             )
             .expect("splice");
@@ -7262,7 +7584,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -7290,6 +7612,8 @@ mod tests {
             // S162 —— 谱倾斜还原。⛔ 这一个**改音频**(出厂 1.0),所以它进指纹的同时
             //    `RANGE_ALGO_VERSION` 与 audition cache tag 都跟着 bump 到 `s162b`。
             range_tilt(),
+            // S162 —— 渲染时按实测选落点。⛔ **改音频**(出厂开)⇒ 与它一起 bump 到 `s162c`。
+            LANDING_PICK_DEFAULT,
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -7298,10 +7622,10 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s162b";
+        const TAG: &str = "s162c";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -7357,6 +7681,7 @@ mod tests {
             ("DEJITTER_DEFAULT", "pub fn dejitter("),
             ("CLOSE_SLIVER_FRAMES_DEFAULT", "fn parse_close_sliver("),
             ("RANGE_TILT_DEFAULT", "pub fn range_tilt("),
+            ("LANDING_PICK_DEFAULT", "pub fn landing_pick("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
@@ -9428,7 +9753,7 @@ mod tests {
         let sr: u32 = plan["sample_rate"].as_u64().unwrap() as u32;
         eprintln!("[splice] {} jobs · base {} · sr {sr} · UTAI_RANGE_SEAM_ALIGN = {} ms",
                   jobs.len(), base.len(), seam_align_ms());
-        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, |s, _own| {
+        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, &[], false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, |s, _own| {
             Ok(rd(&dir.join(format!("donor_post_{s:+}.f32"))))
         })
         .unwrap();

@@ -1820,6 +1820,8 @@ pub async fn render_vocal_segment(
     // dead-only:仅含「真死音」(记录 f0 判据连音高都发不出)的休止分界短语,以最小深度渲染到
     // 最近可唱槽再逆变换回写谱位;其余音符与关扩展逐位一致(输出音高恒=写谱音高,乐谱内容是
     // 底线)。cover/audition 维持整段优化器不变(无音符结构;S82 耳判过的工况)。
+    // ⭐ S162 —— 逐组的落点候选,与 `range_windows` 平行(空 = 关 = 逐位回到今天)。
+    let mut range_alts: Vec<Option<i64>> = Vec::new();
     let range_windows: Vec<crate::inference::vocal_range::DeadJob> = if options.range_extend {
         let speaker = match backend_type {
             VoiceBackendType::SoVits => {
@@ -1833,8 +1835,16 @@ pub async fn render_vocal_segment(
             Some(r) => {
                 let nn = plan_note_nums(&score, phoneme_set);
                 let fr: Vec<i64> = score.iter().map(|n| n.frames).collect();
-                let (plan, unfixable) =
-                    crate::inference::vocal_range::dead_only_plan(&nn, &fr, options.transpose, &r);
+                // ⭐ S162 —— 多带一个**落点候选**出来(见 `dead_only_plan_with_alts`)。
+                // ⛔ 它不改今天的 pick;选不选用由 `landing_pick()` 决定。
+                let (plan, unfixable, plan_alts) =
+                    crate::inference::vocal_range::dead_only_plan_with_alts(
+                        &nn,
+                        &fr,
+                        options.transpose,
+                        &r,
+                        crate::inference::vocal_range::RescueTuning::from_env(),
+                    );
                 // 审计恒打印(S83 承诺):无死音也是一个判决;无解组必须响亮(warn+位置,
                 // 事后取证要「在哪」不只是「几个」——审查 S85)。
                 if plan.is_empty() && unfixable.is_empty() {
@@ -1866,7 +1876,14 @@ pub async fn render_vocal_segment(
                         );
                     }
                 }
-                crate::inference::vocal_range::dead_group_windows(&nn, &fr, &plan)
+                // ⛔ 候选必须对齐到**窗**,不是组:`dead_group_windows` 会合并窗
+                //    ⇒ 按组下标传会张冠李戴(见 `dead_group_windows_alts` 的 doc)。
+                let (jobs_, alts_) = crate::inference::vocal_range::dead_group_windows_alts(
+                    &nn, &fr, &plan, &plan_alts,
+                );
+                range_alts =
+                    if crate::inference::vocal_range::landing_pick() { alts_ } else { Vec::new() };
+                jobs_
             }
             None => {
                 // 「没记录所以没做」必须与「做了且无死音」可区分(审查 S85)。
@@ -2052,7 +2069,7 @@ pub async fn render_vocal_segment(
                     // 在这里算好传下去;渲染函数内部拿不到分母,现算一遍就是造第二份地图。
                     let base_len = result.audio.len();
 
-                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s, own_windows| {
+                    crate::inference::vocal_range::apply_dead_only_windows_alts(&mut result.audio, sr, total_frames, &range_windows, &range_alts, false, |s, own_windows| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
@@ -2209,7 +2226,7 @@ pub async fn render_vocal_segment(
                     // 在这里算好传下去;渲染函数内部拿不到分母,现算一遍就是造第二份地图。
                     let base_len = result.audio.len();
 
-                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s, own_windows| {
+                    crate::inference::vocal_range::apply_dead_only_windows_alts(&mut result.audio, sr, total_frames, &range_windows, &range_alts, false, |s, own_windows| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
