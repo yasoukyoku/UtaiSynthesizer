@@ -2345,8 +2345,18 @@ pub fn note_spans_tied(
     lyrics: &[String],
 ) -> Vec<NoteSpan> {
     const SUSTAIN: &[&str] = &["-", "+", "ー", "〜", "\u{301c}"];
+    /// ⭐⭐⭐ S163 —— **同歌词还不够，音高也要连得上**。
+    ///
+    /// 用户 2026-08-27 报的 yuyuko **4:36.151-4:36.439**：`[792][793][794]` 歌词都是「あ」
+    /// 而 midi 是 **90 / 85 / 83** —— 那是**旋律**不是延续音。`tied` 只看歌词时把它判成延续，
+    /// 于是拼接器给了 120 ms 交叉淡化，**把两个差 7 个半音的音色混在一起 120 毫秒** ⇒ 炸。
+    /// ⛔ 硬切至少干脆；那 120 ms 的渐变把它拖成「滑音 + 双影」，**比不治更糟**。
+    ///
+    /// ⚠ 2 个半音的余量：真正的延续音在谱面上可能带滑音/装饰而微调音高，但不会跳七度。
+    /// ⭐ **延音记号不受这条约束** —— 那是谱面明写的「接着上一个音唱」。
+    const TIED_MAX_ST: i64 = 2;
     let mut acc = 0i64;
-    let mut prev: Option<&str> = None;
+    let mut prev: Option<(&str, i64)> = None;
     note_nums
         .iter()
         .zip(frames.iter())
@@ -2359,9 +2369,10 @@ pub fn note_spans_tied(
             let ly = lyrics.get(k).map(String::as_str).unwrap_or("");
             let tied = sung
                 && !ly.is_empty()
-                && (SUSTAIN.contains(&ly) || prev.is_some_and(|p| p == ly));
+                && (SUSTAIN.contains(&ly)
+                    || prev.is_some_and(|(p, pn)| p == ly && (n - pn).abs() <= TIED_MAX_ST));
             if sung {
-                prev = Some(ly);
+                prev = Some((ly, n));
             } else {
                 prev = None; // ⛔ 隔着休止就不是同一个长音了
             }
@@ -8626,7 +8637,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -8681,6 +8692,9 @@ mod tests {
             //   进指纹的意义是「下一个人翻它的时候必须来这里改一行,于是不得不读那段 doc」。
             std::env::var("UTAI_PSOLA_XDITHER").unwrap_or_else(|_| "0".into()),
             std::env::var("UTAI_PSOLA_XSLIDE").unwrap_or_else(|_| "0".into()),
+            // S163 —— `tied` 的音高容差。⛔ **改音频**(同歌词但音高跳 >2 半音不再算延续音)
+            //    ⇒ 与它一起 bump 到 `s163g`。
+            2,
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -8689,7 +8703,7 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -8701,7 +8715,7 @@ mod tests {
         // ⛔ S163f —— s163e 的**两条行为改动当天被回滚**(`neighbour_ok` 恢复否决 ·
         //    `split_cost` 回 3000,账见 [`SPLIT_MIN_COST_DEFAULT`] 的 doc)。
         //    ⚠ 必须再 bump 一次:s163e 已经渲过一批产物,**同一个 tag 不许对应两种行为**。
-        const TAG: &str = "s163f";
+        const TAG: &str = "s163g";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
