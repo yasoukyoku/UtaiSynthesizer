@@ -2726,7 +2726,9 @@ fn close_short_slivers(mut jobs: Vec<DeadJob>, n: i64) -> Vec<DeadJob> {
 /// 于是这一刀结构上只碰「超出音乐本身起伏」的那部分。
 const RESCUE_LEVEL_MATCH_DB: f32 = 6.0;
 
-/// 软膝的压缩比。超出 [`RESCUE_LEVEL_MATCH_DB`] 的那部分按 `1 − 1/ratio` 压掉。
+/// ⛔ S162 起**不再使用**:软膝(ratio 6)把 rel +9.03 只压到 +6.93,用户耳判仍然听得到。
+/// 阈值以上现在是**硬限**。留着这个常量是为了让下一个人看见「我们试过软膝、它不够」。
+/// 软膝的压缩比(历史)。超出 [`RESCUE_LEVEL_MATCH_DB`] 的那部分按 `1 − 1/ratio` 压掉。
 const RESCUE_LEVEL_MATCH_RATIO: f32 = 6.0;
 
 /// 单个音的最大压低量(dB)。⛔ 防止一个坏参照把音推到荒谬处。
@@ -2858,7 +2860,13 @@ pub fn match_rescued_note_levels(
             continue;
         }
         let over = rel - thresh_db;
-        let g = -(over * (1.0 - 1.0 / RESCUE_LEVEL_MATCH_RATIO)).min(RESCUE_LEVEL_MATCH_CAP);
+        // ⛔⛔ S162(用户 2026-08-26 整曲耳判)—— **软膝太软,离群值压不下来**。
+        // 实测 yuyuko 的「ぴゃ」rel **+9.03**,软膝(ratio 6)只压到 **+6.93**,用户仍然听到它。
+        // 而**五条臂里它是唯一一个超过 6 的音**(其余被救音最大 2.96-5.98,
+        // 而没被救的音自己的 |rel| p90 就有 2.90-5.41)⇒ 它是离群值,不是正常起伏。
+        // ⇒ 阈值以上改成**硬限**(ratio → ∞):+9.03 → **6.00**。
+        // ⭐ 外科手术级:实测**只碰 2 个音**(都在 yuyuko 上),其余四条臂**一个都不碰**。
+        let g = -over.min(RESCUE_LEVEL_MATCH_CAP);
         gains.push((i, g));
         hits += 1;
     }
