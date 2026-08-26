@@ -317,6 +317,61 @@ fn sinc_read(x: &[f32], pos: f64) -> f64 {
     acc
 }
 
+/// S162 —— 按**读取步长**抗混叠的 sinc 读取,给 κ ≠ 0 那一路用。
+///
+/// ## ⛔ 它为什么必须存在
+/// κ ≠ 0 的那一支以前是**线性插值**(`x[k]*(1−f) + x[k+1]*f`),而这个文件里
+/// [`TRANSPORT_SINC_HALF`] 的 doc 逐字写着「**Never substitute linear interpolation here**
+/// … the ruler is being paid, not the ear」—— **同一个文件里两条自相矛盾的做法**。
+/// S148 也登记过「κ>0 把整条渲染送进线性插值分支;整份分析只覆盖 κ=0」
+/// ⇒ **「κ 一开就染色」这个结论,从来没有在 sinc 版的 κ 上验过。**
+///
+/// ## ⭐ 实测代价(相对 FFT 域的理想重采样,真实 donor 素材)
+/// | κ·s | rate | 线性 10-16 kHz | **本函数** |
+/// |---|---|---|---|
+/// | 0.0 | 1.0000 | 0.00 | 0.00(阴性对照)|
+/// | 1.8 | 1.1096 | **−1.97 dB** | **−0.00** |
+/// | 3.6 | 1.2311 | **−1.59** | **−0.00** |
+/// | 6.0 | 1.4142 | **−1.15** | **−0.00** |
+/// ⇒ **换掉它是零代价的。**
+///
+/// ## ⛔ 为什么要按 `stride` 拉宽核
+/// 救援的逆变换 `s > 0` ⇒ `formant_rate = 2^(κ·s/12) > 1` ⇒ 读取步长 > 1 = **下采样**
+/// ⇒ 不只低通,**还混叠**。标准做法:核宽 ×`stride`、截止 `π/stride`。
+/// `stride ≤ 1`(上采样)时退化成定宽核。
+/// ⚠ 归一化用**窗和**而不是除以 `stride`:那样在缓冲两端(核被截断)也不会有增益台阶。
+fn sinc_read_strided(x: &[f32], pos: f64, stride: f64) -> f64 {
+    let scale = stride.max(1.0);
+    let half = ((TRANSPORT_SINC_HALF as f64) * scale).ceil() as isize;
+    let n = x.len() as isize;
+    let c = pos.floor() as isize;
+    let frac = pos - c as f64;
+    let mut acc = 0.0;
+    let mut wsum = 0.0;
+    for k in (-half + 1)..=half {
+        let idx = c + k;
+        if idx < 0 || idx >= n {
+            continue;
+        }
+        let t = (k as f64 - frac) / scale;
+        let s = if t.abs() < 1e-12 {
+            1.0
+        } else {
+            let pt = std::f64::consts::PI * t;
+            pt.sin() / pt
+        };
+        let ph = std::f64::consts::PI * (t / (TRANSPORT_SINC_HALF as f64) + 1.0);
+        let w = 0.42 - 0.5 * ph.cos() + 0.08 * (2.0 * ph).cos();
+        acc += f64::from(x[idx as usize]) * s * w;
+        wsum += s * w;
+    }
+    if wsum.abs() > 1e-12 {
+        acc / wsum
+    } else {
+        acc
+    }
+}
+
 /// Running RMS of the transport residual that was **discarded** (0 when it is carried).
 /// ⭐ This is a direct, non-vacuous readout of the quantity the fix is about: it is exactly
 /// 0.0000 at ratio 1.0, ≈0.41 samples for whole-sample transport at any other ratio, and 0 once
@@ -1919,10 +1974,12 @@ fn add_bell(
                 if sp < 0.0 || sp >= (n - 1) as f64 {
                     continue;
                 }
-                let k = sp.floor();
-                let f = sp - k;
-                let k = k as usize;
-                f64::from(x[k]) * (1.0 - f) + f64::from(x[k + 1]) * f
+                // S162 —— ⛔ 这里以前是**线性插值**,而本文件 `TRANSPORT_SINC_HALF` 的 doc
+                //   逐字写着「Never substitute linear interpolation here」。实测线性在
+                //   10-16 kHz 掉 **1.2-2.0 dB**,而 sinc **0.00** ⇒ 换掉是零代价的。
+                //   救援时 `formant_rate > 1` = 下采样 ⇒ 必须**按步长抗混叠**。
+                //   见 [`sinc_read_strided`]。
+                sinc_read_strided(x, sp, formant_rate)
             };
             acc[ti as usize] += v * w * gain;
             wsum[ti as usize] += w * gain;
@@ -2960,6 +3017,78 @@ pub fn psola_shift_edge(
 
 #[cfg(test)]
 mod tests {
+    /// ⭐⭐⭐ S162 —— **κ 的染色是【线性插值】造成的,不是 κ 这个想法有问题。**
+    ///
+    /// 这条钉三件:
+    /// ⑴ `stride = 1` 时 [`sinc_read_strided`] 与 [`sinc_read`] 在**整数位置**都取回原样本
+    ///    (sinc(k) = 0 for k ≠ 0)——测量链的恒等闸;
+    /// ⑵ ⛔ **抗混叠**:`stride > 1` 时核必须真的拉宽 —— 拿一个**高频正弦**下采样,
+    ///    线性插值会把它读成混叠产物,而本函数必须压住它;
+    /// ⑶ ⛔ **κ = 0 那一支一个字节不动**(`formant_rate == 1.0` 走原路)。
+    #[test]
+    fn the_formant_read_is_antialiased_and_kappa_zero_is_untouched() {
+        // ⑴ 整数位置恒等
+        let x: Vec<f32> = (0..512).map(|i| ((i as f32) * 0.037).sin()).collect();
+        for pos in [64.0f64, 100.0, 255.0] {
+            let a = sinc_read_strided(&x, pos, 1.0);
+            assert!((a - f64::from(x[pos as usize])).abs() < 1e-6,
+                    "stride=1 在整数位置必须取回原样本:{a} vs {}", x[pos as usize]);
+        }
+
+        // ⑵ ⛔ 抗混叠(夹具必须真的会折叠):stride = 1.6 ⇒ 新 Nyquist = sr/(2·1.6) = 15 kHz。
+        //    取 **20.4 kHz**(> 15 kHz)的纯正弦 ⇒ 它**整个**应当被滤掉;
+        //    线性插值挡不住,会把它折成 9.6 kHz 的假信号留在输出里。
+        //    ⚠ 第一版我取了 10.08 kHz —— **那在新 Nyquist 之下,根本不会混叠**,判据当场红,红对了。
+        let sr = 48000.0f64;
+        let f = 20400.0f64;
+        let n = 8192usize;
+        let y: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * f * i as f64 / sr).sin() as f32)
+            .collect();
+        let stride = 1.6f64;
+        let m = ((n as f64) / stride) as usize - 64;
+        let rms = |v: &[f64]| -> f64 { (v.iter().map(|s| s * s).sum::<f64>() / v.len() as f64).sqrt() };
+        let lin: Vec<f64> = (0..m)
+            .map(|j| {
+                let p = j as f64 * stride;
+                let k = p.floor() as usize;
+                let fr = p - k as f64;
+                f64::from(y[k]) * (1.0 - fr) + f64::from(y[k + 1]) * fr
+            })
+            .collect();
+        let anti: Vec<f64> = (0..m).map(|j| sinc_read_strided(&y, j as f64 * stride, stride)).collect();
+        let (el, ea) = (rms(&lin), rms(&anti));
+        assert!(
+            ea < el * 0.35,
+            "超出新 Nyquist 的内容必须被滤掉:线性 rms {el:.4} vs 抗混叠 {ea:.4}(要 <35 %)"
+        );
+        // ⛔ 阴性对照:同一个函数在 stride = 1 上不许把信号也吃掉
+        let keep: Vec<f64> = (0..n - 64).map(|j| sinc_read_strided(&y, j as f64, 1.0)).collect();
+        assert!(
+            rms(&keep) > 0.6,
+            "stride = 1 时不许衰减信号本身(rms {:.4})—— 否则上面那条只是「它把什么都滤掉了」",
+            rms(&keep)
+        );
+
+        // ⑶ κ = 0 ⇒ formant_rate 恰好 1.0 ⇒ 那一支根本不调本函数(源码闸)
+        let src = include_str!("psola.rs");
+        assert!(src.contains("let v = if formant_rate == 1.0 {"),
+                "κ=0 的快路不见了 —— 出厂默认(κ=0)的逐位不变就没人盯了");
+        assert!(src.contains("sinc_read_strided(x, sp, formant_rate)"),
+                "κ≠0 那一路必须走抗混叠 sinc,不许回到线性插值");
+        // ⛔ 只查 κ 那一段的**上下文**,不许全文搜「线性插值」的字样 ——
+        //   上面 ⑵ 的夹具里就有一份线性插值当对照,全文搜会红在**判据自己**身上
+        //   (S161f 那次「红在我自己写的注释上」同型;第一次跑正是这么红的)。
+        let anchor = concat!("let sp = s_pos + (si - s_pos) * formant", "_rate;");
+        let at = src.find(anchor).expect("κ 那一段的锚点不见了");
+        // ⛔ 不许直接切字节:这个文件里全是中文 doc,`at + 600` 十有八九落在一个字符中间
+        //   (第一次跑就 panic 在 `is not a char boundary`)。按【行】取。
+        let after: String = src[at..].lines().take(12).collect::<Vec<_>>().join("
+");
+        assert!(!after.contains("* (1.0 - f)"),
+                "κ 那一路又变回线性插值了 —— 本文件 TRANSPORT_SINC_HALF 的 doc 明令禁止");
+    }
+
     use super::*;
 
     /// A voiced test signal: harmonics of `f0` under a fixed formant envelope.

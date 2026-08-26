@@ -2082,6 +2082,31 @@ pub async fn render_vocal_segment(
                         .map(|r| r.audio)
                     })
                     .map_err(|e| e.to_string())?;
+
+                    // S162 —— **被救音的乐句级电平匹配(只压不抬)**。
+                    // 治用户 2026-08-25/26 两次点名的「yuyuko 的『ぴゃ』响度炸成什么了」:
+                    // 那个音比它的乐句邻居响 **+11.9 dB**,而它的落点在**质量**上是对的
+                    // (梳深 61.2 vs 落深一格的 20.3)—— 落点没选错,是**响度没人管**:
+                    // `match_levels` 五个调用点全传 false(死代码),base 与 donor 只共用一个
+                    // **全曲**归一标量 ⇒ donor 在它舒服的音高上唱多响,就多响地贴回歌里。
+                    // ⛔ 只压不抬:抬会把面状伪影一起抬起来(被抬的音次基频占比高 +6.4…+17.5 dB)。
+                    // 见 `match_rescued_note_levels` 的 doc。
+                    {
+                        let notes: Vec<(i64, i64, bool)> = {
+                            let mut acc = 0i64;
+                            score_ref.iter().map(|n| {
+                                let f0 = acc;
+                                acc += n.frames.max(0);
+                                (f0, n.frames.max(0), n.note_num > 0)
+                            }).collect()
+                        };
+                        let t = crate::inference::vocal_range::level_match_db();
+                        let hit = crate::inference::vocal_range::match_rescued_note_levels(
+                            &mut result.audio, sr, total_frames, &range_windows, &notes, t,
+                        );
+                        // ⭐ 「臂开着」与「臂做了事」分开可查(S129 铁律)+ 打出实际生效值。
+                        tracing::info!("range: level-match {t} dB — {hit} rescued note(s) pushed down");
+                    }
                 }
                 commit_rendered_audio(result, output_path)
             })
@@ -2194,6 +2219,31 @@ pub async fn render_vocal_segment(
                         .map(|r| r.audio)
                     })
                     .map_err(|e| e.to_string())?;
+
+                    // S162 —— **被救音的乐句级电平匹配(只压不抬)**。
+                    // 治用户 2026-08-25/26 两次点名的「yuyuko 的『ぴゃ』响度炸成什么了」:
+                    // 那个音比它的乐句邻居响 **+11.9 dB**,而它的落点在**质量**上是对的
+                    // (梳深 61.2 vs 落深一格的 20.3)—— 落点没选错,是**响度没人管**:
+                    // `match_levels` 五个调用点全传 false(死代码),base 与 donor 只共用一个
+                    // **全曲**归一标量 ⇒ donor 在它舒服的音高上唱多响,就多响地贴回歌里。
+                    // ⛔ 只压不抬:抬会把面状伪影一起抬起来(被抬的音次基频占比高 +6.4…+17.5 dB)。
+                    // 见 `match_rescued_note_levels` 的 doc。
+                    {
+                        let notes: Vec<(i64, i64, bool)> = {
+                            let mut acc = 0i64;
+                            score_ref.iter().map(|n| {
+                                let f0 = acc;
+                                acc += n.frames.max(0);
+                                (f0, n.frames.max(0), n.note_num > 0)
+                            }).collect()
+                        };
+                        let t = crate::inference::vocal_range::level_match_db();
+                        let hit = crate::inference::vocal_range::match_rescued_note_levels(
+                            &mut result.audio, sr, total_frames, &range_windows, &notes, t,
+                        );
+                        // ⭐ 「臂开着」与「臂做了事」分开可查(S129 铁律)+ 打出实际生效值。
+                        tracing::info!("range: level-match {t} dB — {hit} rescued note(s) pushed down");
+                    }
                 }
                 commit_rendered_audio(result, output_path)
             })

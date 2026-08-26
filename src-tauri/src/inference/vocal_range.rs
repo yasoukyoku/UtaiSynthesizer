@@ -1735,9 +1735,16 @@ fn minimal_rescue_shift_capped(
     let best_dead = pool.iter().map(|&s| worst_dead(s)).fold(f32::INFINITY, f32::min);
     let t1: Vec<i64> =
         pool.into_iter().filter(|&s| worst_dead(s) <= best_dead + LANDING_DAMAGE_EPS).collect();
-    let best_thin = t1.iter().copied().map(thinner).fold(f32::INFINITY, f32::min);
-    let t2: Vec<i64> =
-        t1.into_iter().filter(|&s| thinner(s) <= best_thin + LANDING_THIN_EPS).collect();
+    // S162 —— 这一层可以被 `UTAI_RANGE_LANDING_TIE=shallow` 整层跳过(出厂**不跳**)。
+    //   见 [`parse_landing_tie_thin`] 的 doc:akiko 的 ぴゃ 是它的第一个决定性反例。
+    let t2: Vec<i64> = if parse_landing_tie_thin(
+        std::env::var("UTAI_RANGE_LANDING_TIE").ok().as_deref(),
+    ) {
+        let best_thin = t1.iter().copied().map(thinner).fold(f32::INFINITY, f32::min);
+        t1.into_iter().filter(|&s| thinner(s) <= best_thin + LANDING_THIN_EPS).collect()
+    } else {
+        t1
+    };
     // 乘客的 damage 仍然在,只是降到最后一把:同样干净的落点之间,选对乘客更友善的那个。
     let best_all = t2.iter().copied().map(worst).fold(f32::INFINITY, f32::min);
     t2.into_iter().filter(|&s| worst(s) <= best_all + LANDING_DAMAGE_EPS).min_by_key(|s| s.abs())
@@ -1863,6 +1870,27 @@ const LANDING_RATIO_TWO_ST: i64 = 14;
 /// ⚠ Deliberately not a tuning knob: on the four installed records every value from 0.01 to 0.10
 /// picks the same landing, because the steps that matter on this axis are 0.06-0.24 wide.
 const LANDING_THIN_EPS: f32 = 0.04;
+
+/// ⚙ 出厂默认 = `true`(= S151/S157 那一层照旧 = **逐位同今天**)。
+/// `UTAI_RANGE_LANDING_TIE=shallow` 把它关掉 ⇒ 落点平局时**直接取最浅**。
+///
+/// ## ⛔ 它存在的理由:S162 拿到了这一层的第一个**决定性反例**
+/// 炉心融解 `[685]ぴゃ` MIDI 83(+7 ⇒ 90)× **akiko**,只变这一组的落点:
+/// **−13(出厂)落 77 ⇒ 相对邻近 12 音 −12.6 dB = 用户说的「没声」**;
+/// **−12 落 78 ⇒ −0.2 dB = 完全正常,而且梳深 34.3 → 43.6(谐波更清晰)**。
+/// 而 −12/−13/−14 的**死音 damage 全是 0**(打平)⇒ 由 `low_ratio` 决定:
+/// 77 = 0.276 < 78 = 0.388(差 0.112 > `LANDING_THIN_EPS` 0.04)⇒ **78 被踢出**。
+/// ⛔ 扫描在 77 上四列全健康(err 1¢ / voiced 1.00 / rms −1.4 / low_ratio 0.276)——
+/// ⭐ **扫描测的是 400 ms 的稳态「あ」,它结构上看不见「1440 ms 的 /pʲa/ 在那一格唱不出来」。**
+///
+/// ## ⛔⛔ 为什么**没有**据此直接翻掉那一层
+/// S151/S157 有**两把独立尺子 + Fisher p = 0.0026**(落点 77-79 的 donor 音内包络起伏率
+/// **30%** vs ≤76 的 **7%**;同位移下落点 >73 的元音塌 −2.74 dB vs ≤73 的 −0.95,p = 4.2e-10),
+/// 而且它把薄区死音占比压掉一半以上(akiko 30% → 12% · yachiyo 34% → 3%)。
+/// **一个音推翻不了它** —— 这个旋钮是为了让它**被人群级数据裁一次**,不是为了关掉它。
+fn parse_landing_tie_thin(v: Option<&str>) -> bool {
+    !matches!(v.map(str::trim), Some("shallow"))
+}
 
 /// How far past the shallowest qualifying shift the damage ranking may look. **One semitone.**
 ///
@@ -2689,6 +2717,153 @@ fn close_short_slivers(mut jobs: Vec<DeadJob>, n: i64) -> Vec<DeadJob> {
     }
     jobs
 }
+
+/// ⚙ 出厂默认 = `6.0`。**被救音相对乐句邻居的电平,超过这个门就软压**(dB)。`0` = 关。
+///
+/// ⛔ 出处不是拍的:**没被救的音**相对邻居的 |rel| **p90** = yuyuko 5.69 · akiko 3.84 ·
+/// dxl41 3.26 · yachiyo鹅妈妈 3.71 · dxl41鹅妈妈 2.75 —— 那是**这首歌本身的起伏范围**
+/// (那些音在开/关两条臂上逐位相同 ⇒ 与救援无关)。**6.0 取在所有臂的 p90 之上**,
+/// 于是这一刀结构上只碰「超出音乐本身起伏」的那部分。
+const RESCUE_LEVEL_MATCH_DB: f32 = 6.0;
+
+/// 软膝的压缩比。超出 [`RESCUE_LEVEL_MATCH_DB`] 的那部分按 `1 − 1/ratio` 压掉。
+const RESCUE_LEVEL_MATCH_RATIO: f32 = 6.0;
+
+/// 单个音的最大压低量(dB)。⛔ 防止一个坏参照把音推到荒谬处。
+const RESCUE_LEVEL_MATCH_CAP: f32 = 12.0;
+
+/// 出厂门的读取口(env `UTAI_RANGE_LEVEL_MATCH`)。见 [`RESCUE_LEVEL_MATCH_DB`]。
+pub fn level_match_db() -> f32 {
+    parse_level_match_db(std::env::var("UTAI_RANGE_LEVEL_MATCH").ok().as_deref())
+}
+
+fn parse_level_match_db(v: Option<&str>) -> f32 {
+    v.and_then(|x| x.trim().parse::<f32>().ok())
+        .filter(|t| t.is_finite() && (0.0..=24.0).contains(t))
+        .unwrap_or(RESCUE_LEVEL_MATCH_DB)
+}
+
+/// S162 —— **被救音的乐句级电平匹配(只压不抬)**。
+///
+/// ## ⛔ 它治的是什么(用户 2026-08-25/26 两次点名)
+/// 「yuyuko 的那个「ぴゃ」的响度都炸成什么了」——实测炉心融解 `[685]ぴゃ` 在 yuyuko 上
+/// 比**邻近 12 个音的中位**高 **+9.0 dB**(用只算没被救邻居的口径是 **+11.9**),
+/// 而同一个音在东雪莲上是 −1.1、akiko 上是 −12.2。
+/// ⭐ 而它的落点(79)在**质量**上是对的:梳深 **61.2 dB**,落 80 只有 20.3 ——
+/// 79 恰好是 yuyuko 扫描里 `rms_db = 0.0` = **全表最响**的那一格。
+/// ⇒ **落点没选错,是响度没人管**:`match_levels` 五个调用点全传 `false`(死代码),
+/// base 与 donor 只共用一个**全曲**归一标量 ⇒ donor 在它舒服的音高上唱多响,就多响地贴回歌里。
+///
+/// ## ⛔⛔ 为什么**只压不抬**
+/// 双向版实测:被**抬**的音的**次基频占比**(= 面状伪影那条护栏)比没被碰的音高
+/// **+6.4 / +17.5 / +6.6 dB**(yuyuko / akiko / dxl41)⇒ **它们本来就是面状最重的那一批**,
+/// 抬它们就是把面状伪影抬起来 —— 用户 2026-08-26 早上正是为这件事提醒过。
+/// ⇒ 与 [`RESCUE_LEVEL_FLOOR_DB`] 的「只收顶不收底」同形。
+///
+/// ## ⛔ 参照只用【没被救的】邻居
+/// 它们落在窗外 ⇒ 与 base 逐位相同 ⇒ **参照固定,一步到位**。
+/// 含被救邻居的版本实测**迭代不收敛**(max|Δg| 10.85 → 9.04 → 7.54 → 6.28)。
+/// ⚠ 取不到 [`LEVEL_MATCH_MIN_REF`] 个干净邻居的音**一个字不动**(覆盖率实测 44-88%)。
+///
+/// ## ⛔ 粒度必须是【音符】不是【窗】
+/// 窗粒度实测把最干净那条臂(dxl41 × 鹅妈妈)的 |rel| p90 从 **3.79 推到 4.9**——
+/// 一个窗里有多个音,整窗一个增益会连累窗内本来正常的那些。音符粒度上它**一动不动**。
+pub fn match_rescued_note_levels(
+    audio: &mut [f32],
+    sample_rate: u32,
+    total_frames: i64,
+    jobs: &[DeadJob],
+    notes: &[(i64, i64, bool)],
+    thresh_db: f32,
+) -> usize {
+    if thresh_db <= 0.0 || total_frames <= 0 || audio.is_empty() {
+        return 0;
+    }
+    let alen = audio.len();
+    let spf = alen as f64 / total_frames as f64;
+    let span = move |f0: i64, n: i64| -> (usize, usize) {
+        let a = ((f0 as f64) * spf).round().max(0.0) as usize;
+        let b = (((f0 + n) as f64) * spf).round().max(0.0) as usize;
+        (a.min(alen), b.min(alen))
+    };
+    // ── 逐音:电平 + 被窗覆盖的比例 ──────────────────────────────────
+    let mut lv: Vec<f32> = Vec::with_capacity(notes.len());
+    let mut cov: Vec<f32> = Vec::with_capacity(notes.len());
+    for &(f0, n, sung) in notes {
+        if !sung || n < LEVEL_MATCH_MIN_FRAMES {
+            lv.push(f32::NAN);
+            cov.push(0.0);
+            continue;
+        }
+        let (a, b) = span(f0, n);
+        if b <= a + 256 {
+            lv.push(f32::NAN);
+            cov.push(0.0);
+            continue;
+        }
+        let e: f64 = audio[a..b].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>()
+            / (b - a) as f64;
+        lv.push((10.0 * (e + 1e-20).log10()) as f32);
+        let c: i64 = jobs
+            .iter()
+            .map(|j| ((f0 + n).min(j.end) - f0.max(j.start)).max(0))
+            .sum();
+        cov.push((c as f32 / n as f32).clamp(0.0, 1.0));
+    }
+    // ── 逐音:参照 = 邻近的【没被救】唱音的电平中位 ────────────────
+    let mut hits = 0usize;
+    let mut gains: Vec<(usize, f32)> = Vec::new();
+    for i in 0..notes.len() {
+        if !(cov[i] > 0.8) || !lv[i].is_finite() {
+            continue;
+        }
+        let lo = i.saturating_sub(LEVEL_MATCH_NEIGHBOURS);
+        let hi = (i + LEVEL_MATCH_NEIGHBOURS + 1).min(notes.len());
+        let mut refs: Vec<f32> =
+            (lo..hi).filter(|&j| j != i && cov[j] < 0.05 && lv[j].is_finite()).map(|j| lv[j]).collect();
+        if refs.len() < LEVEL_MATCH_MIN_REF {
+            continue;
+        }
+        refs.sort_by(f32::total_cmp);
+        let med = refs[refs.len() / 2];
+        let rel = lv[i] - med;
+        if rel <= thresh_db {
+            continue;
+        }
+        let over = rel - thresh_db;
+        let g = -(over * (1.0 - 1.0 / RESCUE_LEVEL_MATCH_RATIO)).min(RESCUE_LEVEL_MATCH_CAP);
+        gains.push((i, g));
+        hits += 1;
+    }
+    // ── 施加:整个音符跨度上一个常数增益,两端各 10 ms 淡化 ────────
+    let fade = ((sample_rate as usize) / 100).max(2);
+    for (i, g) in gains {
+        let (f0, n, _) = notes[i];
+        let (a, b) = span(f0, n);
+        let k = 10f32.powf(g / 20.0);
+        let w = fade.min((b - a) / 2);
+        for t in a..b {
+            let r = if w == 0 {
+                1.0
+            } else if t < a + w {
+                (t - a) as f32 / w as f32
+            } else if t + w >= b {
+                (b - t) as f32 / w as f32
+            } else {
+                1.0
+            };
+            audio[t] *= 1.0 + (k - 1.0) * r;
+        }
+    }
+    hits
+}
+
+/// 参与匹配的最短音(帧)。短于它的音测不出稳定电平。
+const LEVEL_MATCH_MIN_FRAMES: i64 = 8;
+/// 参照窗:前后各看这么多个唱音。
+const LEVEL_MATCH_NEIGHBOURS: usize = 16;
+/// 至少要这么多个**没被救**的邻居才动手;取不到就一个字不动。
+const LEVEL_MATCH_MIN_REF: usize = 4;
 
 /// S85e windowed donors: the merged, padded, clamped OUTPUT-sample spans one shift's jobs
 /// need rendered. `spf` MUST be the same samples-per-frame map the splicer uses
@@ -6825,7 +7000,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -6848,6 +7023,8 @@ mod tests {
             // S162 —— 薄片闸。⚠ 与上一条同款:进指纹但**出厂 0 ⇒ 不改音频**,
             //    所以加它**不该**触发版本 bump;进指纹的意义是「下一个人翻它必须来这里改一行」。
             parse_close_sliver(None),
+            // S162 —— 同款:进指纹但**出厂 = 今天** ⇒ 不该触发版本 bump。
+            parse_landing_tie_thin(None),
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -6856,7 +7033,7 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         const TAG: &str = "s162";
@@ -6976,6 +7153,130 @@ mod tests {
         }
     }
 
+
+    /// ⭐⭐ S162 —— **被救音的电平匹配:只压不抬 · 只碰被救的音 · 参照只用没被救的邻居。**
+    ///
+    /// ⛔ 没有这条判据,`match_rescued_note_levels` 就只有 doc 和指纹盯着它:
+    /// 把「只压」写成双向、把参照改成含被救邻居、把 cov 门去掉、或者把软膝写成硬压,
+    /// **别的每一条测试都还是绿的**。而「抬」那一半是**实测会把面状伪影抬起来**的
+    /// (被抬的音次基频占比高 +6.4…+17.5 dB),所以「不抬」是承重的,不是风格。
+    #[test]
+    fn the_level_match_only_pushes_loud_rescued_notes_down() {
+        let sr = 48000u32;
+        let hop = 480usize; // 每帧 480 样本 ⇒ total_frames * hop = len
+        let nf = 100i64;
+        let n = (nf as usize) * hop;
+        // 音表:每 10 帧一个音(⛔ 必须 ≥ `LEVEL_MATCH_MIN_FRAMES`,否则整表被跳过 ——
+        //   第一版写成 4 帧,判据当场红,红对了)。
+        let notes: Vec<(i64, i64, bool)> = (0..10).map(|k| (k * 10, 10, true)).collect();
+        // 窗:只盖第 5 个音(帧 50..60)⇒ 只有它是「被救」的
+        let jobs = vec![DeadJob { shift: -7, start: 50, end: 60 }];
+        let mk = |amp_rescued: f32| -> Vec<f32> {
+            let mut v = vec![0.0f32; n];
+            for (i, &(f0, fr, _)) in notes.iter().enumerate() {
+                let a = (f0 as usize) * hop;
+                let b = ((f0 + fr) as usize) * hop;
+                let amp = if i == 5 { amp_rescued } else { 0.1 };
+                for t in a..b {
+                    v[t] = amp * ((t as f32) * 0.05).sin();
+                }
+            }
+            v
+        };
+
+        // ⓐ 被救音**比邻居响 20 dB** ⇒ 必须被压
+        let mut loud = mk(1.0);
+        let before = loud.clone();
+        let hit = match_rescued_note_levels(&mut loud, sr, nf, &jobs, &notes, 6.0);
+        assert_eq!(hit, 1, "响 20 dB 的被救音必须被碰");
+        let seg = |v: &[f32], i: usize| -> f32 {
+            let (f0, fr, _) = notes[i];
+            let (a, b) = ((f0 as usize) * hop, ((f0 + fr) as usize) * hop);
+            (v[a..b].iter().map(|x| x * x).sum::<f32>() / (b - a) as f32).sqrt()
+        };
+        let drop_db = 20.0 * (seg(&loud, 5) / seg(&before, 5)).log10();
+        assert!(drop_db < -5.0, "该被压下来,实际只动了 {drop_db:.1} dB");
+        // ⛔ 没被救的音**一个都不许动**
+        for i in 0..notes.len() {
+            if i == 5 {
+                continue;
+            }
+            let (f0, fr, _) = notes[i];
+            for t in (f0 as usize) * hop..((f0 + fr) as usize) * hop {
+                assert_eq!(loud[t], before[t], "没被救的音 [{i}] 第 {t} 个样本被动了");
+            }
+        }
+
+        // ⓑ ⛔ 被救音**比邻居轻 20 dB** ⇒ **一个字不许动**(抬会把面状伪影一起抬起来)
+        let mut quiet = mk(0.01);
+        let q0 = quiet.clone();
+        let hit2 = match_rescued_note_levels(&mut quiet, sr, nf, &jobs, &notes, 6.0);
+        assert_eq!(hit2, 0, "只压不抬 —— 轻的被救音不许被碰");
+        assert_eq!(quiet, q0, "轻的那一侧必须逐样本不变");
+
+        // ⓒ 软膝:比邻居响 4 dB(< T=6)⇒ 不动
+        let mut mild = mk(0.1 * 10f32.powf(4.0 / 20.0));
+        let m0 = mild.clone();
+        assert_eq!(match_rescued_note_levels(&mut mild, sr, nf, &jobs, &notes, 6.0), 0,
+                   "T 以内不许动");
+        assert_eq!(mild, m0);
+
+        // ⓓ 门 = 0 ⇒ 整条关掉,逐样本不变
+        let mut off = mk(1.0);
+        let o0 = off.clone();
+        assert_eq!(match_rescued_note_levels(&mut off, sr, nf, &jobs, &notes, 0.0), 0);
+        assert_eq!(off, o0, "thresh = 0 必须是逐样本 no-op");
+
+        // ⓔ ⛔⛔ **一个【没被救】但比邻居响 20 dB 的音,一个字都不许碰。**
+        //    ⚠ 这一格是**变异抓出来的**:上一版夹具里没被救的音电平全一样,于是
+        //    「去掉 cov 门」这条变异**照绿** —— 判据在那条轴上是空的。
+        let mut loud_clean = {
+            let mut v = vec![0.0f32; n];
+            for (i, &(f0, fr, _)) in notes.iter().enumerate() {
+                let a = (f0 as usize) * hop;
+                let b = ((f0 + fr) as usize) * hop;
+                // 音 2 **没被窗盖**,却比邻居响 20 dB;音 5 被盖但电平正常
+                let amp = if i == 2 { 1.0 } else { 0.1 };
+                for t in a..b {
+                    v[t] = amp * ((t as f32) * 0.05).sin();
+                }
+            }
+            v
+        };
+        let lc0 = loud_clean.clone();
+        assert_eq!(
+            match_rescued_note_levels(&mut loud_clean, sr, nf, &jobs, &notes, 6.0),
+            0,
+            "没被救的音再响也不许碰 —— 那是乐曲本身的强弱"
+        );
+        assert_eq!(loud_clean, lc0, "没被救的响音必须逐样本不变");
+
+        // ⓕ ⛔ 干净邻居不够 ⇒ 不动(把所有音都盖进窗里)
+        let all = vec![DeadJob { shift: -7, start: 0, end: 100 }];
+        let mut none_ref = mk(1.0);
+        let r0 = none_ref.clone();
+        assert_eq!(match_rescued_note_levels(&mut none_ref, sr, nf, &all, &notes, 6.0), 0,
+                   "没有干净邻居当参照时必须放弃,而不是拿被救的邻居凑");
+        assert_eq!(none_ref, r0);
+    }
+
+    /// S162 —— 两个旋钮的出厂值与垃圾值倒向。
+    #[test]
+    fn the_s162_landing_and_level_knobs_ship_as_declared() {
+        assert!(parse_landing_tie_thin(None), "落点平局破法出厂 = thin(= 逐位同今天)");
+        assert!(!parse_landing_tie_thin(Some("shallow")), "shallow 必须关得掉那一层");
+        for junk in ["", "thin", "1", "0", "deep"] {
+            assert!(parse_landing_tie_thin(Some(junk)), "垃圾值 {junk:?} 必须落回出厂");
+        }
+        // ⚠ `trim` 是有意的(与本文件其它 `parse_*` 一致)⇒ 带空格的写法照样关得掉。
+        assert!(!parse_landing_tie_thin(Some("  shallow  ")), "trim 之后应当仍然识别");
+        assert_eq!(parse_level_match_db(None), 6.0, "电平匹配出厂门 = 6 dB");
+        assert_eq!(parse_level_match_db(Some("0")), 0.0, "0 必须关得掉");
+        assert_eq!(parse_level_match_db(Some("4.5")), 4.5);
+        for junk in ["", "abc", "-1", "25", "nan", "inf"] {
+            assert_eq!(parse_level_match_db(Some(junk)), 6.0, "垃圾值 {junk:?} 必须落回出厂");
+        }
+    }
 
     /// ⭐⭐ S162 —— **薄片闸**:相邻两窗之间 1..n 帧的缝用前一个窗的尾巴补上,
     /// 而**负的缝(已经重叠)一个字不许动** —— 那是 [`GUARD_FRAMES`] 有意做的。

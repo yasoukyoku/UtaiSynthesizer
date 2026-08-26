@@ -1615,6 +1615,23 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
     )
     .unwrap();
 
+    // S162 —— 与生产同一条:被救音的乐句级电平匹配(只压不抬)。见 `match_rescued_note_levels`。
+    {
+        let notes: Vec<(i64, i64, bool)> = {
+            let mut acc = 0i64;
+            triples.iter().map(|t| {
+                let f0 = acc;
+                acc += t.frames.max(0);
+                (f0, t.frames.max(0), t.note_num > 0)
+            }).collect()
+        };
+        let t = super::super::vocal_range::level_match_db();
+        let hit = super::super::vocal_range::match_rescued_note_levels(
+            &mut result.audio, sr, total_frames, &jobs, &notes, t,
+        );
+        eprintln!("[mg] level-match {t} dB — {hit} rescued note(s) pushed down");
+    }
+
     let out_dir = mg_out_dir();
     std::fs::create_dir_all(&out_dir).unwrap();
     let stem = format!("mg_deadonly_{arm}_{mtag}");
