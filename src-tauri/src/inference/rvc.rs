@@ -679,6 +679,12 @@ pub fn run_pipeline(
                         s,
                         options.range_formant_follow,
                         Some((&pf_shift[fa..fb], (donor.sample_rate as usize / 100).max(1))),
+                        // ⛔ S162 —— **cover 车道不吃谱倾斜(`tilt = 0`)**。
+                        // 这条引擎两条车道共用,而 tilt 的表是在**谱面轨**素材上拟的、
+                        // **cover 上一个读数都没有**;而 cover 的深救援反而更重
+                        // (S160 的计划输出:|s|≥8 占救援总时长 **78.1%**,最深 **−18**,
+                        //  已超出表的范围)⇒ 按「证明有效果才翻默认」的规矩,不跟着翻。
+                        0.0,
                     )
                     .map_err(UtaiError::Inference)?;
                     let n = inv.len().min(base_len - a);

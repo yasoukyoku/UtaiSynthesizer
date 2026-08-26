@@ -4475,8 +4475,9 @@ pub fn apply_inverse(
     shift: i64,
     kappa: f32,
     fed_f0: Option<(&[f32], usize)>,
+    tilt: f64,
 ) -> Result<Vec<f32>, String> {
-    apply_inverse_with(inverse_engine(), audio, sample_rate, shift, kappa, fed_f0)
+    apply_inverse_with(inverse_engine(), audio, sample_rate, shift, kappa, fed_f0, tilt)
 }
 
 /// S159 —— [`apply_inverse`],但只保证 `keep` 那几段**样本**是逆变换过的;窗外原样透传。
@@ -4498,13 +4499,17 @@ pub fn apply_inverse_windowed(
     kappa: f32,
     fed_f0: Option<(&[f32], usize)>,
     keep: &[(usize, usize)],
+    tilt: f64,
 ) -> Result<Vec<f32>, String> {
-    apply_inverse_windowed_with(inverse_engine(), audio, sample_rate, shift, kappa, fed_f0, keep)
+    apply_inverse_windowed_with(
+        inverse_engine(), audio, sample_rate, shift, kappa, fed_f0, keep, tilt,
+    )
 }
 
 /// [`apply_inverse`] with the engine named explicitly — the A/B arm and the tests take this door.
 /// (Selecting the engine through the process environment inside a test would race the other
 /// tests in the same binary.)
+#[allow(clippy::too_many_arguments)]
 pub fn apply_inverse_with(
     engine: InverseEngine,
     audio: Vec<f32>,
@@ -4512,8 +4517,9 @@ pub fn apply_inverse_with(
     shift: i64,
     kappa: f32,
     fed_f0: Option<(&[f32], usize)>,
+    tilt: f64,
 ) -> Result<Vec<f32>, String> {
-    apply_inverse_windowed_with(engine, audio, sample_rate, shift, kappa, fed_f0, &[])
+    apply_inverse_windowed_with(engine, audio, sample_rate, shift, kappa, fed_f0, &[], tilt)
 }
 
 /// [`apply_inverse_windowed`] with the engine named explicitly — **the single execution point**.
@@ -4526,6 +4532,7 @@ pub fn apply_inverse_windowed_with(
     kappa: f32,
     fed_f0: Option<(&[f32], usize)>,
     keep: &[(usize, usize)],
+    tilt: f64,
 ) -> Result<Vec<f32>, String> {
     if shift == 0 || audio.is_empty() {
         return Ok(audio);
@@ -4587,8 +4594,11 @@ pub fn apply_inverse_windowed_with(
                 keep,
                 fill,
                 dejitter(),
-                // S162 —— 谱倾斜还原(出厂 0 = 关 = 逐位不变)。见 `utai_dsp::psola::TILT_TABLE`。
-                range_tilt(),
+                // S162 —— 谱倾斜还原。⛔ **显式参数,不是全局读取**:
+                // 这条引擎是**两条车道共用**的,而表是在**谱面轨**素材上拟的、
+                // cover 上一个读数都没有(而 cover 的深救援反而更重:|s|≥8 占救援总时长
+                // 78.1%,最深 −18 已超出表的范围)⇒ 谱面轨传 `range_tilt()`,cover 传 0。
+                tilt,
             );
             // ⛔⛔ S159 —— 判据是 `islands_seen`(窗过滤**之前**的候选岛数),不是 `islands`。
             // 加了窗之后 `islands == 0` 多了一个**正常**的来源:这一遍的窗全落在休止里。
@@ -7187,6 +7197,58 @@ mod tests {
     }
 
 
+    /// ⛔⛔ S162 —— **谱倾斜只走谱面轨;cover 那两条车道传 `0.0`。**
+    ///
+    /// ## 为什么要一条源码级的闸
+    /// `apply_inverse*` 是**两条车道共用的单一执行点**(S85 为这条规则付过一夜)。
+    /// tilt 的表是在**谱面轨**素材上拟的,而 **cover 上一个读数都没有** ——
+    /// 而且 cover 的深救援反而更重(S160 的计划输出:`|s| ≥ 8` 占救援总时长 **78.1%**,
+    /// 最深 **−18**,已超出表的范围)。
+    /// ⇒ 下一个人重构时把 cover 那两处顺手改成 `range_tilt()`,**不会有任何行为判据变红**,
+    ///   而那是一次静默退化。所以这条闸盯的是**源码本身**。
+    ///
+    /// ⛔ 按**行**取,不许按字节切 —— 这几个文件里全是中文 doc。
+    #[test]
+    fn the_spectral_tilt_reaches_the_score_lane_and_never_the_cover_lane() {
+        let want_zero = [
+            ("rvc.rs", include_str!("rvc.rs")),
+            ("sovits.rs", include_str!("sovits.rs")),
+        ];
+        for (name, src) in want_zero {
+            let lines: Vec<&str> = src.lines().collect();
+            let at = lines
+                .iter()
+                .position(|l| l.contains("vocal_range::apply_inverse("))
+                .unwrap_or_else(|| panic!("{name} 里找不到 apply_inverse 调用 —— 这条闸已经瞎了"));
+            // 调用点之后 12 行内必须出现独立的 `0.0,`(tilt 实参)
+            let win = lines[at..(at + 12).min(lines.len())].join("\n");
+            assert!(
+                win.contains("0.0,"),
+                "{name} 的 cover 调用点没有把 tilt 传 0 —— \n\
+                 tilt 的表只在谱面轨素材上拟过,cover 上一个读数都没有(而它的深救援更重:\n\
+                 |s|≥8 占救援总时长 78.1%,最深 −18 已超出表的范围)。\n\
+                 要给 cover 开,先在 cover 的 donor 转储上拟/验一张表。\n实际:\n{win}"
+            );
+            assert!(
+                !win.contains("range_tilt()"),
+                "{name} 的 cover 调用点被接到了 `range_tilt()` 上 —— 见上一条的理由"
+            );
+        }
+        // ⛔ 阴性对照:谱面轨那一条**必须**接着 `range_tilt()`,
+        //    否则上面两条在「tilt 根本没人用」的实现上照样全绿。
+        let score = include_str!("score2svc.rs");
+        let lines: Vec<&str> = score.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("vocal_range::apply_inverse_windowed("))
+            .expect("score2svc.rs 里找不到 apply_inverse_windowed 调用");
+        let win = lines[at..(at + 14).min(lines.len())].join("\n");
+        assert!(
+            win.contains("range_tilt()"),
+            "谱面轨那一条没接 `range_tilt()` —— 那这把刀出厂就是空的。实际:\n{win}"
+        );
+    }
+
     /// ⭐⭐ S162 —— **被救音的电平匹配:只压不抬 · 只碰被救的音 · 参照只用没被救的邻居。**
     ///
     /// ⛔ 没有这条判据,`match_rescued_note_levels` 就只有 doc 和指纹盯着它:
@@ -8061,12 +8123,12 @@ mod tests {
             }
         }
         let fed = Some((f0.as_slice(), hop));
-        let full = apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, fed)
+        let full = apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, fed, 0.0)
             .expect("整条臂必须成功");
         // ⑴ + ⑵ —— 窗只盖第一段。
         let keep = [(0usize, seg.len())];
         let win = apply_inverse_windowed_with(
-            InverseEngine::Psola, x.clone(), sr, -6, 0.0, fed, &keep,
+            InverseEngine::Psola, x.clone(), sr, -6, 0.0, fed, &keep, 0.0,
         )
         .expect("窗臂必须成功");
         assert_ne!(win, full, "窄窗与整条臂逐位相同 —— `keep` 在某一层被丢掉了,提速是假的");
@@ -8075,14 +8137,14 @@ mod tests {
         let mid = seg.len() + gap.len() / 2;
         let empty = apply_inverse_windowed_with(
             InverseEngine::Psola, x.clone(), sr, -6, 0.0, fed,
-            &[(mid, mid + hop)],
+            &[(mid, mid + hop)], 0.0,
         );
         assert_eq!(empty.as_deref(), Ok(x.as_slice()), "窗切不到岛时必须原样返回,而不是报错");
         // ⛔ 阴性对照:同一条路上「真的没有音高」仍然必须响亮失败 —— 否则 ⑶ 只是把那条闸拆了。
         let silent = vec![0.0f32; f0.len()];
         assert_eq!(
             apply_inverse_windowed_with(
-                InverseEngine::Psola, x, sr, -6, 0.0, Some((&silent, hop)), &keep,
+                InverseEngine::Psola, x, sr, -6, 0.0, Some((&silent, hop)), &keep, 0.0,
             )
             .err()
             .as_deref(),
@@ -8101,7 +8163,7 @@ mod tests {
         let sr = 44100u32;
         let x = inverse_probe_tone(sr, 1.0);
         let untouched =
-            apply_inverse(x.clone(), sr, 0, DEFAULT_FORMANT_KAPPA, None).expect("shift 0");
+            apply_inverse(x.clone(), sr, 0, DEFAULT_FORMANT_KAPPA, None, 0.0).expect("shift 0");
         assert_eq!(untouched, x);
         let fed: Vec<f32> = vec![220.0; 101];
         let hop = sr as usize / 100;
@@ -8114,6 +8176,7 @@ mod tests {
                     shift,
                     kappa,
                     Some((fed.as_slice(), hop)),
+                    0.0,
                 )
                 .unwrap_or_else(|e| panic!("{engine:?} shift={shift} kappa={kappa}: {e}"));
                 assert_eq!(y.len(), x.len(), "{engine:?} shift={shift} kappa={kappa}");
@@ -8138,7 +8201,7 @@ mod tests {
             ("all-unvoiced track", Some(vec![0.0f32; 51])),
         ] {
             let arg = fed.as_ref().map(|v| (v.as_slice(), hop));
-            let got = apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, arg);
+            let got = apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, arg, 0.0);
             assert_eq!(
                 got.err().as_deref(),
                 Some("RANGE_INVERSE_NO_PITCH"),
@@ -8148,7 +8211,7 @@ mod tests {
         // …and a zero hop is the same class of "I cannot locate the periods".
         let fed = vec![220.0f32; 51];
         assert_eq!(
-            apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, Some((&fed, 0)))
+            apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, Some((&fed, 0)), 0.0)
                 .err()
                 .as_deref(),
             Some("RANGE_INVERSE_NO_PITCH")
@@ -8156,7 +8219,7 @@ mod tests {
         // Negative control: the same call WITH pitch must succeed — otherwise the assertions
         // above would pass on a function that always fails.
         assert!(
-            apply_inverse_with(InverseEngine::Psola, x, sr, -6, 0.0, Some((&fed, hop))).is_ok(),
+            apply_inverse_with(InverseEngine::Psola, x, sr, -6, 0.0, Some((&fed, hop)), 0.0).is_ok(),
             "with a voiced fed f0 the inverse must succeed"
         );
     }
@@ -9119,8 +9182,10 @@ mod tests {
             .collect();
 
         let n = x.len();
-        let y = apply_inverse_with(engine, x, spec.sample_rate, shift, kappa, Some((&f0, hop)))
-            .expect("inverse");
+        // ⭐ 探针继续听 `UTAI_RANGE_TILT` —— tilt 的零渲染噪声 A/B 就是从这里跑的。
+        let y =
+            apply_inverse_with(engine, x, spec.sample_rate, shift, kappa, Some((&f0, hop)), range_tilt())
+                .expect("inverse");
         assert_eq!(y.len(), n, "exact-length contract");
         // ⛔ S159zz —— 下面那条 wav 出口是 **PCM_16 + 逐臂峰值归一**:比值型尺子不怕增益,
         // 但量化地板骗过我们一次了(S159z 的「唱音内绝对静音」)。⇒ 想量小差就读这份原始 f32。
@@ -9172,11 +9237,13 @@ mod tests {
         let x = inverse_probe_tone(sr, 0.5);
         let fed = vec![220.0f32; 51];
         let hop = sr as usize / 100;
-        let a = apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, Some((&fed, hop)))
-            .expect("psola");
-        let b =
-            apply_inverse_with(InverseEngine::Signalsmith, x.clone(), sr, -6, 0.0, Some((&fed, hop)))
-                .expect("signalsmith");
+        let a =
+            apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, Some((&fed, hop)), 0.0)
+                .expect("psola");
+        let b = apply_inverse_with(
+            InverseEngine::Signalsmith, x.clone(), sr, -6, 0.0, Some((&fed, hop)), 0.0,
+        )
+        .expect("signalsmith");
         assert_eq!(a.len(), b.len());
         let diff = a.iter().zip(b.iter()).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
         assert!(diff > 1e-3, "the two engines produced the same audio (max |Δ| {diff})");

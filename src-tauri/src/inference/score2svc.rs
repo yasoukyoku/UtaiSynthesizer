@@ -2611,6 +2611,10 @@ fn apply_range_inverse(
         kappa,
         Some((note_hz, (sample_rate as usize / 50).max(1))),
         keep,
+        // ⭐ S162 —— **谱面轨吃谱倾斜**(出厂 1.0)。表就是在这条车道的素材上拟的:
+        // 靶子是**浅救援 −6**(用户说的「另一部分正常」那一半),留出验证下形状距离降 26-46%,
+        // 跨模型零噪声护栏 10/10 改善。⛔ cover 那两个调用点传 0 —— 见它们头上的注释。
+        super::vocal_range::range_tilt(),
     )
     .map_err(UtaiError::Inference);
     if let Ok(y) = &out {

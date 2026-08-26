@@ -256,6 +256,8 @@ fn mg_cvfix_inverse(
         f0shift,
         kappa,
         Some((&hz, sample_rate as usize / 50)),
+        // ⭐ 谱面轨的探针 ⇒ 跟出厂一致(听 `UTAI_RANGE_TILT`)。
+        super::super::vocal_range::range_tilt(),
     )
     .unwrap()
 }
@@ -2726,6 +2728,8 @@ fn mg_render_cover() {
             shift,
             kappa,
             Some((&pf, r.sample_rate as usize / 100)),
+            // ⛔ **cover 探针 ⇒ 0.0**,与生产的 cover 车道一致(表没在 cover 上验过)。
+            0.0,
         )
         .unwrap();
     }
