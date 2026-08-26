@@ -4484,6 +4484,17 @@ pub fn apply_dead_only_windows_with(
                             }
                         }
                         // ⭐ S163 —— 音内「唱没了」的毫秒数(不需要参照)。
+                        // ⭐⭐⭐ S163 —— 谐波谱峰的**宽度**（每一根谐波自己糊不糊）。
+                        // ⛔ 这一处曾经漏掉（只加在了修补遍后的重评估那处）⇒ `CandScore::width`
+                        //    在**主路径**上恒为空，于是 `width_eps` 全曲只触发 1 次（那 1 次正是
+                        //    修补遍后的）、`width_floor` 结构上触发不了。实测 P2 臂：`peak-width veto` **0 次**。
+                        if nd.hz > 0.0 {
+                            if let Some(w) =
+                                utai_dsp::harmonicity::harmonic_peak_width_pct(seg, sample_rate, nd.hz)
+                            {
+                                sc.width.push((ni, w));
+                            }
+                        }
                         let g = silence_run_ms(seg, sample_rate);
                         if g > 0.0 {
                             sc.gone.push((ni, g));
