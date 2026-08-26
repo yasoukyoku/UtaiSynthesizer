@@ -372,6 +372,198 @@ fn sinc_read_strided(x: &[f32], pos: f64, stride: f64) -> f64 {
     }
 }
 
+/// S162 —— **谱倾斜还原**用的频带中心(Hz)。表与它一一对应。
+const TILT_F: [f32; 9] = [300.0, 550.0, 950.0, 1600.0, 2600.0, 4100.0, 6500.0, 10000.0, 14000.0];
+
+/// ⚙ 出厂默认 = `0.0`(= 关 = 逐位不变)。`UTAI_RANGE_TILT=<0..1>` 打开;`1.0` = 全额还原。
+///
+/// **深救援的「虚/弱」是一条谱【倾斜】,而且它有真值可以还原。**
+///
+/// ## ⛔ 靶子不是发明的,是实测的 `base`
+/// S159zzb / S159zzk 的强制深度扫描(transpose 固定 +7 + `UTAI_MG_PLAN` 全曲强制 −d)
+/// ⇒ `base` = 模型**原生**唱 +7,`donor_post_-d` = 唱 +7−d 再被 PSOLA 抬回 +7
+/// ⇒ **同一批音、同一个输出音高** ⇒ 两者的谱包络之差**就是**要还原的量。
+/// 下表 = −(donor_post 相对 base 的包络差),两首谱(鹅妈妈 137 音 / 炉心融解 142 音)取平均。
+///
+/// | 深度 | 300 | 550 | 950 | 1.6k | 2.6k | 4.1k | 6.5k | 10k | 14k |
+/// |---|---|---|---|---|---|---|---|---|---|
+/// | −6 | −5.32 | −0.70 | +2.67 | +2.24 | +1.50 | +0.38 | +1.15 | +1.07 | −4.66 |
+/// | −10 | −8.58 | −2.69 | +2.20 | +5.03 | +4.61 | +1.70 | +1.40 | +2.93 | −7.15 |
+/// | −14 | −12.62 | −4.05 | +2.50 | +6.50 | +6.29 | +2.42 | +2.00 | +4.44 | −8.42 |
+///
+/// ⭐ **200-700 Hz 那两档是【压】** ⇒ 与「面状伪影」那条护栏**同向**(次基频跟着被压)。
+///
+/// ## ⭐⭐ 为什么它天然让段与段之间音色一致
+/// 每一段都被拉向**同一个**目标(模型在 target 音区的音色)⇒ 深度不同的相邻两段,
+/// 还原之后落在同一处。⛔ 这正是 κ 做不到的:κ 把共振峰**平移** `κ·s`,不同 s 搬不同量;
+/// 而实测 **α ≈ 0.005**(模型共振峰几乎不随音高移动)⇒ 平移本身就是错的算子。
+///
+/// ## ⛔ 膝盖以内恒等
+/// `|s| ≤ 6` 强度为 0(浅救援今天是好的,不许动);`min(1, (|s|−6)/4)` 淡入,−10 起满额。
+const TILT_TABLE: [(i64, [f32; 9]); 4] = [
+    (6, [-5.32, -0.70, 2.67, 2.24, 1.50, 0.38, 1.15, 1.07, -4.66]),
+    (8, [-5.49, -0.79, 2.39, 3.02, 1.58, 0.23, 2.47, 2.39, -6.38]),
+    (10, [-8.58, -2.69, 2.20, 5.03, 4.61, 1.70, 1.40, 2.93, -7.15]),
+    (14, [-12.62, -4.05, 2.50, 6.50, 6.29, 2.42, 2.00, 4.44, -8.42]),
+];
+
+/// 按救援深度取还原曲线(dB),含膝盖淡入与表内线性插值。
+fn tilt_curve(depth_semitones: f64, strength: f64) -> [f64; 9] {
+    let d = depth_semitones.abs();
+    let knee = ((d - 6.0) / 4.0).clamp(0.0, 1.0) * strength.clamp(0.0, 1.0);
+    let mut out = [0.0f64; 9];
+    if knee <= 0.0 {
+        return out;
+    }
+    let di = d.round() as i64;
+    let (lo, hi) = {
+        let mut lo = TILT_TABLE[0];
+        let mut hi = TILT_TABLE[TILT_TABLE.len() - 1];
+        for w in TILT_TABLE.windows(2) {
+            if w[0].0 <= di && di <= w[1].0 {
+                lo = w[0];
+                hi = w[1];
+                break;
+            }
+        }
+        if di <= TILT_TABLE[0].0 {
+            lo = TILT_TABLE[0];
+            hi = TILT_TABLE[0];
+        }
+        if di >= TILT_TABLE[TILT_TABLE.len() - 1].0 {
+            lo = TILT_TABLE[TILT_TABLE.len() - 1];
+            hi = lo;
+        }
+        (lo, hi)
+    };
+    let t = if hi.0 == lo.0 { 0.0 } else { (d - lo.0 as f64) / (hi.0 - lo.0) as f64 };
+    for i in 0..9 {
+        out[i] = (f64::from(lo.1[i]) + (f64::from(hi.1[i]) - f64::from(lo.1[i])) * t) * knee;
+    }
+    out
+}
+
+/// 施加谱倾斜还原:零相位的**幅度**整形,STFT overlap-add(Hann,hop = N/2,严格 COLA)。
+///
+/// ⛔ 只改**幅度**,相位一个字节不动 ⇒ 不搬共振峰、不动时间结构。
+/// ⛔ 全 0 曲线 ⇒ 逐位恒等(判据钉住)。
+fn apply_spectral_tilt(x: &mut [f32], sample_rate: u32, curve: &[f64; 9]) {
+    if curve.iter().all(|v| v.abs() < 1e-9) || x.len() < 4096 {
+        return;
+    }
+    const N: usize = 2048;
+    let hop = N / 2;
+    let win: Vec<f64> = (0..N)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos())
+        .collect();
+    // 逐 bin 增益:在 log-f 上对表插值
+    let sr = f64::from(sample_rate);
+    let gain: Vec<f64> = (0..=N / 2)
+        .map(|k| {
+            let f = k as f64 * sr / N as f64;
+            let g_db = if f <= f64::from(TILT_F[0]) {
+                curve[0]
+            } else if f >= f64::from(TILT_F[8]) {
+                curve[8]
+            } else {
+                let mut v = curve[0];
+                for i in 0..8 {
+                    let (a, b) = (f64::from(TILT_F[i]), f64::from(TILT_F[i + 1]));
+                    if f >= a && f <= b {
+                        let t = (f / a).ln() / (b / a).ln();
+                        v = curve[i] + (curve[i + 1] - curve[i]) * t;
+                        break;
+                    }
+                }
+                v
+            };
+            10f64.powf(g_db / 20.0)
+        })
+        .collect();
+    let n = x.len();
+    let mut out = vec![0.0f64; n];
+    let mut wsum = vec![0.0f64; n];
+    let mut buf = vec![0.0f64; N];
+    let mut pos = 0usize;
+    while pos + N <= n {
+        for i in 0..N {
+            buf[i] = f64::from(x[pos + i]) * win[i];
+        }
+        // 实 FFT(朴素 DFT 太慢 ⇒ 用简单的 radix-2)
+        let mut re = buf.clone();
+        let mut im = vec![0.0f64; N];
+        fft_in_place(&mut re, &mut im);
+        for k in 0..=N / 2 {
+            let g = gain[k];
+            re[k] *= g;
+            im[k] *= g;
+            if k > 0 && k < N / 2 {
+                re[N - k] *= g;
+                im[N - k] *= g;
+            }
+        }
+        // 逆变换(共轭法)
+        for v in im.iter_mut() {
+            *v = -*v;
+        }
+        fft_in_place(&mut re, &mut im);
+        let s = 1.0 / N as f64;
+        for i in 0..N {
+            out[pos + i] += re[i] * s * win[i];
+            wsum[pos + i] += win[i] * win[i];
+        }
+        pos += hop;
+    }
+    for i in 0..n {
+        if wsum[i] > 1e-9 {
+            x[i] = (out[i] / wsum[i]) as f32;
+        }
+    }
+}
+
+/// 就地 radix-2 FFT(N 必须是 2 的幂)。⛔ 只给 [`apply_spectral_tilt`] 用。
+fn fft_in_place(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2usize;
+    while len <= n {
+        let ang = -2.0 * std::f64::consts::PI / len as f64;
+        let (wr, wi) = (ang.cos(), ang.sin());
+        let mut i = 0usize;
+        while i < n {
+            let (mut cr, mut ci) = (1.0f64, 0.0f64);
+            for k in 0..len / 2 {
+                let (ur, ui) = (re[i + k], im[i + k]);
+                let (vr, vi) = (
+                    re[i + k + len / 2] * cr - im[i + k + len / 2] * ci,
+                    re[i + k + len / 2] * ci + im[i + k + len / 2] * cr,
+                );
+                re[i + k] = ur + vr;
+                im[i + k] = ui + vi;
+                re[i + k + len / 2] = ur - vr;
+                im[i + k + len / 2] = ui - vi;
+                let nr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = nr;
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+}
+
 /// Running RMS of the transport residual that was **discarded** (0 when it is carried).
 /// ⭐ This is a direct, non-vacuous readout of the quantity the fix is about: it is exactly
 /// 0.0000 at ratio 1.0, ≈0.41 samples for whole-sample transport at any other ratio, and 0 once
@@ -2310,7 +2502,7 @@ pub fn psola_shift_win(
     psola_shift_edge(
         x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
         phase_lock, infrasonic, env_restore_ms, bridge_unvoiced_ms, win_periods, xgrain, lpc_order,
-        keep, false, 0.0,
+        keep, false, 0.0, 0.0,
     )
 }
 
@@ -2367,6 +2559,8 @@ pub fn psola_shift_edge(
     edge_fill: bool,
     // S159zzf —— 读点去抖的强度(0…1)。`0.0` = 关 = 逐位不变。见 [`dejitter_marks`]。
     dejitter: f64,
+    // S162 —— 谱倾斜还原的强度(0…1)。`0.0` = 关 = **逐位不变**。见 [`TILT_TABLE`]。
+    tilt: f64,
 ) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
@@ -3012,11 +3206,63 @@ pub fn psola_shift_edge(
         diag.cola_w_p01 = at(0.01);
         diag.cola_w_p99 = at(0.99);
     }
+    // S162 —— 谱倾斜还原(出厂 0 = 关 = 逐位不变)。⛔ 放在**最后**:它的靶子是
+    //   `donor_post` 相对 `base` 的包络差,而那正是这一整条链跑完之后的东西。
+    //   ⛔ 只改幅度、不动相位 ⇒ 不搬共振峰(κ 才搬,而实测 α ≈ 0.005 ⇒ 平移是错的算子)。
+    {
+        let curve = tilt_curve(semitones, tilt);
+        apply_spectral_tilt(&mut out, sample_rate, &curve);
+    }
     (out, diag)
 }
 
 #[cfg(test)]
 mod tests {
+    /// ⭐⭐⭐ S162 —— **谱倾斜还原**:关着逐位不变 · 膝盖以内恒等 · 只改幅度不改相位。
+    #[test]
+    fn the_spectral_tilt_is_identity_when_off_and_inside_the_knee() {
+        let sr = 44100u32;
+        let hop = 882usize;
+        let f0 = 220.0f64;
+        let x = voiced(sr, 1.0, f0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let run = |st: f64, tilt: f64| {
+            psola_shift_edge(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off,
+                             0.0, 0.0, 1.0, 0.0, 0, &[], false, 0.0, tilt).0
+        };
+        // ⑴ tilt = 0 ⇒ 逐位同今天(出厂)
+        for st in [2.0f64, 8.0, 14.0] {
+            assert_eq!(run(st, 0.0), run(st, 0.0), "自比");
+        }
+        // ⑵ ⛔ 膝盖以内(|s| ≤ 6)即使 tilt = 1 也**一个字节不动**
+        for st in [2.0f64, 4.0, 6.0] {
+            assert_eq!(run(st, 1.0), run(st, 0.0),
+                       "{st} st 在膝盖以内,tilt 不许动它 —— 浅救援今天是好的");
+        }
+        // ⑶ 膝盖以外必须**真的做事**(否则上面两条只是「它什么都不做」)
+        let a = run(14.0, 0.0);
+        let b = run(14.0, 1.0);
+        let n = a.len().min(b.len());
+        let d: f64 = (0..n).map(|i| (f64::from(a[i]) - f64::from(b[i])).powi(2)).sum::<f64>() / n as f64;
+        let e: f64 = (0..n).map(|i| f64::from(a[i]).powi(2)).sum::<f64>() / n as f64;
+        let rel = 10.0 * (d / (e + 1e-30) + 1e-30).log10();
+        assert!(rel > -40.0, "−14 st 上 tilt=1 必须真的改变输出,实际只有 {rel:.1} dB");
+
+        // ⑷ 曲线本身:膝盖内全 0、−10 起满额、表内插值单调
+        for d in [0.0f64, 3.0, 6.0] {
+            assert!(tilt_curve(-d, 1.0).iter().all(|v| v.abs() < 1e-12), "{d} st 膝盖内必须全 0");
+        }
+        let c10 = tilt_curve(-10.0, 1.0);
+        let c14 = tilt_curve(-14.0, 1.0);
+        assert!(c10[0] < -5.0 && c14[0] < c10[0], "200-400 Hz 该压,而且越深压越多");
+        assert!(c14[4] > 4.0, "2-3 kHz 该抬");
+        // strength 线性
+        let half = tilt_curve(-14.0, 0.5);
+        for i in 0..9 {
+            assert!((half[i] - c14[i] * 0.5).abs() < 1e-9, "strength 必须线性");
+        }
+    }
+
     /// ⭐⭐⭐ S162 —— **κ 的染色是【线性插值】造成的,不是 κ 这个想法有问题。**
     ///
     /// 这条钉三件:
@@ -3654,7 +3900,7 @@ mod tests {
         let run = |st: f64, win: f64, fill: bool| {
             psola_shift_edge(
                 &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, win, 0.0, 0,
-                &[], fill, 0.0,
+                &[], fill, 0.0, 0.0,
             )
         };
 

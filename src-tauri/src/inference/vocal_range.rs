@@ -2732,6 +2732,19 @@ const RESCUE_LEVEL_MATCH_RATIO: f32 = 6.0;
 /// 单个音的最大压低量(dB)。⛔ 防止一个坏参照把音推到荒谬处。
 const RESCUE_LEVEL_MATCH_CAP: f32 = 12.0;
 
+/// ⚙ 出厂默认 = `0.0`(= 关 = **逐位不变**)。`UTAI_RANGE_TILT=<0..1>` 打开;`1.0` = 全额还原。
+///
+/// **深救援的「虚/弱」是一条谱【倾斜】,靶子是实测的 `base`。**
+/// 表、机理与「为什么这不是开 EQ」全在 `utai_dsp::psola::TILT_TABLE` 的 doc 上。
+/// ⛔ `|s| ≤ 6` 一个字节不动(浅救援今天是好的)。
+pub fn range_tilt() -> f64 {
+    std::env::var("UTAI_RANGE_TILT")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .unwrap_or(0.0)
+}
+
 /// 出厂门的读取口(env `UTAI_RANGE_LEVEL_MATCH`)。见 [`RESCUE_LEVEL_MATCH_DB`]。
 pub fn level_match_db() -> f32 {
     parse_level_match_db(std::env::var("UTAI_RANGE_LEVEL_MATCH").ok().as_deref())
@@ -4560,6 +4573,8 @@ pub fn apply_inverse_windowed_with(
                 keep,
                 fill,
                 dejitter(),
+                // S162 —— 谱倾斜还原(出厂 0 = 关 = 逐位不变)。见 `utai_dsp::psola::TILT_TABLE`。
+                range_tilt(),
             );
             // ⛔⛔ S159 —— 判据是 `islands_seen`(窗过滤**之前**的候选岛数),不是 `islands`。
             // 加了窗之后 `islands == 0` 多了一个**正常**的来源:这一遍的窗全落在休止里。
