@@ -50,8 +50,21 @@ pub(crate) fn commit_rendered_audio(
         std::fs::create_dir_all(parent).map_err(|e| format!("RENDER_WRITE_FAILED: {}", e))?;
     }
     let sample_rate = result.sample_rate;
+    let mut samples = result.audio;
+    // ⭐⭐ S163 —— **写盘前的最后一道**:`save_wav` 写 16 bit 时会 `clamp(-1.0, 1.0)`,
+    //    而在这之前没有任何一层看过峰值。实测 yuyuko × 炉心 +7 有 **756 个样本**顶到满刻度
+    //    (0:57.340 起连续 180 ms)。机理与代价在 `audio::peak_guard` 的 doc 里。
+    // ⛔ S129 铁律:「护栏开着」与「护栏做了事」必须分开可查 ⇒ 动手了就**响亮**地说。
+    if let Some(peak) = crate::audio::peak_guard(&mut samples, crate::audio::OUTPUT_PEAK_CEILING) {
+        tracing::warn!(
+            "output peak {peak:.4} would have been hard-clipped by the 16-bit writer — \
+             scaled the whole track by {:.2} dB (ceiling {:.2})",
+            20.0 * (crate::audio::OUTPUT_PEAK_CEILING / peak).log10(),
+            crate::audio::OUTPUT_PEAK_CEILING
+        );
+    }
     let buf = crate::audio::AudioBuffer {
-        samples: result.audio,
+        samples,
         sample_rate,
         channels: 1,
     };
@@ -1822,6 +1835,8 @@ pub async fn render_vocal_segment(
     // 底线)。cover/audition 维持整段优化器不变(无音符结构;S82 耳判过的工况)。
     // ⭐ S162 —— 逐组的落点候选,与 `range_windows` 平行(空 = 关 = 逐位回到今天)。
     let mut range_alts: Vec<Option<i64>> = Vec::new();
+    // ⭐ S163 —— 音符表(输出时间轴)。落点选法的逐音打分 + 两把电平刀**共用**它。
+    let mut range_spans: Vec<crate::inference::vocal_range::NoteSpan> = Vec::new();
     let range_windows: Vec<crate::inference::vocal_range::DeadJob> = if options.range_extend {
         let speaker = match backend_type {
             VoiceBackendType::SoVits => {
@@ -1835,6 +1850,9 @@ pub async fn render_vocal_segment(
             Some(r) => {
                 let nn = plan_note_nums(&score, phoneme_set);
                 let fr: Vec<i64> = score.iter().map(|n| n.frames).collect();
+                // ⛔ 与计划**同一份** `nn`/`fr`:音符表和落点决策必须来自同一条时间轴。
+                range_spans =
+                    crate::inference::vocal_range::note_spans(&nn, &fr, options.transpose);
                 // ⭐ S162 —— 多带一个**落点候选**出来(见 `dead_only_plan_with_alts`)。
                 // ⛔ 它不改今天的 pick;选不选用由 `landing_pick()` 决定。
                 let (plan, unfixable, plan_alts) =
@@ -2069,7 +2087,7 @@ pub async fn render_vocal_segment(
                     // 在这里算好传下去;渲染函数内部拿不到分母,现算一遍就是造第二份地图。
                     let base_len = result.audio.len();
 
-                    crate::inference::vocal_range::apply_dead_only_windows_alts(&mut result.audio, sr, total_frames, &range_windows, &range_alts, false, |s, own_windows| {
+                    crate::inference::vocal_range::apply_dead_only_windows_alts(&mut result.audio, sr, total_frames, &range_windows, &range_alts, &range_spans, false, |s, own_windows| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
@@ -2109,14 +2127,8 @@ pub async fn render_vocal_segment(
                     // ⛔ 只压不抬:抬会把面状伪影一起抬起来(被抬的音次基频占比高 +6.4…+17.5 dB)。
                     // 见 `match_rescued_note_levels` 的 doc。
                     {
-                        let notes: Vec<(i64, i64, bool)> = {
-                            let mut acc = 0i64;
-                            score_ref.iter().map(|n| {
-                                let f0 = acc;
-                                acc += n.frames.max(0);
-                                (f0, n.frames.max(0), n.note_num > 0)
-                            }).collect()
-                        };
+                        // ⭐ S163 —— 与落点选法共用同一份音符表(此前这里另抄了一遍)。
+                        let notes: &[crate::inference::vocal_range::NoteSpan] = &range_spans;
                         // ⭐⭐ S162 —— **乐句内跨组的电平对齐**,排在逐音那把刀【之前】:
                         // 先把**段的整体偏置**拉平,逐音那把再去压离群值。
                         // 治用户 2026-08-26 听出来的「同一乐句里深救援那半段比浅的轻 2.7 dB」
@@ -2126,7 +2138,7 @@ pub async fn render_vocal_segment(
                             let (cut, lift) =
                                 crate::inference::vocal_range::phrase_level_limits();
                             let n = crate::inference::vocal_range::match_phrase_group_levels(
-                                &mut result.audio, sr, total_frames, &range_windows, &notes, cut,
+                                &mut result.audio, sr, total_frames, &range_windows, notes, cut,
                                 lift,
                             );
                             tracing::info!(
@@ -2135,7 +2147,7 @@ pub async fn render_vocal_segment(
                         }
                         let t = crate::inference::vocal_range::level_match_db();
                         let hit = crate::inference::vocal_range::match_rescued_note_levels(
-                            &mut result.audio, sr, total_frames, &range_windows, &notes, t,
+                            &mut result.audio, sr, total_frames, &range_windows, notes, t,
                         );
                         // ⭐ 「臂开着」与「臂做了事」分开可查(S129 铁律)+ 打出实际生效值。
                         tracing::info!("range: level-match {t} dB — {hit} rescued note(s) pushed down");
@@ -2226,7 +2238,7 @@ pub async fn render_vocal_segment(
                     // 在这里算好传下去;渲染函数内部拿不到分母,现算一遍就是造第二份地图。
                     let base_len = result.audio.len();
 
-                    crate::inference::vocal_range::apply_dead_only_windows_alts(&mut result.audio, sr, total_frames, &range_windows, &range_alts, false, |s, own_windows| {
+                    crate::inference::vocal_range::apply_dead_only_windows_alts(&mut result.audio, sr, total_frames, &range_windows, &range_alts, &range_spans, false, |s, own_windows| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
@@ -2262,14 +2274,8 @@ pub async fn render_vocal_segment(
                     // ⛔ 只压不抬:抬会把面状伪影一起抬起来(被抬的音次基频占比高 +6.4…+17.5 dB)。
                     // 见 `match_rescued_note_levels` 的 doc。
                     {
-                        let notes: Vec<(i64, i64, bool)> = {
-                            let mut acc = 0i64;
-                            score_ref.iter().map(|n| {
-                                let f0 = acc;
-                                acc += n.frames.max(0);
-                                (f0, n.frames.max(0), n.note_num > 0)
-                            }).collect()
-                        };
+                        // ⭐ S163 —— 与落点选法共用同一份音符表(此前这里另抄了一遍)。
+                        let notes: &[crate::inference::vocal_range::NoteSpan] = &range_spans;
                         // ⭐⭐ S162 —— **乐句内跨组的电平对齐**,排在逐音那把刀【之前】:
                         // 先把**段的整体偏置**拉平,逐音那把再去压离群值。
                         // 治用户 2026-08-26 听出来的「同一乐句里深救援那半段比浅的轻 2.7 dB」
@@ -2279,7 +2285,7 @@ pub async fn render_vocal_segment(
                             let (cut, lift) =
                                 crate::inference::vocal_range::phrase_level_limits();
                             let n = crate::inference::vocal_range::match_phrase_group_levels(
-                                &mut result.audio, sr, total_frames, &range_windows, &notes, cut,
+                                &mut result.audio, sr, total_frames, &range_windows, notes, cut,
                                 lift,
                             );
                             tracing::info!(
@@ -2288,7 +2294,7 @@ pub async fn render_vocal_segment(
                         }
                         let t = crate::inference::vocal_range::level_match_db();
                         let hit = crate::inference::vocal_range::match_rescued_note_levels(
-                            &mut result.audio, sr, total_frames, &range_windows, &notes, t,
+                            &mut result.audio, sr, total_frames, &range_windows, notes, t,
                         );
                         // ⭐ 「臂开着」与「臂做了事」分开可查(S129 铁律)+ 打出实际生效值。
                         tracing::info!("range: level-match {t} dB — {hit} rescued note(s) pushed down");

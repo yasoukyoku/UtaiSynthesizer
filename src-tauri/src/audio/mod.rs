@@ -471,6 +471,50 @@ pub fn sanitize_non_finite(samples: &mut [f32]) -> usize {
     replaced
 }
 
+/// ⭐⭐ S163 —— **削波护栏**:交给 [`save_wav`] 之前把峰压回天花板以下。
+///
+/// ## 它存在的唯一理由,就在下面那一行 `save_wav` 里
+/// `save_wav` 写 16 bit 时是 `sample.clamp(-1.0, 1.0)` ⇒ **超过 1.0 的样本被硬削顶**,
+/// 而**没有任何一层在那之前看过一眼峰值**。
+///
+/// ## 谁会超(实测,不是假想)
+/// 谱面轨的音域扩展:base 那一遍归一到 0.92,而每一遍 donor 乘的是**base 的**标量
+/// (`peak_normalize_to(.., 0.92, Some(base_pre_norm_peak))`,S147 定的,为的是两边共用
+/// 一个标量)⇒ **donor 在它唱得响的地方就会超过 0.92,甚至超过 1.0**。
+/// 实测 S163 出厂臂:yuyuko × 炉心 +7 峰 **1.0000**、**756 个样本 |v|>0.999**、
+/// 最长一段 **0:57.340 起 180 ms**(= 用户 2026-08-26 点名的那一处);
+/// yachiyo × 鹅妈妈 +7 也有 3 个样本(1:27.160)。
+/// ⭐ 用户对它的定性:「就算真是模型烂,那我们碰上了也意味着**社区确实有这种模型**,
+/// 那就得做好优化」⇒ **不许推给模型**。
+///
+/// ## 为什么是**一个全曲标量**而不是限幅器
+/// 限幅器会改**波形**(那才是真的「压平」);一个标量**只改响度**:
+/// 相对电平、波峰因数、频谱形状**一个字节不动**。代价上限 = 超出量本身
+/// (yuyuko 那条臂 = **0.09 dB**),远低于可闻刻度(~2.7 dB)。
+/// ⛔ 而且它**只压不抬**:峰没超天花板的臂**逐位不变**(严格大于才动手)。
+///
+/// 返回 `Some(动手之前的峰)`——调用方**必须**把它打进日志:
+/// 「护栏开着」与「护栏做了事」要分开可查(S129 铁律)。
+pub fn peak_guard(samples: &mut [f32], ceiling: f32) -> Option<f32> {
+    if !(ceiling > 0.0) || samples.is_empty() {
+        return None;
+    }
+    let peak = samples.iter().fold(0.0f32, |a, &v| if v.is_finite() { a.max(v.abs()) } else { a });
+    if !(peak > ceiling) {
+        return None;
+    }
+    let g = ceiling / peak;
+    for v in samples.iter_mut() {
+        *v *= g;
+    }
+    Some(peak)
+}
+
+/// ⚙ [`peak_guard`] 的天花板。**不是 0.92**:0.92 是**渲染**那一遍自己的归一目标
+/// (`score2svc::peak_normalize_to`),而这一条是**写盘前的最后一道**,它只需要
+/// 「不被 16 bit 削掉」。取 0.99 是为了**少动**:实测超标的臂只需要 0.09 dB。
+pub const OUTPUT_PEAK_CEILING: f32 = 0.99;
+
 pub fn save_wav(path: &Path, buffer: &AudioBuffer) -> Result<()> {
     let spec = hound::WavSpec {
         channels: buffer.channels,
@@ -523,4 +567,84 @@ pub fn save_wav_f32(path: &Path, buffer: &AudioBuffer) -> Result<()> {
     }
     writer.finalize().map_err(|e| crate::UtaiError::Audio(format!("Finalize error: {}", e)))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod peak_guard_tests {
+    use super::*;
+
+    /// ⛔⛔ S163 —— **护栏只在真的超了的时候动手,而且只动一个标量。**
+    ///
+    /// 四格,少一格这条判据就有一根轴是空的:
+    /// ⑴ 超了 ⇒ 峰回到天花板;⑵ ⛔ **波形形状逐样本成比例**(它不是限幅器);
+    /// ⑶ ⛔ **阴性对照**:没超 ⇒ **逐位不变**;⑷ 天花板荒谬 / 空缓冲 ⇒ 不动手。
+    #[test]
+    fn the_peak_guard_only_scales_and_only_when_it_must() {
+        // ⑴ + ⑵
+        let src: Vec<f32> = (0..1000).map(|i| 1.5 * ((i as f32) * 0.017).sin()).collect();
+        let mut x = src.clone();
+        let was = peak_guard(&mut x, OUTPUT_PEAK_CEILING).expect("超了就该动手");
+        assert!((was - 1.5).abs() < 1e-3, "报回来的峰应当是动手之前的:{was}");
+        let peak = x.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        assert!((peak - OUTPUT_PEAK_CEILING).abs() < 1e-4, "峰没回到天花板:{peak}");
+        let g = OUTPUT_PEAK_CEILING / was;
+        for (a, b) in src.iter().zip(x.iter()) {
+            assert!((a * g - b).abs() < 1e-6, "不是一个标量 —— 它变成限幅器了");
+        }
+        // ⑶ ⛔ 阴性对照:没超 ⇒ 逐位不变
+        let quiet: Vec<f32> = src.iter().map(|v| v * 0.5).collect();
+        let mut y = quiet.clone();
+        assert_eq!(peak_guard(&mut y, OUTPUT_PEAK_CEILING), None);
+        assert_eq!(y, quiet, "没超的缓冲必须逐位不变");
+        // ⚠ 恰好等于天花板也不许动(严格大于才动手)
+        let mut edge = vec![OUTPUT_PEAK_CEILING, -OUTPUT_PEAK_CEILING, 0.0];
+        let e0 = edge.clone();
+        assert_eq!(peak_guard(&mut edge, OUTPUT_PEAK_CEILING), None);
+        assert_eq!(edge, e0);
+        // ⑷ 退化输入
+        let mut z = vec![2.0f32];
+        assert_eq!(peak_guard(&mut z, 0.0), None);
+        assert_eq!(peak_guard(&mut [], 0.99), None);
+    }
+
+    /// ⛔⛔ S163 —— **它必须接在写盘的那条路上**,否则就是一条谁也不调用的纯函数。
+    ///
+    /// 这一条走**生产自己的出口** [`crate::commands::inference::commit_rendered_audio`]
+    /// 的完整来回:交一个峰 1.5 的缓冲,读回来必须**没有一个样本顶到满刻度**。
+    /// ⛔ 变异靶:把 `commit_rendered_audio` 里那一句 `peak_guard` 删掉 ⇒ 当场红。
+    ///
+    /// ⭐ 外加一格**源码级**的:mg 台子那一条也必须接着 —— 台子与生产不是同一条链的话,
+    /// 台子上量到的一切都不代表用户听到的东西(S162 为这件事付过学费)。
+    #[test]
+    fn a_hot_buffer_reaches_the_writer_without_clipping() {
+        let samples: Vec<f32> = (0..2000).map(|i| 1.5 * ((i as f32) * 0.031).sin()).collect();
+        let dir = std::env::temp_dir().join("utai_peak_guard_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("hot.wav");
+        crate::commands::inference::commit_rendered_audio(
+            crate::inference::SynthesisResult {
+                audio: samples.clone(),
+                sample_rate: 44100,
+                pre_norm_peak: None,
+            },
+            p.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        let mut r = hound::WavReader::open(&p).unwrap();
+        let back: Vec<i16> = r.samples::<i16>().map(|v| v.unwrap()).collect();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(back.len(), samples.len());
+        let hot = back.iter().filter(|v| v.abs() >= 32760).count();
+        assert_eq!(hot, 0, "还有 {hot} 个样本顶到满刻度 —— 护栏没接在写盘那条路上");
+        // ⛔ 形状成比例(它是标量不是限幅器)—— 拿两个相邻峰的比值当指纹
+        let peak = back.iter().map(|v| v.abs()).max().unwrap();
+        assert!(peak > 32000, "压过头了:峰只有 {peak}");
+
+        // ⭐ 源码级:mg 台子那一条
+        let mg = include_str!("../inference/score2svc_mg.rs");
+        assert!(
+            mg.contains("peak_guard(&mut result.audio"),
+            "mg 台子没接同一道护栏 —— 台子上量到的东西就不代表生产"
+        );
+    }
 }

@@ -14,6 +14,7 @@
 
 pub mod demucs;
 pub mod formant;
+pub mod harmonicity;
 pub mod mdx;
 pub mod psola;
 pub mod stft;

@@ -1618,6 +1618,8 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
         }
         let _ = std::fs::write(dir.join("total_frames.txt"), total_frames.to_string());
     }
+    // ⭐ S163 —— 音符表(输出时间轴)。落点选法的逐音打分与两把电平刀**共用**它。
+    let spans = super::super::vocal_range::note_spans(&nn, &fr, transpose);
     super::super::vocal_range::apply_dead_only_windows_alts(
         &mut result.audio,
         sr,
@@ -1625,6 +1627,7 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
         &jobs,
         // ⭐ S162 —— 台子也走落点候选,否则离线读数与生产不是同一条链。
         if super::super::vocal_range::landing_pick() { &plan_alts } else { &[] },
+        &spans,
         false, // 与生产同:donor 共用 base 的归一前峰 ⇒ 不需要 active-RMS 猜台阶
         |s, own| {
             // S159 —— 与生产同一条:保留区间由**拥有帧→样本地图的人**算,闭包只把 `own` 传进去。
@@ -1650,29 +1653,34 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
 
     // S162 —— 与生产同一条:被救音的乐句级电平匹配(只压不抬)。见 `match_rescued_note_levels`。
     {
-        let notes: Vec<(i64, i64, bool)> = {
-            let mut acc = 0i64;
-            triples.iter().map(|t| {
-                let f0 = acc;
-                acc += t.frames.max(0);
-                (f0, t.frames.max(0), t.note_num > 0)
-            }).collect()
-        };
+        // ⭐ S163 —— 与落点选法共用同一份音符表(此前这里另抄了一遍 `acc += frames`)。
+        let notes: &[super::super::vocal_range::NoteSpan] = &spans;
         // ⭐⭐ S162 —— 乐句内跨组的电平对齐,排在逐音那把刀之前。见 `match_phrase_group_levels`。
         {
             let (cut, lift) = super::super::vocal_range::phrase_level_limits();
             let n = super::super::vocal_range::match_phrase_group_levels(
-                &mut result.audio, sr, total_frames, &jobs, &notes, cut, lift,
+                &mut result.audio, sr, total_frames, &jobs, notes, cut, lift,
             );
             eprintln!("[mg] phrase-level -{cut}/+{lift} dB — {n} segment(s) aligned");
         }
         let t = super::super::vocal_range::level_match_db();
         let hit = super::super::vocal_range::match_rescued_note_levels(
-            &mut result.audio, sr, total_frames, &jobs, &notes, t,
+            &mut result.audio, sr, total_frames, &jobs, notes, t,
         );
         eprintln!("[mg] level-match {t} dB — {hit} rescued note(s) pushed down");
     }
 
+    // ⭐ S163 —— 与生产的 `commit_rendered_audio` **同一道**削波护栏。
+    //    ⛔ 台子少一道就不是同一条链了(S163 的读数全靠这条臂)。
+    if let Some(peak) =
+        crate::audio::peak_guard(&mut result.audio, crate::audio::OUTPUT_PEAK_CEILING)
+    {
+        eprintln!(
+            "[mg] peak-guard: {peak:.4} -> {:.2} ({:+.2} dB on the whole track)",
+            crate::audio::OUTPUT_PEAK_CEILING,
+            20.0 * (crate::audio::OUTPUT_PEAK_CEILING / peak).log10()
+        );
+    }
     let out_dir = mg_out_dir();
     std::fs::create_dir_all(&out_dir).unwrap();
     let stem = format!("mg_deadonly_{arm}_{mtag}");

@@ -1107,14 +1107,62 @@ pub fn dead_only_plan_with_alts(
             dead_only_plan_with_alts(note_nums, frames, transpose, range, alt_tune);
         ALT_PLAN_REENTRY.with(|f| f.set(false));
         for (gi, g) in out.iter().enumerate() {
-            if let Some(a) = alt_plan.iter().find(|x| x.start == g.start) {
-                if a.shift != g.shift {
-                    alts[gi] = Some(a.shift);
+            // ⛔⛔ S163 —— **必须 `start` 与 `end` 都相同**。
+            //
+            // 只按 `start` 找是 S162 那条「张冠李戴」的**第二次复发**(第一次是按组下标
+            // 平行传给渲染层,已修):两份计划的**预算不同 ⇒ 分组也不同**,实测
+            // `landing = 1` 给出 **95 组**而 `landing = 3` 给出 **90 组**。于是
+            // 「起点相同」的两个组可能**根本不是同一批音**,而它的落点是为**另一批音**解出来的。
+            //
+            // 实测(akiko × 炉心 +7):plan `[698..704]` 需要 −10(最高音目标 MIDI 87),
+            // 而同起点的 alt 组是 `[698..701]`(把那个高音**分出去了**)⇒ 它的落点是 **−4**。
+            // 把 −4 当候选交给渲染层,它在整窗电平上反而**更贴近**邻居 ⇒ **赢了** ⇒
+            // 那个音的救援被整个丢掉:实测谐波能量占比 **−0.98 → −19.56 dB**、
+            // 梳深 26.9 → 8.4、次基频 −25.1 → **+19.9**,与**关掉扩展的 `base` 几乎逐格相同**。
+            // 这就是用户 2026-08-26 报的「4:09.478 塌了」,而**同一首歌里它发生 5 次**。
+            //
+            // 人群面(4 个模型 × 2 首谱 × 移调 0/7):带候选 341 组,**22 组(6.5%)**
+            // 起点相同而范围不同;东雪莲 × 鹅妈妈 +7 上是 **6/7**。
+            // ⇒ 范围一对不上就**不带候选**(那一组照走今天的落点,零风险)。
+            alts[gi] = alt_shift_for(g, &alt_plan);
+            if alts[gi].is_none() {
+                if let Some(x) = alt_plan.iter().find(|x| x.start == g.start && x.end != g.end) {
+                    tracing::info!(
+                        "range: notes[{}..={}] landing candidate DROPPED — the narrow-budget plan grouped it as \
+                         [{}..={}] instead, so its {:+} was solved for a DIFFERENT set of notes",
+                        g.start,
+                        g.end,
+                        x.start,
+                        x.end,
+                        x.shift
+                    );
                 }
             }
         }
     }
     (out, unfixable, alts)
+}
+
+/// ⭐⭐ S163 —— 从**窄预算那份计划**里给一个组取落点候选。
+///
+/// ⛔⛔ **必须 `start` 与 `end` 都相同。**两份计划的预算不同 ⇒ **分组也不同**
+/// (实测 akiko × 炉心 +7:`landing = 1` 出 **95 组**、`landing = 3` 出 **90 组**),
+/// 于是「起点相同」的两个组可能**根本不是同一批音**,它的落点是为**别的音**解出来的。
+///
+/// 实测那一处(用户 2026-08-26 报的 **4:09.478「み」**):
+/// plan `[698..=704]`(最高音目标 MIDI **87**)拿到窄预算 `[698..=701]` 的 **−4**
+/// ⇒ 落在 **83**,**仍在死区**;而它在**整窗**电平上反而更贴近邻居 ⇒ 赢了
+/// ⇒ 那个音的救援被整个丢掉(谐波能量占比 −0.98 → **−19.56 dB**,与关掉扩展的 `base` 几乎相同),
+/// 而这在同一首歌里**发生 5 次**。人群面:341 组带候选里 **22 组(6.5%)**是这个形状。
+///
+/// ⭐ 抽成具名函数的唯一理由:**判据要咬得到它**(见
+/// `a_landing_candidate_is_never_borrowed_from_a_differently_grouped_plan` 的 ⑶)。
+fn alt_shift_for(g: &DeadGroup, alt_plan: &[DeadGroup]) -> Option<i64> {
+    alt_plan
+        .iter()
+        .find(|x| x.start == g.start && x.end == g.end)
+        .map(|x| x.shift)
+        .filter(|&s| s != g.shift)
 }
 
 thread_local! {
@@ -2109,6 +2157,56 @@ pub struct DeadJob {
     pub end: i64,
 }
 
+/// ⭐ S163 —— 一个音在**输出时间轴**上的跨度 + 它的目标基频。
+///
+/// ⛔ 为什么是一个类型而不是三个平行数组 / 一个元组:今天有**三处**要按音符切这条时间轴
+/// (`match_rescued_note_levels` / `match_phrase_group_levels` / 落点选法的逐音打分),
+/// 而 S162 已经在「按**组下标**平行传候选」上栽过一次张冠李戴。⇒ 一个类型,一个构造器。
+///
+/// `hz` = **目标**基频(= `(note_num + transpose)` 那一格的等程律频率)。
+/// ⛔ 它只许用于**同一个音的两个候选之间**的比较 —— 谐波序号尺子跨音区不可比(S162 栽过三次)。
+/// `0.0` = 不知道 ⇒ 谐波那一轴对这个音**弃权**。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteSpan {
+    /// 起始帧(与 [`DeadJob`] 同一条帧轴)。
+    pub start: i64,
+    /// 帧数。
+    pub frames: i64,
+    /// 是不是**唱音**(`note_num > 0`;休止/换气不是)。
+    pub sung: bool,
+    /// 目标基频(Hz);0 = 未知。
+    pub hz: f32,
+}
+
+/// 从谱面的「音高 + 帧数」铺出 [`NoteSpan`] 表。⛔ **三个调用点共用这一个构造器** ——
+/// 它们此前各自写了一遍 `acc += frames.max(0)`,而那正是「同一份地图抄三遍」的形状。
+///
+/// `transpose` 与 `dead_only_plan_with` 里的 `eff` 同一条:`(n + transpose).clamp(1, 127)`。
+pub fn note_spans(note_nums: &[i64], frames: &[i64], transpose: i64) -> Vec<NoteSpan> {
+    let mut acc = 0i64;
+    note_nums
+        .iter()
+        .zip(frames.iter())
+        .map(|(&n, &f)| {
+            let start = acc;
+            let fr = f.max(0);
+            acc += fr;
+            let sung = n > 0;
+            NoteSpan {
+                start,
+                frames: fr,
+                sung,
+                hz: if sung {
+                    let m = (n + transpose).clamp(1, 127);
+                    440.0 * 2f32.powf((m - 69) as f32 / 12.0)
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect()
+}
+
 /// `f0_hz` = 整段探测 f0(**未 pad 网格、含用户移调**=模型将要唱的音高,与输出时间轴对齐)。
 /// 区域在原始帧号上构建:GAP_TOL_MS 桥接高潮内的清辅音/换气微隙;浊死帧数 ≥ MIN_VIOLATION_MS
 /// 起判(S62b 幻影岛铁律:rmvpe 倍频误读绝不触发染色)。区内被拖拽的浊帧必须保持 singable。
@@ -2949,12 +3047,74 @@ fn parse_level_match_db(v: Option<&str>) -> f32 {
 /// ## ⛔ 粒度必须是【音符】不是【窗】
 /// 窗粒度实测把最干净那条臂(dxl41 × 鹅妈妈)的 |rel| p90 从 **3.79 推到 4.9**——
 /// 一个窗里有多个音,整窗一个增益会连累窗内本来正常的那些。音符粒度上它**一动不动**。
+/// 逐音电平(dBFS)与「被救援窗覆盖的比例」。⛔ **唯一**一份口径 ——
+/// 电平匹配与落点选法共用它,否则两处会各自漂移(S162 的 `subf0` 就是这样读反号的)。
+/// 不是唱音 / 太短 / 取不到样本 ⇒ 电平 `NaN`、覆盖率 0。
+fn note_levels_and_coverage(
+    audio: &[f32],
+    spf: f64,
+    jobs: &[DeadJob],
+    notes: &[NoteSpan],
+) -> (Vec<f32>, Vec<f32>) {
+    let alen = audio.len();
+    let mut lv: Vec<f32> = Vec::with_capacity(notes.len());
+    let mut cov: Vec<f32> = Vec::with_capacity(notes.len());
+    for nd in notes {
+        if !nd.sung || nd.frames < LEVEL_MATCH_MIN_FRAMES {
+            lv.push(f32::NAN);
+            cov.push(0.0);
+            continue;
+        }
+        let a = (((nd.start as f64) * spf).round().max(0.0) as usize).min(alen);
+        let b = ((((nd.start + nd.frames) as f64) * spf).round().max(0.0) as usize).min(alen);
+        if b <= a + 256 {
+            lv.push(f32::NAN);
+            cov.push(0.0);
+            continue;
+        }
+        let e: f64 = audio[a..b].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>()
+            / (b - a) as f64;
+        lv.push((10.0 * (e + 1e-20).log10()) as f32);
+        let c: i64 = jobs
+            .iter()
+            .map(|j| ((nd.start + nd.frames).min(j.end) - nd.start.max(j.start)).max(0))
+            .sum();
+        cov.push((c as f32 / nd.frames as f32).clamp(0.0, 1.0));
+    }
+    (lv, cov)
+}
+
+/// 逐音参照 = 邻近 ±[`LEVEL_MATCH_NEIGHBOURS`] 个**没被救**唱音的电平**中位**。
+///
+/// ⛔ 为什么参照必须是「在唱的、没被救的邻居」,而不是「窗外那一片 base 的平均」:
+/// 后者在**密集救援的乐句**里主要是**休止**(数字静音)⇒ 参照读到 −100 dBFS ⇒
+/// 「|电平 − 参照|」退化成「谁更轻谁赢」,方向正好反了。
+/// 实测 akiko × 炉心 +7:60 个窗里有 **6 个**的窗外参照比全曲唱音中位低 >15 dB。
+/// ⚠ 取不到 [`LEVEL_MATCH_MIN_REF`] 个干净邻居 ⇒ `NaN`,调用方**弃权**而不是瞎猜。
+fn clean_neighbour_refs(lv: &[f32], cov: &[f32]) -> Vec<f32> {
+    (0..lv.len())
+        .map(|i| {
+            let lo = i.saturating_sub(LEVEL_MATCH_NEIGHBOURS);
+            let hi = (i + LEVEL_MATCH_NEIGHBOURS + 1).min(lv.len());
+            let mut refs: Vec<f32> = (lo..hi)
+                .filter(|&j| j != i && cov[j] < 0.05 && lv[j].is_finite())
+                .map(|j| lv[j])
+                .collect();
+            if refs.len() < LEVEL_MATCH_MIN_REF {
+                return f32::NAN;
+            }
+            refs.sort_by(f32::total_cmp);
+            refs[refs.len() / 2]
+        })
+        .collect()
+}
+
 pub fn match_rescued_note_levels(
     audio: &mut [f32],
     sample_rate: u32,
     total_frames: i64,
     jobs: &[DeadJob],
-    notes: &[(i64, i64, bool)],
+    notes: &[NoteSpan],
     thresh_db: f32,
 ) -> usize {
     if thresh_db <= 0.0 || total_frames <= 0 || audio.is_empty() {
@@ -2967,46 +3127,16 @@ pub fn match_rescued_note_levels(
         let b = (((f0 + n) as f64) * spf).round().max(0.0) as usize;
         (a.min(alen), b.min(alen))
     };
-    // ── 逐音:电平 + 被窗覆盖的比例 ──────────────────────────────────
-    let mut lv: Vec<f32> = Vec::with_capacity(notes.len());
-    let mut cov: Vec<f32> = Vec::with_capacity(notes.len());
-    for &(f0, n, sung) in notes {
-        if !sung || n < LEVEL_MATCH_MIN_FRAMES {
-            lv.push(f32::NAN);
-            cov.push(0.0);
-            continue;
-        }
-        let (a, b) = span(f0, n);
-        if b <= a + 256 {
-            lv.push(f32::NAN);
-            cov.push(0.0);
-            continue;
-        }
-        let e: f64 = audio[a..b].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>()
-            / (b - a) as f64;
-        lv.push((10.0 * (e + 1e-20).log10()) as f32);
-        let c: i64 = jobs
-            .iter()
-            .map(|j| ((f0 + n).min(j.end) - f0.max(j.start)).max(0))
-            .sum();
-        cov.push((c as f32 / n as f32).clamp(0.0, 1.0));
-    }
-    // ── 逐音:参照 = 邻近的【没被救】唱音的电平中位 ────────────────
+    // ── 逐音:电平 + 被窗覆盖的比例 + 干净邻居参照(共用口径)────────
+    let (lv, cov) = note_levels_and_coverage(audio, spf, jobs, notes);
+    let refs = clean_neighbour_refs(&lv, &cov);
     let mut hits = 0usize;
     let mut gains: Vec<(usize, f32)> = Vec::new();
     for i in 0..notes.len() {
-        if !(cov[i] > 0.8) || !lv[i].is_finite() {
+        if !(cov[i] > 0.8) || !lv[i].is_finite() || !refs[i].is_finite() {
             continue;
         }
-        let lo = i.saturating_sub(LEVEL_MATCH_NEIGHBOURS);
-        let hi = (i + LEVEL_MATCH_NEIGHBOURS + 1).min(notes.len());
-        let mut refs: Vec<f32> =
-            (lo..hi).filter(|&j| j != i && cov[j] < 0.05 && lv[j].is_finite()).map(|j| lv[j]).collect();
-        if refs.len() < LEVEL_MATCH_MIN_REF {
-            continue;
-        }
-        refs.sort_by(f32::total_cmp);
-        let med = refs[refs.len() / 2];
+        let med = refs[i];
         let rel = lv[i] - med;
         if rel <= thresh_db {
             continue;
@@ -3025,8 +3155,7 @@ pub fn match_rescued_note_levels(
     // ── 施加:整个音符跨度上一个常数增益,两端各 10 ms 淡化 ────────
     let fade = ((sample_rate as usize) / 100).max(2);
     for (i, g) in gains {
-        let (f0, n, _) = notes[i];
-        let (a, b) = span(f0, n);
+        let (a, b) = span(notes[i].start, notes[i].frames);
         let k = 10f32.powf(g / 20.0);
         let w = fade.min((b - a) / 2);
         for t in a..b {
@@ -3108,7 +3237,7 @@ pub fn match_phrase_group_levels(
     sample_rate: u32,
     total_frames: i64,
     jobs: &[DeadJob],
-    notes: &[(i64, i64, bool)],
+    notes: &[NoteSpan],
     cut_db: f32,
     lift_db: f32,
 ) -> usize {
@@ -3125,7 +3254,8 @@ pub fn match_phrase_group_levels(
     // ── 逐音:电平 + 这个音属于哪一段(= 覆盖它最多的那个 job 的 shift;没被救 = None)──
     let mut lv: Vec<f32> = Vec::with_capacity(notes.len());
     let mut seg: Vec<Option<i64>> = Vec::with_capacity(notes.len());
-    for &(f0, n, sung) in notes {
+    for nd in notes {
+        let (f0, n, sung) = (nd.start, nd.frames, nd.sung);
         let (a, b) = span(f0, n);
         let mut best: (i64, Option<i64>) = (0, None);
         for j in jobs {
@@ -3153,12 +3283,12 @@ pub fn match_phrase_group_levels(
     let mut hits = 0usize;
     let mut i = 0usize;
     while i < notes.len() {
-        if !notes[i].2 {
+        if !notes[i].sung {
             i += 1;
             continue;
         }
         let s = i;
-        while i < notes.len() && notes[i].2 {
+        while i < notes.len() && notes[i].sung {
             i += 1;
         }
         let e = i; // [s, e)
@@ -3180,7 +3310,7 @@ pub fn match_phrase_group_levels(
         let mut est: Vec<Option<(f32, i64)>> = Vec::with_capacity(runs.len());
         for &(_, a, b) in &runs {
             let mut v: Vec<f32> = (a..b).filter(|&j| lv[j].is_finite()).map(|j| lv[j]).collect();
-            let sus: i64 = (a..b).filter(|&j| lv[j].is_finite()).map(|j| notes[j].1).sum();
+            let sus: i64 = (a..b).filter(|&j| lv[j].is_finite()).map(|j| notes[j].frames).sum();
             if v.is_empty() || sus < PHRASE_LEVEL_MIN_SUSTAIN {
                 est.push(None);
                 continue;
@@ -3207,8 +3337,8 @@ pub fn match_phrase_group_levels(
                 continue;
             }
             let (_, a, b) = runs[j];
-            let (x0, _) = span(notes[a].0, notes[a].1);
-            let (_, x1) = span(notes[b - 1].0, notes[b - 1].1);
+            let (x0, _) = span(notes[a].start, notes[a].frames);
+            let (_, x1) = span(notes[b - 1].start, notes[b - 1].frames);
             if x1 <= x0 {
                 continue;
             }
@@ -3259,6 +3389,72 @@ pub fn landing_pick() -> bool {
 
 /// ⚙ 出厂默认。见 [`landing_pick`]。
 const LANDING_PICK_DEFAULT: bool = true;
+
+/// ⚙ 出厂默认 = 3.0(**dB**,见 [`LANDING_HARM_EPS_DEFAULT`])。
+/// `UTAI_RANGE_LANDING_HARM=0` 关掉 ⇒ 落点选法退回「只看电平」。
+///
+/// ## ⭐⭐⭐ 它补的是落点这条链上唯一没人管的一根轴:**谐波结构**
+/// S162 收工时定的根因是「落点链没有一层在优化耳朵在意的东西」——
+/// 计划器的 `damage` 来自**扫描表**(400 ms 稳态「あ」,已证与「ぴゃ」这类音完全不相关),
+/// 而 S162 加的渲染时选法优化的是 **`|rel|`(电平)**。⇒ **两层都不看谐波。**
+///
+/// 电平这根轴有两个结构性盲点(S163 逐条实测):
+/// * ⛔ 它**需要参照**,而参照 = 邻近**没被救**的唱音 —— 密集救援的乐句里一个都没有
+///   (实测 akiko × 炉心 +7:68 个带候选的窗里 **24 个**取不到);
+/// * ⛔ 它**分不开「唱得响」与「唱得对」**:一个**根本没救到**的候选(落点仍在死区、
+///   与关掉扩展的 `base` 几乎逐格相同)在电平上反而**更贴近**邻居。
+///
+/// ⇒ 加一根**不需要参照、而且与电平无关**的轴:
+/// [`utai_dsp::harmonicity::harmonic_energy_fraction_db`] —— 「这段音频有多少能量真的
+/// 落在**目标基频**的各次谐波上」。
+///
+/// ## 为什么阈值是 3 dB(实测定的,不是猜的)
+/// akiko × 炉心 +7,同一份 donor 缓冲上逐音比两个候选(n = 275 个音):
+/// **健康的一对**候选之间 |Δ| 的 p90 = **0.17 dB**、p99 = **1.83**、max 6.05;
+/// 而那 5 处「救援被丢掉」的音是 **11-18.6 dB**。
+/// ⇒ 3 dB 的门槛:5/5 灾难全抓住,240 个健康音里只碰 **1** 个
+/// (音[130]「り」,它两个候选一个 −12.5 一个 −6.5,而被留下的那个在**四根轴上都更好**)。
+///
+/// ⛔ **它只在同一个音的两个候选之间比** —— 谐波序号尺子跨音区不可比(S162 栽过三次)。
+pub fn landing_harm_eps() -> f32 {
+    parse_landing_harm(std::env::var("UTAI_RANGE_LANDING_HARM").ok().as_deref())
+}
+
+fn parse_landing_harm(v: Option<&str>) -> f32 {
+    v.and_then(|x| x.trim().parse::<f32>().ok())
+        .filter(|t| t.is_finite() && (0.0..=24.0).contains(t))
+        .unwrap_or(LANDING_HARM_EPS_DEFAULT)
+}
+
+/// ⚙ 出厂默认。见 [`landing_harm_eps`]。
+const LANDING_HARM_EPS_DEFAULT: f32 = 3.0;
+
+/// ⭐ S163 —— 一个落点候选在**一个窗**里的逐音读数。
+///
+/// ⛔ 为什么是**逐音**而不是整窗一个数:一个窗里可能有 7 个音,而只有 1 个塌了。
+/// 实测 4:09.478「み」只占整窗 **180 ms / 1.4 s** ⇒ 整窗 RMS 结构上看不见它
+/// (那一处生产读到的整窗 |rel| 是 0.31 vs 1.51 —— **塌掉的那个反而赢**)。
+#[derive(Default, Clone)]
+struct CandScore {
+    /// (音下标, |电平 − 干净邻居中位| dB)。只含**取得到参照**的音。
+    rel: Vec<(usize, f32)>,
+    /// (音下标, 谐波能量占比 dB)。**不需要参照**。
+    harm: Vec<(usize, f32)>,
+}
+
+impl CandScore {
+    /// 组的成绩 = **组内最差的那个音**(S162 oracle 用的就是这个口径:
+    /// 一个塌掉的音就毁了一整组,平均值会把它稀释掉)。
+    fn worst_rel(&self) -> Option<f32> {
+        self.rel.iter().map(|&(_, v)| v).fold(None, |a: Option<f32>, v| {
+            Some(a.map_or(v, |x: f32| x.max(v)))
+        })
+    }
+
+    fn harm_of(&self, i: usize) -> Option<f32> {
+        self.harm.iter().find(|&&(k, _)| k == i).map(|&(_, v)| v)
+    }
+}
 
 /// 乐句内跨组对齐:**压**的上限(dB)。见 [`match_phrase_group_levels`]。
 const PHRASE_LEVEL_CUT_DB: f32 = 3.0;
@@ -3467,7 +3663,7 @@ pub fn apply_dead_only_windows(
     donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
     apply_dead_only_windows_alts(
-        base, sample_rate, total_frames, jobs, &[], match_levels, donor_render,
+        base, sample_rate, total_frames, jobs, &[], &[], match_levels, donor_render,
     )
 }
 
@@ -3498,6 +3694,9 @@ pub fn apply_dead_only_windows_alts(
     total_frames: i64,
     jobs: &[DeadJob],
     alts: &[Option<i64>],
+    // ⭐ S163 —— 打分改成**逐音**(见 [`CandScore`])⇒ 需要音符表。
+    //    空切片 ⇒ 没有候选可选,逐位回到今天(cover 车道恒如此)。
+    notes: &[NoteSpan],
     match_levels: bool,
     donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
@@ -3507,10 +3706,14 @@ pub fn apply_dead_only_windows_alts(
         total_frames,
         jobs,
         alts,
+        notes,
         match_levels,
         join_rests_enabled(),
         // S159zm —— env 只在这一个入口读一次(见 [`seam_align_ms`])。
         (seam_align_ms() * f64::from(sample_rate) / 1000.0).round() as usize,
+        // ⛔ S163 —— 同一条规矩:谐波否决的门限由**参数**给,判据才关得掉
+        //    (关掉它正是那条阴性对照:没有它,「更响但没在唱目标音高」的候选会赢)。
+        landing_harm_eps(),
         donor_render,
     )
 }
@@ -3527,11 +3730,15 @@ pub fn apply_dead_only_windows_with(
     // ⭐ S162 —— 逐组的落点候选(与 `jobs` 平行;`None` = 没有候选)。
     //    空切片 ⇒ **逐位回到今天**。见 [`apply_dead_only_windows_alts`]。
     alts: &[Option<i64>],
+    // ⭐ S163 —— 音符表(输出时间轴)。逐音打分要它;没有候选时一行都不碰它。
+    notes: &[NoteSpan],
     match_levels: bool,
     join_enabled: bool,
     // S159zm —— 拼接前的对齐半径(**样本**)。⛔ 与 `join_enabled` 同一条理由:
     // `_with` 变体的旋钮一律是**参数**,判据才关得掉(S151 笔1)。
     align: usize,
+    // ⭐ S163 —— 谐波否决的门限(dB);`0.0` = 关。见 [`landing_harm_eps`]。
+    harm_eps: f32,
     mut donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
     if jobs.is_empty() || base.is_empty() || total_frames <= 0 {
@@ -3549,50 +3756,46 @@ pub fn apply_dead_only_windows_with(
     }
     shifts.sort_unstable();
     shifts.dedup();
-    // ⛔ 参照电平 = **窗外**的 base(那些样本与 base 逐位相同 ⇒ 参照固定,一步到位;
-    //    含被救邻居的版本 S162 实测**迭代不收敛**)。
-    let outside: Vec<bool> = {
-        let mut m = vec![true; base.len()];
-        for j in jobs {
-            let (a, b) = (
-                ((j.start as f64) * spf).round().max(0.0) as usize,
-                ((j.end as f64) * spf).round().max(0.0) as usize,
-            );
-            for v in m.iter_mut().take(b.min(base.len())).skip(a.min(base.len())) {
-                *v = false;
-            }
-        }
-        m
+    // ⭐⭐ S163 —— 打分的两根轴,都在**同一份 donor 缓冲**上算(零渲染噪声)。
+    //
+    // ⛔ 参照换掉了:S162 用的是「窗外 base 的 ±2 s **平均**」,而在密集救援的乐句里
+    //    窗外主要是**休止**(数字静音)⇒ 参照读到 −100 dBFS ⇒ `|电平 − 参照|` 退化成
+    //    「谁更轻谁赢」,方向正好反了(实测 60 个窗里 6 个)。
+    //    现在与 [`match_rescued_note_levels`] **共用同一份口径**:
+    //    邻近 ±16 个**没被救的唱音**的电平中位;取不到 4 个 ⇒ 这个音**弃权**。
+    let scoring = alts.iter().any(Option::is_some) && !notes.is_empty();
+    let (note_lv, note_cov) = if scoring {
+        note_levels_and_coverage(base, spf, jobs, notes)
+    } else {
+        (Vec::new(), Vec::new())
     };
-    let ref_db = |a: usize, b: usize| -> Option<f64> {
-        // 窗前后各 2 秒里的**窗外** base
-        let w = (sample_rate as usize) * 2;
-        let lo = a.saturating_sub(w);
-        let hi = (b + w).min(base.len());
-        let mut e = 0.0f64;
-        let mut n = 0usize;
-        for t in lo..hi {
-            if outside[t] {
-                e += f64::from(base[t]) * f64::from(base[t]);
-                n += 1;
-            }
-        }
-        if n < sample_rate as usize / 2 {
-            return None;
-        }
-        let m = e / n as f64;
-        if m > 1e-14 {
-            Some(10.0 * m.log10())
-        } else {
-            None
-        }
+    let note_ref = if scoring { clean_neighbour_refs(&note_lv, &note_cov) } else { Vec::new() };
+    let harm_eps = if scoring { harm_eps } else { 0.0 };
+    // 每个窗**正身**里的音 = 被这个窗盖住 ≥80% 的唱音(它的好坏由这个窗的落点决定)。
+    let job_notes: Vec<Vec<usize>> = if scoring {
+        jobs.iter()
+            .map(|j| {
+                (0..notes.len())
+                    .filter(|&i| {
+                        let nd = &notes[i];
+                        nd.sung
+                            && nd.frames >= LEVEL_MATCH_MIN_FRAMES
+                            && ((nd.start + nd.frames).min(j.end) - nd.start.max(j.start)).max(0)
+                                * 5
+                                >= nd.frames * 4
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
     };
     // S152 —— 每一遍 donor 在**它自己的窗 ± 余量**上的样本,留到全部渲完之后再拼。
     // ⛔ 为什么要留:窗边该放在休止的哪一点,只有**同时看得见两侧那两条 donor** 才决定得了
     // (见 `join_rests`)。留的是片段不是整条:全曲窗覆盖约 56 %,实测这首歌约 30 MB。
     let mut kept: Vec<(i64, usize, Vec<f32>)> = Vec::new();
-    // ⭐ S162 —— (组下标, shift, lo, 片段, |rel| 打分)。`alts` 空时每组只有一项 ⇒ 逐位同今天。
-    let mut cand: Vec<(usize, i64, usize, Vec<f32>, Option<f64>)> = Vec::new();
+    // ⭐ S162/S163 —— (组下标, shift, lo, 片段, 逐音打分)。`alts` 空时每组只有一项 ⇒ 逐位同今天。
+    let mut cand: Vec<(usize, i64, usize, Vec<f32>, CandScore)> = Vec::new();
     for s in shifts {
         // 这一遍**自己**的窗。⛔ 同一个 filter 下面 :896 还要用一次(音频域拼接),两处必须
         // 是同一个谓词 —— 那正是 S147 hotfix 的形状:闭包那一侧漏了它,拼接这一侧没漏,
@@ -3628,28 +3831,37 @@ pub fn apply_dead_only_windows_with(
         // 那一刀保住的样本区间必须 ⊇ 这里切走的片段,而两处各写一遍 = 一处改了另一处不改。
         for (ji, j) in jobs.iter().enumerate().filter(|(ji, j)| mine(*ji, j)) {
             if let Some((lo, hi)) = donor_read_span(j, spf, n, MERGE_BRIDGE_FRAMES) {
-                // ⭐ 打分:窗**正身**上的电平相对邻近窗外 base 的电平
-                let (wa, wb) = (
-                    ((j.start as f64) * spf).round().max(0.0) as usize,
-                    ((j.end as f64) * spf).round().max(0.0) as usize,
-                );
-                let score = ref_db(wa, wb).and_then(|r| {
-                    let (a, b) = (wa.max(lo).min(hi), wb.min(hi));
-                    if b <= a + 256 {
-                        return None;
+                // ⭐⭐ S163 —— **逐音**打分(两根轴,全部在这一份 donor 缓冲上算)。
+                let mut sc = CandScore::default();
+                if scoring {
+                    for &ni in &job_notes[ji] {
+                        let nd = &notes[ni];
+                        let na = ((nd.start as f64) * spf).round().max(0.0) as usize;
+                        let nb = (((nd.start + nd.frames) as f64) * spf).round().max(0.0) as usize;
+                        let (a, b) = (na.max(lo).min(hi), nb.min(hi));
+                        // ⛔ 读到的必须覆盖这个音的 ≥80%,否则量的是半个音(窗边那一截)。
+                        if b <= a + 1024 || (b - a) * 5 < (nb.saturating_sub(na)) * 4 {
+                            continue;
+                        }
+                        let seg = &donor[a..b];
+                        let e: f64 = seg.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>()
+                            / (b - a) as f64;
+                        let l = (10.0 * (e + 1e-20).log10()) as f32;
+                        if note_ref[ni].is_finite() {
+                            sc.rel.push((ni, (l - note_ref[ni]).abs()));
+                        }
+                        if nd.hz > 0.0 {
+                            if let Some(h) = utai_dsp::harmonicity::harmonic_energy_fraction_db(
+                                seg,
+                                sample_rate,
+                                nd.hz,
+                            ) {
+                                sc.harm.push((ni, h));
+                            }
+                        }
                     }
-                    let m: f64 = donor[a..b]
-                        .iter()
-                        .map(|&v| f64::from(v) * f64::from(v))
-                        .sum::<f64>()
-                        / (b - a) as f64;
-                    if m > 1e-14 {
-                        Some((10.0 * m.log10() - r).abs())
-                    } else {
-                        None
-                    }
-                });
-                cand.push((ji, s, lo, donor[lo..hi].to_vec(), score));
+                }
+                cand.push((ji, s, lo, donor[lo..hi].to_vec(), sc));
             }
         }
     }
@@ -3661,10 +3873,46 @@ pub fn apply_dead_only_windows_with(
             continue;
         }
         if mine.len() > 1 {
-            // ⛔ 打分拿不到时(邻域里窗外样本太少)**退回今天的 pick**,不许瞎猜。
+            // ── ⓐ **谐波否决**(S163)────────────────────────────────────
+            // 逐音比「谐波能量占比」——**同一个音 ⇒ 同一个目标 f0 ⇒ 可比**。
+            // 某个候选只要在**任何一个音**上差 ≥ `harm_eps` dB,就把它剔掉。
+            // ⛔ 两个互相否决时(各自都有一个音输给对方)**谁也不剔** —— 那不是一边倒,
+            //    交给下面的电平轴去裁。
+            if harm_eps > 0.0 {
+                let loses: Vec<usize> = mine
+                    .iter()
+                    .copied()
+                    .filter(|&x| {
+                        mine.iter().any(|&y| {
+                            y != x && {
+                                let w = cand[x]
+                                    .4
+                                    .harm
+                                    .iter()
+                                    .filter_map(|&(i, hx)| cand[y].4.harm_of(i).map(|hy| hx - hy))
+                                    .fold(f32::INFINITY, f32::min);
+                                w.is_finite() && w < -harm_eps
+                            }
+                        })
+                    })
+                    .collect();
+                let live: Vec<usize> =
+                    mine.iter().copied().filter(|c| !loses.contains(c)).collect();
+                if !live.is_empty() && live.len() < mine.len() {
+                    tracing::info!(
+                        "range: group[{}..{}] harmonic veto — dropped {:?} (per-note harmonic energy fraction worse by >= {harm_eps} dB)",
+                        jobs[ji].start,
+                        jobs[ji].end,
+                        loses.iter().map(|&c| cand[c].1).collect::<Vec<_>>()
+                    );
+                    mine = live;
+                }
+            }
+            // ── ⓑ **电平**:逐音 |rel|,组取**最差的音**;取不到参照 ⇒ 无穷大 ────
+            // ⛔ 两边都取不到 ⇒ 比较判平 ⇒ 下面那条平局规则**保持计划的落点**,不许瞎猜。
             mine.sort_by(|&x, &y| {
-                let sx = cand[x].4.unwrap_or(f64::INFINITY);
-                let sy = cand[y].4.unwrap_or(f64::INFINITY);
+                let sx = cand[x].4.worst_rel().unwrap_or(f32::INFINITY);
+                let sy = cand[y].4.worst_rel().unwrap_or(f32::INFINITY);
                 sx.partial_cmp(&sy).unwrap_or(std::cmp::Ordering::Equal).then_with(|| {
                     (cand[x].1 != jobs[ji].shift).cmp(&(cand[y].1 != jobs[ji].shift))
                 })
@@ -3677,19 +3925,21 @@ pub fn apply_dead_only_windows_with(
                 "range: group[{}..{}] landing candidates {:?} — kept {:+}",
                 jobs[ji].start,
                 jobs[ji].end,
-                mine.iter().map(|&c| (cand[c].1, cand[c].4)).collect::<Vec<_>>(),
+                mine.iter()
+                    .map(|&c| (cand[c].1, cand[c].4.worst_rel(), cand[c].4.harm.len()))
+                    .collect::<Vec<_>>(),
                 pick
             );
             if pick != jobs[ji].shift {
                 tracing::info!(
                     "range: group[{}..{}] landing re-picked {:+} → {:+} by measurement \
-                     (|rel| {:.1} vs {:.1} dB)",
+                     (worst-note |rel| {:.1} vs {:.1} dB)",
                     jobs[ji].start,
                     jobs[ji].end,
                     jobs[ji].shift,
                     pick,
-                    cand[mine[0]].4.unwrap_or(f64::NAN),
-                    cand[mine[1]].4.unwrap_or(f64::NAN)
+                    cand[mine[0]].4.worst_rel().unwrap_or(f32::NAN),
+                    cand[mine[1]].4.worst_rel().unwrap_or(f32::NAN)
                 );
             }
         }
@@ -5861,9 +6111,11 @@ mod tests {
             total,
             &jobs,
             &[],
+            &[],
             false,
             join_rests_enabled(),
             0, // ⛔ 关掉对齐:见上面那段
+            0.0,
             |s, _own| Ok(donor_of(s)),
         )
         .unwrap();
@@ -6119,7 +6371,7 @@ mod tests {
         let (base0, left, right) = join_fixture(n);
         let run = |join: bool| {
             let mut b = base0.clone();
-            apply_dead_only_windows_with(&mut b, sr, total, &jobs, &[], false, join, 0, |s, _| {
+            apply_dead_only_windows_with(&mut b, sr, total, &jobs, &[], &[], false, join, 0, 0.0, |s, _| {
                 Ok(if s == -9 { left.clone() } else { right.clone() })
             })
             .unwrap();
@@ -6204,7 +6456,7 @@ mod tests {
         };
         for join in [false, true] {
             let mut base = vec![0.02f32; base_len]; // −34 dBFS 的底,好让「洞」量得出来
-            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, &[], false, join, 0, |s, own| {
+            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0, |s, own| {
                 // ⭐ 生产走的就是 `donor_keep_samples` 这一个函数,判据不许自己再拼一遍公式。
                 let keep = donor_keep_samples_with(own, base_len, TOTAL_FRAMES, true);
                 let mut d = vec![-1.0f32; base_len];
@@ -6234,7 +6486,7 @@ mod tests {
             // ⛔ 阴性对照 ②:余量给不够时会怎样 —— 而**两条臂的答案不一样,那正是这条判据的重点**。
             let mut tight = vec![0.02f32; base_len];
             apply_dead_only_windows_with(
-                &mut tight, SR, TOTAL_FRAMES, &jobs, &[], false, join, 0,
+                &mut tight, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0,
                 |s, own| Ok(paint(own, 0, s)),
             )
             .expect("splice");
@@ -7584,7 +7836,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -7614,6 +7866,12 @@ mod tests {
             range_tilt(),
             // S162 —— 渲染时按实测选落点。⛔ **改音频**(出厂开)⇒ 与它一起 bump 到 `s162c`。
             LANDING_PICK_DEFAULT,
+            // S163 —— 落点选法的**谐波否决**门限。⛔ **改音频**(出厂 3.0)⇒ bump 到 `s163a`。
+            //   ⚠ 同一次 bump 还盖着两条**没有旋钮**的行为改动(指纹结构上看不见它们,
+            //   所以在这里写明白):①落点候选必须与它服务的那一组**覆盖同一批音**;
+            //   ②打分从「整窗一个 RMS」改成**逐音、取组内最差**,参照换成
+            //   「邻近没被救的唱音的中位」(= `match_rescued_note_levels` 那一套)。
+            parse_landing_harm(None),
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -7622,10 +7880,10 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s162c";
+        const TAG: &str = "s163a";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -7682,6 +7940,7 @@ mod tests {
             ("CLOSE_SLIVER_FRAMES_DEFAULT", "fn parse_close_sliver("),
             ("RANGE_TILT_DEFAULT", "pub fn range_tilt("),
             ("LANDING_PICK_DEFAULT", "pub fn landing_pick("),
+            ("LANDING_HARM_EPS_DEFAULT", "pub fn landing_harm_eps("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
@@ -7816,9 +8075,10 @@ mod tests {
         let spf = 441usize; // 每帧 441 样本 ⇒ 每个音 8820 样本
         let n = (total as usize) * spf;
         // 音表:[休止] + 8 个唱音 + [休止]
-        let mut notes: Vec<(i64, i64, bool)> = Vec::new();
+        let mut notes: Vec<NoteSpan> = Vec::new();
         for i in 0..10i64 {
-            notes.push((i * nf, nf, !(i == 0 || i == 9)));
+            let sung = !(i == 0 || i == 9);
+            notes.push(NoteSpan { start: i * nf, frames: nf, sung, hz: if sung { 440.0 } else { 0.0 } });
         }
         // 前 4 个唱音 = shift −4,后 4 个 = shift −12
         let jobs = vec![
@@ -7904,12 +8164,14 @@ mod tests {
         let n = (nf as usize) * hop;
         // 音表:每 10 帧一个音(⛔ 必须 ≥ `LEVEL_MATCH_MIN_FRAMES`,否则整表被跳过 ——
         //   第一版写成 4 帧,判据当场红,红对了)。
-        let notes: Vec<(i64, i64, bool)> = (0..10).map(|k| (k * 10, 10, true)).collect();
+        let notes: Vec<NoteSpan> =
+            (0..10).map(|k| NoteSpan { start: k * 10, frames: 10, sung: true, hz: 440.0 }).collect();
         // 窗:只盖第 5 个音(帧 50..60)⇒ 只有它是「被救」的
         let jobs = vec![DeadJob { shift: -7, start: 50, end: 60 }];
         let mk = |amp_rescued: f32| -> Vec<f32> {
             let mut v = vec![0.0f32; n];
-            for (i, &(f0, fr, _)) in notes.iter().enumerate() {
+            for (i, nd) in notes.iter().enumerate() {
+                let (f0, fr) = (nd.start, nd.frames);
                 let a = (f0 as usize) * hop;
                 let b = ((f0 + fr) as usize) * hop;
                 let amp = if i == 5 { amp_rescued } else { 0.1 };
@@ -7926,7 +8188,7 @@ mod tests {
         let hit = match_rescued_note_levels(&mut loud, sr, nf, &jobs, &notes, 6.0);
         assert_eq!(hit, 1, "响 20 dB 的被救音必须被碰");
         let seg = |v: &[f32], i: usize| -> f32 {
-            let (f0, fr, _) = notes[i];
+            let (f0, fr) = (notes[i].start, notes[i].frames);
             let (a, b) = ((f0 as usize) * hop, ((f0 + fr) as usize) * hop);
             (v[a..b].iter().map(|x| x * x).sum::<f32>() / (b - a) as f32).sqrt()
         };
@@ -7937,7 +8199,7 @@ mod tests {
             if i == 5 {
                 continue;
             }
-            let (f0, fr, _) = notes[i];
+            let (f0, fr) = (notes[i].start, notes[i].frames);
             for t in (f0 as usize) * hop..((f0 + fr) as usize) * hop {
                 assert_eq!(loud[t], before[t], "没被救的音 [{i}] 第 {t} 个样本被动了");
             }
@@ -7968,7 +8230,8 @@ mod tests {
         //    「去掉 cov 门」这条变异**照绿** —— 判据在那条轴上是空的。
         let mut loud_clean = {
             let mut v = vec![0.0f32; n];
-            for (i, &(f0, fr, _)) in notes.iter().enumerate() {
+            for (i, nd) in notes.iter().enumerate() {
+                let (f0, fr) = (nd.start, nd.frames);
                 let a = (f0 as usize) * hop;
                 let b = ((f0 + fr) as usize) * hop;
                 // 音 2 **没被窗盖**,却比邻居响 20 dB;音 5 被盖但电平正常
@@ -7994,6 +8257,273 @@ mod tests {
         assert_eq!(match_rescued_note_levels(&mut none_ref, sr, nf, &all, &notes, 6.0), 0,
                    "没有干净邻居当参照时必须放弃,而不是拿被救的邻居凑");
         assert_eq!(none_ref, r0);
+    }
+
+    /// ⛔⛔⭐ S163 —— **落点候选必须与它服务的那一组【覆盖同一批音】。**
+    ///
+    /// ## 它治的是什么(实测,不是假想)
+    /// 候选 = 「窄预算(`landing = 1`)那份计划的落点」,按**组的起始音**取。
+    /// 而两份计划的预算不同 ⇒ **分组也不同**:实测 akiko × 炉心 +7,
+    /// `landing = 1` 出 **95 组**、`landing = 3` 出 **90 组**。
+    /// 于是「起点相同」的两个组可能**根本不是同一批音**,它的落点是为**别的音**解出来的。
+    ///
+    /// 用户 2026-08-26 报的 **4:09.478「み」**就是这个:plan `[698..=704]` 的最高音
+    /// 目标 MIDI **87**,需要 −10;而同起点的窄预算组是 `[698..=701]`(把那个高音分出去了)
+    /// ⇒ 它的落点是 **−4**,落在 **83** —— **仍在死区**。把它当候选交给渲染层,
+    /// 它在**整窗**电平上反而更贴近邻居 ⇒ 赢了 ⇒ 那个音的救援被整个丢掉。
+    /// 同一份转储上实测:谐波能量占比 **−0.98 → −19.56 dB**、梳深 26.9 → 8.4、
+    /// 次基频 −25.1 → **+19.9**,与**关掉扩展的 `base` 几乎逐格相同**;
+    /// 而这在**同一首歌里发生 5 次**。人群面:4 模型 × 2 谱 × 移调 0/7 共 341 组带候选,
+    /// **22 组(6.5%)**起点相同而范围不同(东雪莲 × 鹅妈妈 +7 是 6/7)。
+    ///
+    /// ## 这条钉三件
+    /// ⑴ 夹具**真的**复现了「两个预算分组不同」(否则这条判据是空的);
+    /// ⑵ 每一个带出来的候选,**都救得动这一组自己的死音**;
+    /// ⑶ ⛔ **阴性对照 = 旧规则**:只认起点的那一版在同一份夹具上会挑出一个**救不动**的候选。
+    #[test]
+    fn a_landing_candidate_is_never_borrowed_from_a_differently_grouped_plan() {
+        // 炉心融解 notes[697..=708](休止 + と び こ ん ん で み い た ら + 休止),akiko,+7。
+        let nn = [0i64, 73, 75, 73, 72, 68, 68, 80, 75, 75, 76, 0];
+        let fr = [9i64, 9, 9, 9, 10, 9, 9, 9, 9, 18, 46, 9];
+        let r = akiko_like();
+        let today = RescueTuning::today();
+        let (plan, _, alts) = dead_only_plan_with_alts(&nn, &fr, 7, &r, today);
+        let (alt_plan, _, _) =
+            dead_only_plan_with_alts(&nn, &fr, 7, &r, RescueTuning { landing: Some(1), ..today });
+        eprintln!("[plan] {plan:?}\n[alt ] {alt_plan:?}\n[alts] {alts:?}");
+
+        // ⑴ 前提:两个预算的**分组**必须真的不同
+        let span = |p: &[DeadGroup]| p.iter().map(|g| (g.start, g.end)).collect::<Vec<_>>();
+        assert_ne!(
+            span(&plan),
+            span(&alt_plan),
+            "夹具没复现「两个预算分组不同」——那这条判据就是空的"
+        );
+
+        // ⑵ 每个候选都救得动**这一组自己**的死音
+        let eff = |k: usize| (nn[k] + 7).clamp(1, 127);
+        for (gi, g) in plan.iter().enumerate() {
+            let Some(alt) = alts[gi] else { continue };
+            for k in g.start..=g.end {
+                let p = eff(k);
+                assert!(
+                    r.slot_reachable(p + alt),
+                    "候选 {alt:+} 让 notes[{k}](MIDI {p})唱不出来"
+                );
+                if !r.slot_singable(p) {
+                    assert!(
+                        r.slot_landing_ok(p + alt),
+                        "候选 {alt:+} 把 notes[{k}] 的死音(MIDI {p})落在 {} —— 那还是死的",
+                        p + alt
+                    );
+                }
+            }
+        }
+
+        // ⑶ ⛔⛔ **变异靶** —— 直接问 [`alt_shift_for`]:两份计划就是实测到的那两份
+        //    (akiko × 炉心 +7,notes[698..=707];`landing=3` vs `landing=1`)。
+        //    把 `x.end == g.end` 这一条去掉,这一格当场红。
+        let shipped = DeadGroup { start: 698, end: 704, shift: -10 };
+        let narrow = [
+            DeadGroup { start: 698, end: 701, shift: -4 },
+            DeadGroup { start: 704, end: 705, shift: -9 },
+            DeadGroup { start: 706, end: 707, shift: -5 },
+        ];
+        assert!(
+            narrow.iter().any(|x| x.start == shipped.start),
+            "夹具没造对:旧规则(只认起点)必须**找得到**东西,否则这一格是空的"
+        );
+        assert_eq!(
+            alt_shift_for(&shipped, &narrow),
+            None,
+            "范围不同的组不许当候选 —— 它的 −4 是为 [698..=701] 解出来的"
+        );
+        // 而那个落点对这一组的最高音(目标 MIDI 87)**是救不动的** —— 后果这一侧也钉住
+        assert!(!r.slot_landing_ok(87 - 4), "83 仍在死区:这正是旧规则交出去的落点");
+        assert!(r.slot_landing_ok(87 - 10), "−10 才落得下(实测出厂就是它)");
+        // ⭐ 阴性对照的另一半:**范围一样**时候选照常带出来(否则这条规则等于关掉了候选)
+        assert_eq!(
+            alt_shift_for(&shipped, &[DeadGroup { start: 698, end: 704, shift: -12 }]),
+            Some(-12),
+            "同一批音、不同落点 ⇒ 必须带出候选"
+        );
+        assert_eq!(
+            alt_shift_for(&shipped, &[DeadGroup { start: 698, end: 704, shift: -10 }]),
+            None,
+            "落点相同 ⇒ 没有候选可言"
+        );
+    }
+
+    /// 判据用的合成台:12 个音 × 10 帧(每帧 100 ms),窗盖住音 4-6。
+    /// 返回 (base, notes, jobs, alts, 每帧样本数)。
+    #[cfg(test)]
+    fn pick_rig() -> (Vec<f32>, Vec<NoteSpan>, Vec<DeadJob>, Vec<Option<i64>>, usize) {
+        const SPF: usize = 4410; // 100 ms @ 44.1 kHz
+        let nf = 10i64;
+        let notes: Vec<NoteSpan> = (0..12i64)
+            .map(|i| NoteSpan { start: i * nf, frames: nf, sung: true, hz: 440.0 })
+            .collect();
+        let jobs = vec![DeadJob { shift: -8, start: 4 * nf, end: 7 * nf }];
+        let alts = vec![Some(-4i64)];
+        // base:窗外的音都在同一个电平上(⇒ 干净邻居 9 个,参照取得到);窗内是「死」的。
+        let n = 12 * (nf as usize) * SPF;
+        let mut base = vec![0.0f32; n];
+        for (i, nd) in notes.iter().enumerate() {
+            let amp = if (4..7).contains(&i) { 0.003 } else { 0.1 };
+            let (a, b) = ((nd.start as usize) * SPF, ((nd.start + nd.frames) as usize) * SPF);
+            for (t, v) in base[a..b].iter_mut().enumerate() {
+                *v = amp * (2.0 * std::f32::consts::PI * 440.0 * t as f32 / 44100.0).sin();
+            }
+        }
+        (base, notes, jobs, alts, SPF)
+    }
+
+    /// 在 `notes[i]` 的正中央量电平(dBFS)——避开窗边那 10 ms 交叉淡化。
+    #[cfg(test)]
+    fn mid_db(x: &[f32], i: usize, spf: usize) -> f32 {
+        let (a, b) = ((i * 10 + 3) * spf, (i * 10 + 7) * spf);
+        let e: f64 =
+            x[a..b].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / (b - a) as f64;
+        (10.0 * (e + 1e-30).log10()) as f32
+    }
+
+    /// ⛔⛔⭐ S163 —— **落点打分必须【逐音】,而且组的成绩 = 组内最差的那个音。**
+    ///
+    /// S162 那一版是**整窗一个 RMS**。一个窗里可能有 7 个音,而只有 1 个塌了:
+    /// 实测 4:09.478「み」只占整窗 **180 ms / 1.4 s** ⇒ 整窗 RMS 结构上看不见它
+    /// (生产读到的整窗 |rel| 是 **0.31 vs 1.51 —— 塌掉的那个反而赢**)。
+    ///
+    /// 夹具**按这个形状造**:候选 B 有两个音更贴、第三个音塌 20 dB。
+    /// ⑴ 预注册:**整窗口径确实会选 B**(在判据里当场算出来,不是嘴上说);
+    /// ⑵ 逐音口径必须选 A;⑶ ⛔ 阴性对照:把那个塌掉的音改成正常,逐音口径就该选 B。
+    #[test]
+    fn the_landing_pick_is_decided_per_note_so_one_collapsed_note_cannot_hide() {
+        let (base0, notes, jobs, alts, spf) = pick_rig();
+        let total = 120i64;
+        // A(计划 −8):三个音都比参照低 2 dB;B(候选 −4):两个音 +0.5,第三个 −20。
+        let mk = |gains: [f32; 3]| -> Vec<f32> {
+            let mut d = vec![0.0f32; base0.len()];
+            for (k, g) in gains.iter().enumerate() {
+                let i = 4 + k;
+                let amp = 0.1 * 10f32.powf(g / 20.0);
+                let (a, b) = ((i * 10) * spf, ((i + 1) * 10) * spf);
+                for (t, v) in d[a..b].iter_mut().enumerate() {
+                    *v = amp * (2.0 * std::f32::consts::PI * 440.0 * t as f32 / 44100.0).sin();
+                }
+            }
+            d
+        };
+        let run = |collapse: f32| -> Vec<f32> {
+            let mut b = base0.clone();
+            apply_dead_only_windows_with(
+                &mut b,
+                44100,
+                total,
+                &jobs,
+                &alts,
+                &notes,
+                false,
+                false,
+                0,
+                0.0, // ⛔ 谐波否决关掉 —— 这一条只钉【粒度】那根轴
+                |s, _| Ok(if s == -8 { mk([-2.0, -2.0, -2.0]) } else { mk([0.5, 0.5, collapse]) }),
+            )
+            .unwrap();
+            b
+        };
+
+        // ⑴ 预注册:**整窗**口径下 B 更贴(算给自己看,免得这条判据靠嘴说)
+        let win_db = |g: [f32; 3]| -> f32 {
+            let p: f32 = g.iter().map(|v| 10f32.powf(v / 10.0)).sum::<f32>() / 3.0;
+            10.0 * p.log10()
+        };
+        let (wa, wb) = (win_db([-2.0, -2.0, -2.0]).abs(), win_db([0.5, 0.5, -20.0]).abs());
+        assert!(wb < wa, "夹具没造对:整窗口径下 B({wb:.2})必须比 A({wa:.2})更贴");
+
+        // ⑵ 逐音口径:**A 赢**(B 那个塌掉的音 20 dB)
+        let got = run(-20.0);
+        let d = mid_db(&got, 5, spf);
+        assert!(
+            (d - (-23.01 - 2.0)).abs() < 0.6,
+            "该选 A(每个音 −2 dB),窗内读到 {d:.2} dBFS"
+        );
+
+        // ⑶ ⛔ 阴性对照:第三个音不塌了 ⇒ 逐音口径就该选 B
+        let ok = run(0.5);
+        let d2 = mid_db(&ok, 5, spf);
+        assert!(
+            (d2 - (-23.01 + 0.5)).abs() < 0.6,
+            "没有塌掉的音时该选 B(+0.5 dB),窗内读到 {d2:.2} dBFS"
+        );
+    }
+
+    /// ⛔⛔⭐⭐ S163 —— **谐波否决:一个「更响但没在唱目标音高」的候选必须被剔掉。**
+    ///
+    /// 这是落点这条链上**唯一不需要参照**的一根轴,而参照恰恰在最需要它的地方取不到
+    /// (密集救援的乐句里没有「没被救的邻居」——实测 68 个带候选的窗里 **24 个**取不到)。
+    ///
+    /// 夹具:候选 B 的电平**正好等于**参照(|rel| = 0,电平轴上完胜),
+    /// 但它唱的是 1.5 倍的音高 —— 也就是「根本没救到」的那种形状。
+    /// ⑴ 出厂门限下必须选 A;⑵ ⛔ **阴性对照:门限 = 0(关掉)时必须选 B** ——
+    /// 没有这一格,这条判据分不清「否决起作用」与「A 本来就会赢」。
+    #[test]
+    fn the_harmonic_veto_drops_a_candidate_that_is_not_singing_the_target_pitch() {
+        let (base0, notes, jobs, alts, spf) = pick_rig();
+        let total = 120i64;
+        let stack = |f0: f32, amp: f32, n: usize| -> Vec<f32> {
+            let mut d = vec![0.0f32; n];
+            for i in 4..7usize {
+                let (a, b) = ((i * 10) * spf, ((i + 1) * 10) * spf);
+                for (t, v) in d[a..b].iter_mut().enumerate() {
+                    let tt = t as f32 / 44100.0;
+                    let mut y = 0.0f32;
+                    for k in 1..=8usize {
+                        y += (1.0 / k as f32)
+                            * (2.0 * std::f32::consts::PI * f0 * k as f32 * tt).sin();
+                    }
+                    *v = amp * y;
+                }
+            }
+            d
+        };
+        // A(计划 −8):唱**目标音高** 440,但比参照轻 4 dB。
+        // B(候选 −4):唱 660(= 1.5 倍,音高不对),电平正好等于参照。
+        let run = |eps: f32| -> Vec<f32> {
+            let mut b = base0.clone();
+            apply_dead_only_windows_with(
+                &mut b, 44100, total, &jobs, &alts, &notes, false, false, 0, eps,
+                |s, _| {
+                    Ok(if s == -8 {
+                        stack(440.0, 0.0537, base0.len())
+                    } else {
+                        stack(660.0, 0.0851, base0.len())
+                    })
+                },
+            )
+            .unwrap();
+            b
+        };
+        // 先把两条臂各自的电平量出来 —— 判据靠它区分「选了谁」。
+        let a_db = mid_db(&stack(440.0, 0.0537, base0.len()), 5, spf);
+        let b_db = mid_db(&stack(660.0, 0.0851, base0.len()), 5, spf);
+        assert!(
+            b_db > a_db + 2.0,
+            "夹具没造对:B 必须在**电平**上明显占优({b_db:.2} vs {a_db:.2} dBFS)"
+        );
+
+        // ⑴ 出厂门限:谐波否决把 B 剔掉 ⇒ 选 A
+        let on = mid_db(&run(LANDING_HARM_EPS_DEFAULT), 5, spf);
+        assert!(
+            (on - a_db).abs() < 0.8,
+            "出厂门限下该选 A(唱对音高的那个),读到 {on:.2},A={a_db:.2} B={b_db:.2}"
+        );
+
+        // ⑵ ⛔ 阴性对照:门限 = 0 ⇒ 只剩电平轴 ⇒ 选 B
+        let off = mid_db(&run(0.0), 5, spf);
+        assert!(
+            (off - b_db).abs() < 0.8,
+            "关掉谐波否决就只剩电平轴,该选 B,读到 {off:.2},A={a_db:.2} B={b_db:.2}"
+        );
     }
 
     /// S162 —— 两个旋钮的出厂值与垃圾值倒向。
@@ -9753,7 +10283,7 @@ mod tests {
         let sr: u32 = plan["sample_rate"].as_u64().unwrap() as u32;
         eprintln!("[splice] {} jobs · base {} · sr {sr} · UTAI_RANGE_SEAM_ALIGN = {} ms",
                   jobs.len(), base.len(), seam_align_ms());
-        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, &[], false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, |s, _own| {
+        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, &[], &[], false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, landing_harm_eps(), |s, _own| {
             Ok(rd(&dir.join(format!("donor_post_{s:+}.f32"))))
         })
         .unwrap();
