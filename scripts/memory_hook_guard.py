@@ -231,6 +231,41 @@ def flight_hits(tool, payload, conf):
     return (("要改 " + r, [r]) if is_guarded(r, conf) else (None, []))
 
 
+def ear_conf(conf):
+    return conf.get("ear_judgement") or {}
+
+
+def wav_seconds(path):
+    """读 WAV 头算秒数。⛔ 读不动就返回 None —— 这条闸永远不许因为读不动一个文件而挡人。"""
+    try:
+        import wave
+        with wave.open(path, "rb") as w:
+            r = w.getframerate()
+            return (w.getnframes() / float(r)) if r else None
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def render_ear(conf, why, extra=None):
+    e = ear_conf(conf)
+    lines = ["⛔⛔ 耳判交付闸 —— " + why, ""]
+    lines.append(e.get("headline", ""))
+    lines.append("")
+    for r in e.get("hard_rules", []):
+        lines.append("  " + r)
+    if extra:
+        lines.append("")
+        lines += extra
+    lines += [
+        "",
+        "**要做的是**:把**整曲**那两条臂直接交出去(它们已经渲好了,就在 `UTAI_MG_OUTDIR` 里),",
+        "   `cp` 成看得懂的名字放进 `TESTING\\s162_耳判\\<轮次>\\`,然后 SendUserFile 整曲。",
+        "⛔ 别把这条读成噪音:这条规矩**已经被记过两次而我仍然犯了** ——",
+        "   失效点不是不知道,是动手那一刻没有东西拦我。",
+    ]
+    return "\n".join(lines)
+
+
 def render_flight(reason, live, conf):
     stale = float(flight_conf(conf).get("stale_hours") or 12)
     lines = ["⛔⛔ 有整曲渲染在途,而 " + reason + " —— 改它会让 cargo 重编,",
@@ -306,7 +341,7 @@ def main():
     tool = payload.get("tool_name", "")
     # ⚠ Bash 只走「在途渲染闸」那一段:那七个必读区是按 file_path 登记的,
     #   而在途闸恰恰必须管 Bash(bypass 模式下大部分改动是 sed / heredoc 走的)。
-    if tool not in ("Edit", "Write", "NotebookEdit", "MultiEdit", "Bash"):
+    if tool not in ("Edit", "Write", "NotebookEdit", "MultiEdit", "Bash", "SendUserFile"):
         _emit()
 
     try:
@@ -323,6 +358,33 @@ def main():
                   note="⛔⛔ 有整曲渲染在途:%s —— 已拒。撤标记的命令在正文里" % reason)
 
     if tool == "Bash":
+        cmd = (payload.get("tool_input") or {}).get("command") or ""
+        # ⛔ 用**动作位正则**,不是裸子串:第一版拿子串匹配,当场拦住了我
+        #    「往记忆文件里写这条规矩本身」的那条命令 —— 那几个词在散文里纯属正常。
+        #    一条整天误报的闸会被调成噪音然后被无视(本模块 `_how` 里就写着这句)。
+        for pat in ear_conf(conf).get("deny_regex", []):
+            try:
+                if re.search(pat, cmd):
+                    _emit(deny=render_ear(conf, "这条命令在**切片段**(命中 `%s`)" % pat),
+                          note="⛔⛔ 耳判交付闸:别切片段,给整曲 —— 已拒")
+            except re.error:
+                pass    # 正则写坏了不许把工具挡死 —— fail-open
+        _emit()
+
+    if tool == "SendUserFile":
+        files = (payload.get("tool_input") or {}).get("files") or []
+        lo = float(ear_conf(conf).get("min_seconds") or 60)
+        short = []
+        for f in files:
+            if not str(f).lower().endswith((".wav", ".flac", ".mp3")):
+                continue
+            d = wav_seconds(str(f))
+            if d is not None and d < lo:
+                short.append("   · %.1f s  %s" % (d, f))
+        if short:
+            _emit(context=render_ear(conf, "要交的音频里有**短于 %.0f 秒**的" % lo,
+                                     ["**这几条**:"] + short),
+                  note="⛔ 耳判交付闸:交的是片段,不是整曲")
         _emit()
 
     fp = (payload.get("tool_input") or {}).get("file_path") or ""

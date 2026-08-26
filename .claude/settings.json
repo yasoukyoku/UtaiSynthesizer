@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash",
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash|SendUserFile",
         "hooks": [
           {
             "type": "command",
