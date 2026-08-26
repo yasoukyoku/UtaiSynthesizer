@@ -864,6 +864,66 @@ fn max_correlation(x: &[f32], t1: f64, period: f64, lo: f64, hi: f64) -> (f64, f
 #[cfg(test)]
 static GRAIN_TRACE: std::sync::Mutex<Vec<[f64; 8]>> = std::sync::Mutex::new(Vec::new());
 
+/// ⭐⭐⭐ S163 —— 颗粒**抖动选择**的深度(`UTAI_PSOLA_XDITHER`,0..1)。
+///
+/// **0 = 今天 = `xgrain` 的线性混合 = 逐位不变**;1 = 纯抖动选择。
+///
+/// ## 它治什么
+/// 用户 2026-08-27 标的「除了 f0 剩下的部分都没声了 / 电都没了」= **谐波之间被挖空**。
+/// `inverse_probe` 同一份缓冲进出、78 个音:**`xgrain` 的线性插值一项就占 9.64 dB**
+/// (70/78 个音 >3 dB)。机理:插值 = 加权平均 ⇒ 谐波同相位保留,而**谐波间不相关的噪声
+/// 被压掉**。⛔ 但 `xgrain` 不能关(关掉半频/合唱感恶化 16.60 dB)⇒ 只能换算子。
+///
+/// ⇒ 「混合两颗」换成「**按 `fr` 的概率选一颗**」:期望值与线性插值逐点相同 ⇒ 成对结构照样
+/// 被打散(而且从确定性平滑变成白噪化,打得更彻底),而每一颗都是**完整的源波形**。
+///
+/// ⚠ 与 `xgrain` 是**乘法关系**:`xgrain` 决定「混不混」,`xdither` 决定「混合还是抽签」。
+/// ⭐⭐⭐ S163 —— **读点滑动**（`UTAI_PSOLA_XSLIDE`, 0..1）。
+///
+/// **0 = 今天 = 逐位不变**。1 = 读点在相邻两个源脉冲之间按 `fr` 线性滑动。
+///
+/// ## 为什么需要它（两个目标的冲突）
+/// * `xgrain`（混合两颗）：打散成对 ✓，但**加权平均把谐波间的噪声压掉** ✗（实测 9.64 dB）；
+/// * `xdither`（抽签选一颗）：噪声保住 ✓，但**成对结构回来**了 ✗（半频 +13.86 dB）。
+/// ⇒ 两者都只成一半，而且失败方向相反。
+///
+/// ## 这一刀
+/// **不混合两颗，而是让读点在两个源脉冲之间连续滑动**：
+/// * 每一颗仍然是**完整的源波形** ⇒ 噪声不被平均；
+/// * 读点随 `fr` 连续变化 ⇒ 相邻若干颗不再读**同一段波形** ⇒ 成对被打散。
+/// ⚠ 代价：读点不再对齐到脉冲上（`snap_to_pulse` 想避开的东西）⇒ 重叠相加时
+/// 相位不一致。那正是打破相干性所需的，但它同时会不会伤到谐波主体，**只能实测**。
+fn xslide() -> f64 {
+    std::env::var("UTAI_PSOLA_XSLIDE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(0.0)
+}
+
+fn xdither() -> f64 {
+    std::env::var("UTAI_PSOLA_XDITHER")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(0.0)
+}
+
+/// ⭐ S163 —— 抖动选择用的确定性 01 哈希(splitmix64)。
+///
+/// ⛔ 为什么不是 RNG:同一份输入必须渲出同一份输出。这条线上「整曲渲染不可复现」已经是
+/// 一层噪声底(S162:同一条 base 渲 7 遍 = 7 个哈希,源头在解码 ONNX),**不许再加一层** ——
+/// 否则任何 A/B 都不可归因。
+#[inline]
+fn dither01(i: u64) -> f64 {
+    let mut h = i ^ 0x9E37_79B9_7F4A_7C15;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h >> 11) as f64 / (1u64 << 53) as f64
+}
+
 #[cfg(test)]
 fn grain_trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2789,6 +2849,15 @@ pub fn psola_shift_edge(
         // S159zzf —— 这条岛的**去抖读点表**(几何仍然用 `src`,见 [`dejitter_marks`])。
         let src_rd = dejitter_marks(&src, dejitter, DEJITTER_SPAN);
         let (mut first_lw, mut last_rw) = (f64::NAN, f64::NAN);
+        // ⭐⭐⭐ S163 —— `xdither` 的**误差扩散**状态。
+        // ⛔ 独立随机抽签失败的原因：连续两颗有 ~50% 概率选到**同一颗**
+        // ⇒ 成对结构回来（实测半频 +13.86 dB）。误差扩散保证：
+        // ① 局部平均**严格等于** `fr`（期望值与线性插值相同 ⇒ 半频照压）；
+        // ② **不出现长游程**（不会连续选同一颗超过必要）⇒ 成对被打散；
+        // ③ 而每一颗仍然是**完整的源波形** ⇒ 谐波间的噪声不被加权平均掉。
+        // ⚠ 纯时域，**没有任何频率参数** ⇒ 不会因为 f0 不同而失效（用户 2026-08-27：
+        //   「这个音 2f0 是 2kHz 那其他音呢？你这样硬切那不还是烂完了」）。
+        let mut dith_err = 0.0f64;
         for s in covered.iter_mut().take(c1).skip(c0) {
             *s = true;
         }
@@ -2910,6 +2979,7 @@ pub fn psola_shift_edge(
             //   后者依赖 `round()` 与 `fr < 0.5` 的等价性,而我不想让逐位恒等挂在那个等价性上。
             // S159zzf —— 读点去抖(见 [`dejitter_marks`])。⛔ 只换读点,几何仍用 `src`。
             let rd = |i: usize| -> f64 { src_rd[i.min(src_rd.len() - 1)] };
+            let mut return_slide: Option<f64> = None;
             let (p0, g0, p1, g1) = if xgrain > 0.0 {
                 let uu = us[i];
                 let lo = (uu as usize).min(src.len() - 1);
@@ -2919,15 +2989,43 @@ pub fn psola_shift_edge(
                 // wsola 挪的是**读点**,对两颗粒施加同一个位移(wsola 默认 0 ⇒ off = 0)。
                 let off = s_pos - src[k];
                 let (lo, hi) = (lo, hi);
+                // ⭐⭐⭐ S163 —— `xdither` 只改**这一对权重**:`(1−fr, fr)` 换成
+                // `(0,1)` 或 `(1,0)`(按 `fr` 的概率抽签)。读点 / 窗宽 / 几何一个字不动。
+                // 见 [`xdither`] 的 doc:治的是「谐波之间被挖空」,而期望值不变 ⇒ 半频不受影响。
+                // ⭐⭐⭐ S163 —— `xslide`：不混合两颗，而是让**读点**在两个源脉冲之间
+                // 按 `fr` 线性滑动（见 [`xslide`] 的 doc：它同时满足「每颗完整」与「内容连续变」）。
+                let xs = xslide();
+                if xs > 0.0 {
+                    let slid = rd(lo) * (1.0 - fr * xs) + rd(hi) * (fr * xs);
+                    return_slide = Some(slid + off);
+                }
+                let xd = xdither();
+                let (wl, wh) = if xd > 0.0 {
+                    // 误差扩散（见循环外 `dith_err` 的注释）。
+                    // ⚠ `dither01` 只在 `xdither` 带小数时做一次轻微扰动，防止
+                    //   误差扩散自己在 `fr` 恰好是简单分数时锁成固定周期。
+                    dith_err += fr + 1e-3 * (dither01(i as u64) - 0.5);
+                    let hit = dith_err >= 0.5;
+                    if hit {
+                        dith_err -= 1.0;
+                    }
+                    let (pl, ph) = if hit { (0.0, 1.0) } else { (1.0, 0.0) };
+                    ((1.0 - xd) * (1.0 - fr) + xd * pl, (1.0 - xd) * fr + xd * ph)
+                } else {
+                    (1.0 - fr, fr)
+                };
                 (
                     rd(lo) + off,
-                    (1.0 - xgrain) * nl + xgrain * (1.0 - fr),
+                    (1.0 - xgrain) * nl + xgrain * wl,
                     rd(hi) + off,
-                    (1.0 - xgrain) * nh + xgrain * fr,
+                    (1.0 - xgrain) * nh + xgrain * wh,
                 )
             } else {
                 (s_pos + (rd(k) - src[k]), 1.0, 0.0, 0.0)
             };
+            // ⭐ S163 —— `xslide` 开着时，两颗塔塔换成**一颗滑动读点的完整颗粒**。
+            let (p0, g0, p1, g1) =
+                if let Some(sl) = return_slide { (sl, 1.0, 0.0, 0.0) } else { (p0, g0, p1, g1) };
             // S151 —— **源覆盖率**:这一颗粒从源上读的是 `[s_pos − lw, s_pos + rw)`。上移时
             // `lw = rw = T_src / ratio`(上面那两个 `min` 取的是目标邻距),所以一旦
             // `ratio > 2`(= |位移| > 12 半音),相邻两个读窗之间就留下一段**永远不进任何颗粒**
