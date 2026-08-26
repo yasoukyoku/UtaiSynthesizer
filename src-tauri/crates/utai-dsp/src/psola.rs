@@ -375,9 +375,12 @@ fn sinc_read_strided(x: &[f32], pos: f64, stride: f64) -> f64 {
     }
 }
 
-/// S162 —— 缓冲区末尾「裸透传」最多淡化这么长(ms)。真的清音/静音尾巴远长于它;
-/// 实测这个缺陷只有 **5.3 / 5.9 ms**。见 `psola_shift_win` 里那一段。
-const TAIL_FADE_MAX_MS: f64 = 30.0;
+/// S162 —— 缓冲区末尾的**释放期**长度(ms)。
+///
+/// ⛔ 第一版只淡化「裸透传」那 5 ms,结果盲搜峰值 **18.6 → 25.1 dB(更糟)**:
+/// **一个 5 ms 的淡出本身就是宽带瞬变**。⇒ 必须足够长,长到它的谱是低频的。
+/// 80 ms ≈ 一个自然的音尾释放;⛔ 只在缓冲末尾**还在唱**(不是自然收尾/静音)时才刻。
+const TAIL_RELEASE_MS: f64 = 80.0;
 
 /// S162 —— **谱倾斜还原**用的频带中心(Hz)。表与它一一对应。
 const TILT_F: [f32; 9] = [300.0, 550.0, 950.0, 1600.0, 2600.0, 4100.0, 6500.0, 10000.0, 14000.0];
@@ -3098,20 +3101,38 @@ pub fn psola_shift_edge(
     // ⛔ 三条硬门,少一条这一刀就会去碰**正常的**透传(岛间的清辅音本来就该原样过):
     //  ⑴ 这一段必须**顶到缓冲末尾**;⑵ 必须**紧接在 covered 之后**;
     //  ⑶ 长度 ≤ `TAIL_FADE_MAX_MS` —— 真的清音/静音尾巴远长于它。
+    // ⛔⛔ S162 第二版 —— **第一版(只淡化裸透传那 5 ms)把它弄得更糟**:
+    // 盲搜峰值 **18.6 → 25.1 dB**(带数 5/7 → 6/7)。原因很直白:
+    // **一个 5 ms 的淡出【本身就是一个宽带瞬变】** —— 我把「阶跃」换成了「更陡的包络拐点」。
+    // 用户 2026-08-26:「本来音尾就应该能自然收,好嘛你现在连自然收都做不到反倒在这硬切,
+    // 而且还切不明白」。
+    //
+    // ⇒ 真问题不是那 5 ms,是**最后一个音的释放期根本不存在**:歌在音符结束的那一帧就没了,
+    //    而 donor 素材是从音符**中段**来的 ⇒ 缓冲末尾停在一个满电平的稳态上。
+    // ⇒ 修法:缓冲末尾若停在**有声且不静**的地方,就在最后 `TAIL_RELEASE_MS` 上刻一条
+    //    **释放曲线**(半升余弦,足够长 ⇒ 它的谱是低频的,不是瞬变)。
+    // ⛔ 三条硬门不变:①顶到缓冲末尾 ②末尾那一段必须有声 ③末尾不能本来就已经安静
+    //    (真的自然收尾 / 静音结尾 ⇒ 一个字不动)。
     if tail_fade {
-        let cap = ((TAIL_FADE_MAX_MS * f64::from(sample_rate) / 1000.0) as usize).max(1);
-        let mut a = n;
-        while a > 0 && !covered[a - 1] {
-            a -= 1;
-        }
-        let run = n - a;
-        if run > 0 && run <= cap && a > 0 && covered[a - 1] {
-            for (k, i) in (a..n).enumerate() {
-                let t = (k as f64) / (run as f64);
-                let w = 0.5 * (1.0 + (std::f64::consts::PI * t).cos());
-                out[i] = (f64::from(out[i]) * w) as f32;
+        let rel = ((TAIL_RELEASE_MS * f64::from(sample_rate) / 1000.0) as usize).max(1).min(n / 4);
+        // 末尾 10 ms 的电平 vs 它前面 200 ms 的电平 —— 已经收下去了就别动
+        let w = ((sample_rate as usize) / 100).max(1).min(n);
+        let e_end: f64 =
+            out[n - w..].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / w as f64;
+        let back = (w * 20).min(n);
+        let e_ref: f64 = out[n - back..n - w]
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum::<f64>()
+            / (back - w).max(1) as f64;
+        let still_singing = e_end > 1e-10 && e_end > e_ref * 0.25;
+        if still_singing {
+            for (k, i) in (n - rel..n).enumerate() {
+                let t = (k as f64) / (rel as f64);
+                let g = 0.5 * (1.0 + (std::f64::consts::PI * t).cos());
+                out[i] = (f64::from(out[i]) * g) as f32;
             }
-            diag.tail_fade_samples = run;
+            diag.tail_fade_samples = rel;
         }
     }
     // S154 —— **振幅包络守恒**。读数无条件算(S152 那条规矩),修法由 `env_restore_ms` 控。
@@ -3455,19 +3476,31 @@ mod tests {
         // ⑵ 只动最末尾:第一个不同的样本必须落在最后 30 ms 之内
         let first_diff = (0..a.len()).find(|&i| a[i] != b[i]);
         let i = first_diff.expect("⛔ tail_fade 开着却什么都没动 —— 那这条判据是空的");
-        let cap = (30 * sr as usize) / 1000;
+        // ⛔ S162 第二版:契约从「只动裸透传那 5 ms」换成「**最后 80 ms 一条释放曲线**」——
+        //    第一版实测把盲搜峰值从 18.6 推到 **25.1 dB(更糟)**:5 ms 的淡出本身就是宽带瞬变。
+        let cap = (TAIL_RELEASE_MS as usize * sr as usize) / 1000 + sr as usize / 100;
         assert!(
             a.len() - i <= cap,
-            "只许动最后 30 ms,实际从末尾前 {} 个样本({:.1} ms)就开始动了",
-            a.len() - i,
+            "只许动最后 ~{:.0} ms,实际从末尾前 {:.1} ms 就开始动了",
+            TAIL_RELEASE_MS,
             (a.len() - i) as f32 / sr as f32 * 1000.0
         );
-        // 末尾必须被压下去(淡到 0)
+        // 末尾必须被压下去(释放到 0)
         assert!(
             b[b.len() - 1].abs() <= a[a.len() - 1].abs() * 0.25 + 1e-6,
-            "末尾该被淡到接近 0:{} vs {}",
+            "末尾该被释放到接近 0:{} vs {}",
             b[b.len() - 1],
             a[a.len() - 1]
+        );
+        // ⛔ 释放必须是**平滑**的:相邻样本的最大跳变不许比原来大(那正是第一版栽的地方)
+        let step = |v: &[f32]| {
+            v.windows(2).rev().take(cap).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max)
+        };
+        assert!(
+            step(&b) <= step(&a) * 1.05 + 1e-6,
+            "释放本身不许造出更大的瞬变:{:.5} vs 原来 {:.5}",
+            step(&b),
+            step(&a)
         );
         // ⑶ ⛔ 阴性对照:末尾接一大段静音(不是被截断的岛)⇒ 两边逐位相同
         let mut y = x.clone();
