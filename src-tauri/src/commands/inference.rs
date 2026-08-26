@@ -1851,8 +1851,10 @@ pub async fn render_vocal_segment(
                 let nn = plan_note_nums(&score, phoneme_set);
                 let fr: Vec<i64> = score.iter().map(|n| n.frames).collect();
                 // ⛔ 与计划**同一份** `nn`/`fr`:音符表和落点决策必须来自同一条时间轴。
-                range_spans =
-                    crate::inference::vocal_range::note_spans(&nn, &fr, options.transpose);
+                let lyr: Vec<String> = score.iter().map(|n| n.lyric.clone()).collect();
+                range_spans = crate::inference::vocal_range::note_spans_tied(
+                    &nn, &fr, options.transpose, &lyr,
+                );
                 // ⭐ S162 —— 多带一个**落点候选**出来(见 `dead_only_plan_with_alts`)。
                 // ⛔ 它不改今天的 pick;选不选用由 `landing_pick()` 决定。
                 let (plan, unfixable, plan_alts) =

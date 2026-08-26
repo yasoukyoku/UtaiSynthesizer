@@ -1619,7 +1619,8 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
         let _ = std::fs::write(dir.join("total_frames.txt"), total_frames.to_string());
     }
     // ⭐ S163 —— 音符表(输出时间轴)。落点选法的逐音打分与两把电平刀**共用**它。
-    let spans = super::super::vocal_range::note_spans(&nn, &fr, transpose);
+    let lyr: Vec<String> = triples.iter().map(|t| t.lyric.clone()).collect();
+    let spans = super::super::vocal_range::note_spans_tied(&nn, &fr, transpose, &lyr);
     super::super::vocal_range::apply_dead_only_windows_alts(
         &mut result.audio,
         sr,

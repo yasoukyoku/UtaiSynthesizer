@@ -1143,6 +1143,67 @@ pub fn dead_only_plan_with_alts(
     (out, unfixable, alts)
 }
 
+
+/// ⭐ S163 —— 一个组的定案:**三层**,每一层都只在**同一个音**上比。
+///
+/// ⓪ **塌陷否决**:某个候选把一个唱音唱成了 ≥`repair_ms` 的静音,而另一个没有 ⇒ 剔掉它。
+///    (`repair_ms == 0` ⇒ 这一层关掉。)
+/// ⓐ **谐波否决**:逐音比谐波能量占比,某个候选在**任何一个音**上差 ≥`harm_eps` dB ⇒ 剔掉。
+///    ⛔ 互相否决时谁也不剔 —— 那不是一边倒。
+/// ⓑ **电平**:逐音 `|rel|`,组取**最差的音**;取不到参照 ⇒ 无穷大 ⇒ 判平 ⇒ 保持计划的落点。
+///
+/// 返回排好序的下标(第一个 = 选中的)。
+fn decide_group(
+    cand: &[(usize, i64, usize, Vec<f32>, CandScore)],
+    ji: usize,
+    plan_shift: i64,
+    harm_eps: f32,
+    repair_ms: f32,
+) -> Vec<usize> {
+    let mut mine: Vec<usize> = (0..cand.len()).filter(|&c| cand[c].0 == ji).collect();
+    if mine.len() < 2 {
+        return mine;
+    }
+    if repair_ms > 0.0 {
+        let ok: Vec<usize> =
+            mine.iter().copied().filter(|&c| cand[c].4.worst_gone() < repair_ms).collect();
+        if !ok.is_empty() && ok.len() < mine.len() {
+            mine = ok;
+        }
+    }
+    if harm_eps > 0.0 && mine.len() > 1 {
+        let loses: Vec<usize> = mine
+            .iter()
+            .copied()
+            .filter(|&x| {
+                mine.iter().any(|&y| {
+                    y != x && {
+                        let w = cand[x]
+                            .4
+                            .harm
+                            .iter()
+                            .filter_map(|&(i, hx)| cand[y].4.harm_of(i).map(|hy| hx - hy))
+                            .fold(f32::INFINITY, f32::min);
+                        w.is_finite() && w < -harm_eps
+                    }
+                })
+            })
+            .collect();
+        let live: Vec<usize> = mine.iter().copied().filter(|c| !loses.contains(c)).collect();
+        if !live.is_empty() && live.len() < mine.len() {
+            mine = live;
+        }
+    }
+    mine.sort_by(|&x, &y| {
+        let sx = cand[x].4.worst_rel().unwrap_or(f32::INFINITY);
+        let sy = cand[y].4.worst_rel().unwrap_or(f32::INFINITY);
+        sx.partial_cmp(&sy)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| (cand[x].1 != plan_shift).cmp(&(cand[y].1 != plan_shift)))
+    });
+    mine
+}
+
 /// ⭐⭐ S163 —— 从**窄预算那份计划**里给一个组取落点候选。
 ///
 /// ⛔⛔ **必须 `start` 与 `end` 都相同。**两份计划的预算不同 ⇒ **分组也不同**
@@ -2176,6 +2237,10 @@ pub struct NoteSpan {
     pub sung: bool,
     /// 目标基频(Hz);0 = 未知。
     pub hz: f32,
+    /// ⭐ S163 —— **这个音是不是上一个音的延续**(同一个音节被写成了好几个音符)。
+    /// 用户 2026-08-26:「我实在受不了那种一个长音三个听感,或者长音割裂了」。
+    /// 它只影响**拼接**:延续处的交叉淡化拉长(见 [`tied_xfade_ms`]);音节变化处一个字节不动。
+    pub tied: bool,
 }
 
 /// 从谱面的「音高 + 帧数」铺出 [`NoteSpan`] 表。⛔ **三个调用点共用这一个构造器** ——
@@ -2183,15 +2248,41 @@ pub struct NoteSpan {
 ///
 /// `transpose` 与 `dead_only_plan_with` 里的 `eff` 同一条:`(n + transpose).clamp(1, 127)`。
 pub fn note_spans(note_nums: &[i64], frames: &[i64], transpose: i64) -> Vec<NoteSpan> {
+    note_spans_tied(note_nums, frames, transpose, &[])
+}
+
+/// [`note_spans`],外加**歌词**(用来认「这个音是不是上一个音的延续」)。
+/// `lyrics` 为空 ⇒ `tied` 全 false ⇒ 拼接层逐位回到今天。
+///
+/// ⛔ 判定只用**歌词相同**或**延音记号**,不用音高 —— 实测炉心融解结尾那个长音
+/// (`[796..=802]` 全是「あ」)音高是 71/73/75/76/83/81,按音高认会全部漏掉。
+pub fn note_spans_tied(
+    note_nums: &[i64],
+    frames: &[i64],
+    transpose: i64,
+    lyrics: &[String],
+) -> Vec<NoteSpan> {
+    const SUSTAIN: &[&str] = &["-", "+", "ー", "〜", "\u{301c}"];
     let mut acc = 0i64;
+    let mut prev: Option<&str> = None;
     note_nums
         .iter()
         .zip(frames.iter())
-        .map(|(&n, &f)| {
+        .enumerate()
+        .map(|(k, (&n, &f))| {
             let start = acc;
             let fr = f.max(0);
             acc += fr;
             let sung = n > 0;
+            let ly = lyrics.get(k).map(String::as_str).unwrap_or("");
+            let tied = sung
+                && !ly.is_empty()
+                && (SUSTAIN.contains(&ly) || prev.is_some_and(|p| p == ly));
+            if sung {
+                prev = Some(ly);
+            } else {
+                prev = None; // ⛔ 隔着休止就不是同一个长音了
+            }
             NoteSpan {
                 start,
                 frames: fr,
@@ -2202,6 +2293,7 @@ pub fn note_spans(note_nums: &[i64], frames: &[i64], transpose: i64) -> Vec<Note
                 } else {
                     0.0
                 },
+                tied,
             }
         })
         .collect()
@@ -3429,6 +3521,168 @@ fn parse_landing_harm(v: Option<&str>) -> f32 {
 /// ⚙ 出厂默认。见 [`landing_harm_eps`]。
 const LANDING_HARM_EPS_DEFAULT: f32 = 3.0;
 
+/// ⚙ 出厂默认 = 200.0(**毫秒**,见 [`LANDING_REPAIR_MS_DEFAULT`])。
+/// `UTAI_RANGE_REPAIR=0` 关掉 ⇒ 不再渲修补遍,逐位回到「只有计划 + 候选」。
+///
+/// ## ⭐⭐⭐ 它治的是「救援把一个音唱没了」
+/// 用户点名的 **yuyuko 4:49**:`[801]あ`(目标 MIDI 90,落点 −11)在 **289.62-289.94** 之间
+/// 塌到 **−70 dBFS**,`base` 同刻平稳在 −32 —— 塌在**解码**里,PSOLA 与拼接都无辜。
+/// S162 把它登记成「离群点」收工了。**S163 补上了那件一直没做的事:对这一处做落点扫描。**
+///
+/// | 落点 | −9 | **−10** | **−11(出厂)** | **−12** | −13 | −14 |
+/// |---|---|---|---|---|---|---|
+/// | 低于 −40 dBFS 的 20 ms 格 | 12 | **0** | **17** | **0** | 0 | 0 |
+/// | 该段最低 dBFS | −72.5 | −27.0 | **−72.7** | −22.9 | −23.5 | −18.0 |
+///
+/// ⇒ ⭐ **只有 −11 与 −9 塌,一个半音之外全干净** —— 不是「模型上限」,是**那一格的死点**。
+/// ⛔ 而落点选法结构上够不着它:yuyuko 的窄预算计划给出的落点与出厂**完全相同**
+///    ⇒ 一个候选都没有 ⇒ 选法根本没被调用。
+///
+/// ## ⛔ 为什么是「先渲、发现塌了再补一遍」而不是「一开始就多渲 ±1」
+/// 实测(四条臂的计划):给**每一组**都加 ±1 ⇒ donor 覆盖 85-152 s → **256-456 s = 3 倍**;
+/// 只给 |s|≥8 的组加 ⇒ 仍是 **2 倍**。而**真正塌掉的音,四条臂 525 个被救音里只有 1 个**。
+/// ⇒ 代价必须跟着「真的坏了」走,不能跟着「可能坏」走。
+///
+/// ## ⛔ 检测器为什么长这样(三条,全部是实测逼出来的)
+/// ⑴ **不许用「音内中位 − 最低 100 ms」**:那把尺子被**辅音**污染 ——
+///    掐掉音头 25%/音尾 15% 之后,四条臂上仍有 **6-11 个音**超过 22 dB,
+///    而它们全是 `か`/`が`/`さ`/`つ`(音中间本来就有塞擦音)。
+/// ⑵ **不许掐音头**:4:49 那一处的塌陷正好在**音的起头**(七度大跳的起音),
+///    掐 25% 就把它掐掉了。
+/// ⑶ ⇒ 判据 = 「唱音**内部**连续 ≥ 这个毫秒数、**绝对**低于 [`REPAIR_FLOOR_DBFS`]、
+///    **而且**比该音自己的中位低 > [`REPAIR_REL_DB`]」。
+///    实测选择性:**525 个被救音里只命中 1 个**(正是 `[801]あ`,300 ms),
+///    akiko / yachiyo / 东雪莲 **0 个**。
+pub fn landing_repair_ms() -> f32 {
+    parse_landing_repair(std::env::var("UTAI_RANGE_REPAIR").ok().as_deref())
+}
+
+fn parse_landing_repair(v: Option<&str>) -> f32 {
+    v.and_then(|x| x.trim().parse::<f32>().ok())
+        .filter(|t| t.is_finite() && (0.0..=2000.0).contains(t))
+        .unwrap_or(LANDING_REPAIR_MS_DEFAULT)
+}
+
+/// ⚙ 出厂默认。见 [`landing_repair_ms`]。
+const LANDING_REPAIR_MS_DEFAULT: f32 = 200.0;
+
+/// ⚙ 出厂默认 = 15.0(**dB**,见 [`HANDOVER_DEFICIT_DB_DEFAULT`])。
+/// `UTAI_RANGE_HANDOVER=0` 关掉 ⇒ 交接点逐帧回到今天。
+///
+/// ## ⭐⭐⭐ **拼接器不许把输出交给一条【正在静音】的 donor**
+/// 用户 2026-08-26 深夜:「yuyuko 4:49 这次没炸,但它的下一个音 **4:50.694** 反而炸了 ——
+/// 别跟我扯模型达不到,这个之前甚至能达到」。**他是对的,而且这条比 4:49 更普遍。**
+///
+/// 四层剖面(同一次 run 的转储;窗 `−11` 覆盖到 290.76,窗 `−9` 从 290.68 开始,重叠 80 ms):
+///
+/// | 时刻 | base | donor −11(**出去的**)| donor −9(**进来的**)| 成品 |
+/// |---|---|---|---|---|
+/// | 290.690 | −39.4 | **−22.5** | −49.9 | −58.4 |
+/// | 290.730 | −36.6 | **−22.8** | **−67.9** | **−72.6** |
+/// | 290.760 | −34.6 | **−13.2** | −48.2 | −46.0 |
+///
+/// ⇒ **出去的那条一路是好的,进来的那条自己有 60-80 ms 的静音起头,而交接照做不误。**
+///
+/// ## ⛔ 它和「短停顿伪影」是**同一个**缺陷
+/// 同一把尺子扫四条臂(缝数 / 命中):yuyuko 54/**1**(= 290.680)·
+/// yachiyo 90/**5**(= **229.500 · 238.140 · 246.800**,正是用户点名的 3:49.524 / 3:58.162 那一族)·
+/// akiko 51/0 · 东雪莲 49/0。
+/// ⇒ S163 为薄片族试过的**四种闭合方式全部判负**(左吞 / 中点 / 右吞 / `join_rests`),
+///    原因现在清楚了:**它们改的是「在哪儿交接」的几何,而病灶是「交给谁」**。
+///
+/// ## 为什么延后交接是安全的(不是拿音高换)
+/// ⭐ `donor_post` **每一遍都在目标音高上**(逆变换已经做完)⇒ 两条 donor 的差别是
+/// **落点带来的音色**,不是音高。多用出去的那一条 ≤[`HANDOVER_MAX_MS`],
+/// 换来的是「不掉进 60-80 ms 的静音」。
+/// ⛔ 而且它**只在真的有缺口时动手**:没缺口 ⇒ 交接点逐样本不变。
+pub fn handover_deficit_db() -> f32 {
+    parse_handover(std::env::var("UTAI_RANGE_HANDOVER").ok().as_deref())
+}
+
+fn parse_handover(v: Option<&str>) -> f32 {
+    v.and_then(|x| x.trim().parse::<f32>().ok())
+        .filter(|t| t.is_finite() && (0.0..=60.0).contains(t))
+        .unwrap_or(HANDOVER_DEFICIT_DB_DEFAULT)
+}
+
+/// ⚙ 出厂默认。见 [`handover_deficit_db`]。
+const HANDOVER_DEFICIT_DB_DEFAULT: f32 = 15.0;
+
+/// ⚙ 出厂默认 = 120.0(**毫秒**,见 [`TIED_XFADE_MS_DEFAULT`])。`UTAI_RANGE_TIED_XFADE=0`
+/// 关掉 ⇒ 所有接缝都用 10 ms,逐位回到今天。
+///
+/// ## ⭐⭐ **同一个长音内部的接缝,交叉淡化拉长**
+/// 用户 2026-08-26:「我实在受不了那种**一个长音三个听感**,或者**长音割裂**了」。
+/// 一个持续的长音在谱面上是好几个连着的**同词**音符(炉心融解结尾的「あ」是 `[796..=802]`
+/// 共 7 个),而计划器按**死音**分组 ⇒ 同一个长音被切成 2-4 段、每段一个落点,
+/// 段与段之间只有 **10 ms** 的交叉淡化。
+///
+/// ⭐ 两条 donor 的**音高都是目标音高**(逆变换已经做完)⇒ 它们的差别只是落点带来的
+/// **音色**。在一个持续的元音上把音色**慢慢**换过去是听不出缝的;10 ms 换才是「割裂」。
+///
+/// ## ⛔ 为什么只在【延续】处拉长
+/// S162 的 2×2(只有同一类边界上的跨组 vs 同组才是有效对照):
+/// **长音延续** 跨组比同组贵 **电平 +1.10 dB · 谱形状 +0.51**;
+/// **音节变化** 只有 +0.13 / +0.05 ≈ 零。
+/// ⇒ 代价几乎全在长音内部;而音节边界上有**辅音与起音**,拉长淡化会把它糊掉 ⇒ 一个字节不动。
+///
+/// ⚠ 上限还会被两侧窗自己的长度夹住(`xf.min((b − a) / 2)`),所以短窗上它自动退化。
+pub fn tied_xfade_ms() -> f64 {
+    parse_tied_xfade(std::env::var("UTAI_RANGE_TIED_XFADE").ok().as_deref())
+}
+
+fn parse_tied_xfade(v: Option<&str>) -> f64 {
+    v.and_then(|x| x.trim().parse::<f64>().ok())
+        .filter(|t| t.is_finite() && (0.0..=400.0).contains(t))
+        .unwrap_or(TIED_XFADE_MS_DEFAULT)
+}
+
+/// ⚙ 出厂默认。见 [`tied_xfade_ms`]。
+const TIED_XFADE_MS_DEFAULT: f64 = 120.0;
+/// 交接最多往后挪这么久(ms)。⛔ 上限的理由:再久就等于让出去的那条 donor 唱下一个音
+/// 的一大截,而它的**落点**(音色)不是为那个音选的。
+/// ⚠ 它远小于 [`MERGE_BRIDGE_FRAMES`](25 帧 = 500 ms)留出来的片段余量 ⇒ 结构上够得着。
+const HANDOVER_MAX_MS: f64 = 150.0;
+/// 出去的那条至少要有这么响,才算「手上有好料」——否则两边都是安静的休止,不关这一刀的事。
+const HANDOVER_ALIVE_DBFS: f32 = -40.0;
+/// 评估窗(ms):在交接点往后这么长的一段上比两条 donor 的电平。
+const HANDOVER_WIN_MS: f64 = 40.0;
+/// 塌陷的**绝对**地板 —— 低于它才算「唱没了」,而不是一个辅音凹陷。
+const REPAIR_FLOOR_DBFS: f32 = -50.0;
+/// 同时还要比**该音自己的中位**低这么多 —— 挡掉「整个音本来就很轻」那一类。
+const REPAIR_REL_DB: f32 = 25.0;
+
+/// 一个音**内部**最长的一段「唱没了」有多少毫秒(0 = 没有)。
+///
+/// ⛔ 逐 20 ms 格;两条门必须**同时**满足(绝对地板 + 相对该音中位),理由在
+/// [`landing_repair_ms`] 的 doc 里 —— 只用相对量会被辅音污染,只用绝对量会被轻音污染。
+fn silence_run_ms(seg: &[f32], sample_rate: u32) -> f32 {
+    let cell = (sample_rate as usize / 50).max(16); // 20 ms
+    let k = seg.len() / cell;
+    if k < 4 {
+        return 0.0;
+    }
+    let mut lv: Vec<f32> = Vec::with_capacity(k);
+    for i in 0..k {
+        let s = &seg[i * cell..(i + 1) * cell];
+        let e: f64 = s.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / cell as f64;
+        lv.push((10.0 * (e + 1e-20).log10()) as f32);
+    }
+    let mut sorted = lv.clone();
+    sorted.sort_by(f32::total_cmp);
+    let med = sorted[sorted.len() / 2];
+    let (mut run, mut best) = (0usize, 0usize);
+    for &v in &lv {
+        if v < REPAIR_FLOOR_DBFS && v < med - REPAIR_REL_DB {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    best as f32 * 20.0
+}
+
 /// ⭐ S163 —— 一个落点候选在**一个窗**里的逐音读数。
 ///
 /// ⛔ 为什么是**逐音**而不是整窗一个数:一个窗里可能有 7 个音,而只有 1 个塌了。
@@ -3440,6 +3694,8 @@ struct CandScore {
     rel: Vec<(usize, f32)>,
     /// (音下标, 谐波能量占比 dB)。**不需要参照**。
     harm: Vec<(usize, f32)>,
+    /// ⭐ S163 —— (音下标, 音内最长「唱没了」的毫秒数)。**不需要参照**。见 [`silence_run_ms`]。
+    gone: Vec<(usize, f32)>,
 }
 
 impl CandScore {
@@ -3453,6 +3709,11 @@ impl CandScore {
 
     fn harm_of(&self, i: usize) -> Option<f32> {
         self.harm.iter().find(|&&(k, _)| k == i).map(|&(_, v)| v)
+    }
+
+    /// 这一组里**最长**的那一段「唱没了」。
+    fn worst_gone(&self) -> f32 {
+        self.gone.iter().map(|&(_, v)| v).fold(0.0f32, f32::max)
     }
 }
 
@@ -3714,6 +3975,9 @@ pub fn apply_dead_only_windows_alts(
         // ⛔ S163 —— 同一条规矩:谐波否决的门限由**参数**给,判据才关得掉
         //    (关掉它正是那条阴性对照:没有它,「更响但没在唱目标音高」的候选会赢)。
         landing_harm_eps(),
+        landing_repair_ms(),
+        handover_deficit_db(),
+        tied_xfade_ms(),
         donor_render,
     )
 }
@@ -3739,6 +4003,12 @@ pub fn apply_dead_only_windows_with(
     align: usize,
     // ⭐ S163 —— 谐波否决的门限(dB);`0.0` = 关。见 [`landing_harm_eps`]。
     harm_eps: f32,
+    // ⭐ S163 —— 修补遍的门限(ms);`0.0` = 关。见 [`landing_repair_ms`]。
+    repair_ms: f32,
+    // ⭐ S163 —— 交接点体检的门限(dB);`0.0` = 关。见 [`handover_deficit_db`]。
+    handover_db: f32,
+    // ⭐ S163 —— 长音延续处的交叉淡化(ms);`0.0` = 关。见 [`tied_xfade_ms`]。
+    tied_xf_ms: f64,
     mut donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
     if jobs.is_empty() || base.is_empty() || total_frames <= 0 {
@@ -3763,7 +4033,10 @@ pub fn apply_dead_only_windows_with(
     //    「谁更轻谁赢」,方向正好反了(实测 60 个窗里 6 个)。
     //    现在与 [`match_rescued_note_levels`] **共用同一份口径**:
     //    邻近 ±16 个**没被救的唱音**的电平中位;取不到 4 个 ⇒ 这个音**弃权**。
-    let scoring = alts.iter().any(Option::is_some) && !notes.is_empty();
+    // ⛔⛔ S163 —— **不只是「有候选才量」**：修补遍的触发条件本身就是「量了才知道」，
+    //    而用户点名的 yuyuko 4:49 那一组 **一个候选都没有**（窄预算那份计划给出的落点与出厂完全相同）。
+    //    第一版写成 `alts 非空` ⇒ 那一组结构上永远不会被量 ⇒ 修补遍对它是死代码。
+    let scoring = (alts.iter().any(Option::is_some) || repair_ms > 0.0) && !notes.is_empty();
     let (note_lv, note_cov) = if scoring {
         note_levels_and_coverage(base, spf, jobs, notes)
     } else {
@@ -3771,6 +4044,7 @@ pub fn apply_dead_only_windows_with(
     };
     let note_ref = if scoring { clean_neighbour_refs(&note_lv, &note_cov) } else { Vec::new() };
     let harm_eps = if scoring { harm_eps } else { 0.0 };
+    let repair_ms = if scoring { repair_ms } else { 0.0 };
     // 每个窗**正身**里的音 = 被这个窗盖住 ≥80% 的唱音(它的好坏由这个窗的落点决定)。
     let job_notes: Vec<Vec<usize>> = if scoring {
         jobs.iter()
@@ -3859,94 +4133,174 @@ pub fn apply_dead_only_windows_with(
                                 sc.harm.push((ni, h));
                             }
                         }
+                        // ⭐ S163 —— 音内「唱没了」的毫秒数(不需要参照)。
+                        let g = silence_run_ms(seg, sample_rate);
+                        if g > 0.0 {
+                            sc.gone.push((ni, g));
+                        }
                     }
                 }
                 cand.push((ji, s, lo, donor[lo..hi].to_vec(), sc));
             }
         }
     }
-    // ⭐ S162 —— 逐组定案:有候选的组挑 `|rel|` 更小的那个;没有候选的组原样。
-    for ji in 0..jobs.len() {
-        let mut mine: Vec<usize> =
-            (0..cand.len()).filter(|&c| cand[c].0 == ji).collect();
-        if mine.is_empty() {
-            continue;
+    // ⭐ S162/S163 —— 逐组定案(三层,见 [`decide_group`]);没有候选的组原样。
+    let mut chosen: Vec<Option<usize>> = vec![None; jobs.len()];
+    let log_pick = |cand: &[(usize, i64, usize, Vec<f32>, CandScore)],
+                    mine: &[usize],
+                    ji: usize,
+                    jobs: &[DeadJob]| {
+        if mine.len() < 2 {
+            return;
         }
-        if mine.len() > 1 {
-            // ── ⓐ **谐波否决**(S163)────────────────────────────────────
-            // 逐音比「谐波能量占比」——**同一个音 ⇒ 同一个目标 f0 ⇒ 可比**。
-            // 某个候选只要在**任何一个音**上差 ≥ `harm_eps` dB,就把它剔掉。
-            // ⛔ 两个互相否决时(各自都有一个音输给对方)**谁也不剔** —— 那不是一边倒,
-            //    交给下面的电平轴去裁。
-            if harm_eps > 0.0 {
-                let loses: Vec<usize> = mine
-                    .iter()
-                    .copied()
-                    .filter(|&x| {
-                        mine.iter().any(|&y| {
-                            y != x && {
-                                let w = cand[x]
-                                    .4
-                                    .harm
-                                    .iter()
-                                    .filter_map(|&(i, hx)| cand[y].4.harm_of(i).map(|hy| hx - hy))
-                                    .fold(f32::INFINITY, f32::min);
-                                w.is_finite() && w < -harm_eps
-                            }
-                        })
-                    })
-                    .collect();
-                let live: Vec<usize> =
-                    mine.iter().copied().filter(|c| !loses.contains(c)).collect();
-                if !live.is_empty() && live.len() < mine.len() {
-                    tracing::info!(
-                        "range: group[{}..{}] harmonic veto — dropped {:?} (per-note harmonic energy fraction worse by >= {harm_eps} dB)",
-                        jobs[ji].start,
-                        jobs[ji].end,
-                        loses.iter().map(|&c| cand[c].1).collect::<Vec<_>>()
-                    );
-                    mine = live;
-                }
-            }
-            // ── ⓑ **电平**:逐音 |rel|,组取**最差的音**;取不到参照 ⇒ 无穷大 ────
-            // ⛔ 两边都取不到 ⇒ 比较判平 ⇒ 下面那条平局规则**保持计划的落点**,不许瞎猜。
-            mine.sort_by(|&x, &y| {
-                let sx = cand[x].4.worst_rel().unwrap_or(f32::INFINITY);
-                let sy = cand[y].4.worst_rel().unwrap_or(f32::INFINITY);
-                sx.partial_cmp(&sy).unwrap_or(std::cmp::Ordering::Equal).then_with(|| {
-                    (cand[x].1 != jobs[ji].shift).cmp(&(cand[y].1 != jobs[ji].shift))
-                })
-            });
-            let pick = cand[mine[0]].1;
-            // ⛔ S129 铁律:「臂开着」与「臂做了事」必须**分开**可查。
-            //    第一版只在 pick 改变时才打 ⇒ 「候选没生成」与「候选生成了但没赢」
-            //    读起来一模一样,而那正是 akiko 的「ぴゃ」卡了两轮的原因。
+        // ⛔ S129 铁律:「臂开着」与「臂做了事」必须**分开**可查 —— 每一组都打候选表。
+        tracing::info!(
+            "range: group[{}..{}] landing candidates {:?} — kept {:+}",
+            jobs[ji].start,
+            jobs[ji].end,
+            mine.iter()
+                .map(|&c| (cand[c].1, cand[c].4.worst_rel(), cand[c].4.worst_gone()))
+                .collect::<Vec<_>>(),
+            cand[mine[0]].1
+        );
+        if cand[mine[0]].1 != jobs[ji].shift {
             tracing::info!(
-                "range: group[{}..{}] landing candidates {:?} — kept {:+}",
+                "range: group[{}..{}] landing re-picked {:+} → {:+} by measurement \
+                 (worst-note |rel| {:.1} dB, silence {:.0} ms)",
                 jobs[ji].start,
                 jobs[ji].end,
-                mine.iter()
-                    .map(|&c| (cand[c].1, cand[c].4.worst_rel(), cand[c].4.harm.len()))
-                    .collect::<Vec<_>>(),
-                pick
+                jobs[ji].shift,
+                cand[mine[0]].1,
+                cand[mine[0]].4.worst_rel().unwrap_or(f32::NAN),
+                cand[mine[0]].4.worst_gone()
             );
-            if pick != jobs[ji].shift {
-                tracing::info!(
-                    "range: group[{}..{}] landing re-picked {:+} → {:+} by measurement \
-                     (worst-note |rel| {:.1} vs {:.1} dB)",
+        }
+    };
+    for ji in 0..jobs.len() {
+        let mine = decide_group(&cand, ji, jobs[ji].shift, harm_eps, repair_ms);
+        log_pick(&cand, &mine, ji, jobs);
+        chosen[ji] = mine.first().copied();
+    }
+
+    // ── ⭐⭐⭐ S163 —— **修补遍**:被选中的那一遍里若有唱音【自己塌成一段静音】,
+    //    就再渲 `shift ± 1` 的**那一组窗**,按同一套打分重选。
+    //    ⛔ 代价跟着「真的坏了」走:实测四条臂 525 个被救音里**只有 1 个**命中
+    //    (yuyuko 4:49 的 `[801]あ`,300 ms);而「一开始就给每组多渲 ±1」要付 2-3 倍。
+    if repair_ms > 0.0 && scoring {
+        let need: Vec<usize> = (0..jobs.len())
+            .filter(|&ji| {
+                chosen[ji].is_some_and(|c| cand[c].4.worst_gone() >= repair_ms)
+            })
+            .collect();
+        if !need.is_empty() {
+            for &ji in &need {
+                tracing::warn!(
+                    "range: group[{}..{}] at {:+} sang {:.0} ms of SILENCE inside a note — \
+                     rendering ±1 repair passes",
                     jobs[ji].start,
                     jobs[ji].end,
-                    jobs[ji].shift,
-                    pick,
-                    cand[mine[0]].4.worst_rel().unwrap_or(f32::NAN),
-                    cand[mine[1]].4.worst_rel().unwrap_or(f32::NAN)
+                    cand[chosen[ji].unwrap()].1,
+                    cand[chosen[ji].unwrap()].4.worst_gone()
                 );
             }
+            let mut by_shift: std::collections::BTreeMap<i64, Vec<usize>> = Default::default();
+            for &ji in &need {
+                let cur = cand[chosen[ji].unwrap()].1;
+                for d in [-1i64, 1] {
+                    let s2 = cur + d;
+                    if s2 == 0 || s2.abs() > MAX_RANGE_SHIFT {
+                        continue;
+                    }
+                    // ⛔ 已经渲过这个 shift 的组不再重复(它本来就是候选之一)
+                    if cand.iter().any(|c| c.0 == ji && c.1 == s2) {
+                        continue;
+                    }
+                    by_shift.entry(s2).or_default().push(ji);
+                }
+            }
+            for (s2, gs) in by_shift {
+                let own: Vec<(i64, i64)> =
+                    gs.iter().map(|&ji| (jobs[ji].start, jobs[ji].end)).collect();
+                let donor = donor_render(s2, &own)?;
+                let n = base.len().min(donor.len());
+                for &ji in &gs {
+                    let j = &jobs[ji];
+                    if let Some((lo, hi)) = donor_read_span(j, spf, n, MERGE_BRIDGE_FRAMES) {
+                        let mut sc = CandScore::default();
+                        for &ni in &job_notes[ji] {
+                            let nd = &notes[ni];
+                            let na = ((nd.start as f64) * spf).round().max(0.0) as usize;
+                            let nb =
+                                (((nd.start + nd.frames) as f64) * spf).round().max(0.0) as usize;
+                            let (a, b) = (na.max(lo).min(hi), nb.min(hi));
+                            if b <= a + 1024 || (b - a) * 5 < (nb.saturating_sub(na)) * 4 {
+                                continue;
+                            }
+                            let seg = &donor[a..b];
+                            let e: f64 =
+                                seg.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>()
+                                    / (b - a) as f64;
+                            let l = (10.0 * (e + 1e-20).log10()) as f32;
+                            if note_ref[ni].is_finite() {
+                                sc.rel.push((ni, (l - note_ref[ni]).abs()));
+                            }
+                            if nd.hz > 0.0 {
+                                if let Some(h) =
+                                    utai_dsp::harmonicity::harmonic_energy_fraction_db(
+                                        seg,
+                                        sample_rate,
+                                        nd.hz,
+                                    )
+                                {
+                                    sc.harm.push((ni, h));
+                                }
+                            }
+                            let g = silence_run_ms(seg, sample_rate);
+                            if g > 0.0 {
+                                sc.gone.push((ni, g));
+                            }
+                        }
+                        cand.push((ji, s2, lo, donor[lo..hi].to_vec(), sc));
+                    }
+                }
+            }
+            for &ji in &need {
+                let mine = decide_group(&cand, ji, jobs[ji].shift, harm_eps, repair_ms);
+                if let Some(&c) = mine.first() {
+                    tracing::info!(
+                        "range: group[{}..{}] repair — {:?} ⇒ kept {:+} (silence {:.0} ms)",
+                        jobs[ji].start,
+                        jobs[ji].end,
+                        mine.iter()
+                            .map(|&x| (cand[x].1, cand[x].4.worst_gone()))
+                            .collect::<Vec<_>>(),
+                        cand[c].1,
+                        cand[c].4.worst_gone()
+                    );
+                    chosen[ji] = Some(c);
+                }
+            }
         }
-        let c = &cand[mine[0]];
-        kept.push((ji as i64, c.2, c.3.clone()));
     }
-    splice_kept(base, sample_rate, spf, jobs, &kept, xf, join_enabled, align)
+
+    for ji in 0..jobs.len() {
+        if let Some(c) = chosen[ji] {
+            kept.push((ji as i64, cand[c].2, cand[c].3.clone()));
+        }
+    }
+    splice_kept(
+        base,
+        sample_rate,
+        spf,
+        jobs,
+        &kept,
+        xf,
+        join_enabled,
+        align,
+        handover_db,
+        notes,
+        (tied_xf_ms * f64::from(sample_rate) / 1000.0) as usize,
+    )
 }
 
 /// S152 —— 拼接层,从 `apply_dead_only_windows` 拆出来:它现在拿到的是**全部**位移的 donor
@@ -4033,6 +4387,95 @@ fn parse_seam_align(v: Option<&str>) -> f64 {
         .unwrap_or(SEAM_ALIGN_MS_DEFAULT)
 }
 
+
+/// ⭐⭐⭐ S163 —— 交接点体检:**进来的那条 donor 静音时,把交接往后挪**。
+///
+/// 返回 `oi -> 新的切换样本`,与 [`join_rests`] 同一种口径(左窗伸到切换点、右窗从
+/// 切换点往前一个淡化宽度开始)⇒ 两者可以合并,而**这一把优先**(它治的是「掉进静音」,
+/// 那比「缝落在哪儿」严重一个量级)。
+///
+/// 账与出处在 [`handover_deficit_db`] 的 doc 上。⛔ `deficit <= 0` ⇒ 空表 ⇒ 逐样本不变。
+#[allow(clippy::too_many_arguments)]
+fn defer_dead_handover(
+    sample_rate: u32,
+    spf: f64,
+    jobs: &[DeadJob],
+    kept: &[(i64, usize, Vec<f32>)],
+    order: &[usize],
+    deficit: f32,
+) -> std::collections::HashMap<usize, usize> {
+    let mut out = std::collections::HashMap::new();
+    if deficit <= 0.0 || order.len() < 2 {
+        return out;
+    }
+    let w = (f64::from(sample_rate) * HANDOVER_WIN_MS / 1000.0) as usize;
+    let step = (f64::from(sample_rate) * 0.010) as usize;
+    let max_defer = (f64::from(sample_rate) * HANDOVER_MAX_MS / 1000.0) as usize;
+    let slice = |ji: usize| kept.iter().find(|(i, _, _)| *i == ji as i64);
+    let lvl = |lo: usize, seg: &[f32], a: usize| -> f32 {
+        if a < lo || a + w > lo + seg.len() {
+            return f32::NEG_INFINITY;
+        }
+        let s = &seg[a - lo..a - lo + w];
+        let e: f64 = s.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / w as f64;
+        (10.0 * (e + 1e-20).log10()) as f32
+    };
+    for oi in 0..order.len() - 1 {
+        let (l, r) = (order[oi], order[oi + 1]);
+        if jobs[l].shift == jobs[r].shift {
+            continue;
+        }
+        let (Some((_, llo, lseg)), Some((_, rlo, rseg))) = (slice(l), slice(r)) else { continue };
+        // 今天的交接就在右窗起点
+        let t0 = ((jobs[r].start.max(0) as f64) * spf) as usize;
+        let (lv0, rv0) = (lvl(*llo, lseg, t0), lvl(*rlo, rseg, t0));
+        if !lv0.is_finite() || !rv0.is_finite() {
+            continue;
+        }
+        if lv0 <= HANDOVER_ALIVE_DBFS || lv0 - rv0 <= deficit {
+            continue;
+        }
+        // 往后找第一个「进来的那条追上来」的点
+        let mut t = t0;
+        let mut fixed = None;
+        while t + step <= t0 + max_defer {
+            t += step;
+            let (lv, rv) = (lvl(*llo, lseg, t), lvl(*rlo, rseg, t));
+            if !lv.is_finite() || !rv.is_finite() {
+                break;
+            }
+            if rv >= lv - deficit * 0.5 {
+                fixed = Some(t);
+                break;
+            }
+        }
+        match fixed {
+            Some(t) => {
+                tracing::info!(
+                    "range: handover at {:.3}s deferred by {:.0} ms — the incoming donor {:+} was \
+                     {:.1} dB below the outgoing {:+} ({:.1} vs {:.1} dBFS)",
+                    t0 as f64 / f64::from(sample_rate),
+                    (t - t0) as f64 * 1000.0 / f64::from(sample_rate),
+                    jobs[r].shift,
+                    lv0 - rv0,
+                    jobs[l].shift,
+                    lv0,
+                    rv0
+                );
+                out.insert(oi, t);
+            }
+            None => tracing::warn!(
+                "range: handover at {:.3}s — the incoming donor {:+} is {:.1} dB down and does not \
+                 recover within {HANDOVER_MAX_MS:.0} ms; leaving the seam where it is",
+                t0 as f64 / f64::from(sample_rate),
+                jobs[r].shift,
+                lv0 - rv0
+            ),
+        }
+    }
+    out
+}
+
 fn splice_kept(
     base: &mut [f32],
     sample_rate: u32,
@@ -4042,6 +4485,12 @@ fn splice_kept(
     xf: usize,
     join_enabled: bool,
     align: usize,
+    // ⭐ S163 —— 交接点体检的门限(dB);`0.0` = 关。见 [`handover_deficit_db`]。
+    handover_db: f32,
+    // ⭐ S163 —— 音符表(认「长音延续」用);空 ⇒ 逐位回到今天。见 [`tied_xfade_ms`]。
+    notes: &[NoteSpan],
+    // ⭐ S163 —— 长音延续处的交叉淡化(样本);`0` = 关。
+    tied_xf: usize,
 ) -> crate::Result<()> {
     // ⛔ `join_enabled` 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
     let n = base.len();
@@ -4050,7 +4499,56 @@ fn splice_kept(
     // 顺序错了就会淡回 base,也就是这一刀本来要消灭的那个洞。
     let mut order: Vec<usize> = (0..jobs.len()).collect();
     order.sort_by_key(|&i| (jobs[i].start, jobs[i].end));
-    let join = join_rests(base, sample_rate, spf, jobs, kept, &order, xf, join_enabled);
+    let mut join = join_rests(base, sample_rate, spf, jobs, kept, &order, xf, join_enabled);
+    // ⭐⭐ S163 —— 交接点体检**优先**:它治的是「掉进静音」,比「缝落在哪儿」严重一个量级。
+    join.extend(defer_dead_handover(sample_rate, spf, jobs, kept, &order, handover_db));
+    // ⭐⭐ S163 —— **长音延续处的接缝改成长交叉淡化**(用户:「一个长音三个听感 / 长音割裂」)。
+    // ⛔ 做法必须走 `join` 那一套:左窗**硬写到交接点**(不淡出)、右窗**从交接点往前**
+    //    一个淡化宽度开始淡入 ⇒ 淡入区里另一侧是**左窗的 donor**。
+    //    第一版只把淡入拉长而没挪起点 ⇒ 淡入区另一侧是 `base` ⇒ **挖了一个 120 ms 的坑**。
+    let mut xf_at: std::collections::HashMap<usize, usize> = Default::default();
+    if tied_xf > xf && !notes.is_empty() && order.len() > 1 {
+        let tol = (sample_rate as usize) / 25; // 40 ms
+        let tied_here = |t: usize| -> bool {
+            notes.iter().any(|nd| {
+                if !nd.sung {
+                    return false;
+                }
+                let s0 = ((nd.start as f64) * spf) as usize;
+                let s1 = (((nd.start + nd.frames) as f64) * spf) as usize;
+                if s1 <= s0 {
+                    return false;
+                }
+                // ⓐ 交接点落在一个**延续音**的头上(±40 ms)⇒ 同一个长音被切开了
+                (nd.tied && t + tol >= s0 && t <= s0 + tol)
+                    // ⓑ 交接点落在一个音的**肚子里**(离两端都 >40 ms)⇒ 也是把一个音切开
+                    || (t > s0 + tol && t + tol < s1)
+            })
+        };
+        for oi in 0..order.len() - 1 {
+            let (l, r) = (order[oi], order[oi + 1]);
+            if jobs[l].shift == jobs[r].shift {
+                continue;
+            }
+            // ⛔ 交接点体检**优先**:它已经挪过的点尊重它,只把淡化拉长。
+            let t = join
+                .get(&oi)
+                .copied()
+                .unwrap_or_else(|| ((jobs[r].start.max(0) as f64) * spf) as usize);
+            if !tied_here(t) {
+                continue;
+            }
+            join.insert(oi, t);
+            xf_at.insert(oi + 1, tied_xf);
+        }
+        if !xf_at.is_empty() {
+            tracing::info!(
+                "range: {} seam(s) inside a sustained note widened to {:.0} ms of donor-to-donor crossfade",
+                xf_at.len(),
+                tied_xf as f64 * 1000.0 / f64::from(sample_rate)
+            );
+        }
+    }
     for (oi, &ji) in order.iter().enumerate() {
         let j = &jobs[ji];
         // ⛔ 片段一次找完,不许放进逐样本的循环 —— 那是 53 × 12.8 M 次线性扫。
@@ -4071,7 +4569,8 @@ fn splice_kept(
             if let Some(t) = join.get(&(oi - 1)).copied() {
                 // ⛔ 赋值而不是 `min` —— 切换点可能**晚于**今天的窗起点(46 s 那处的正解就是),
                 // 只往前挪的话那一半永远够不着。
-                a = t.saturating_sub(xf).min(n);
+                // ⭐ S163 —— 往前挪的量 = **这个窗自己的淡入宽度**(长音延续处是 120 ms)。
+                a = t.saturating_sub(xf_at.get(&oi).copied().unwrap_or(xf)).min(n);
             }
         }
             // 窗短于双淡化 → 收缩淡化宽度;完全空窗才放弃,响亮。
@@ -4127,8 +4626,13 @@ fn splice_kept(
             }
             let a = a.max(sa);
             let b = b.min(sb);
-            let xfw = xf.min((b.saturating_sub(a)) / 2);
-            if b <= a || xfw == 0 {
+            // ⭐⭐ S163 —— 淡入宽度逐窗给(长音延续处拉长,见 [`tied_xfade_ms`]);
+            // 淡出永远是 10 ms —— 被拉长的那一侧一定是 `hard_end`(左窗硬写到交接点),
+            // 所以它根本不淡出。
+            let xf_in = xf_at.get(&oi).copied().unwrap_or(xf);
+            let xfw = xf_in.min((b.saturating_sub(a)) / 2);
+            let xfw_out = xf.min((b.saturating_sub(a)) / 2);
+            if b <= a || xfw == 0 || xfw_out == 0 {
                 tracing::warn!(
                     "range-extend(dead-only): window frames {fa}..{fb} degenerate after clamp ({a}..{b} samples) — NOT rescued"
                 );
@@ -4154,8 +4658,8 @@ fn splice_kept(
             for k in a..b {
                 let w = if fade_in && k < a + xfw {
                     0.5 - 0.5 * (std::f32::consts::PI * (k - a) as f32 / xfw as f32).cos()
-                } else if fade_out && k >= b - xfw {
-                    0.5 - 0.5 * (std::f32::consts::PI * (b - k) as f32 / xfw as f32).cos()
+                } else if fade_out && k >= b - xfw_out {
+                    0.5 - 0.5 * (std::f32::consts::PI * (b - k) as f32 / xfw_out as f32).cos()
                 } else {
                     1.0
                 };
@@ -5954,7 +6458,7 @@ mod tests {
                 kept.push((0, lo, donor[lo..hi].to_vec()));
             }
             let xf = (SR as usize / 100).max(2);
-            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align).unwrap();
+            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0).unwrap();
             b
         };
 
@@ -6116,6 +6620,9 @@ mod tests {
             join_rests_enabled(),
             0, // ⛔ 关掉对齐:见上面那段
             0.0,
+            0.0,
+            0.0,
+            0.0,
             |s, _own| Ok(donor_of(s)),
         )
         .unwrap();
@@ -6230,9 +6737,9 @@ mod tests {
         let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left), (1, 0, right)];
 
         let mut off = base.clone();
-        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0).unwrap();
+        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0).unwrap();
         let mut on = base.clone();
-        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0).unwrap();
+        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0).unwrap();
 
         // ⓐ 关着 ⇒ 那个洞必须还在:52800 开窗之后是右 donor 的静音。
         assert!(
@@ -6336,7 +6843,7 @@ mod tests {
             (1, 53_000, right[53_000..(380 * 480)].to_vec()),
         ];
         let mut out = base.clone();
-        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0).unwrap();
+        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0).unwrap();
         assert_eq!(out[0], -1.0, "窗外仍是 base");
         assert!((out[30_000] - 0.5).abs() < 1e-6, "左窗内仍是左 donor");
     }
@@ -6371,7 +6878,7 @@ mod tests {
         let (base0, left, right) = join_fixture(n);
         let run = |join: bool| {
             let mut b = base0.clone();
-            apply_dead_only_windows_with(&mut b, sr, total, &jobs, &[], &[], false, join, 0, 0.0, |s, _| {
+            apply_dead_only_windows_with(&mut b, sr, total, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, |s, _| {
                 Ok(if s == -9 { left.clone() } else { right.clone() })
             })
             .unwrap();
@@ -6456,7 +6963,7 @@ mod tests {
         };
         for join in [false, true] {
             let mut base = vec![0.02f32; base_len]; // −34 dBFS 的底,好让「洞」量得出来
-            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0, |s, own| {
+            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, |s, own| {
                 // ⭐ 生产走的就是 `donor_keep_samples` 这一个函数,判据不许自己再拼一遍公式。
                 let keep = donor_keep_samples_with(own, base_len, TOTAL_FRAMES, true);
                 let mut d = vec![-1.0f32; base_len];
@@ -6486,7 +6993,7 @@ mod tests {
             // ⛔ 阴性对照 ②:余量给不够时会怎样 —— 而**两条臂的答案不一样,那正是这条判据的重点**。
             let mut tight = vec![0.02f32; base_len];
             apply_dead_only_windows_with(
-                &mut tight, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0,
+                &mut tight, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0,
                 |s, own| Ok(paint(own, 0, s)),
             )
             .expect("splice");
@@ -7836,7 +8343,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} handover={} tiedxf={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -7872,6 +8379,12 @@ mod tests {
             //   ②打分从「整窗一个 RMS」改成**逐音、取组内最差**,参照换成
             //   「邻近没被救的唱音的中位」(= `match_rescued_note_levels` 那一套)。
             parse_landing_harm(None),
+            // S163 —— **修补遍**的门限(ms)。⛔ **改音频**(出厂 200)⇒ bump 到 `s163b`。
+            parse_landing_repair(None),
+            // S163 —— **交接点体检**。⛔ **改音频**(出厂 15)⇒ bump 到 `s163c`。
+            parse_handover(None),
+            // S163 —— 长音延续处的交叉淡化。⛔ **改音频**(出厂 120 ms)⇒ 与 handover 一起 bump。
+            parse_tied_xfade(None),
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -7880,10 +8393,10 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 handover=15 tiedxf=120 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s163a";
+        const TAG: &str = "s163c";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -7941,6 +8454,9 @@ mod tests {
             ("RANGE_TILT_DEFAULT", "pub fn range_tilt("),
             ("LANDING_PICK_DEFAULT", "pub fn landing_pick("),
             ("LANDING_HARM_EPS_DEFAULT", "pub fn landing_harm_eps("),
+            ("LANDING_REPAIR_MS_DEFAULT", "pub fn landing_repair_ms("),
+            ("HANDOVER_DEFICIT_DB_DEFAULT", "pub fn handover_deficit_db("),
+            ("TIED_XFADE_MS_DEFAULT", "pub fn tied_xfade_ms("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
@@ -8078,7 +8594,13 @@ mod tests {
         let mut notes: Vec<NoteSpan> = Vec::new();
         for i in 0..10i64 {
             let sung = !(i == 0 || i == 9);
-            notes.push(NoteSpan { start: i * nf, frames: nf, sung, hz: if sung { 440.0 } else { 0.0 } });
+            notes.push(NoteSpan {
+                start: i * nf,
+                frames: nf,
+                sung,
+                hz: if sung { 440.0 } else { 0.0 },
+                tied: false,
+            });
         }
         // 前 4 个唱音 = shift −4,后 4 个 = shift −12
         let jobs = vec![
@@ -8165,7 +8687,7 @@ mod tests {
         // 音表:每 10 帧一个音(⛔ 必须 ≥ `LEVEL_MATCH_MIN_FRAMES`,否则整表被跳过 ——
         //   第一版写成 4 帧,判据当场红,红对了)。
         let notes: Vec<NoteSpan> =
-            (0..10).map(|k| NoteSpan { start: k * 10, frames: 10, sung: true, hz: 440.0 }).collect();
+            (0..10).map(|k| NoteSpan { start: k * 10, frames: 10, sung: true, hz: 440.0, tied: false }).collect();
         // 窗:只盖第 5 个音(帧 50..60)⇒ 只有它是「被救」的
         let jobs = vec![DeadJob { shift: -7, start: 50, end: 60 }];
         let mk = |amp_rescued: f32| -> Vec<f32> {
@@ -8361,7 +8883,7 @@ mod tests {
         const SPF: usize = 4410; // 100 ms @ 44.1 kHz
         let nf = 10i64;
         let notes: Vec<NoteSpan> = (0..12i64)
-            .map(|i| NoteSpan { start: i * nf, frames: nf, sung: true, hz: 440.0 })
+            .map(|i| NoteSpan { start: i * nf, frames: nf, sung: true, hz: 440.0, tied: false })
             .collect();
         let jobs = vec![DeadJob { shift: -8, start: 4 * nf, end: 7 * nf }];
         let alts = vec![Some(-4i64)];
@@ -8426,6 +8948,9 @@ mod tests {
                 false,
                 0,
                 0.0, // ⛔ 谐波否决关掉 —— 这一条只钉【粒度】那根轴
+                0.0, // ⛔ 修补遍也关掉
+                0.0, // ⛔ 交接点体检也关掉
+                0.0, // ⛔ 长音淡化也关掉
                 |s, _| Ok(if s == -8 { mk([-2.0, -2.0, -2.0]) } else { mk([0.5, 0.5, collapse]) }),
             )
             .unwrap();
@@ -8491,7 +9016,7 @@ mod tests {
         let run = |eps: f32| -> Vec<f32> {
             let mut b = base0.clone();
             apply_dead_only_windows_with(
-                &mut b, 44100, total, &jobs, &alts, &notes, false, false, 0, eps,
+                &mut b, 44100, total, &jobs, &alts, &notes, false, false, 0, eps, 0.0, 0.0, 0.0,
                 |s, _| {
                     Ok(if s == -8 {
                         stack(440.0, 0.0537, base0.len())
@@ -8524,6 +9049,321 @@ mod tests {
             (off - b_db).abs() < 0.8,
             "关掉谐波否决就只剩电平轴,该选 B,读到 {off:.2},A={a_db:.2} B={b_db:.2}"
         );
+    }
+
+    /// ⛔⛔⭐⭐⭐ S163 —— **救援把一个音唱成了静音时,必须自己再渲一遍去修**。
+    ///
+    /// ## 它治的是用户点名的 yuyuko **4:49**
+    /// `[801]あ`(目标 MIDI 90、落点 −11)在 289.62-289.94 之间塌到 **−70 dBFS**,
+    /// 而同刻 `base` 平稳在 −32 ⇒ 塌在**解码**里。S162 把它登记成「离群点」收工。
+    /// S163 补做了那件一直没做的事 —— **对这一处做落点扫描**:
+    ///
+    /// | 落点 | −9 | **−10** | **−11(出厂)** | **−12** | −13 | −14 |
+    /// |---|---|---|---|---|---|---|
+    /// | 低于 −40 dBFS 的 20 ms 格 | 12 | **0** | **17** | **0** | 0 | 0 |
+    ///
+    /// ⇒ 一个半音之外全干净 ⇒ **不是模型上限,是那一格的死点**,而落点选法结构上够不着它
+    ///   (yuyuko 的窄预算计划与出厂**完全相同** ⇒ 一个候选都没有)。
+    ///
+    /// ## 这一条钉四件
+    /// ⑴ 计划的那一遍唱出静音 ⇒ **多渲 ±1 并换过去**;
+    /// ⑵ ⛔ **阴性对照 A**:计划那一遍好好的 ⇒ **一次修补遍都不许渲**(记账用调用计数);
+    /// ⑶ ⛔ **阴性对照 B**:门限 = 0(关掉)⇒ 即使塌了也不修、也不多渲;
+    /// ⑷ ⛔ 修补遍**也要过同一套打分** —— 一个「不塌但完全不像话」的修补候选不许赢。
+    #[test]
+    fn a_note_the_rescue_sang_into_silence_triggers_a_repair_pass() {
+        let (base0, notes, jobs, _alts, spf) = pick_rig();
+        let total = 120i64;
+        // 计划 −8;窗盖住音 4-6。素材:正常段 = 参照电平的正弦。
+        let tone = |amp: f32, hole: Option<(usize, usize)>| -> Vec<f32> {
+            let mut d = vec![0.0f32; base0.len()];
+            for i in 4..7usize {
+                let (a, b) = ((i * 10) * spf, ((i + 1) * 10) * spf);
+                for (t, v) in d[a..b].iter_mut().enumerate() {
+                    *v = amp * (2.0 * std::f32::consts::PI * 440.0 * t as f32 / 44100.0).sin();
+                }
+            }
+            // 「唱没了」:音 5 中段挖掉 300 ms(⇒ 低于 −50 dBFS 且比该音中位低 >25 dB)
+            if let Some((a, b)) = hole {
+                for v in d[a..b].iter_mut() {
+                    *v = 0.0;
+                }
+            }
+            d
+        };
+        let hole = ((5 * 10 + 3) * spf, (5 * 10 + 6) * spf); // 300 ms,音 5 的中段
+        let calls = std::cell::RefCell::new(Vec::<i64>::new());
+        let run = |repair_ms: f32, broken: bool| -> (Vec<f32>, Vec<i64>) {
+            calls.borrow_mut().clear();
+            let mut b = base0.clone();
+            apply_dead_only_windows_with(
+                &mut b, 44100, total, &jobs, &[], &notes, false, false, 0, 0.0, repair_ms, 0.0, 0.0,
+                |s, _| {
+                    calls.borrow_mut().push(s);
+                    Ok(if s == -8 && broken {
+                        tone(0.1, Some(hole))
+                    } else if s == -8 {
+                        tone(0.1, None)
+                    } else {
+                        // ⭐ 修补遍：**没有洞**，但故意比计划那一遍【轻 3 dB】——
+                        // ⛔ 否则「逐音最差 |rel|」那一层自己就能选对，
+                        //    【塌陷否决】那一层就是空的（变异 r2 当场抬出来的）。
+                        tone(0.1 * 10f32.powf(-3.0 / 20.0), None)
+                    })
+                },
+            )
+            .unwrap();
+            let c = calls.borrow().clone();
+            (b, c)
+        };
+        let mid = |x: &[f32]| -> f32 {
+            let (a, b) = (hole.0, hole.1);
+            let e: f64 =
+                x[a..b].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / (b - a) as f64;
+            (10.0 * (e + 1e-30).log10()) as f32
+        };
+
+        // ⑴ 塌了 ⇒ 修补遍跑了,而且洞被补上
+        let (fixed, c1) = run(LANDING_REPAIR_MS_DEFAULT, true);
+        assert!(
+            c1.len() > 1,
+            "唱出静音却没渲修补遍 —— donor_render 只被调用了 {:?}",
+            c1
+        );
+        assert!(
+            c1.iter().any(|&s| s == -7 || s == -9),
+            "修补遍必须是 ±1:实际调用 {:?}",
+            c1
+        );
+        assert!(mid(&fixed) > -35.0, "洞没被补上:那 300 ms 读 {:.1} dBFS", mid(&fixed));
+
+        // ⑵ ⛔ 阴性对照 A:没塌 ⇒ **一次都不许多渲**
+        let (ok, c2) = run(LANDING_REPAIR_MS_DEFAULT, false);
+        assert_eq!(c2, vec![-8], "没塌却多渲了:{c2:?} —— 代价必须跟着「真的坏了」走");
+        assert!(mid(&ok) > -35.0);
+
+        // ⑶ ⛔ 阴性对照 B:门限 0 ⇒ 既不修也不多渲
+        let (off, c3) = run(0.0, true);
+        assert_eq!(c3, vec![-8], "门限 0 还多渲了:{c3:?}");
+        assert!(
+            mid(&off) < -60.0,
+            "门限 0 时那 300 ms 必须还是静音,实际 {:.1} dBFS",
+            mid(&off)
+        );
+    }
+
+    /// ⛔ S163 —— [`silence_run_ms`] 的两条门必须**同时**成立。
+    ///
+    /// ⑴ 只低于绝对地板不算(整个音本来就很轻);⑵ 只相对该音中位低不算(**辅音凹陷**)。
+    /// 第 ⑵ 条是实测逼出来的:用「音内中位 − 最低 100 ms」那把尺子,四条臂上有 **6-11 个音**
+    /// 超过 22 dB,而它们全是 `か`/`が`/`さ`/`つ`。
+    #[test]
+    fn the_silence_detector_needs_both_gates() {
+        let sr = 44100u32;
+        let n = sr as usize; // 1 s
+        let tone = |amp: f32| -> Vec<f32> {
+            (0..n).map(|i| amp * ((i as f32) * 0.05).sin()).collect()
+        };
+        // ⓐ 真的塌了:中段 300 ms 归零
+        let mut hole = tone(0.1);
+        for v in hole[(n * 35 / 100)..(n * 65 / 100)].iter_mut() {
+            *v = 0.0;
+        }
+        assert!(silence_run_ms(&hole, sr) >= 200.0, "300 ms 的洞没读出来");
+        // ⓑ ⛔ 整段都很轻(远低于地板)但**没有洞** ⇒ 0
+        assert_eq!(silence_run_ms(&tone(0.0004), sr), 0.0, "整体轻不等于唱没了");
+        // ⓒ ⛔ **辅音式凹陷**:中段掉 30 dB 但仍在 −45 dBFS 以上 ⇒ 0
+        let mut dip = tone(0.5);
+        for v in dip[(n * 35 / 100)..(n * 65 / 100)].iter_mut() {
+            *v *= 0.03;
+        }
+        assert_eq!(silence_run_ms(&dip, sr), 0.0, "辅音凹陷被当成「唱没了」");
+        // ⓓ 太短的段不猜
+        assert_eq!(silence_run_ms(&tone(0.1)[..100], sr), 0.0);
+    }
+
+    /// ⛔⛔⭐⭐⭐ S163 —— **拼接器不许把输出交给一条【正在静音】的 donor。**
+    ///
+    /// 用户 2026-08-26 深夜点破 yuyuko **4:50.694**:我修好 4:49 之后它反而炸了。
+    /// 四层剖面(同一次 run 的转储)说得很清楚 —— 出去的那条 donor 一路是好的(−22…−29 dBFS),
+    /// 进来的那条自己有 60-80 ms 的静音起头(−49…−68),而交接照做不误 ⇒ 成品掉到 −72。
+    /// 而这**不是一处**:同一把尺子扫四条臂,yuyuko 1 处(正是它)、
+    /// yachiyo **5 处**(229.500 / 238.140 / 246.800 = 用户点名的 3:49.524 / 3:58.162 那一族)。
+    ///
+    /// 这一条钉三件:⑴ 有缺口 ⇒ 洞被补上;⑵ ⛔ 门限 0 ⇒ 洞还在(**阴性对照**);
+    /// ⑶ ⛔ 进来的那条本来就好 ⇒ **逐样本不变**(**阴性对照**,防「它其实在无条件延后」)。
+    #[test]
+    fn the_splice_never_hands_over_to_a_silent_donor() {
+        const SR: u32 = 48000;
+        let spf = 960.0f64; // 20 ms/帧
+        let total = 100i64;
+        let n = (total as f64 * spf) as usize;
+        // 左窗 [10,40)、右窗 [40,80),位移不同 ⇒ 交接在 40 帧 = 0.80 s
+        let jobs = vec![
+            DeadJob { shift: -5, start: 10, end: 40 },
+            DeadJob { shift: -9, start: 40, end: 80 },
+        ];
+        let tone = |amp: f32, len: usize| -> Vec<f32> {
+            (0..len).map(|i| amp * ((i as f32) * 0.07).sin()).collect()
+        };
+        // 右边那条 donor:窗起点之后 `hole_ms` 毫秒是静音
+        let make = |hole_ms: f64| -> (Vec<f32>, Vec<f32>) {
+            let left = tone(0.2, n);
+            let mut right = tone(0.2, n);
+            let h0 = (40.0 * spf) as usize;
+            let h1 = h0 + (f64::from(SR) * hole_ms / 1000.0) as usize;
+            for v in right[h0..h1.min(n)].iter_mut() {
+                *v = 0.0;
+            }
+            (left, right)
+        };
+        let run = |hole_ms: f64, db: f32| -> Vec<f32> {
+            let (left, right) = make(hole_ms);
+            let mut b = vec![0.0f32; n];
+            apply_dead_only_windows_with(
+                &mut b, SR, total, &jobs, &[], &[], false, false, 0, 0.0, 0.0, db, 0.0,
+                |s, _| Ok(if s == -5 { left.clone() } else { right.clone() }),
+            )
+            .unwrap();
+            b
+        };
+        let hole_db = |x: &[f32]| -> f32 {
+            // 交接之后那 60 ms(⛔ 跳开 10 ms 的交叉淡化)
+            let a = (40.0 * spf) as usize + SR as usize / 100;
+            let b = a + SR as usize * 6 / 100;
+            let e: f64 =
+                x[a..b].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / (b - a) as f64;
+            (10.0 * (e + 1e-30).log10()) as f32
+        };
+
+        // ⑴ 有 80 ms 的静音起头 ⇒ 出厂门限把洞补上
+        let fixed = run(80.0, HANDOVER_DEFICIT_DB_DEFAULT);
+        assert!(
+            hole_db(&fixed) > -25.0,
+            "交接之后还是个洞:{:.1} dBFS —— 手上明明有好料",
+            hole_db(&fixed)
+        );
+        // ⑵ ⛔ 阴性对照:门限 0 ⇒ 洞照旧
+        let off = run(80.0, 0.0);
+        assert!(
+            hole_db(&off) < -60.0,
+            "门限 0 时那 60 ms 必须还是洞,实际 {:.1} dBFS",
+            hole_db(&off)
+        );
+        // ⑶ ⛔ 阴性对照:进来的那条本来就好 ⇒ **逐样本不变**
+        let a = run(0.0, HANDOVER_DEFICIT_DB_DEFAULT);
+        let b = run(0.0, 0.0);
+        assert_eq!(a, b, "没有缺口时交接点被动了 —— 它不许无条件延后");
+    }
+
+    /// ⛔⛔⭐⭐ S163 —— **同一个长音内部的接缝,交叉淡化必须拉长;音节边界上一个字节不动。**
+    ///
+    /// 用户 2026-08-26:「我实在受不了那种**一个长音三个听感**,或者**长音割裂**了」。
+    /// 炉心融解结尾那个「あ」在谱面上是 `[796..=802]` **七个连着的同词音符**,
+    /// 而计划器按死音分组把它切成 3-4 段、每段一个落点,段间只有 **10 ms** 淡化。
+    ///
+    /// ⭐ 两条 donor 的**音高都是目标音高**(逆变换已经做完)⇒ 差别只是落点带来的**音色**;
+    /// 在持续元音上慢慢换音色听不出缝,10 ms 换才是「割裂」。
+    ///
+    /// 三格:⑴ `tied` ⇒ 过渡真的变长;⑵ ⛔ **阴性对照**:同一份素材、`tied = false`
+    /// ⇒ **逐样本等于关掉**(证明它认的是「延续」不是「有缝就拉长」);
+    /// ⑶ ⛔ **阴性对照**:旋钮 0 ⇒ 逐样本回到今天。
+    #[test]
+    fn a_seam_inside_one_long_note_gets_a_long_crossfade() {
+        const SR: u32 = 48000;
+        let spf = 960.0f64; // 20 ms/帧
+        let total = 100i64;
+        let n = (total as f64 * spf) as usize;
+        // 两个窗在 40 帧(0.80 s)交接;音符表:每 20 帧一个音
+        let jobs = vec![
+            DeadJob { shift: -4, start: 10, end: 40 },
+            DeadJob { shift: -9, start: 40, end: 80 },
+        ];
+        let spans = |tied: bool| -> Vec<NoteSpan> {
+            (0..5i64)
+                .map(|k| NoteSpan {
+                    start: k * 20,
+                    frames: 20,
+                    sung: true,
+                    hz: 440.0,
+                    // 第 2 个音(帧 40 起)= 交接落点;只有它的 `tied` 在变
+                    tied: tied && k == 2,
+                })
+                .collect()
+        };
+        let loud: Vec<f32> = (0..n).map(|i| 0.30 * ((i as f32) * 0.07).sin()).collect();
+        let soft: Vec<f32> = (0..n).map(|i| 0.03 * ((i as f32) * 0.07).sin()).collect();
+        let run = |tied: bool, xf_ms: f64| -> Vec<f32> {
+            let nd = spans(tied);
+            let mut b = vec![0.0f32; n];
+            apply_dead_only_windows_with(
+                &mut b, SR, total, &jobs, &[], &nd, false, false, 0, 0.0, 0.0, 0.0, xf_ms,
+                |s, _| Ok(if s == -4 { loud.clone() } else { soft.clone() }),
+            )
+            .unwrap();
+            b
+        };
+        // 过渡宽度 = 输出包络从 90% 走到 10% 用了多少毫秒
+        let width_ms = |x: &[f32]| -> f64 {
+            let cell = SR as usize / 500; // 2 ms
+            let c: Vec<f32> = (0..n / cell)
+                .map(|i| {
+                    let s = &x[i * cell..(i + 1) * cell];
+                    (s.iter().map(|v| v * v).sum::<f32>() / cell as f32).sqrt()
+                })
+                .collect();
+            let hi = 0.30 / std::f32::consts::SQRT_2;
+            let (mut a, mut b) = (None, None);
+            for (i, &v) in c.iter().enumerate() {
+                if i * cell < (35.0 * spf) as usize {
+                    continue;
+                }
+                if a.is_none() && v < hi * 0.9 {
+                    a = Some(i);
+                }
+                if a.is_some() && b.is_none() && v < hi * 0.1 {
+                    b = Some(i);
+                }
+            }
+            match (a, b) {
+                (Some(x), Some(y)) => (y - x) as f64 * cell as f64 * 1000.0 / f64::from(SR),
+                _ => f64::NAN,
+            }
+        };
+
+        let long = width_ms(&run(true, TIED_XFADE_MS_DEFAULT));
+        let short = width_ms(&run(false, TIED_XFADE_MS_DEFAULT));
+        assert!(
+            long > 40.0,
+            "长音延续处的过渡只有 {long:.0} ms —— 拉长那一条没生效"
+        );
+        assert!(
+            short < 20.0,
+            "⛔ 音节变化处也被拉长了({short:.0} ms)—— 它认错了边界"
+        );
+        // ⑶ ⛔ 旋钮 0 ⇒ 与「不 tied」逐样本相同
+        assert_eq!(run(true, 0.0), run(false, 0.0), "旋钮 0 时两种边界必须一模一样");
+        assert_eq!(run(false, TIED_XFADE_MS_DEFAULT), run(false, 0.0),
+                   "非延续边界上开不开旋钮必须逐样本相同");
+    }
+
+    /// ⛔ S163 —— `note_spans_tied` 认「延续」只看**歌词**,不看音高。
+    /// 实测炉心融解结尾那个长音 `[796..=802]` 全是「あ」而音高是 71/73/75/76/83/81 ——
+    /// 按音高认会**全部漏掉**。⛔ 隔着休止不算延续。
+    #[test]
+    fn a_tied_note_is_recognised_by_its_lyric_not_its_pitch() {
+        let nn = [71i64, 73, 75, 76, 0, 83, 83];
+        let fr = [10i64; 7];
+        let ly: Vec<String> =
+            ["あ", "あ", "あ", "あ", "R", "あ", "い"].iter().map(|s| s.to_string()).collect();
+        let v = note_spans_tied(&nn, &fr, 0, &ly);
+        assert!(!v[0].tied, "第一个音没有前驱");
+        assert!(v[1].tied && v[2].tied && v[3].tied, "同词的连音必须认成延续(音高在变)");
+        assert!(!v[4].tied, "休止不是唱音");
+        assert!(!v[5].tied, "⛔ 隔着休止就不是同一个长音了");
+        assert!(!v[6].tied, "换了词就不是延续");
+        // ⛔ 没有歌词 ⇒ 全 false ⇒ 拼接层逐位回到今天
+        assert!(note_spans(&nn, &fr, 0).iter().all(|x| !x.tied));
     }
 
     /// S162 —— 两个旋钮的出厂值与垃圾值倒向。
@@ -10283,7 +11123,7 @@ mod tests {
         let sr: u32 = plan["sample_rate"].as_u64().unwrap() as u32;
         eprintln!("[splice] {} jobs · base {} · sr {sr} · UTAI_RANGE_SEAM_ALIGN = {} ms",
                   jobs.len(), base.len(), seam_align_ms());
-        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, &[], &[], false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, landing_harm_eps(), |s, _own| {
+        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, &[], &[], false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, landing_harm_eps(), landing_repair_ms(), handover_deficit_db(), tied_xfade_ms(), |s, _own| {
             Ok(rd(&dir.join(format!("donor_post_{s:+}.f32"))))
         })
         .unwrap();
