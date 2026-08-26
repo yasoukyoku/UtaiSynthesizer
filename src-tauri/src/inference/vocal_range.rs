@@ -2502,7 +2502,9 @@ pub fn dead_group_windows(
             DeadJob { shift: g.shift, start: cum[g.start] - pre, end: cum[g.end + 1] + post }
         })
         .collect();
-    merge_same_shift_across_rests(note_nums, plan, raw)
+    let merged = merge_same_shift_across_rests(note_nums, plan, raw);
+    // S162 —— 薄片闸(出厂 0 = 关 = 逐帧不变)。见 `CLOSE_SLIVER_FRAMES_DEFAULT`。
+    close_short_slivers(merged, parse_close_sliver(std::env::var("UTAI_RANGE_CLOSE_SLIVER").ok().as_deref()))
 }
 
 /// 能被桥接的休止上限,50 fps 帧(= 0.5 s)。缺陷本身只有 60 ms;这个数是「够宽到覆盖所有
@@ -2620,6 +2622,73 @@ fn merge_same_shift_across_rests(
 const SHORT_REST_NO_EXTEND_FRAMES: i64 = 3;
 
 const GUARD_FRAMES: i64 = 2;
+
+/// ⚙ 出厂默认 = `0`(= 关 = 窗逐帧不变)。`UTAI_RANGE_CLOSE_SLIVER=<帧>` 打开。
+///
+/// **薄片闸** —— 相邻两个救援窗之间留下的那一小截 `base`,让两个窗在**休止里**接上。
+///
+/// ## 症状(S162 量清)
+/// 有休止时 `pre = 4.min(gap/2)` / `post = 2.min(gap/2)` ⇒ 休止长于 6 帧时两侧各吃一截,
+/// **中间留下 1-5 帧的 base**。鹅妈妈 +7 × yachiyo 上 **36 条,位移不同的 36 条、相同的 0 条**。
+/// 用户 2026-08-25 点名的五处竖线里**有四处**落在这种薄片上(3:35.925 / 3:40.858 /
+/// 3:49.524 / 3:58.162)。3:49.500 逐段电平(成品):donor −48.2 / **薄片 −31.6** / donor −40.3,
+/// 而同处 `base` 是 −32.8 / −31.6 / −27.8(平滑)⇒ **薄片是【没被救的那一版】,比两侧的 donor
+/// 响 8-17 dB** —— 40 ms 的「好 / 坏 / 好」。
+///
+/// ## ⛔ 分量如实登记:**离群点,不是规律**
+/// 配对对照(同一位置在 `base` 上的台阶):薄片 n=36 Δ台阶中位 **+3.3 dB** / p90 +12.1;
+/// **窗【内部】的音符边界** n=585 中位 **−1.2** / p90 **+6.0**。
+/// ⇒ 中位只高 4.5 dB,对照的 p90 就盖过它的中位。**但用户点的 3:49.500 读 +12.8。**
+/// ⇒ ⛔ **出厂关,而且【判负】—— 不许把它写成「等耳判」。**
+///
+/// ## ⛔⛔ S162 当场就用拼接探针判掉了它
+///
+/// ⭐ 台子:`splice_probe` 吃同一份 `base` + `donor_post`,**只换窗**(把关着那一臂的
+/// `windows_frames` 按新规则重算写进 JSON,零代码)⇒ **零渲染噪声**(钩子区:凡是只改
+/// 拼接层的 A/B 一律走它,别渲两遍整曲 —— 那会差 85 % 样本)。
+/// ⛔ 阴性对照先跑:改动样本 **0.527 %**(预期 ≈ 补进去的 1.60 s = 0.596 %)、
+/// **薄片 ±30 ms 之外 max|Δ| = 0.000e+00** ⇒ 测量链干净。
+///
+/// **而读数是掷硬币**(鹅妈妈 +7 × yachiyo,只算邻域 >−40 dBFS = 真在唱的 n=14):
+/// 台阶 关 中位 **33.0 dB** / p90 50.4 → 开 **36.3** / 48.6;**配对 Δ 中位 −0.2 dB,改善的 7/14**。
+/// 用户点名的四处逐带竖线分:3:35.925 **+2 带** · 3:40.858 −2 · 3:49.524 **±0** · 3:58.162 −2
+/// ⇒ **没有方向**。
+///
+/// ⇒ 旋钮与判据留在原地,只为把这一次的读数钉在代码里(**别重造**)。
+///
+/// ⭐ 真正的线索在别处:S162 的三层分解读出 **拼接那一层对这一族的贡献是 −0.00 dB**
+/// (n=247,阴性对照 −0.01)⇒ **竖线的主体不在拼接层,在解码层。**
+///
+/// ⛔ 只补**正的**缝;负数 = 两窗已经重叠,那是 [`GUARD_FRAMES`] 有意做的,一个字不许动。
+const CLOSE_SLIVER_FRAMES_DEFAULT: i64 = 0;
+
+/// ⚙ 出厂默认 = 0(= 关 = 窗逐帧不变)。账与机理在 [`CLOSE_SLIVER_FRAMES_DEFAULT`] 的 doc 上。
+/// `UTAI_RANGE_CLOSE_SLIVER=<帧>` 打开；超出 `0..=12` 的值一律退回出厂（不许静默夹住）。
+fn parse_close_sliver(v: Option<&str>) -> i64 {
+    v.and_then(|x| x.trim().parse::<i64>().ok())
+        .filter(|n| (0..=12).contains(n))
+        .unwrap_or(CLOSE_SLIVER_FRAMES_DEFAULT)
+}
+
+/// 把相邻两窗之间 `1..=n` 帧的缝用**前一个窗的尾巴**补上。`n == 0` ⇒ 原样返回(逐帧不变)。
+///
+/// ⛔ 它必须跑在 [`merge_same_shift_across_rests`] **之后** —— 那一把先把「位移相同、
+/// 中间只隔休止」的窗合掉,剩下的缝才**全部**是异位移的(实测 36/36)。
+fn close_short_slivers(mut jobs: Vec<DeadJob>, n: i64) -> Vec<DeadJob> {
+    if n <= 0 || jobs.len() < 2 {
+        return jobs;
+    }
+    let mut order: Vec<usize> = (0..jobs.len()).collect();
+    order.sort_by_key(|&i| jobs[i].start);
+    for w in 0..order.len().saturating_sub(1) {
+        let (a, b) = (order[w], order[w + 1]);
+        let gap = jobs[b].start - jobs[a].end;
+        if gap >= 1 && gap <= n {
+            jobs[a].end = jobs[b].start;
+        }
+    }
+    jobs
+}
 
 /// S85e windowed donors: the merged, padded, clamped OUTPUT-sample spans one shift's jobs
 /// need rendered. `spf` MUST be the same samples-per-frame map the splicer uses
@@ -6756,7 +6825,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -6776,6 +6845,9 @@ mod tests {
             //    (理由与那三条承重判据写在 `windowed_inverse()` 的 doc 里)。
             //    进指纹的意义是「下一个人翻它的时候必须来这里改一行,于是不得不读那段 doc」。
             parse_windowed_inverse(None),
+            // S162 —— 薄片闸。⚠ 与上一条同款:进指纹但**出厂 0 ⇒ 不改音频**,
+            //    所以加它**不该**触发版本 bump;进指纹的意义是「下一个人翻它必须来这里改一行」。
+            parse_close_sliver(None),
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -6784,10 +6856,10 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=false uvgatek=1.5 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s161g";
+        const TAG: &str = "s162";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -6841,6 +6913,7 @@ mod tests {
             ("WINDOWED_INVERSE_DEFAULT", "pub fn windowed_inverse("),
             ("FORMANT_KNEE_DEFAULT", "pub fn formant_knee("),
             ("DEJITTER_DEFAULT", "pub fn dejitter("),
+            ("CLOSE_SLIVER_FRAMES_DEFAULT", "fn parse_close_sliver("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
@@ -6903,6 +6976,52 @@ mod tests {
         }
     }
 
+
+    /// ⭐⭐ S162 —— **薄片闸**:相邻两窗之间 1..n 帧的缝用前一个窗的尾巴补上,
+    /// 而**负的缝(已经重叠)一个字不许动** —— 那是 [`GUARD_FRAMES`] 有意做的。
+    ///
+    /// ⛔ 没有这条判据,`close_short_slivers` 就只有 doc 和指纹盯着它:
+    /// 把 `gap >= 1` 写成 `gap >= 0`、把「补前一个的尾」写成「拉后一个的头」、
+    /// 或者把 `n` 的门去掉,**别的每一条测试都还是绿的**。
+    #[test]
+    fn the_sliver_gate_closes_only_short_positive_gaps() {
+        let j = |shift: i64, start: i64, end: i64| DeadJob { shift, start, end };
+
+        // ⓐ n == 0 ⇒ 逐帧不变(出厂)
+        let src = vec![j(-5, 100, 200), j(-10, 202, 300)];
+        assert_eq!(close_short_slivers(src.clone(), 0), src, "出厂必须逐帧不变");
+
+        // ⓑ 2 帧的缝、n = 3 ⇒ 两窗接上(补的是**前一个的尾**,后一个的 start 不许动)
+        let out = close_short_slivers(src.clone(), 3);
+        assert_eq!(out[0].end, 202, "前一个窗的尾应该补到后一个窗的起点");
+        assert_eq!(out[0].start, 100, "前一个窗的头不许动");
+        assert_eq!((out[1].start, out[1].end), (202, 300), "后一个窗一个字不许动");
+
+        // ⓒ 缝比 n 大 ⇒ 不动(长休止里留 base 是对的)
+        let far = vec![j(-5, 100, 200), j(-10, 210, 300)];
+        assert_eq!(close_short_slivers(far.clone(), 3), far, "缝超过门限不许补");
+
+        // ⓓ ⛔ 负的缝(两窗重叠 = `GUARD_FRAMES` 有意做的)一个字不许动
+        let ov = vec![j(-5, 100, 205), j(-10, 201, 300)];
+        assert_eq!(close_short_slivers(ov.clone(), 3), ov, "已经重叠的窗不许再动");
+
+        // ⓔ 零缝(正好接上)也不许动 —— `gap >= 1` 那道门的边界
+        let touch = vec![j(-5, 100, 200), j(-10, 200, 300)];
+        assert_eq!(close_short_slivers(touch.clone(), 3), touch, "gap == 0 不该触发");
+
+        // ⓕ 输入乱序也要对(jobs 不保证按 start 排好)
+        let un = vec![j(-10, 202, 300), j(-5, 100, 200)];
+        let out = close_short_slivers(un, 3);
+        let a = out.iter().find(|x| x.start == 100).unwrap();
+        assert_eq!(a.end, 202, "乱序输入也要按时间轴找邻居");
+
+        // ⓖ 旋钮:垃圾值退回出厂,不许静默夹住
+        assert_eq!(parse_close_sliver(None), 0);
+        assert_eq!(parse_close_sliver(Some("3")), 3);
+        for junk in ["", "abc", "-1", "13", "2.5", "nan"] {
+            assert_eq!(parse_close_sliver(Some(junk)), 0, "垃圾值 {junk:?} 必须落回出厂");
+        }
+    }
 
     /// ⭐⭐⭐ S159zzl —— **带膝盖的共振峰跟随:关着逐位不变,膝盖以内恒等,越过之后按 `c·(|s|−6)` 起。**
     ///

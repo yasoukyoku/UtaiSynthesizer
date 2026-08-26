@@ -879,14 +879,40 @@ fn parse_score_f0_lerp(v: Option<&str>) -> bool {
     !matches!(v, Some("0"))
 }
 
-/// S160q —— 这两个是 [`gate_unvoiced_tone`] 的纯函数入口(出厂 **关**;见那段 doc 的
-/// 「为什么 S160k 没有把它翻成出厂」)。做成纯函数只为一件事:**让它进得了指纹**。
+/// ⚙ **出厂默认 = 开**(S162 翻的;S160q 起是 [`gate_unvoiced_tone`] 的纯函数入口,
+/// 做成纯函数只为一件事:**让它进得了指纹**)。**只有字面量 `"0"` 关得掉**
+/// —— 与 `parse_fill1` / `parse_score_f0_lerp` 同极性,垃圾值一律落回出厂。
+///
+/// ⛔ 为什么 S162 才敢翻(S160k 那一版**没有护栏**):用户耳判确认它除掉了 0:47.229 那声咔哒,
+/// 但全曲对拍发现它在 **46 条段里削掉真起音**(模型常把浊音渲得比乐谱音头早)。
+/// S162 给它加了 [`parse_uvgate_guard_ms`](出厂 20 ms),把**真起音区**(距清音 run 尾 ≤1 帧)
+/// 被压 >6 dB 的格从 **28 → 8(−71%)**,而治愈只从 −13.6 掉到 **−13.0 dB**;
+/// 护栏 40 那一档是**预注册的阴性对照**,治愈当场归零(+0.5 dB)⇒ 20 是唯一工作点。
 fn parse_uvgate(v: Option<&str>) -> bool {
-    matches!(v, Some("1"))
+    !matches!(v, Some("0"))
 }
 fn parse_uvgate_k(v: Option<&str>) -> f32 {
-    v.and_then(|x| x.trim().parse::<f32>().ok()).filter(|k| k.is_finite() && *k > 0.0).unwrap_or(1.5)
+    v.and_then(|x| x.trim().parse::<f32>().ok())
+        .filter(|k| k.is_finite() && (1.0..=6.0).contains(k))
+        .unwrap_or(1.5)
 }
+/// ⚙ **出厂默认 = 20.0**(S162 翻的)。起音护栏(毫秒)。
+///
+/// 门只认「喂进去的 `note_hz == 0`」,而**模型常把浊音渲得比乐谱音头早**几十毫秒
+/// ⇒ 清音 run 的**后**端(紧挨着后继浊音那一侧)躺着的往往是**真起音**,
+/// 门会把它的基频整个滤掉(S160k 全曲对拍:46 条段 / 0.76 s,最深 −37.5 dB)。
+/// 护栏 = 那一侧留 `guard_ms` 不碰。⛔ 只在**真有后继浊音**时收 —— 没有后继就没有起音可保。
+fn parse_uvgate_guard_ms(v: Option<&str>) -> f32 {
+    v.and_then(|x| x.trim().parse::<f32>().ok())
+        .filter(|g| g.is_finite() && (0.0..=200.0).contains(g))
+        .unwrap_or(UVGATE_GUARD_MS_DEFAULT)
+}
+
+/// ⚙ 出厂默认 = `20.0`。**宽度是数据给的,不是拍的**:门会删掉的那部分能量(截止以下)
+/// 沿清音段位置的剖面 —— 距段尾 0-20 ms **+19.5 dB** · 20-40 ms **−1.8** · 40-60 ms **−130.8**
+/// (鹅妈妈 +7 × yachiyo,141 个 ≥100 ms 的清音段,中位)⇒ **真起音就在最后那 20 ms 里**。
+/// ⛔ 再宽就开始吃掉门本身:护栏 40 上 0:47.229 那个 3 帧的 run 只剩 1 帧,治愈从 −13.0 变成 **+0.5 dB**。
+const UVGATE_GUARD_MS_DEFAULT: f32 = 20.0;
 fn parse_valley_adaptive(v: Option<&str>) -> bool {
     matches!(v.map(str::trim), Some("1" | "true" | "on" | "yes"))
 }
@@ -1031,13 +1057,14 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} valadapt={} valafter={} valhuman={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
         FILL_MAX_FRAMES_DEFAULT,
         parse_uvgate(None),
         parse_uvgate_k(None),
+        parse_uvgate_guard_ms(None),
         parse_valley_adaptive(None),
         parse_valley_after(None),
         // S161 —— ⚠ 与 `parse_windowed_inverse` 同款:它进指纹但**出厂关 ⇒ 不改音频**,
@@ -2443,10 +2470,18 @@ fn seam_fade(audio: &mut [f32], wav: &mut [f32], sample_rate: u32) {
 /// ✅ 同一段的辅音噪声(2-8 kHz)31.0 → **32.2 / 31.7** —— 两档都没伤到它,所以多压的 10 dB
 /// 买不到额外的确定性,却多了一分吃掉辅音的风险。
 /// ⛔ 只在 **donor 那一遍**(`range_shift != 0`)走这条路;base 一个字节不动。
-fn gate_unvoiced_tone(audio: &mut [f32], sample_rate: u32, note_hz: &[f32], k: f32, fade_ms: f32) -> usize {
+fn gate_unvoiced_tone(
+    audio: &mut [f32],
+    sample_rate: u32,
+    note_hz: &[f32],
+    k: f32,
+    fade_ms: f32,
+    guard_ms: f32,
+) -> usize {
     let hop = (sample_rate as usize / 50).max(1);
     let n = audio.len();
     let fade = ((fade_ms / 1000.0) * sample_rate as f32) as usize;
+    let guard = ((guard_ms / 1000.0) * sample_rate as f32) as usize;
     let mut hit = 0usize;
     let mut i = 0usize;
     while i < note_hz.len() {
@@ -2467,7 +2502,12 @@ fn gate_unvoiced_tone(audio: &mut [f32], sample_rate: u32, note_hz: &[f32], k: f
         };
         let cut = (k * f_ref).clamp(200.0, 2500.0);
         let a = (i * hop).min(n);
-        let b = ((j + 1) * hop).min(n);
+        let mut b = ((j + 1) * hop).min(n);
+        // S162 —— 起音护栏:后继浊音那一侧留 `guard` 个样本不碰(见 `parse_uvgate_guard_ms`)。
+        // ⛔ 只在**真有后继浊音**时收:run 落在曲尾(没有 `next`)时没有起音可保,收了纯亏。
+        if next.is_some() {
+            b = b.saturating_sub(guard).max(a);
+        }
         if b > a + 2 * fade + 8 {
             highpass_span(audio, sample_rate, a, b, cut, fade);
             hit += 1;
@@ -2550,14 +2590,18 @@ fn apply_range_inverse(
     // ⚠ 放在 dump **之前**:那份 dump 的语义是「**PSOLA 实际吃到的东西**」。
     let mut audio = audio;
     if parse_uvgate(std::env::var("UTAI_MG_UVGATE").ok().as_deref()) {
-        let k = std::env::var("UTAI_MG_UVGATE_K")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v >= 1.0 && *v <= 6.0)
-            .unwrap_or(1.5);
-        let hit = gate_unvoiced_tone(&mut audio, sample_rate, note_hz, k, 4.0);
-        // 「臂开着」与「臂做了事」必须分开可查(S129 铁律)。
-        tracing::info!("range-extend(donor {range_shift:+}): uv-gate k={k} — {hit} unvoiced span(s) high-passed");
+        // ⛔ S162 —— 调用点**必须走那两个纯函数**,否则「进指纹的默认」与「实际跑的默认」
+        //    会各走各的(钩子区:纯函数不接到调用点上就是空判据)。以前这里自己抄了一份
+        //    `parse::<f32>() + 范围过滤`,范围与 `parse_uvgate_k` 并不相同。
+        let k = parse_uvgate_k(std::env::var("UTAI_MG_UVGATE_K").ok().as_deref());
+        let guard_ms = parse_uvgate_guard_ms(std::env::var("UTAI_MG_UVGATE_GUARD_MS").ok().as_deref());
+        let hit = gate_unvoiced_tone(&mut audio, sample_rate, note_hz, k, 4.0, guard_ms);
+        // 「臂开着」与「臂做了事」必须分开可查(S129 铁律);⭐ 并且把**实际生效值**打出来
+        // (钩子区:凡加一个旋钮,同时加一行打印实际生效值 —— S160e/f 两个静默失效的旋钮
+        //  都是被这一行抓住的)。
+        tracing::info!(
+            "range-extend(donor {range_shift:+}): uv-gate k={k} guard={guard_ms}ms — {hit} unvoiced span(s) high-passed"
+        );
     }
     dump_donor_buffer("pre", range_shift, &audio, note_hz);
     let out = super::vocal_range::apply_inverse_windowed(
@@ -4221,7 +4265,7 @@ mod s160k_uvgate_tests {
         }
         let mut x = tone(20 * hop, sr as f32, 494.0);
         let before = x.clone();
-        let hit = gate_unvoiced_tone(&mut x, sr, &hz, 1.5, 4.0);
+        let hit = gate_unvoiced_tone(&mut x, sr, &hz, 1.5, 4.0, 0.0);
         assert_eq!(hit, 1, "只该命中一段");
         // 清音段正中被压掉(494 Hz 在 1.5×494 = 741 Hz 截止之下)
         let (a, b) = (8 * hop, 12 * hop);
@@ -4238,14 +4282,85 @@ mod s160k_uvgate_tests {
         // ⛔ 全清音(没有任何浊音参照)⇒ 一个字不动
         let hz0 = vec![0.0f32; 20];
         let mut y = before.clone();
-        assert_eq!(gate_unvoiced_tone(&mut y, sr, &hz0, 1.5, 4.0), 0);
+        assert_eq!(gate_unvoiced_tone(&mut y, sr, &hz0, 1.5, 4.0, 0.0), 0);
         assert_eq!(y, before);
 
         // ⛔ 全浊音 ⇒ 一个字不动
         let hz1 = vec![494.0f32; 20];
         let mut z = before.clone();
-        assert_eq!(gate_unvoiced_tone(&mut z, sr, &hz1, 1.5, 4.0), 0);
+        assert_eq!(gate_unvoiced_tone(&mut z, sr, &hz1, 1.5, 4.0, 0.0), 0);
         assert_eq!(z, before);
+    }
+
+    /// S162 —— **起音护栏**:清音 run 的【后】端留 `guard_ms` 不碰,而【前】端照旧。
+    ///
+    /// ⛔ 为什么要这条:S160k 那把刀**用户耳判确认有效**却一直没翻默认,原因是全曲对拍
+    /// 发现它在 **46 条段里削掉真起音**(0.76 s,最深 −37.5 dB)—— 模型常把浊音渲得比
+    /// 乐谱音头早几十毫秒。护栏就是这条尾巴;没有一条判据钉住它「保的是后端不是前端」,
+    /// 下一个人把 `b` 写成 `a` 或者两端都收都不会红。
+    #[test]
+    fn the_onset_guard_spares_the_tail_of_the_run_and_only_the_tail() {
+        let sr = 44100u32;
+        let hop = sr as usize / 50; // 882
+        // 20 帧:0-7 浊音,8-15 清音(8 帧 = 160 ms),16-19 浊音
+        let mut hz = vec![494.0f32; 20];
+        for t in 8..16 {
+            hz[t] = 0.0;
+        }
+        let x0 = tone(20 * hop, sr as f32, 494.0);
+        let (a, b) = (8 * hop, 16 * hop);
+
+        // 护栏 0 = 老行为:整段被压
+        let mut none = x0.clone();
+        assert_eq!(gate_unvoiced_tone(&mut none, sr, &hz, 1.5, 4.0, 0.0), 1);
+
+        // 护栏 40 ms = 1764 样本:后 40 ms 必须**逐位不变**
+        let mut g40 = x0.clone();
+        assert_eq!(gate_unvoiced_tone(&mut g40, sr, &hz, 1.5, 4.0, 40.0), 1, "护栏不该让它不开火");
+        let guard = (0.040 * sr as f32) as usize;
+        for t in (b - guard)..b {
+            assert_eq!(g40[t], x0[t], "护栏内第 {t} 个样本被门碰了");
+        }
+        // ⛔ 阴性对照:同样长度的**前**端必须仍然被压(护栏只保后端)
+        let att_head = 20.0
+            * (rms(&g40[a + 400..a + guard]) / rms(&x0[a + 400..a + guard])).log10();
+        assert!(att_head < -10.0, "run 的前端不该被护栏保住,实际只衰减 {att_head:.1} dB");
+        // ⛔ 而 guard=0 的那条臂在同一段后端上**必须**被压 —— 否则这条判据是空的
+        let att_tail0 = 20.0
+            * (rms(&none[b - guard..b - 400]) / rms(&x0[b - guard..b - 400])).log10();
+        assert!(att_tail0 < -10.0, "guard=0 时后端本该被压,实际 {att_tail0:.1} dB ⇒ 判据是空的");
+
+        // ⛔ 没有后继浊音(run 一直到结尾)⇒ 护栏不许生效(没有起音可保)
+        let mut hz_end = vec![494.0f32; 20];
+        for t in 8..20 {
+            hz_end[t] = 0.0;
+        }
+        let mut tail = x0.clone();
+        assert_eq!(gate_unvoiced_tone(&mut tail, sr, &hz_end, 1.5, 4.0, 40.0), 1);
+        let e = 20 * hop;
+        let att_eof = 20.0 * (rms(&tail[e - guard..e - 400]) / rms(&x0[e - guard..e - 400])).log10();
+        assert!(att_eof < -10.0, "曲尾那段没有后继浊音,护栏不该收,实际 {att_eof:.1} dB");
+    }
+
+    /// S162 —— 出厂默认:**门开着 + 护栏 20 ms**,而且垃圾值不许静默改变出厂臂。
+    ///
+    /// ⛔ 没有这条判据,「我们翻了」与「有人翻回去了」在别的每一条测试上长得一模一样。
+    /// 账在 `parse_uvgate` 的 doc 上(治愈 −13.0 dB / 真起音区代价 28 → 8 格)。
+    #[test]
+    fn the_gate_ships_on_with_a_twenty_millisecond_onset_guard() {
+        use super::{parse_uvgate, parse_uvgate_guard_ms};
+        assert!(parse_uvgate(None), "出厂必须【开】(S162 翻的;UTAI_MG_UVGATE=0 才关)");
+        assert!(!parse_uvgate(Some("0")), "字面量 0 必须关得掉");
+        for junk in ["", "true", "yes", "2", "on", " 0", "false"] {
+            assert!(parse_uvgate(Some(junk)), "垃圾值 {junk:?} 不许静默关掉出厂臂");
+        }
+        assert_eq!(parse_uvgate_guard_ms(None), 20.0, "出厂护栏必须是 20 ms");
+        assert_eq!(parse_uvgate_guard_ms(Some("0")), 0.0, "旋钮要能退回 S160k 那一版");
+        assert_eq!(parse_uvgate_guard_ms(Some("40")), 40.0);
+        assert_eq!(parse_uvgate_guard_ms(Some(" 25.5 ")), 25.5);
+        for junk in ["", "abc", "-1", "nan", "inf", "1e9", "201"] {
+            assert_eq!(parse_uvgate_guard_ms(Some(junk)), 20.0, "垃圾值 {junk:?} 必须落回出厂");
+        }
     }
 }
 
@@ -4270,7 +4385,7 @@ mod s160q_f0_lerp_tests {
         // ⛔⛔ 这条判据存在的理由:S160q 之前,本文件的生产默认【完全不在任何指纹里】,
         //     而 `FILL_ISOLATED_UV_DEFAULT` 出厂就是开着的。
         let fp = production_defaults_fingerprint();
-        for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "valadapt=", "valafter=", "valhuman=", "valdb=", "valenv="] {
+        for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "uvgateguard=", "valadapt=", "valafter=", "valhuman=", "valdb=", "valenv="] {
             assert!(fp.contains(key), "指纹串缺 {key} —— 少一个默认就少一道成对 bump 的闸:{fp}");
         }
     }
@@ -4375,6 +4490,7 @@ mod s160q_f0_lerp_tests {
             ("UTAI_MG_FILL_MAX", "fillmax="),
             ("UTAI_MG_UVGATE", "uvgate="),
             ("UTAI_MG_UVGATE_K", "uvgatek="),
+            ("UTAI_MG_UVGATE_GUARD_MS", "uvgateguard="),
             ("UTAI_MG_VALLEY_ADAPT", "valadapt="),
             ("UTAI_MG_VALLEY_AFTER", "valafter="),
             ("UTAI_VALLEY_HUMAN", "valhuman="),

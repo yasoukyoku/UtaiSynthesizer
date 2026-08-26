@@ -36,6 +36,25 @@ use std::time::Instant;
 
 const WORK: &str = r"D:\MyDev\TESTING\不为人所知的鹅妈妈童谣";
 
+/// S162 —— **音频产物的落点**。默认仍是 `WORK\probe`(历史臂全在那儿,读侧一个字节不动);
+/// `UTAI_MG_OUTDIR` 给绝对路径就用绝对路径,给相对名就当 `probe` 下的子目录。
+///
+/// ⛔ 为什么要它:用户 2026-08-25 —— 「音频你给我单独建一个子路径来,别全堆 probe 里,
+/// 现在那文件夹里七百多个东西你让我硬找啊」。`probe\` 今天有 745 个文件,而 mg 台子的
+/// 文件名**不带谱标识**(钩子区那条「拿 probe 里的臂之前先对 `plan.json` 的 `total_frames`」
+/// 就是这个坑的产物)⇒ 一场一目录既是给人看的,也顺带把「拿错臂」的面积缩小。
+///
+/// ⚠ 只作用在**写**上。`load_score()` / `mg_notes.json` 等读侧仍固定在 `probe\`。
+fn mg_out_dir() -> std::path::PathBuf {
+    match std::env::var("UTAI_MG_OUTDIR") {
+        Ok(s) if !s.trim().is_empty() => {
+            let p = std::path::PathBuf::from(s.trim());
+            if p.is_absolute() { p } else { Path::new(WORK).join("probe").join(p) }
+        }
+        _ => Path::new(WORK).join("probe"),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ScoreJson {
     tempo: f64,
@@ -964,7 +983,7 @@ fn mg_render_rvc() {
     if f0shift != 0 && inverse {
         audio = mg_cvfix_inverse(audio, r.sample_rate, f0shift, kappa, &evts, &vf0);
     }
-    let out_dir = Path::new(WORK).join("probe");
+    let out_dir = mg_out_dir();
     std::fs::create_dir_all(&out_dir).unwrap();
     let ftag = if f0shift != 0 {
         format!("_f{f0shift}{}", if inverse { "" } else { "_raw" })
@@ -1230,7 +1249,7 @@ fn mg_render_sovits() {
     if f0shift != 0 && inverse {
         audio = mg_cvfix_inverse(audio, r.sample_rate, f0shift, kappa, &evts, &vf0);
     }
-    let out_dir = Path::new(WORK).join("probe");
+    let out_dir = mg_out_dir();
     std::fs::create_dir_all(&out_dir).unwrap();
     let ftag = if f0shift != 0 {
         format!("_f{f0shift}{}", if inverse { "" } else { "_raw" })
@@ -1596,7 +1615,7 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
     )
     .unwrap();
 
-    let out_dir = Path::new(WORK).join("probe");
+    let out_dir = mg_out_dir();
     std::fs::create_dir_all(&out_dir).unwrap();
     let stem = format!("mg_deadonly_{arm}_{mtag}");
     write_wav16(&out_dir.join(format!("{stem}.wav")), &result.audio, sr);
@@ -1623,11 +1642,12 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
     )
     .unwrap();
     eprintln!(
-        "[mg] dead-only '{arm}': {:.2}s audio, {} 组 / {} 个 donor 遍, {:.1}s wall -> probe\\{stem}.wav",
+        "[mg] dead-only '{arm}': {:.2}s audio, {} 组 / {} 个 donor 遍, {:.1}s wall -> {}\\{stem}.wav",
         result.audio.len() as f32 / sr as f32,
         plan.len(),
         jobs.iter().map(|j| j.shift).collect::<std::collections::BTreeSet<_>>().len(),
-        t0.elapsed().as_secs_f64()
+        t0.elapsed().as_secs_f64(),
+        out_dir.display()
     );
 }
 
@@ -2402,7 +2422,7 @@ fn mg_render_rvc_oversampled() {
         cv_cursor += chunk.t;
     }
     peak_normalize(&mut audio, 0.92);
-    let out_dir = Path::new(WORK).join("probe");
+    let out_dir = mg_out_dir();
     let ttag = if let Some((lo, hi)) = core {
         format!("_c{:.0}_{:.0}", lo * 100.0, hi * 100.0)
     } else if tail != 0 {
@@ -2686,7 +2706,7 @@ fn mg_render_cover() {
         )
         .unwrap();
     }
-    let out_dir = Path::new(WORK).join("probe");
+    let out_dir = mg_out_dir();
     std::fs::create_dir_all(&out_dir).unwrap();
     let name = format!("mg_cover_{a}_{b}_{mtag}{}.wav", mg_shift_tag(shift, inverse, kappa));
     write_wav16(&out_dir.join(&name), &audio, r.sample_rate);
