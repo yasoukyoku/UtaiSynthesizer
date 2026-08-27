@@ -3514,13 +3514,13 @@ mod tests {
         }
     }
 
-    /// ⛔ 旋钮：`0` 关、`1` 开、其它回默认（**出厂 false** —— 效果未经耳判证明，见常量 doc）。
+    /// ⛔ 旋钮：`0` 关、`1` 开、其它回默认（**出厂 true**，用户 2026-08-28 拍板，见常量 doc）。
     #[test]
     fn rest_bucket_target_knob_parses() {
-        assert!(!super::super::score2cv::parse_rest_bucket_target(None));
+        assert!(super::super::score2cv::parse_rest_bucket_target(None));
         assert!(super::super::score2cv::parse_rest_bucket_target(Some("1")));
         assert!(!super::super::score2cv::parse_rest_bucket_target(Some("0")));
-        assert!(!super::super::score2cv::parse_rest_bucket_target(Some("x")));
+        assert!(super::super::score2cv::parse_rest_bucket_target(Some("x")));
     }
 
     /// ⛔ flags：只标 **SP 之后的辅音串**，到元音为止；**AP（呼吸）不算休止**。
