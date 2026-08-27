@@ -4058,6 +4058,103 @@ fn parse_usag_dim(v: Option<&str>) -> f32 {
 /// ⚙ 出厂默认。见 [`landing_usag_dim_cap`]。
 const USAG_DIM_CAP_DEFAULT: f32 = 3.0;
 
+/// ⚙ 出厂默认 = 0.0(**关** = 逐位不变)。`UTAI_RANGE_DIPFILL=<dB>` 打开 ——
+/// **donor 静音坑回填**:donor 相对它自己在该窗内的中位低过这么多 dB 时,把 `base` 混回来。
+///
+/// # 靶子(四模型共 194 个,用户 2026-08-27 点名 akiko 2:05.252 是其中之一)
+/// 「成品比 `base` 低 >8 dB、宽 <150 ms、两侧救援本来在工作」的洞,
+/// **80% 落在音符结束前 30-45 ms**。
+///
+/// # ⛔ 逐个排除(都有诊断臂,别重造)
+/// **不是修补遍**(关掉反而 51 个)· **不是 tilt**(关掉 45)· **不是电平层**(关掉 48)·
+/// **不是接缝/淡化**(43 个里 **36 个在窗正中**,离淡化区 200-2000 ms)。
+/// ✅ **92% 是 donor 自己就比 `base` 低 >6 dB** —— 模型用移调后的 f0 重唱时,
+/// 在音尾比原音高时**更早、更深**地衰减,而 `base` 在那里是正常的。
+///
+/// # 为什么门限是 20
+/// 相对**该窗内的中位**:洞处 donor **p50 −34.9…−39.2 dB**,而 `base` 只有 **−8.8…−13.4**
+/// ⇒ 20 dB 把两者完全分开(同门限下 `base` 只命中 0-4 个)。
+///
+/// # 安全性(四模型,命中段上的 `base − donor`)
+/// akiko +15.3 dB(有益 89% / 有害 **3%**)· yuyuko +15.6(90% / **1%**)·
+/// 东雪莲 +12.7(94% / **0%**)· yachiyo +10.1(83% / **1%**)
+/// ⇒ 那里 `base` 比 donor 高 10-16 dB(donor 几乎是静音),填 `base` 是**把有声的换回来**,
+/// 不是「退回没救援」。命中 **3-6% 的格**。
+///
+/// ⛔ **不碰 donor 选择、不碰落点** —— 纯拼接层(用户:「别把 donor 选择再整烂了」)。
+/// ⛔ **全曲统一判据,不针对任何坐标**(用户:「普遍问题别特殊化处理」)。
+pub fn dipfill_depth_db() -> f32 {
+    parse_dipfill(std::env::var("UTAI_RANGE_DIPFILL").ok().as_deref())
+}
+
+fn parse_dipfill(v: Option<&str>) -> f32 {
+    match v {
+        None => DIPFILL_DEPTH_DEFAULT,
+        Some(t) => t
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|x| x.is_finite() && *x >= 0.0 && *x <= 60.0)
+            .unwrap_or(DIPFILL_DEPTH_DEFAULT),
+    }
+}
+
+/// ⚙ 出厂默认。见 [`dipfill_depth_db`]。
+const DIPFILL_DEPTH_DEFAULT: f32 = 0.0;
+
+/// ⭐ S163 —— 回填段的最大宽度(ms)。比这更宽的不是「坑」,是「整段没救到」,
+/// 那种情况填 `base` 等于把整段救援退掉 ⇒ 不碰。
+const DIPFILL_MAX_MS: f32 = 80.0;
+
+/// ⭐ S163 —— 回填的淡入淡出(ms)。⛔ 不许硬切:两侧是 donor、中间是 base,
+/// 硬切会在 10 ms 内造出两条新的不连续。
+const DIPFILL_FADE_MS: f32 = 10.0;
+
+/// ⭐⭐⭐ S163 —— 找出 `seg` 里「相对自己中位低过 `depth`」且宽 ≤ `DIPFILL_MAX_MS` 的坑。
+///
+/// 返回 `(起, 止)` 的样本区间(相对 `seg` 的下标)。
+/// ⛔ 中位只用**有声**的格算(`> -60 dBFS`),否则窗内的静音会把参照拖到地板上。
+fn dipfill_spans(seg: &[f32], sample_rate: u32, depth: f32) -> Vec<(usize, usize)> {
+    if depth <= 0.0 || seg.is_empty() {
+        return Vec::new();
+    }
+    let h = (sample_rate as usize / 100).max(1); // 10 ms
+    let n = seg.len() / h;
+    if n < 8 {
+        return Vec::new();
+    }
+    let lv: Vec<f32> = (0..n)
+        .map(|i| {
+            let c = &seg[i * h..(i + 1) * h];
+            let e: f64 = c.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / h as f64;
+            (10.0 * (e + 1e-20).log10()) as f32
+        })
+        .collect();
+    let mut alive: Vec<f32> = lv.iter().copied().filter(|v| *v > -60.0).collect();
+    if alive.len() < 8 {
+        return Vec::new();
+    }
+    alive.sort_by(f32::total_cmp);
+    let med = alive[alive.len() / 2];
+    let maxw = (DIPFILL_MAX_MS / 10.0) as usize;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        if lv[i] < med - depth {
+            let a = i;
+            while i < n && lv[i] < med - depth {
+                i += 1;
+            }
+            if i - a <= maxw {
+                out.push((a * h, (i * h).min(seg.len())));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// ⭐⭐⭐ S163 —— 静音次键「算有差别」的最小毫秒数。
 ///
 /// ⚙ 出厂 **15.0 ms**。理由:`silence_run_ms` 的量化格是帧(20 ms),
@@ -5070,6 +5167,8 @@ pub fn apply_dead_only_windows_with(
         handover_db,
         notes,
         (tied_xf_ms * f64::from(sample_rate) / 1000.0) as usize,
+        // ⭐⭐⭐⭐ S163 §34 —— donor 静音坑回填（出厂 0 = 关 = 逐位不变）。
+        dipfill_depth_db(),
     )
 }
 
@@ -5260,6 +5359,9 @@ fn splice_kept(
     notes: &[NoteSpan],
     // ⭐ S163 —— 长音延续处的交叉淡化(样本);`0` = 关。
     tied_xf: usize,
+    // ⭐⭐⭐⭐ S163 §34 —— donor 静音坑回填的门限(dB);`0` = 关 = 逐位不变。
+    //    见 [`dipfill_depth_db`]。
+    dipfill_db: f32,
 ) -> crate::Result<()> {
     // ⛔ `join_enabled` 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
     let n = base.len();
@@ -5460,6 +5562,36 @@ fn splice_kept(
                     xfw_out as f64 * 1000.0 / f64::from(sample_rate),
                 );
             }
+            // ⭐⭐⭐⭐ S163 §34 —— **donor 静音坑回填**(见 [`dipfill_depth_db`])。
+            // 出厂 `0.0` ⇒ `spans` 恒空 ⇒ 逐位不变。
+            let dips = dipfill_spans(seg, sample_rate, dipfill_db);
+            let dip_fade = ((f64::from(sample_rate) * f64::from(DIPFILL_FADE_MS) / 1000.0) as usize).max(1);
+            if !dips.is_empty() {
+                tracing::info!(
+                    "range: splice#{oi} shift {:+} —— donor 静音坑回填 {} 段 (共 {:.0} ms)",
+                    j.shift,
+                    dips.len(),
+                    dips.iter().map(|&(x, y)| y - x).sum::<usize>() as f64 * 1000.0
+                        / f64::from(sample_rate)
+                );
+            }
+            // ⛔ 坑是按 `seg` 的下标找的 ⇒ 判断必须用 `si`,不是 `k`。
+            let dip_keep = |si: usize| -> f32 {
+                let mut keep = 1.0f32;
+                for &(x, y) in &dips {
+                    if si >= x && si < y {
+                        return 0.0;
+                    }
+                    // 两侧各一个淡化宽度线性过渡,不许硬切
+                    if si + dip_fade > x && si < x {
+                        keep = keep.min((x - si) as f32 / dip_fade as f32);
+                    }
+                    if si >= y && si < y + dip_fade {
+                        keep = keep.min((si - y) as f32 / dip_fade as f32);
+                    }
+                }
+                keep
+            };
             for k in a..b {
                 let w = if fade_in && k < a + xfw {
                     0.5 - 0.5 * (std::f32::consts::PI * (k - a) as f32 / xfw as f32).cos()
@@ -5470,6 +5602,7 @@ fn splice_kept(
                 };
                 // S159zm —— 带上对齐偏移 `d`;越界时退回 0(不挪),而不是 panic。
                 let si = (k as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize - 1);
+                let w = w * dip_keep(si as usize);
                 base[k] = base[k] * (1.0 - w) + seg[si as usize] * w;
             }
         }
@@ -6853,6 +6986,72 @@ pub fn apply_inverse_windowed_with(
 #[cfg(test)]
 mod tests {
 
+    /// ⛔⛔ S163 §34 —— 钉住 [`dipfill_spans`] 的三条行为。
+    ///
+    /// 夹具照抄实测形状：donor 在窗内的中位是 `−10 dBFS` 级，
+    /// 而洞处掉到 `−45` 级（实测 p50 相对窗内中位 **−34.9…−39.2 dB**，
+    /// 而 `base` 同处只有 **−8.8…−13.4** ⇒ 门限 20 把两者分开）。
+    ///
+    /// ⚠ 变异检查（都试过，会红）：
+    /// * 门限写成 10 ⇒ ⑶ 失守（`base` 那种 −12 dB 的自然衰减也会被当成坑）；
+    /// * 去掉宽度上限 ⇒ ⑵ 失守（整段没救到的会被整段填成 base = 把救援退掉）；
+    /// * 中位用**全部**格算而不是只用有声格 ⇒ 参照被静音拖到地板，一个坑都找不到。
+    #[test]
+    fn dipfill_only_catches_deep_narrow_silent_pits() {
+        let sr = 44_100u32;
+        let h = sr as usize / 100; // 10 ms
+        let mk = |lv: &[f32]| -> Vec<f32> {
+            let mut v = Vec::with_capacity(lv.len() * h);
+            for (i, &a) in lv.iter().enumerate() {
+                for k in 0..h {
+                    let t = (i * h + k) as f64 / f64::from(sr);
+                    v.push((f64::from(a) * (2.0 * std::f64::consts::PI * 300.0 * t).sin()) as f32);
+                }
+            }
+            v
+        };
+        // ⑴ 深而窄的坑（30 ms，−40 dB 级）⇒ 必须找到
+        let mut lv = vec![0.3f32; 40];
+        lv[20] = 0.003;
+        lv[21] = 0.003;
+        lv[22] = 0.003;
+        let pit = mk(&lv);
+        let got = dipfill_spans(&pit, sr, 20.0);
+        assert_eq!(got.len(), 1, "深而窄的坑必须找到一个 —— 实测 {got:?}");
+        assert!(
+            got[0].0 <= 20 * h && got[0].1 >= 23 * h - h,
+            "坑的位置要对上 —— 实测 {:?}，期望覆盖 {}..{}",
+            got[0],
+            20 * h,
+            23 * h
+        );
+
+        // ⑵ 同样深但**太宽**（150 ms）⇒ 不许碰（那是「整段没救到」）
+        let mut wide = vec![0.3f32; 40];
+        for x in wide.iter_mut().skip(10).take(15) {
+            *x = 0.003;
+        }
+        assert!(
+            dipfill_spans(&mk(&wide), sr, 20.0).is_empty(),
+            "太宽的低段不是坑，不许回填"
+        );
+
+        // ⑶ base 那种自然衰减（−12 dB 级）⇒ 门限 20 必须放过
+        let mut soft = vec![0.3f32; 40];
+        for x in soft.iter_mut().skip(20).take(3) {
+            *x = 0.075; // ≈ −12 dB
+        }
+        assert!(
+            dipfill_spans(&mk(&soft), sr, 20.0).is_empty(),
+            "−12 dB 的自然衰减不是坑 —— 实测 {:?}",
+            dipfill_spans(&mk(&soft), sr, 20.0)
+        );
+
+        // ⑷ 出厂关（depth = 0）⇒ 永远返回空 ⇒ 逐位不变
+        assert!(dipfill_spans(&pit, sr, 0.0).is_empty(), "depth=0 必须逐位不变");
+    }
+
+
     /// ⛔⛔ S163 —— 钉住 [`landing_usag_eps`] 换掉排序主键的**三种**行为。
     ///
     /// 夹具照抄用户点名的那一组的真实形状(akiko 4:07,日志原文
@@ -7336,7 +7535,7 @@ mod tests {
                 kept.push((0, lo, donor[lo..hi].to_vec()));
             }
             let xf = (SR as usize / 100).max(2);
-            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0).unwrap();
+            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0).unwrap();
             b
         };
 
@@ -7618,9 +7817,9 @@ mod tests {
         let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left), (1, 0, right)];
 
         let mut off = base.clone();
-        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0).unwrap();
+        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0).unwrap();
         let mut on = base.clone();
-        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0).unwrap();
+        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0).unwrap();
 
         // ⓐ 关着 ⇒ 那个洞必须还在:52800 开窗之后是右 donor 的静音。
         assert!(
@@ -7724,7 +7923,7 @@ mod tests {
             (1, 53_000, right[53_000..(380 * 480)].to_vec()),
         ];
         let mut out = base.clone();
-        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0).unwrap();
+        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0).unwrap();
         assert_eq!(out[0], -1.0, "窗外仍是 base");
         assert!((out[30_000] - 0.5).abs() < 1e-6, "左窗内仍是左 donor");
     }
@@ -9255,7 +9454,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}              usag={} usagdim={} gonesort={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}              usag={} usagdim={} gonesort={} dipfill={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -9326,6 +9525,8 @@ mod tests {
             parse_usag_dim(None),
             // ⭐⭐⭐ S163 §26 —— 静音次键的 eps。⛔ **无条件生效 ⇒ 改音频** ⇒ 必须在指纹里。
             GONE_SORT_EPS_MS,
+            // ⭐ S163 §34 —— donor 静音坑回填（出厂 0 = 关）。
+            parse_dipfill(None),
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -9334,7 +9535,7 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -9417,6 +9618,7 @@ mod tests {
             ("TIED_XFADE_MS_DEFAULT", "pub fn tied_xfade_ms("),
             ("USAG_EPS_DEFAULT", "pub fn landing_usag_eps("),
             ("USAG_DIM_CAP_DEFAULT", "pub fn landing_usag_dim_cap("),
+            ("DIPFILL_DEPTH_DEFAULT", "pub fn dipfill_depth_db("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
