@@ -4221,9 +4221,16 @@ const REST_TAIL_GUARD_MS: f32 = 40.0;
 /// ⚙ 出厂默认 = true —— `UTAI_RANGE_ONSET_FIT=0` 关掉。**起音形状整形**:
 /// 把 donor 起音的上升曲线拉回 `base` 的形状(稳态电平不动)。见 [`ONSET_FIT_MS`]。
 pub fn onset_fit_enabled() -> bool {
-    !matches!(
+    // ⛔ S163 v17b 判负并**默认关**(用户 2026-08-28:「那刚才那一刀我觉得也得关;它应该还是没在点上」)。
+    //    它确实把起音陡度追回了 base(−2.00 → +2.00 ms)、稳态一个字节没动(−0.015 dB),
+    //    用户也确认过「辅音倒是稍微好点了」,但**没打到点上**。
+    //    真正的线索在别处:**浊辅音「だ」被渲成了清辅音「た」的听感**(见 §39.5 / 【8a】)。
+    matches!(
         std::env::var("UTAI_RANGE_ONSET_FIT").ok().as_deref().map(str::trim),
-        Some("0") | Some("off") | Some("false") | Some("no")
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    ) || !matches!(
+        std::env::var("UTAI_RANGE_ONSET_FIT").ok().as_deref().map(str::trim),
+        Some("0") | Some("off") | Some("false") | Some("no") | None
     )
 }
 
@@ -10464,7 +10471,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s164t";
+        const TAG: &str = "s164u";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
