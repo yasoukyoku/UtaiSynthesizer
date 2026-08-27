@@ -1057,7 +1057,7 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{},{},{},{} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{},{},{},{},{} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
@@ -1081,6 +1081,7 @@ pub(crate) fn production_defaults_fingerprint() -> String {
         PREROLL_DAMP_MAX_SLOPE_DB_PER_MS,
         PREROLL_DAMP_LEFT_SLOPE_DB_PER_MS,
         PREROLL_DAMP_LEFT_BORROW_MS,
+        PREROLL_PEAK_WIN_MS,
         // ⛔⛔ S161b —— **类深度与槽形也进指纹**。S161 只登记了旋钮,而这一场改的是**常量**
         //    (浊塞音 11.7 → 20 窄槽、闪音 6.8 → 8):旋钮没动、指纹没动、音频却变了 ⇒ 又是零红。
         //    ⇒ 凡是这几个常量被改,这条闸当场红,红的措辞会指到那三处版本字面量。
@@ -1941,6 +1942,12 @@ const PREROLL_DAMP_LEFT_SLOPE_DB_PER_MS: f32 = 2.0;
 /// 否则 `f_left` 会退化成几个样本 = 极陡 = 又一条竖条纹。
 const PREROLL_DAMP_LEFT_BORROW_MS: f32 = 5.0;
 
+/// 判定平台「有多响」时取的窗宽（ms）——**取压制区内最响的这么一窗**，不是全区平均。
+/// ⛔ 与验收/耳判的口径对齐（那边量的是音头前 [−80,−45] 的平台）。
+/// 全区平均会被压制区里安静的部分拉低：实测 1:44.097 平均 −36 dB 而峰段 −16 dB
+/// ⇒ 闸只压 4 dB，而耳朵听到的是 −16 那一段。
+const PREROLL_PEAK_WIN_MS: f32 = 35.0;
+
 fn preroll_damp_enabled() -> bool {
     parse_preroll_damp(std::env::var("UTAI_PREROLL_DAMP").ok().as_deref())
 }
@@ -2022,7 +2029,27 @@ fn apply_preroll_damp(
             }
             audio[a..b].iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / (b - a) as f64
         };
-        let (pe, se) = (energy(s, e), energy(rs, re));
+        // ⛔⛔ **闸和它服务的判据必须同尺子**（S163 血训，这里踩过一次）：
+        //    第一版 `pe` 取压制区 `[s,e]` 的**平均**能量，而压制区里大半是很安静的段
+        //    ⇒ 平均被拉低到 −36 dB、判定「不太响」⇒ 只压 4 dB；
+        //    而耳朵（和验收指标）听的是那段平台**最响**的部分（−16 dB）。
+        //    ⇒ 改成取压制区内**最响的 `PREROLL_PEAK_WIN_MS` 窗**，与验收口径一致。
+        let pw = ms(PREROLL_PEAK_WIN_MS).min(e - s);
+        let pe = if pw >= 1 && e > s {
+            let mut best = 0.0f64;
+            let mut i = s;
+            while i + pw <= e {
+                let v = energy(i, i + pw);
+                if v > best {
+                    best = v;
+                }
+                i += (pw / 4).max(1);
+            }
+            best
+        } else {
+            energy(s, e)
+        };
+        let se = energy(rs, re);
         if !(se > 0.0) || !(pe > 0.0) {
             continue;
         }
@@ -3404,6 +3431,36 @@ mod tests {
             c <= f64::from(PREROLL_DAMP_LEFT_SLOPE_DB_PER_MS) * f64::from(PREROLL_DAMP_LEFT_BORROW_MS) + 1.0,
             "左侧没空间却压了 {c:.1} dB —— 借的长度撑不住这个斜率"
         );
+    }
+
+    /// ⛔⛔ **承重**：判定「有多响」必须看**峰段**，不是全区平均。
+    /// S163 实测 1:44.097：压制区平均 −36 dB 而平台峰段 −16 dB
+    /// ⇒ 用平均时闸只压 4 dB，而耳朵听到的正是 −16 那一段（用户：「1:44 那个还挺明显的」）。
+    /// 夹具：压制区里**只有一小段是响的**，其余很安静 —— 平均口径会漏判，峰段口径不会。
+    #[test]
+    fn preroll_damp_judges_by_the_peak_window_not_the_average() {
+        let sr = 44_100usize;
+        let keep = (PREROLL_KEEP_MS / 1000.0 * sr as f32) as usize;
+        let n = 160 * sr / 1000;
+        let pre = 60 * sr / 1000;
+        let mut x = vec![0.0f32; pre + n + sr];
+        // 压制区 = [pre, pre+n-keep] = 120 ms：前 40 ms 很响，其余很安静
+        let loud_end = pre + 40 * sr / 1000;
+        for v in x[pre..loud_end].iter_mut() {
+            *v = 0.2;                      // 响段
+        }
+        for v in x[loud_end..pre + n].iter_mut() {
+            *v = 0.0008;                   // 安静段（把平均拉到远低于阈值）
+        }
+        for v in x[pre + n + sr / 20..pre + n + sr / 20 + sr / 10].iter_mut() {
+            *v = 1.0;                      // 稳态参照
+        }
+        let hit = apply_preroll_damp(&mut x, &[(pre, pre + n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, sr as u32);
+        assert_eq!(hit, 1, "峰段 −14 dB 远超阈值，必须判为要压（全区平均会漏判）");
+        let cut = (pre..loud_end)
+            .map(|i| -20.0 * f64::from(x[i].abs() / 0.2).log10())
+            .fold(0.0f64, f64::max);
+        assert!(cut > 6.0, "响段只压了 {cut:.1} dB —— 闸还是在看平均");
     }
 
     /// ⛔ flags：只标 **SP 之后的辅音串**，到元音为止；**AP（呼吸）不算休止**。
