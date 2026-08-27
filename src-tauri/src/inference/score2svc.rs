@@ -1452,6 +1452,7 @@ pub fn render_score_sovits(
     audio = apply_range_inverse(
         audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full,
         donor.map_or(&[][..], |d| d.keep_samples),
+        donor.and_then(|d| d.windows.first().map(|w| w.0)),
     )?;
     let t_inverse = t0.elapsed().as_secs_f64();
     // S159zb —— 攒下来的辅音谷在这里刻(见 `valley_after_inverse`)。
@@ -1745,6 +1746,7 @@ pub fn render_score_rvc(
     audio = apply_range_inverse(
         audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full,
         donor.map_or(&[][..], |d| d.keep_samples),
+        donor.and_then(|d| d.windows.first().map(|w| w.0)),
     )?;
     let t_inverse = t0.elapsed().as_secs_f64();
     // S159zb —— 攒下来的辅音谷在这里刻(见 `valley_after_inverse`)。
@@ -2922,6 +2924,8 @@ fn apply_range_inverse(
     kappa: f32,
     note_hz: &[f32],
     keep: &[(usize, usize)],
+    // S165 —— 这一组救援窗的**首帧**(谱面帧),只用来给诊断转储命名。见 [`dump_stem`]。
+    dump_group: Option<i64>,
 ) -> crate::Result<Vec<f32>> {
     if range_shift == 0 || audio.is_empty() {
         return Ok(audio);
@@ -2946,7 +2950,11 @@ fn apply_range_inverse(
             "range-extend(donor {range_shift:+}): uv-gate k={k} guard={guard_ms}ms — {hit} unvoiced span(s) high-passed"
         );
     }
-    dump_donor_buffer("pre", range_shift, &audio, note_hz);
+    // ⚠ stem 只在转储开着时算(它会往一个进程内的表里插一条)。
+    let stem = std::env::var_os("UTAI_RANGE_DUMP_DONOR").map(|_| dump_stem(range_shift, dump_group));
+    if let Some(st) = &stem {
+        dump_donor_buffer("pre", st, &audio, note_hz);
+    }
     let out = super::vocal_range::apply_inverse_windowed(
         audio,
         sample_rate,
@@ -2960,14 +2968,53 @@ fn apply_range_inverse(
         super::vocal_range::range_tilt(),
     )
     .map_err(UtaiError::Inference);
-    if let Ok(y) = &out {
-        dump_donor_buffer("post", range_shift, y, note_hz);
+    if let (Ok(y), Some(st)) = (&out, &stem) {
+        dump_donor_buffer("post", st, y, note_hz);
     }
     out
 }
 
+/// S165 —— 这一次 donor 渲染的转储 stem(`pre` / `post` / `f0` 三个文件**共用**一个)。
+///
+/// ⛔ 为什么需要它:S159g 的文件名里只有 `shift`,而**同一个 shift 会被多个救援组各渲一遍**
+/// ⇒ 后一组把前一组的转储整个覆盖掉。实测(S163 §47.4):yuyuko 246 个被救音里只有 127 个
+/// 能在转储里找到自己那一段、yachiyo 663 里只有 227,而 **`shift = −9` 是 89/89 全部落空** ——
+/// 用户点名的「卡痰」段主体正好走 −9 ⇒ 那条线**结构上不可归因**。S163 §43 那张四层分解表
+/// 就是在这份被覆盖的转储上算的,要重做。
+///
+/// 组标识取**这一组第一个窗的起始帧**(`DonorCtx::windows[0].0`,谱面帧 —— 与
+/// `plan.windows_frames` / `dead_group_windows` 同一坐标)⇒ 离线脚本不用解析日志就能对上。
+/// 同一进程里万一还撞(同一组的两个落点候选恰好给出同一 shift),加 `_2` / `_3`… ⇒
+/// **本进程内绝不覆盖**;跨进程仍然覆盖(重跑同一个目录 = 换成新的一遍,与今天语义相同)。
+///
+/// ⚠ 只在 `UTAI_RANGE_DUMP_DONOR` 存在时被调用 —— 它有副作用(往进程内的表里插一条)。
+fn dump_stem(shift: i64, group: Option<i64>) -> String {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static USED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let base = match group {
+        Some(g) => format!("{shift:+}_f{g}"),
+        // 整条 donor(没有窗)—— 台子与旧路径会走到这里。
+        None => format!("{shift:+}_all"),
+    };
+    let mut used = USED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if used.insert(base.clone()) {
+        return base;
+    }
+    for n in 2..100_000u32 {
+        let s = format!("{base}_{n}");
+        if used.insert(s.clone()) {
+            return s;
+        }
+    }
+    base
+}
+
 /// S159g —— `UTAI_RANGE_DUMP_DONOR=<dir>`:把逆变换**前后**的缓冲各落一份裸 f32(小端),
-/// 外加那一遍喂进去的 `note_hz`。文件名 `donor_<pre|post>_<shift>.f32`。
+/// 外加那一遍喂进去的 `note_hz`。文件名 `donor_<pre|post>_<stem>.f32`,`stem` 见 [`dump_stem`]。
 ///
 /// ⛔ 为什么需要一个新出口:S159g 已经把 donor 那一路在**音符交界处**的塌陷
 /// (~40 ms 宽 · 电平 −2…−4 dB · 谱心 −20…−30%)量清楚了,并且逐条排除了
@@ -2979,7 +3026,7 @@ fn apply_range_inverse(
 ///
 /// ⚠ 只在 env 存在时写盘;写不动只 `warn!`,不许让渲染失败。
 /// ⚠ 它**不是**生产路径上的开销:`var_os` 每次都读,但没设时立刻返回。
-fn dump_donor_buffer(tag: &str, shift: i64, buf: &[f32], note_hz: &[f32]) {
+fn dump_donor_buffer(tag: &str, stem: &str, buf: &[f32], note_hz: &[f32]) {
     let Some(dir) = std::env::var_os("UTAI_RANGE_DUMP_DONOR") else { return };
     let dir = std::path::PathBuf::from(dir);
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -2990,7 +3037,7 @@ fn dump_donor_buffer(tag: &str, shift: i64, buf: &[f32], note_hz: &[f32]) {
     for v in buf {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
-    let p = dir.join(format!("donor_{tag}_{shift:+}.f32"));
+    let p = dir.join(format!("donor_{tag}_{stem}.f32"));
     match std::fs::write(&p, &bytes) {
         Ok(()) => tracing::info!("range dump: {} samples -> {}", buf.len(), p.display()),
         Err(e) => tracing::warn!("range dump: {} failed: {e}", p.display()),
@@ -3000,7 +3047,7 @@ fn dump_donor_buffer(tag: &str, shift: i64, buf: &[f32], note_hz: &[f32]) {
         for v in note_hz {
             hz.extend_from_slice(&v.to_le_bytes());
         }
-        let p = dir.join(format!("donor_f0_{shift:+}.f32"));
+        let p = dir.join(format!("donor_f0_{stem}.f32"));
         if let Err(e) = std::fs::write(&p, &hz) {
             tracing::warn!("range dump: {} failed: {e}", p.display());
         }
@@ -3049,6 +3096,52 @@ mod mg_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── S165:donor 转储命名 ────────────────────────────────────────────────────────
+
+    /// ⛔ 这条判据存在的理由是一次**结构性的归因塌方**:S159g 起转储文件名里只有 `shift`,
+    /// 而同一个 shift 会被**多个救援组**各渲一遍 ⇒ 后一组整个覆盖前一组。实测 `shift = −9`
+    /// 89 个被救音**一个都对不上**,而用户点名的「卡痰」段主体正好走 −9。
+    ///
+    /// ⚠ 用一个**本判据专用**的 shift 值,免得与并行跑的其它判据共用那张进程内的表。
+    #[test]
+    fn dump_stem_separates_groups_and_never_collides_in_one_process() {
+        const SH: i64 = -7771; // 这条判据私有
+
+        // ⑴ 不同组 ⇒ 不同 stem(这就是那次塌方的直接病因)
+        let a = dump_stem(SH, Some(120));
+        let b = dump_stem(SH, Some(3456));
+        assert_eq!(a, "-7771_f120");
+        assert_eq!(b, "-7771_f3456");
+        assert_ne!(a, b);
+
+        // ⑵ 同一组的两个落点候选恰好给出同一 shift ⇒ 仍然不许覆盖
+        let a2 = dump_stem(SH, Some(120));
+        assert_eq!(a2, "-7771_f120_2");
+        assert_eq!(dump_stem(SH, Some(120)), "-7771_f120_3");
+
+        // ⑶ 没有窗(整条 donor / 台子的旧路径)⇒ 有一个明写的名字,不是空串
+        assert_eq!(dump_stem(SH, None), "-7771_all");
+        assert_eq!(dump_stem(SH, None), "-7771_all_2");
+
+        // ⑷ 阴性对照:换 shift ⇒ 与上面任何一个都不撞
+        assert_eq!(dump_stem(SH + 1, Some(120)), "-7770_f120");
+    }
+
+    /// `apply_range_inverse` 的**每一个**调用点都得把组标识传下去 —— 漏一个,那一条车道的
+    /// 转储就悄悄退回「同 shift 互相覆盖」,而且**不会报错、只会给出看着正常的文件**。
+    /// (钩子区:凡是「漏了也不报错」的接线,判据必须盯源码。)
+    #[test]
+    fn every_range_inverse_call_site_passes_its_group_tag() {
+        let src = include_str!("score2svc.rs");
+        let calls = src.matches("audio = apply_range_inverse(").count();
+        let tagged = src.matches("donor.and_then(|d| d.windows.first().map(|w| w.0))").count();
+        assert!(calls >= 2, "调用点少于两个 —— 这个断言的前提变了,去看代码");
+        assert_eq!(
+            calls, tagged,
+            "有 {calls} 个 `apply_range_inverse` 调用点,却只有 {tagged} 个传了组标识"
+        );
+    }
     // ── S147 B2:donor 打洞 ─────────────────────────────────────────────────────────
     fn kmask_chunks(lens: &[usize], hard: &[usize]) -> Vec<Chunk> {
         lens.iter()
