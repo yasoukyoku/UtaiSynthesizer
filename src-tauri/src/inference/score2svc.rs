@@ -1057,7 +1057,7 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
@@ -1073,6 +1073,11 @@ pub(crate) fn production_defaults_fingerprint() -> String {
         // ⭐ S163 —— 休止门的 fade 随窗长收缩。**出厂开 ⇒ 改音频 ⇒ 必须配版本 bump**
         //    (与 `valley_human` 那条相反，它出厂关所以不 bump)。
         parse_rest_gate_shrink(None),
+        // ⭐ S163 —— preroll 辅音前部衰减。**出厂开 ⇒ 改音频 ⇒ 必须配版本 bump**。
+        //    三个常量都进指纹：改任何一个都会动听感。
+        parse_preroll_damp(None),
+        PREROLL_KEEP_MS,
+        PREROLL_DAMP_THRESH_DB,
         // ⛔⛔ S161b —— **类深度与槽形也进指纹**。S161 只登记了旋钮,而这一场改的是**常量**
         //    (浊塞音 11.7 → 20 窄槽、闪音 6.8 → 8):旋钮没动、指纹没动、音频却变了 ⇒ 又是零红。
         //    ⇒ 凡是这几个常量被改,这条闸当场红,红的措辞会指到那三处版本字面量。
@@ -1282,6 +1287,9 @@ pub fn render_score_sovits(
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
     let vl_onset = voiceless_onset_flags(&arr);
+    // S163 —— 被 `consonant_preroll` 提前到休止里的辅音串。见 `PREROLL_DAMP_DEFAULT`。
+    let pre_cons = preroll_consonant_flags(&arr);
+    let mut preroll_damped = 0usize;
     let emphasis_gain = if shaping.consonant_emphasis_db.is_finite() && shaping.consonant_emphasis_db > 0.0 {
         10f32.powf(shaping.consonant_emphasis_db.min(12.0) / 20.0)
     } else {
@@ -1386,6 +1394,20 @@ pub fn render_score_sovits(
         // S83 knife 6: crisp up voiceless onsets (+2.5 dB trapezoid on their windows)
         let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
         apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
+        // ⭐ S163 —— 压 preroll 辅音窗的**前部**（紧贴音头的真辅音不动）。见 `PREROLL_DAMP_DEFAULT`。
+        // ⛔ 放在 `apply_emphasis` **之后**：那一刀给清辅音 onset +2.5 dB，先压后抬会互相抵消。
+        if preroll_damp_enabled() {
+            let pc_wins = chunk_flag_windows(chunk, wav.len(), &pre_cons[chunk.start..chunk.end]);
+            let keep = ((PREROLL_KEEP_MS / 1000.0) * m.sample_rate as f32).round().max(1.0) as usize;
+            preroll_damped += apply_preroll_damp(
+                &mut wav,
+                &pc_wins,
+                keep,
+                PREROLL_DAMP_THRESH_DB,
+                PREROLL_DAMP_MAX_DB,
+                emphasis_fade_samples(m.sample_rate),
+            );
+        }
         // S97 ②a 刀: restore phrase-final sonorant codas swallowed by the release ramp
         apply_coda_lift(&mut wav, chunk, &coda_lifts, emphasis_fade_samples(m.sample_rate));
         // S84 C 刀: carve the chain-internal syllable-boundary valleys (measured class depths × scale)
@@ -1558,6 +1580,9 @@ pub fn render_score_rvc(
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
     let vl_onset = voiceless_onset_flags(&arr);
+    // S163 —— 被 `consonant_preroll` 提前到休止里的辅音串。见 `PREROLL_DAMP_DEFAULT`。
+    let pre_cons = preroll_consonant_flags(&arr);
+    let mut preroll_damped = 0usize;
     let emphasis_gain = if shaping.consonant_emphasis_db.is_finite() && shaping.consonant_emphasis_db > 0.0 {
         10f32.powf(shaping.consonant_emphasis_db.min(12.0) / 20.0)
     } else {
@@ -1650,6 +1675,20 @@ pub fn render_score_rvc(
         // S83 knife 6: crisp up voiceless onsets (+2.5 dB trapezoid on their windows)
         let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
         apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
+        // ⭐ S163 —— 压 preroll 辅音窗的**前部**（紧贴音头的真辅音不动）。见 `PREROLL_DAMP_DEFAULT`。
+        // ⛔ 放在 `apply_emphasis` **之后**：那一刀给清辅音 onset +2.5 dB，先压后抬会互相抵消。
+        if preroll_damp_enabled() {
+            let pc_wins = chunk_flag_windows(chunk, wav.len(), &pre_cons[chunk.start..chunk.end]);
+            let keep = ((PREROLL_KEEP_MS / 1000.0) * m.sample_rate as f32).round().max(1.0) as usize;
+            preroll_damped += apply_preroll_damp(
+                &mut wav,
+                &pc_wins,
+                keep,
+                PREROLL_DAMP_THRESH_DB,
+                PREROLL_DAMP_MAX_DB,
+                emphasis_fade_samples(m.sample_rate),
+            );
+        }
         // S97 ②a 刀: restore phrase-final sonorant codas swallowed by the release ramp
         apply_coda_lift(&mut wav, chunk, &coda_lifts, emphasis_fade_samples(m.sample_rate));
         // S84 C 刀: carve the chain-internal syllable-boundary valleys (measured class depths × scale)
@@ -1738,7 +1777,7 @@ pub fn render_score_rvc(
         "[perf] score/rvc {secs:.1}s audio in {wall:.2}s (RTF {:.3}) · {} chunks · \
          s2cv {t_s2cv:.2}s ({:.0}%) · decode(net_g) {t_decode:.2}s ({:.0}%) · \
          inverse {t_inverse:.2}s ({:.0}%) · other {:.2}s · range_shift {range_shift:+} \
-         · skipped {skipped}/{} · len!= {len_mismatch} · total{total_delta:+}",
+         · skipped {skipped}/{} · len!= {len_mismatch} · total{total_delta:+} \n         · predamp {preroll_damped}",
         if secs > 0.0 { wall / secs } else { 0.0 },
         chunks.len(),
         100.0 * t_s2cv / wall.max(1e-9),
@@ -1835,6 +1874,146 @@ fn chunk_flag_windows(chunk: &Chunk, out_len: usize, flags: &[bool]) -> Vec<(usi
         cursor += d;
     }
     wins
+}
+
+/// ⚙ 出厂默认 = true —— `UTAI_PREROLL_DAMP=0` 关。
+///
+/// ## 缺陷（用户 2026-08-28：「**很短的休止中间会漏出伪影**」）
+///
+/// `consonant_preroll` 把下一个音的辅音提前到休止里，而它分配的长度**远超**那个辅音真正需要的：
+/// 实测（`diag_sp_phone_dur_after_preroll`，真实 `build_arrays_daw`）休止 140 ms 时
+/// `k` 占 **120 ms**、`w` 占 **80 ms**，而真实的 k/w 只需 30-60 ms。
+///
+/// 音头前的能量剖面（鹅妈妈 × yachiyo × +7，`base`，相对该音稳态 dB）：
+/// ```text
+///            −120   −100    −80    −60    −40    −20      0
+/// 元音        −50   −279   −279   −279   −270    −35     −0   ← 基线：音头前 40 ms 才起音
+/// 清辅音     −274   −270    −45    −40    −25     −1     +8   ← 从 −80 ms 就开始出声
+/// 近音(w/j) −274   −273    −42    −31    −26     −7     −0
+/// ```
+/// ⇒ 多出来的那 40 ms 落在**谱面的休止**里。用户报的坐标（全是「うぉ」= `w`+`o`）平台电平
+/// **−15…−37 dB**，而他自己排除的 1:51.451（「这个不是空拍」）只有 **−45…−64** ——
+/// **阴性对照是用户给的**，阈值就落在 −40 附近。
+///
+/// ## ⛔ 不是「割裂」
+/// 用户同时怀疑「preroll 过长导致辅音提前发声、和元音割裂」。**实测方向相反**：
+/// 辅音类的「辅音包→谷→元音起音」谷深 p50 **−0.7 dB**（基本单调爬升，没有谷），
+/// 而用户报的三个谷深只有 **3.2 / 4.2 / 5.6**，他排除的那个反而 **28.2**（谷最深）。
+/// ⇒ 问题是**平台太响**，不是断开。⇒ 这一刀压平台，**绝不挖谷**。
+///
+/// ## 做什么
+/// 对**跟在 SP 之后的辅音音素窗**，只处理它的**前部**（`PREROLL_KEEP_MS` 之外的那段，
+/// 紧贴音头的真辅音一个字节不动），量它相对该音稳态的电平，超过 `PREROLL_DAMP_THRESH_DB`
+/// 才压，压到阈值为止，最多 `PREROLL_DAMP_MAX_DB`。梯形淡入淡出，只改增益、**不改时序**
+/// （用户：辅音时序一个字节不许动）。
+const PREROLL_DAMP_DEFAULT: bool = true;
+
+/// 紧贴音头保留的真辅音长度（ms）—— 元音基线证明音头前 40 ms 本来就该有起音。
+const PREROLL_KEEP_MS: f32 = 40.0;
+/// 平台电平（相对该音稳态）超过这个才压。用户给的阴性对照落在 −45…−64，报的落在 −15…−37。
+const PREROLL_DAMP_THRESH_DB: f32 = -40.0;
+/// 最多压多少 dB（护栏，不是参数）。
+const PREROLL_DAMP_MAX_DB: f32 = 18.0;
+
+fn preroll_damp_enabled() -> bool {
+    parse_preroll_damp(std::env::var("UTAI_PREROLL_DAMP").ok().as_deref())
+}
+
+fn parse_preroll_damp(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => PREROLL_DAMP_DEFAULT,
+    }
+}
+
+/// **跟在 SP 之后的辅音音素**（= 被 `consonant_preroll` 提前到休止里的那些）。
+///
+/// 与 [`voiceless_onset_flags`] 同一个模式：在 `ScoreArrays` 层算（那里有音素字符串），
+/// 调用点按 `chunk.start..chunk.end` 切片。
+/// ⛔ 判「辅音」用的是 **不在 `tbl::VOWEL_SET` 里**，而不是「清辅音」——
+/// 用户报的坐标全是「うぉ」，它分解成 **`w` + `o`**，`w` 是**浊近音**，
+/// 按清浊分类会把整条链漏掉（S163 §45.3 踩过一次）。
+fn preroll_consonant_flags(arr: &ScoreArrays) -> Vec<bool> {
+    let n = arr.phon.len();
+    let mut f = vec![false; n];
+    let mut after_sp = false;
+    for i in 0..n {
+        let p = arr.phon[i];
+        if p == "SP" {
+            after_sp = true;
+            continue;
+        }
+        if p == "AP" {
+            after_sp = false; // 呼吸不是休止，别把它后面的辅音也算进来
+            continue;
+        }
+        if !after_sp {
+            continue;
+        }
+        if super::score2cv_tables::VOWEL_SET.contains(&p) {
+            after_sp = false; // 到元音为止
+        } else {
+            f[i] = true;
+        }
+    }
+    f
+}
+
+/// 压 preroll 辅音窗的**前部**。见 [`PREROLL_DAMP_DEFAULT`]。
+///
+/// ⛔ 只改增益、不改时序；紧贴音头的 `keep` 样本一个字节不动。
+/// ⛔ 阈值以下的窗**逐位不变**（`gain == 1.0` 时直接跳过，不做恒等乘法）。
+fn apply_preroll_damp(
+    audio: &mut [f32],
+    windows: &[(usize, usize)],
+    keep: usize,
+    thresh_db: f32,
+    max_cut_db: f32,
+    fade: usize,
+) -> usize {
+    let mut hit = 0usize;
+    for &(s, e0) in windows {
+        let e0 = e0.min(audio.len());
+        if e0 <= s {
+            continue;
+        }
+        // 只处理「远离音头」的那段
+        let e = e0.saturating_sub(keep);
+        if e <= s {
+            continue; // 辅音本来就短于 keep ⇒ 全是真辅音，不碰
+        }
+        // 参照：窗之后 50-150 ms 的稳态（= 那个音的元音）
+        let rs = (e0 + fade).min(audio.len());
+        let re = (rs + fade * 20).min(audio.len());
+        if re <= rs {
+            continue;
+        }
+        let energy = |a: usize, b: usize| -> f64 {
+            if b <= a {
+                return 0.0;
+            }
+            audio[a..b].iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / (b - a) as f64
+        };
+        let (pe, se) = (energy(s, e), energy(rs, re));
+        if !(se > 0.0) || !(pe > 0.0) {
+            continue;
+        }
+        let rel_db = 10.0 * (pe / se).log10();
+        if rel_db <= f64::from(thresh_db) {
+            continue; // 平台本来就安静 ⇒ 逐位不变
+        }
+        let cut_db = (rel_db - f64::from(thresh_db)).min(f64::from(max_cut_db));
+        let gain = 10f64.powf(-cut_db / 20.0) as f32;
+        hit += 1;
+        let f = fade.max(1) as f32;
+        for i in s..e {
+            let edge = (i - s).min(e - 1 - i) as f32;
+            let ramp = (edge / f).min(1.0);
+            audio[i] *= 1.0 + (gain - 1.0) * ramp;
+        }
+    }
+    hit
 }
 
 /// Trapezoid gain over each window: edges ramp 1→gain over `fade` samples (no clicks), plateau at
@@ -3030,6 +3209,85 @@ mod tests {
             }
         }
     }
+
+    /// ⛔⛔ **承重**：平台电平在阈值以下的窗**逐位不变**。
+    /// 这一刀只该碰「本该静音却响着」的那些；用户自己给的阴性对照（1:51.451，平台 −45…−64 dB）
+    /// 必须一个字节都不动。
+    #[test]
+    fn preroll_damp_leaves_quiet_platforms_bit_identical() {
+        let sr = 44_100usize;
+        let fade = sr / 200;
+        let keep = (PREROLL_KEEP_MS / 1000.0 * sr as f32) as usize;
+        // 窗 200 ms，平台很轻（相对稳态 −50 dB），后面接一段稳态
+        let n = sr / 5;
+        let mut x = vec![0.0f32; n + sr];
+        for v in x[..n].iter_mut() {
+            *v = 0.003;                     // 平台
+        }
+        for v in x[n + fade..n + fade + fade * 20].iter_mut() {
+            *v = 1.0;                       // 稳态参照
+        }
+        let before = x.clone();
+        let hit = apply_preroll_damp(&mut x, &[(0, n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, fade);
+        assert_eq!(hit, 0, "安静平台不该被判为要压");
+        assert_eq!(x, before, "阈值以下必须逐位不变");
+    }
+
+    /// ⭐ 平台响到超阈值时**真的被压**，而且**紧贴音头的 `keep` 一个字节不动**。
+    #[test]
+    fn preroll_damp_cuts_the_loud_platform_but_never_the_real_consonant() {
+        let sr = 44_100usize;
+        let fade = sr / 200;
+        let keep = (PREROLL_KEEP_MS / 1000.0 * sr as f32) as usize;
+        let n = sr / 5; // 200 ms 窗
+        let mut x = vec![0.0f32; n + sr];
+        for v in x[..n].iter_mut() {
+            *v = 0.5;                       // 平台：与稳态同量级 ⇒ 远超 −40 dB
+        }
+        for v in x[n + fade..n + fade + fade * 20].iter_mut() {
+            *v = 1.0;
+        }
+        let tail_before: Vec<f32> = x[n - keep..n].to_vec();
+        let hit = apply_preroll_damp(&mut x, &[(0, n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, fade);
+        assert_eq!(hit, 1, "响平台必须被判为要压");
+        // 前部中心被压下去了
+        let mid = (n - keep) / 2;
+        assert!(x[mid].abs() < 0.5 * 0.5, "平台中心没被压：{}", x[mid]);
+        // ⛔ 紧贴音头的 keep 一个字节不动（辅音时序/真辅音不许碰）
+        assert_eq!(&x[n - keep..n], &tail_before[..], "紧贴音头的真辅音被动了");
+        // ⛔ 压幅有护栏
+        let cut_db = 20.0 * (0.5f32 / x[mid].abs().max(1e-9)).log10();
+        assert!(cut_db <= PREROLL_DAMP_MAX_DB + 0.5, "压过头了：{cut_db} dB");
+    }
+
+    /// ⛔ flags：只标 **SP 之后的辅音串**，到元音为止；**AP（呼吸）不算休止**。
+    /// ⛔ 判「辅音」用的是不在 VOWEL_SET 里，**不是**「清辅音」——
+    /// 用户报的坐标全是「うぉ」= `w`+`o`，`w` 是浊近音，按清浊分类会整条链漏掉（S163 §45.3）。
+    /// ⚠ 用真实的 `build_arrays_daw` 造夹具，不手搓 `ScoreArrays`。
+    #[test]
+    fn preroll_flags_take_the_consonant_run_after_a_rest_including_voiced_glides() {
+        let check = |score: &[(&str, i64, i64)], want_marked: &[&str]| {
+            let arr = daw_ja(score);
+            let f = preroll_consonant_flags(&arr);
+            let got: Vec<&str> = arr
+                .phon
+                .iter()
+                .zip(&f)
+                .filter(|(_, &m)| m)
+                .map(|(p, _)| *p)
+                .collect();
+            assert_eq!(got, want_marked, "谱 {score:?} ⇒ 音素 {:?}", arr.phon);
+        };
+        // ⭐ 用户报的形状：休止之后是「うぉ」= w + o ⇒ 只标 w
+        check(&[("あ", 69, 20), ("R", 0, 7), ("うぉ", 71, 20)], &["w"]);
+        // 清辅音同样标
+        check(&[("あ", 69, 20), ("R", 0, 7), ("か", 71, 20)], &["k"]);
+        // 纯元音开头 ⇒ 什么都不标
+        check(&[("あ", 69, 20), ("R", 0, 7), ("お", 71, 20)], &[]);
+        // 没有休止 ⇒ 什么都不标（这一刀只管被 preroll 推进休止的那些）
+        check(&[("あ", 69, 20), ("か", 71, 20)], &[]);
+    }
+
 
     #[test]
     fn rest_gate_envelope_shape() {
@@ -4705,6 +4963,7 @@ mod s160q_f0_lerp_tests {
             ("UTAI_MG_VALLEY_AFTER", "valafter="),
             ("UTAI_VALLEY_HUMAN", "valhuman="),
             ("UTAI_REST_GATE_SHRINK", "restshrink="),
+            ("UTAI_PREROLL_DAMP", "predamp="),
         ];
         // 只写文件、不改音频的诊断路径(见 `dump_donor_buffer` 的 doc)。
         const EXEMPT: &[&str] = &["UTAI_RANGE_DUMP_DONOR"];
