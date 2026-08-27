@@ -4058,7 +4058,7 @@ fn parse_usag_dim(v: Option<&str>) -> f32 {
 /// ⚙ 出厂默认。见 [`landing_usag_dim_cap`]。
 const USAG_DIM_CAP_DEFAULT: f32 = 3.0;
 
-/// ⚙ 出厂默认 = 20.0（**开**）。`UTAI_RANGE_DIPFILL=0` 关掉 ——
+/// ⚙ 出厂默认 = 12.0（**开**）。`UTAI_RANGE_DIPFILL=0` 关掉 ——
 /// **donor 静音坑回填**:donor 相对它自己在该窗内的中位低过这么多 dB 时,把 `base` 混回来。
 ///
 /// # 靶子(四模型共 194 个,用户 2026-08-27 点名 akiko 2:05.252 是其中之一)
@@ -4100,11 +4100,61 @@ fn parse_dipfill(v: Option<&str>) -> f32 {
 }
 
 /// ⚙ 出厂默认。见 [`dipfill_depth_db`]。
-const DIPFILL_DEPTH_DEFAULT: f32 = 20.0;
+const DIPFILL_DEPTH_DEFAULT: f32 = 12.0;
 
 /// ⭐ S163 —— 回填段的最大宽度(ms)。比这更宽的不是「坑」,是「整段没救到」,
 /// 那种情况填 `base` 等于把整段救援退掉 ⇒ 不碰。
 const DIPFILL_MAX_MS: f32 = 80.0;
+
+/// ⭐⭐⭐⭐ S163 v2 —— **谐波收益闸**:`base` 在坑段的上方谐波强度
+/// (`upper_harmonic_level_db`,2-8×f0)必须比 donor 高过这么多 dB,否则**不填**。
+///
+/// # ⛔ 为什么这一条是承重的
+/// v1 只按全带 RMS 找坑就填,结果**收益主要在基频**
+/// (akiko H1 **+12.1** 而 H3-H8 只有 **+3.6**;yachiyo 全线 **−1.5** ⇒ 净负)。
+/// 用户 2026-08-27 点破:「**你倒是基频连上了 谐波你是一点也不管啊?**」
+///
+/// # 用户点名坐标上的 H3-8 收益(实测,干净转储)
+/// ```text
+/// 应该填：4:50.776 +20.7 · 4:32 深救援 +14.1 · 4:49 +7.8 · 4:07.467 +4.6 · 2:05.252 +2.8
+/// 不该填：1:21.195 −7.7 · 0:44.870 −6.8 · 0:57.240 削波 −5.4 · 0:56 次怪 −3.2
+/// ```
+/// ⇒ 只降门限而不加这道闸,会把 `1:21.195` / `0:44.870` 这些**填坏**。
+const DIPFILL_GAIN_DB: f32 = 0.0;
+
+/// ⭐⭐⭐⭐ S163 v4 —— **电平闸**:坑区间上 `base` 必须比 `donor` 响这么多才准填。
+///
+/// # 为什么必须有它
+/// v3 的判据只问「`donor` 相对**它自己**窗内中位低不低」,
+/// **从没问过「`base` 在这里是不是比 `donor` 还低」**。而这一刀的语义前提是
+/// 「donor 这儿没声了,用 base 顶上」—— `base` 更低的时候填它,结构上只会更糟。
+///
+/// v3 实测两处(都是 dipfill 亲手动的):
+/// ```text
+/// akiko 2:07.987   成品−base 最低  +6.4 → −0.0   (Δ −6.4)
+/// akiko 4:10.187   成品−base 最低  +5.0 → −0.0   (Δ −5.0)
+/// ```
+/// 两处在关掉这一刀时**成品比 base 高 5~6.4 dB**(救援正常工作),
+/// 填进 base 之后精确落到 `−0.0` = base 电平 ⇒ **把好的救援削掉了**。
+///
+/// # ⛔⛔⛔ 尺子必须是「逐 10 ms 格的最大差」,不是区间平均
+/// v4 用 rms(区间平均)实测:
+/// ```text
+///                     rms 尺子      峰值尺子
+/// ぴゃ      (该保住)    −3.8 dB       **+11.6 dB**
+/// 2:07.987(该拦住)   −17.3 dB       −15.4 dB
+/// 4:10.187(该拦住)    −7.3 dB        −4.8 dB
+/// ```
+/// **rms 尺子结构上分不开这三个** —— `ぴゃ` 的 −3.8 夹在两处「该拦住」的读数中间,
+/// 任何门槛都是「要么全过、要么全拦」。v4 取 3 dB ⇒ 两处退化拦住了,
+/// 但 `ぴゃ` 的 **+10.0 改善也一起丢了**(V −0.1 → W −10.2)。
+///
+/// ⇒ 根因是**洞的判据用「最深一格」而闸用「区间平均」**,两把尺子量同一件事。
+///   闸换成同一把尺子之后三个全分得开,3 dB 门槛的余量是 +8.6 / −18.4 / −7.8。
+///
+/// # 3 dB 而不是 0
+/// 0 会在边界上抖(两边差零点几 dB 时填不填全看噪声)。
+const DIPFILL_LEVEL_GAIN_DB: f32 = 3.0;
 
 /// ⭐ S163 —— 回填的淡入淡出(ms)。⛔ 不许硬切:两侧是 donor、中间是 base,
 /// 硬切会在 10 ms 内造出两条新的不连续。
@@ -4114,7 +4164,16 @@ const DIPFILL_FADE_MS: f32 = 10.0;
 ///
 /// 返回 `(起, 止)` 的样本区间(相对 `seg` 的下标)。
 /// ⛔ 中位只用**有声**的格算(`> -60 dBFS`),否则窗内的静音会把参照拖到地板上。
-fn dipfill_spans(seg: &[f32], sample_rate: u32, depth: f32) -> Vec<(usize, usize)> {
+fn dipfill_spans(
+    seg: &[f32],
+    sample_rate: u32,
+    depth: f32,
+    // ⭐⭐⭐⭐ S163 v2 —— `base` 在同一段的样本(与 `seg` 同长同起点),用来算谐波收益闸。
+    //    传空切片 ⇒ 闸不生效(回到 v1 行为,只给判据自测用)。
+    base_here: &[f32],
+    // ⭐ 该段的基频(Hz)。`<= 0` ⇒ 算不了谐波 ⇒ 闸不生效。
+    f0_hz: f32,
+) -> Vec<(usize, usize)> {
     if depth <= 0.0 || seg.is_empty() {
         return Vec::new();
     }
@@ -4146,7 +4205,66 @@ fn dipfill_spans(seg: &[f32], sample_rate: u32, depth: f32) -> Vec<(usize, usize
                 i += 1;
             }
             if i - a <= maxw {
-                out.push((a * h, (i * h).min(seg.len())));
+                let (x, y) = (a * h, (i * h).min(seg.len()));
+                // ⭐⭐⭐⭐ S163 v2 —— **谐波收益闸**:填进去的 `base` 必须在上方谐波上真的更好。
+                //    ⛔ 只看全带电平会「把基频接上而谐波一点没补」(见 [`DIPFILL_GAIN_DB`])。
+                //    ⚠ 谐波要在一个够长的窗上量,而坑本身可能只有 20 ms ⇒ 两侧各借 2048 样本。
+                // ⭐⭐⭐⭐ S163 v4 —— **电平闸**(见 [`DIPFILL_LEVEL_GAIN_DB`])。
+                //    ⛔ 先算它:比谐波闸便宜得多,而且它拦掉的是「把好救援削掉」那一族。
+                let level_ok = if base_here.len() >= seg.len() {
+                    // ⛔⛔ **逐 10 ms 格取最大差,不是区间平均** —— 见 [`DIPFILL_LEVEL_GAIN_DB`]。
+                    //    洞的判据用「最深一格」,这条闸也必须用同一把尺子:
+                    //    v4 用 rms 时 `ぴゃ` 读 −3.8 dB 而峰值读 **+11.6 dB**,
+                    //    夹在两处「该拦住」的读数中间 ⇒ 结构上分不开。
+                    let cell = h.min(y - x).max(1);
+                    let mut best = f64::NEG_INFINITY;
+                    let mut p = x;
+                    while p < y {
+                        let q = (p + cell).min(y);
+                        let e = |v: &[f32]| -> f64 {
+                            v.iter().map(|&z| f64::from(z) * f64::from(z)).sum::<f64>()
+                                / (q - p).max(1) as f64
+                        };
+                        let (be, de) = (e(&base_here[p..q]), e(&seg[p..q]));
+                        let diff = 10.0 * ((be + 1e-20) / (de + 1e-20)).log10();
+                        if diff > best {
+                            best = diff;
+                        }
+                        p = q;
+                    }
+                    best.is_finite() && best > f64::from(DIPFILL_LEVEL_GAIN_DB)
+                } else {
+                    false
+                };
+                let pass = level_ok && if base_here.len() >= seg.len() && f0_hz > 20.0 {
+                    let pad = 2048usize;
+                    let lo = x.saturating_sub(pad);
+                    let hi = (y + pad).min(seg.len());
+                    match (
+                        utai_dsp::harmonicity::upper_harmonic_level_db(
+                            &base_here[lo..hi],
+                            sample_rate,
+                            f0_hz,
+                        ),
+                        utai_dsp::harmonicity::upper_harmonic_level_db(
+                            &seg[lo..hi],
+                            sample_rate,
+                            f0_hz,
+                        ),
+                    ) {
+                        (Some(b), Some(d)) => b - d > DIPFILL_GAIN_DB,
+                        // 量不到 ⇒ 保守：不填（宁可留坑，也不填一个没验证过的 base）
+                        _ => false,
+                    }
+                } else {
+                    // ⛔ 拿不到 base 或 f0 ⇒ **保守不填**：没法验证谐波收益的填充一律不做。
+                    //    这也让判据 
+                    //    自然通过 —— 它传的  是空的 ⇒ f0=0 ⇒ 这一刀不生效。
+                    false
+                };
+                if pass {
+                    out.push((x, y));
+                }
             }
         } else {
             i += 1;
@@ -5155,7 +5273,34 @@ pub fn apply_dead_only_windows_with(
             kept.push((ji as i64, cand[c].2, cand[c].3.clone()));
         }
     }
-    splice_kept(
+    // ⭐⭐⭐⭐ S163 —— **同一次 run 内的对照臂**(纯诊断转储,不参与任何判据)。
+    //
+    // ## ⛔⛔⛔ 为什么验收只能这样做
+    // 整曲渲染**不可复现**(源头在解码)⇒ 每次 run 的 donor 略不同
+    // ⇒ 拼接前的**对齐搜索选出不同的 `d`** ⇒ **整条窗平移几毫秒**。实测跨 run:
+    // ```text
+    // 对齐 |lag| ≥ 1 样本的窗:akiko 56% · yuyuko 70% · yachiyo 64% · 东雪莲 93%
+    // 最大平移 419/162/405/441 样本 = 4-10 ms
+    // 同一把尺子(±60 ms 取最小)的噪声底:
+    //    对齐一致(|lag|<5)  p90 0.48-1.26 dB
+    //    对齐不同(|lag|≥5)  p90 1.49-3.40 dB,**p99 12.8-17.6 dB**
+    // ```
+    // ⇒ **跨 run 比整曲臂,任何逐坐标读数都不可信。**
+    //
+    // 这里在同一次 run 里跑两遍 `splice_kept`,共享**同一份 `kept`**
+    // (= 同一份 donor、同一个 donor 选择、同一次解码)⇒ 零解码噪声、零对齐抖动,
+    // 两条只差 `dipfill` 一个变量。
+    //
+    // ⚠ 没设 env 时 `var` 立刻返回,不多跑一遍 ⇒ 不是生产路径上的开销。
+    // ⛔ 判据不许读这个 env —— 它只写文件,不改本次渲染的音频(与 `dump_donor_buffer` 同性质)。
+    let nodip = std::env::var("UTAI_RANGE_DUMP_NODIP")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let control = nodip.as_ref().map(|_| base.to_vec());
+    let tied_xf_samples = (tied_xf_ms * f64::from(sample_rate) / 1000.0) as usize;
+
+    let out = splice_kept(
         base,
         sample_rate,
         spf,
@@ -5166,10 +5311,58 @@ pub fn apply_dead_only_windows_with(
         align,
         handover_db,
         notes,
-        (tied_xf_ms * f64::from(sample_rate) / 1000.0) as usize,
+        tied_xf_samples,
         // ⭐⭐⭐⭐ S163 §34 —— donor 静音坑回填（出厂 0 = 关 = 逐位不变）。
         dipfill_depth_db(),
-    )
+    );
+
+    if out.is_ok() {
+        if let (Some(dir), Some(mut buf)) = (nodip, control) {
+            // ⛔⛔ **两条必须同层** —— 都在 `splice_kept` 刚结束时落盘。
+            //    第一版只落了对照臂,拿它去比**成品 wav**(还经过 splice 之后的整条处理链)
+            //    ⇒ 差异里混进了那条链:akiko 报「动过 75.30 s、窗外动过 304 万样本」,
+            //    而日志报的 dipfill 生效量只有几百毫秒、窗外更应该是 0。
+            let dump = |name: &str, b: &[f32]| {
+                let dir = std::path::Path::new(&dir);
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    tracing::warn!("range: same-run control arm cannot mkdir {}: {e}", dir.display());
+                    return;
+                }
+                let mut bytes = Vec::with_capacity(b.len() * 4);
+                for v in b {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let p = dir.join(name);
+                match std::fs::write(&p, &bytes) {
+                    Ok(()) => {
+                        tracing::info!("range: same-run control arm {} samples -> {}", b.len(), p.display())
+                    }
+                    Err(e) => tracing::warn!("range: same-run control arm write failed {}: {e}", p.display()),
+                }
+            };
+            // ⑴ dipfill **开**(= 本次渲染真正用的那一条),splice 之后立即
+            dump("dip.f32", base);
+            // ⑵ dipfill **关**,同一份 `kept`,其余一个字节不差
+            match splice_kept(
+                &mut buf,
+                sample_rate,
+                spf,
+                jobs,
+                &kept,
+                xf,
+                join_enabled,
+                align,
+                handover_db,
+                notes,
+                tied_xf_samples,
+                0.0,
+            ) {
+                Ok(()) => dump("nodip.f32", &buf),
+                Err(e) => tracing::warn!("range: same-run control arm failed: {e}"),
+            }
+        }
+    }
+    out
 }
 
 /// S152 —— 拼接层,从 `apply_dead_only_windows` 拆出来:它现在拿到的是**全部**位移的 donor
@@ -5564,11 +5757,47 @@ fn splice_kept(
             }
             // ⭐⭐⭐⭐ S163 §34 —— **donor 静音坑回填**(见 [`dipfill_depth_db`])。
             // 出厂 `0.0` ⇒ `spans` 恒空 ⇒ 逐位不变。
-            let dips = dipfill_spans(seg, sample_rate, dipfill_db);
+            // ⭐⭐⭐⭐ S163 v2 —— 谐波收益闸要 `base` 的同一段与该段的 f0。
+            //    `seg` 覆盖 base 的 `[seg_lo, seg_lo + seg.len())`。
+            // ⛔⛔⛔ S163 v3 —— **判据只许看真正会写出去的那一段**。
+            //    `seg` 两端各带 `MERGE_BRIDGE_FRAMES`(25 帧 ≈ **500 ms**)的窗外材料,
+            //    而写入只覆盖 `[a, b)`。v2 把整条 `seg` 交给判据 ⇒ 两条错:
+            //    ⑴ 边距里的坑**永远不生效**(日志报的回填量因此远大于实际);
+            //    ⑵ `med`(存活中位数 = 判据的地板)**在含窗外材料的全段上算** ⇒ 地板被污染。
+            //    ⚠ `base` 要取**同一时间轴**:`seg[si]` 写到 `base[si + seg_lo - d]`。
+            let si_a = (a as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize) as usize;
+            let si_b = (b as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize) as usize;
+            let (bl, bh) = {
+                let off = *seg_lo as isize - d;
+                (
+                    (off + si_a as isize).clamp(0, base.len() as isize) as usize,
+                    (off + si_b as isize).clamp(0, base.len() as isize) as usize,
+                )
+            };
+            let bslice: &[f32] = if bh > bl { &base[bl..bh] } else { &base[0..0] };
+            // 该窗中点落在哪个唱音里 ⇒ 用它的 f0。找不到 ⇒ 0.0 ⇒ 闸不生效。
+            let mid_frame = ((a + b) / 2) as f64 / spf;
+            let f0_here = notes
+                .iter()
+                .find(|nd| {
+                    nd.sung
+                        && (nd.start as f64) <= mid_frame
+                        && mid_frame < (nd.start + nd.frames) as f64
+                })
+                .map(|nd| nd.hz)
+                .unwrap_or(0.0);
+            let dips: Vec<(usize, usize)> = if si_b > si_a {
+                dipfill_spans(&seg[si_a..si_b], sample_rate, dipfill_db, bslice, f0_here)
+                    .into_iter()
+                    .map(|(x, y)| (x + si_a, y + si_a))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let dip_fade = ((f64::from(sample_rate) * f64::from(DIPFILL_FADE_MS) / 1000.0) as usize).max(1);
             if !dips.is_empty() {
                 tracing::info!(
-                    "range: splice#{oi} shift {:+} —— donor 静音坑回填 {} 段 (共 {:.0} ms)",
+                    "range: splice#{oi} shift {:+} — dipfill filled {} silent pit(s) ({:.0} ms total)",
                     j.shift,
                     dips.len(),
                     dips.iter().map(|&(x, y)| y - x).sum::<usize>() as f64 * 1000.0
@@ -6986,6 +7215,231 @@ pub fn apply_inverse_windowed_with(
 #[cfg(test)]
 mod tests {
 
+    /// ⛔⛔ S163 v2 —— 钉住**谐波收益闸**：坑找到了，但填进去的 `base` 在上方谐波上
+    /// 不比 donor 好时，**必须不填**。
+    ///
+    /// 用户 2026-08-27：「你倒是基频连上了 谐波你是一点也不管啊？」
+    /// v1 只按全带 RMS 找坑就填 ⇒ 收益主要在 H1（akiko H1 +12.1 而 H3-H8 只有 +3.6），
+    /// yachiyo 上全线 −1.5 ⇒ 净负。
+    ///
+    /// 夹具：同一个坑，两种 `base`
+    /// * `rich` —— 上方谐波比 donor 强 ⇒ 必须填；
+    /// * `dull` —— 只有基频、上方谐波比 donor 弱 ⇒ **必须不填**（这正是「基频接上了谐波没补」）。
+    #[test]
+    /// ⛔⛔⛔ S163 v5 —— **电平闸的尺子必须是「逐 10 ms 格的最大差」,不是区间平均**。
+    ///
+    /// v4 用 rms(区间平均)实测,三处点名坐标的读数:
+    /// ```text
+    ///                     rms 尺子      峰值尺子
+    /// ぴゃ      (该保住)    −3.8 dB       **+11.6 dB**
+    /// 2:07.987(该拦住)   −17.3 dB       −15.4 dB
+    /// 4:10.187(该拦住)    −7.3 dB        −4.8 dB
+    /// ```
+    /// **rms 尺子结构上分不开这三个** —— `ぴゃ` 夹在两处「该拦住」的读数中间。
+    ///
+    /// 这里的夹具就是 `ぴゃ` 的形状:坑区间里大部分格 `base` **略低**,
+    /// 只有**最深那一格** `base` 明显更高。区间平均会把它拦掉,逐格峰值会放行。
+    fn dipfill_level_gate_measures_the_deepest_cell_not_the_average() {
+        let sr = 44100u32;
+        let hop = sr as usize / 100;
+        let harm = |i: usize, amp: f32| -> f32 {
+            let w = 2.0 * std::f32::consts::PI * 300.0 * i as f32 / sr as f32;
+            amp * (w.sin() + 0.5 * (2.0 * w).sin() + 0.5 * (3.0 * w).sin()
+                + 0.33 * (4.0 * w).sin())
+        };
+        // donor:40 格常规,坑 = 第 18-23 格。坑里前后几格只低一点,**中间一格塌到底**。
+        let mut donor: Vec<f32> = (0..40 * hop)
+            .map(|i| 0.30 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / sr as f32).sin())
+            .collect();
+        for c in 18..24 {
+            let g = if c == 20 { 0.01 } else { 0.20 }; // 中间一格 −40 dB,其余 −14 dB
+            for v in donor.iter_mut().take((c + 1) * hop).skip(c * hop) {
+                *v *= g;
+            }
+        }
+        // base:坑区间里比 donor 的「其余格」**略低**(0.045 < 0.30×0.20 = 0.06),
+        //      但比塌到底那一格(0.30×0.01 = 0.003)**高得多**。
+        let base_here: Vec<f32> = (0..donor.len())
+            .map(|i| {
+                let c = i / hop;
+                harm(i, if (18..24).contains(&c) { 0.045 } else { 0.30 })
+            })
+            .collect();
+
+        let got = dipfill_spans(&donor, sr, 12.0, &base_here, 300.0);
+        assert_eq!(
+            got.len(),
+            1,
+            "最深一格 base 高 ~13 dB 却没填 —— 闸退回区间平均了(这正是 `ぴゃ` 丢掉改善的那一族)"
+        );
+
+        // ⛔ 阴性对照:把塌到底那一格也抬到和其余格一样 ⇒ 最深格不再有增益 ⇒ 不许填
+        let mut flat = donor.clone();
+        for v in flat.iter_mut().take(21 * hop).skip(20 * hop) {
+            *v *= 20.0; // 0.01 → 0.20,与坑里其余格齐平
+        }
+        let none = dipfill_spans(&flat, sr, 12.0, &base_here, 300.0);
+        assert!(
+            none.is_empty(),
+            "最深格没有增益时不许填(填了 {} 段)—— 闸必须真的在看最深那一格",
+            none.len()
+        );
+    }
+
+    #[test]
+    /// ⛔⛔⛔ S163 v4 —— **`base` 比 `donor` 低的坑一个都不许填**。
+    ///
+    /// 这一刀的语义前提是「donor 这儿没声了,用 base 顶上」。
+    /// v3 没问过这个前提成不成立,结果在两处**救援本来正常工作**的地方
+    /// (成品比 base 高 5~6.4 dB)填了 base,把电平削回 base ⇒ 退化。
+    ///
+    /// 夹具:同一条 donor(带一个深坑),只换 `base` 的电平 ——
+    /// base 响 ⇒ 填;base 轻 ⇒ **一个都不填**。
+    fn dipfill_refuses_to_fill_from_a_base_that_is_quieter_than_the_donor() {
+        let sr = 44100u32;
+        let hop = sr as usize / 100;
+        // donor:40 格 300 Hz 正弦 + 中间 3 格深坑
+        let mut donor: Vec<f32> = (0..40 * hop)
+            .map(|i| 0.30 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / sr as f32).sin())
+            .collect();
+        // ⛔ 坑**不许挖成精确 0** —— 真实的坑只是比窗内中位低 12-40 dB,
+        //    而 `base` 在那里可能仍然更低(akiko 2:07.987:donor 比 base 高 6.4 dB)。
+        //    挖成 0 的话任何 base 都比它响 ⇒ 电平闸恒过 ⇒ 这条判据就是空的。
+        for v in donor.iter_mut().take(21 * hop).skip(18 * hop) {
+            *v *= 0.2; // −14 dB:过 12 dB 的坑门槛,但仍有电平可比
+        }
+        // base:带上方谐波(谐波闸必须能过),电平可调
+        let mk_base = |amp: f32| -> Vec<f32> {
+            (0..donor.len())
+                .map(|i| {
+                    let w = 2.0 * std::f32::consts::PI * 300.0 * i as f32 / sr as f32;
+                    amp * (w.sin() + 0.5 * (2.0 * w).sin() + 0.5 * (3.0 * w).sin()
+                        + 0.33 * (4.0 * w).sin())
+                })
+                .collect()
+        };
+        // ⑴ base 明显比 donor 响 ⇒ 该填
+        let loud = dipfill_spans(&donor, sr, 12.0, &mk_base(0.60), 300.0);
+        assert_eq!(loud.len(), 1, "base 比 donor 响得多时那个坑必须被填上");
+
+        // ⑵ base 明显比 donor 轻 ⇒ **一个都不许填**(填了就是把救援削掉)
+        let quiet = dipfill_spans(&donor, sr, 12.0, &mk_base(0.02), 300.0);
+        assert!(
+            quiet.is_empty(),
+            "base 比 donor 轻的时候填了 {} 段 —— 这正是 v3 削掉救援的那一族",
+            quiet.len()
+        );
+
+        // ⑶ 阴性对照:坑处两边电平相当(在 3 dB 余量之内)⇒ 也不填,不许在边界上抖
+        //    donor 坑处 amp = 0.30 × 0.2 = 0.06;base 取 rms 与它相当的电平。
+        let tie = dipfill_spans(&donor, sr, 12.0, &mk_base(0.055), 300.0);
+        assert!(
+            tie.is_empty(),
+            "坑处两边电平相当时不许填(填了 {} 段)—— 3 dB 余量就是为了不在边界上抖",
+            tie.len()
+        );
+    }
+
+    #[test]
+    /// ⛔⛔⛔ S163 v3 —— **判据的地板只许由窗内材料决定**。
+    ///
+    /// `seg = donor[lo..hi]` 两端各带 `MERGE_BRIDGE_FRAMES`(25 帧 ≈ **500 ms**)窗外材料,
+    /// 而写入只覆盖 `[a, b)`。v2 把整条 `seg` 交给 [`dipfill_spans`] ⇒ `med`(存活中位数)
+    /// 被窗外电平污染。这一条**同一段窗内音频、只换窗外材料**,判定必须一个字不变。
+    ///
+    /// ⚠ 它守的是「判据静默失效」那一族(`width` 栽过一次,dipfill v2 又栽一次)。
+    fn dipfill_floor_is_decided_by_the_written_span_only() {
+        let sr = 44100u32;
+        let hop = sr as usize / 100; // 10 ms
+        let tone = |n: usize, amp: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| amp * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / sr as f32).sin())
+                .collect()
+        };
+        // 窗内:40 格常规电平 + 中间 3 格深坑
+        let mut inside = tone(40 * hop, 0.30);
+        for i in (18 * hop)..(21 * hop) {
+            inside[i] = 0.0;
+        }
+        let verdict = |outside_amp: f32| -> usize {
+            // 两端各 50 格窗外材料 —— 只有电平不同
+            let mut seg = tone(50 * hop, outside_amp);
+            seg.extend_from_slice(&inside);
+            seg.extend(tone(50 * hop, outside_amp));
+            let win = &seg[50 * hop..90 * hop];
+            // ⛔ `base` 必须**真的有上方谐波** —— 谐波收益闸比的就是这个。
+            //    两条都是纯正弦的话闸恒不过,这条判据就只验到「不填」(= 半条空判据)。
+            let base_here: Vec<f32> = (0..win.len())
+                .map(|i| {
+                    let t = i as f32 / sr as f32;
+                    let w = 2.0 * std::f32::consts::PI * 300.0 * t;
+                    0.30 * w.sin()
+                        + 0.15 * (2.0 * w).sin()
+                        + 0.15 * (3.0 * w).sin()
+                        + 0.10 * (4.0 * w).sin()
+                })
+                .collect();
+            dipfill_spans(win, sr, 12.0, &base_here, 300.0).len()
+        };
+        // 窗外很响(+20 dB)/ 很静(−20 dB)/ 与窗内同电平 —— 三种都必须给同一个判定
+        let (loud, quiet, same) = (verdict(3.0), verdict(0.03), verdict(0.30));
+        assert_eq!(
+            (loud, quiet), (same, same),
+            "窗外材料改变了窗内的判定 (响={loud} 静={quiet} 同={same}) —— 地板被污染了"
+        );
+        assert_eq!(same, 1, "窗内那个 30 ms 深坑必须被认出来");
+    }
+
+    #[test]
+    fn dipfill_refuses_to_fill_when_base_has_no_upper_harmonics() {
+        let sr = 44_100u32;
+        let f0 = 300.0f32;
+        let h = sr as usize / 100; // 10 ms
+        let n = 40 * h;
+        let mk = |amp1: f64, amp_up: f64, pit: Option<(usize, usize)>| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f64 / f64::from(sr);
+                    let p = 2.0 * std::f64::consts::PI * f64::from(f0) * t;
+                    let g = match pit {
+                        Some((a, b)) if i >= a && i < b => 0.01,
+                        _ => 1.0,
+                    };
+                    (g * (amp1 * p.sin()
+                        + amp_up * (3.0 * p).sin()
+                        + amp_up * 0.8 * (4.0 * p).sin()
+                        + amp_up * 0.6 * (5.0 * p).sin())) as f32
+                })
+                .collect()
+        };
+        let pit = (20 * h, 23 * h);
+        let donor = mk(0.30, 0.10, Some(pit));      // 坑在 20-23 格
+        let rich = mk(0.30, 0.25, None);            // base：上方谐波更强
+        let dull = mk(0.30, 0.01, None);            // base：几乎只有基频
+
+        let with_rich = dipfill_spans(&donor, sr, 12.0, &rich, f0);
+        assert_eq!(
+            with_rich.len(),
+            1,
+            "base 上方谐波更强时必须填 —— 实测 {with_rich:?}"
+        );
+
+        let with_dull = dipfill_spans(&donor, sr, 12.0, &dull, f0);
+        assert!(
+            with_dull.is_empty(),
+            "⛔ base 只有基频、上方谐波更弱时必须【不填】—— 实测 {with_dull:?}\
+             （这正是「基频连上了 谐波一点没补」那个坑）"
+        );
+        // ⛔ v2 语义：拿不到 `base` ⇒ **保守不填**（没法验证谐波收益就不做）
+        let no_base = dipfill_spans(&donor, sr, 12.0, &[], 0.0);
+        assert!(no_base.is_empty(), "拿不到 base 时必须保守不填");
+
+        // ⛔ 拿不到 f0 ⇒ 同样保守不填
+        let unknown_f0 = dipfill_spans(&donor, sr, 12.0, &dull, 0.0);
+        assert!(unknown_f0.is_empty(), "f0 未知时必须保守不填");
+    }
+
+
     /// ⛔⛔ S163 §34 —— 钉住 [`dipfill_spans`] 的三条行为。
     ///
     /// 夹具照抄实测形状：donor 在窗内的中位是 `−10 dBFS` 级，
@@ -7016,7 +7470,9 @@ mod tests {
         lv[21] = 0.003;
         lv[22] = 0.003;
         let pit = mk(&lv);
-        let got = dipfill_spans(&pit, sr, 20.0);
+        // ⛔ v2：拿不到 base/f0 ⇒ 保守不填 ⇒ 必须把 base 与 f0 给全才会命中
+        let flat_base = vec![0.3f32; pit.len()];
+        let got = dipfill_spans(&pit, sr, 20.0, &flat_base, 300.0);
         assert_eq!(got.len(), 1, "深而窄的坑必须找到一个 —— 实测 {got:?}");
         assert!(
             got[0].0 <= 20 * h && got[0].1 >= 23 * h - h,
@@ -7032,7 +7488,7 @@ mod tests {
             *x = 0.003;
         }
         assert!(
-            dipfill_spans(&mk(&wide), sr, 20.0).is_empty(),
+            dipfill_spans(&mk(&wide), sr, 20.0, &vec![0.3f32; mk(&wide).len()], 300.0).is_empty(),
             "太宽的低段不是坑，不许回填"
         );
 
@@ -7042,13 +7498,13 @@ mod tests {
             *x = 0.075; // ≈ −12 dB
         }
         assert!(
-            dipfill_spans(&mk(&soft), sr, 20.0).is_empty(),
+            dipfill_spans(&mk(&soft), sr, 20.0, &vec![0.3f32; mk(&soft).len()], 300.0).is_empty(),
             "−12 dB 的自然衰减不是坑 —— 实测 {:?}",
-            dipfill_spans(&mk(&soft), sr, 20.0)
+            dipfill_spans(&mk(&soft), sr, 20.0, &vec![0.3f32; mk(&soft).len()], 300.0)
         );
 
         // ⑷ 出厂关（depth = 0）⇒ 永远返回空 ⇒ 逐位不变
-        assert!(dipfill_spans(&pit, sr, 0.0).is_empty(), "depth=0 必须逐位不变");
+        assert!(dipfill_spans(&pit, sr, 0.0, &[], 0.0).is_empty(), "depth=0 必须逐位不变");
     }
 
 
@@ -9535,7 +9991,7 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=20 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=12 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -9552,7 +10008,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s163m";
+        const TAG: &str = "s164a";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
