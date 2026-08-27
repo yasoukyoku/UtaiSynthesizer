@@ -1057,7 +1057,7 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
@@ -1070,6 +1070,9 @@ pub(crate) fn production_defaults_fingerprint() -> String {
         // S161 —— ⚠ 与 `parse_windowed_inverse` 同款:它进指纹但**出厂关 ⇒ 不改音频**,
         //    所以加它**不该**触发版本 bump;进指纹的意义是「下一个人翻它之前必须来这里改一行」。
         parse_valley_human(None),
+        // ⭐ S163 —— 休止门的 fade 随窗长收缩。**出厂开 ⇒ 改音频 ⇒ 必须配版本 bump**
+        //    (与 `valley_human` 那条相反，它出厂关所以不 bump)。
+        parse_rest_gate_shrink(None),
         // ⛔⛔ S161b —— **类深度与槽形也进指纹**。S161 只登记了旋钮,而这一场改的是**常量**
         //    (浊塞音 11.7 → 20 窄槽、闪音 6.8 → 8):旋钮没动、指纹没动、音频却变了 ⇒ 又是零红。
         //    ⇒ 凡是这几个常量被改,这条闸当场红,红的措辞会指到那三处版本字面量。
@@ -2323,6 +2326,27 @@ fn fast_index_weights(arr: &ScoreArrays) -> Vec<f32> {
 
 const REST_GATE_FADE_MS: f32 = 40.0;
 
+/// ⚙ 出厂默认 = true —— `UTAI_REST_GATE_SHRINK=0` 关回固定 40 ms 那一版。
+///
+/// 见 [`apply_rest_gate`] 里那一段：固定 fade 让 **SP 窗 < 2·fade(80 ms)** 的休止
+/// **中心结构上归不了零**，而 `consonant_preroll` 会把 SP 音素本身压短
+/// ⇒ 谱面 140 ms 的休止常常只剩 60-80 ms 的 SP 窗 ⇒ 门关不严。
+/// ⛔ 长窗(n ≥ 2·fade+1)**逐位不变**，判据 `rest_gate_is_bit_identical_on_windows_long_enough_for_the_full_fade`。
+const REST_GATE_SHRINK_DEFAULT: bool = true;
+
+/// See [`REST_GATE_SHRINK_DEFAULT`].
+fn rest_gate_shrink() -> bool {
+    parse_rest_gate_shrink(std::env::var("UTAI_REST_GATE_SHRINK").ok().as_deref())
+}
+
+fn parse_rest_gate_shrink(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => REST_GATE_SHRINK_DEFAULT,
+    }
+}
+
 fn rest_gate_fade_samples(sample_rate: u32) -> usize {
     ((REST_GATE_FADE_MS / 1000.0) * sample_rate as f32).round().max(1.0) as usize
 }
@@ -2351,9 +2375,47 @@ fn chunk_sp_windows(chunk: &Chunk, out_len: usize) -> Vec<(usize, usize)> {
 /// 窗内逐样本乘 keep = max(0, 1 − 距窗缘样本数/fade):窗缘 keep=1(与音符样本连续),
 /// fade 内渐落,深处全零;窗宽 < 2·fade 时为浅谷(不到 0,自然)。
 fn apply_rest_gate(audio: &mut [f32], windows: &[(usize, usize)], fade: usize) {
-    let fade = fade.max(1) as f32;
+    apply_rest_gate_with(audio, windows, fade, rest_gate_shrink())
+}
+
+fn apply_rest_gate_with(audio: &mut [f32], windows: &[(usize, usize)], fade: usize, shrink: bool) {
+    let fade0 = fade.max(1);
     for &(s, e) in windows {
         let e = e.min(audio.len());
+        if e <= s {
+            continue;
+        }
+        // ⭐⭐⭐ S163 —— **fade 按窗长收缩**,否则短休止的中心**结构上归不了零**。
+        //
+        // `keep = 1 − edge/fade` 要到 0 需要 `edge ≥ fade`,而 `edge` 是到最近边缘的距离
+        // ⇒ 窗长必须 ≥ `2·fade`(出厂 `REST_GATE_FADE_MS = 40` ⇒ **80 ms**)。
+        // 而 `chunk_sp_windows` 取的是 **SP 音素自己的 `phone_dur`**,`consonant_preroll`
+        // 把下一个音的辅音提前 ⇒ **SP 音素本身被压短** ⇒ 谱面 140 ms 的休止,SP 窗常常只剩
+        // 60-80 ms ⇒ 门永远关不严,休止中间**漏出模型渲的东西**。
+        //
+        // 实测(鹅妈妈 × yachiyo × +7,`base` 层,休止中段 0.35-0.65 相对相邻音稳态):
+        //
+        // | 谱面休止时长 | 中段最安静点 | 中段 p50 | >−40 dB 的比例 |
+        // |---|---|---|---|
+        // | 0-150 ms | **−48 dB** | **−43.8** | **38%** |
+        // | 150-250 ms | −282 dB | −274.9 | 10% |
+        // | 250-400 ms | −281 dB | −279.3 | 6% |
+        // | 400-1000 ms | −283 dB | −283.4 | 0% |
+        //
+        // ⇒ 长休止能到 **−280 dB(数字静音)**,短休止只到 −48 —— 分界线正是 150 ms 附近。
+        // 用户 2026-08-28:「**很短的休止中间会漏出伪影**」;他报的三个坐标
+        // (1:44.098 / 1:48.431 / 1:57.094)在这把尺子上是 **96% / 91% / 89% 分位**,
+        // 而他自己排除的 1:51.451(「这个不是空拍」)只有 **53%** —— 阴性对照是他给的。
+        //
+        // ⛔ 为什么这样改是安全的:
+        // * **长窗逐位不变** —— `(e−s)/2 ≥ fade` 时 `min` 不起作用;
+        // * **辅音时序一个字节不动** —— SP 窗里没有 preroll 提前进来的辅音,
+        //   那是**下一个音的音素**,不在 `chunk_sp_windows` 里;
+        // * 淡化仍是**线性连续**的(不是阶跃),窗再短也不会自己造出咔哒。
+        // ⛔ `edge` 的最大值是 `(n−1)/2`（`min(i−s, e−1−i)`），不是 `n/2` ——
+        //    收缩到 `n/2` 会差一个样本，中心停在 `keep = 1/fade` 而不是 0（判据抓到过）。
+        let edge_max = ((e - s).saturating_sub(1)) / 2;
+        let fade = if shrink { fade0.min(edge_max.max(1)) } else { fade0 } as f32;
         for i in s..e {
             let edge = (i - s).min(e - 1 - i) as f32;
             let keep = (1.0 - edge / fade).max(0.0);
@@ -2945,11 +3007,26 @@ mod tests {
         assert_eq!(a[500], 0.0); // 窗心全零
         assert_eq!(a[899], 1.0); // 右缘连续
         assert_eq!(a[900], 1.0); // 窗外
-        // 短窗(< 2·fade)= 浅谷,不至 0(自然过渡)
+        // ⛔⛔ S163 —— 这里原本钉的是「短窗(< 2·fade)= **浅谷,不至 0**(自然过渡)」。
+        //    那句「自然过渡」是**推理，从来没有测量支持**，而用户 2026-08-28 的耳朵推翻了它：
+        //    「**很短的休止中间会漏出伪影**」「我们可能一直在这地方差点东西」。
+        //    实测(鹅妈妈×yachiyo×+7，base 层，休止中段相对相邻音稳态)：
+        //      0-150 ms 中段 p50 **−43.8 dB**、**38%** 高于 −40；≥150 ms 能到 **−280 dB**。
+        //    用户报的 1:44.098 / 1:48.431 / 1:57.094 在这把尺子上是 **96% / 91% / 89% 分位**，
+        //    而他自己排除的 1:51.451(「这个不是空拍」)只有 53% —— 阴性对照是他给的。
+        //    ⇒ 「浅谷」不是自然过渡，是**门关不严**。
+        //
+        //    ⚠ 「自然过渡」背后**真实**的担心是「突然归零会造咔哒」——
+        //    那个担心由 `rest_gate_stays_a_continuous_ramp_after_shrinking` 承担(斜坡不是阶跃)，
+        //    而不是靠「不许归零」来回避。长窗本来就归零(上面 a[500] == 0.0)。
+        //    ⚠ 「归零 = 绝对静音」也不是问题：S159z 已结案(PCM_16 量化地板，不可闻)。
         let mut b = vec![1.0f32; 300];
-        apply_rest_gate(&mut b, &[(100, 160)], 100);
-        let mid = b[130];
-        assert!(mid > 0.0 && mid < 1.0, "短窗应为浅谷,得 {mid}");
+        apply_rest_gate_with(&mut b, &[(100, 160)], 100, true);
+        assert_eq!(b[130], 0.0, "短窗的中心也必须真的归零(门要关严)");
+        assert_eq!(b[100], 1.0, "左缘仍与音符连续");
+        assert_eq!(b[159], 1.0, "右缘仍与音符连续");
+        assert_eq!(b[99], 1.0, "窗外不动");
+        assert_eq!(b[160], 1.0, "窗外不动");
     }
 
     #[test]
@@ -3611,6 +3688,82 @@ mod tests {
         let c = voiced.clone();
         assert_eq!(fill_isolated_uv(&mut voiced), 0);
         assert_eq!(voiced, c, "全浊音的轨不许被碰");
+    }
+
+    /// ⛔⛔ **承重**：S163 把 `apply_rest_gate` 的 fade 改成随窗长收缩之后，
+    /// **长窗必须逐位不变** —— 40 ms 那个值是当年为**长休止**定的（用户 2026-08-28：
+    /// 「当时长休止里面露出东西更恶劣，能直接拿大电噪把电平铺满」），
+    /// 这一刀只补**从来没被覆盖过**的短窗，绝不许把当年治好的东西弄回来。
+    #[test]
+    fn rest_gate_is_bit_identical_on_windows_long_enough_for_the_full_fade() {
+        let sr = 44_100u32;
+        let fade = rest_gate_fade_samples(sr); // 40 ms
+        // ⛔ 严格条件是 `edge_max = (n−1)/2 ≥ fade`，即 **n ≥ 2·fade+1**；
+        //    n 恰好 = 2·fade 时旧行为的中心是 `1/fade`（≈5.7e-5）而不是 0，
+        //    收缩会把它压成真 0 —— 那是修好，不是回归，所以这条判据从 2·fade+1 起算。
+        for extra in [1usize, 2, 100] {
+            let n = fade * 2 + extra;
+            let src: Vec<f32> = (0..n + 200)
+                .map(|i| ((i * 7919 % 1000) as f32 / 500.0) - 1.0)
+                .collect();
+            let mut a = src.clone();
+            let mut b = src.clone();
+            apply_rest_gate_with(&mut a, &[(100, 100 + n)], fade, true);
+            apply_rest_gate_with(&mut b, &[(100, 100 + n)], fade, false);
+            assert_eq!(a, b, "窗长 2·fade+{extra}：收缩版与固定版必须逐位相同");
+        }
+    }
+
+    /// ⭐ 短窗（< 2·fade）的**中心必须真的归零** —— 这正是缺陷本身：
+    /// 固定 40 ms 时 `keep = 1 − edge/fade` 恒 > 0，休止中间永远漏着模型渲的东西。
+    /// 实测（鹅妈妈×yachiyo×+7，base 层，休止中段相对相邻音稳态）：
+    /// 0-150 ms 的休止中段 p50 **−43.8 dB**、38% 高于 −40；而 ≥150 ms 的能到 **−280 dB**。
+    #[test]
+    fn rest_gate_closes_fully_even_on_windows_shorter_than_twice_the_fade() {
+        let sr = 44_100u32;
+        let fade = rest_gate_fade_samples(sr);
+        for ms in [10usize, 20, 40, 60, 79] {
+            let n = (ms * sr as usize) / 1000;
+            if n < 4 {
+                continue;
+            }
+            let mut x = vec![1.0f32; n + 200];
+            apply_rest_gate_with(&mut x, &[(100, 100 + n)], fade, true);
+            let mid = 100 + n / 2;
+            assert!(
+                x[mid].abs() < 1e-6,
+                "{ms} ms 窗（{n} 样本）中心没归零：{} —— 门还是关不严",
+                x[mid]
+            );
+            // 阴性对照：窗外一个字节都不许动
+            assert_eq!(x[99], 1.0, "{ms} ms：窗前被动了");
+            assert_eq!(x[100 + n], 1.0, "{ms} ms：窗后被动了");
+        }
+    }
+
+    /// ⛔ 收缩之后**淡化仍然是连续的**（不是阶跃）——
+    /// 窗再短也不许自己造出一个咔哒。判据：相邻样本的增益差有界。
+    #[test]
+    fn rest_gate_stays_a_continuous_ramp_after_shrinking() {
+        let sr = 44_100u32;
+        let fade = rest_gate_fade_samples(sr);
+        for ms in [6usize, 12, 25, 50] {
+            let n = (ms * sr as usize) / 1000;
+            if n < 6 {
+                continue;
+            }
+            let mut x = vec![1.0f32; n + 200];
+            apply_rest_gate_with(&mut x, &[(100, 100 + n)], fade, true);
+            let step = (100..100 + n - 1)
+                .map(|i| (x[i] - x[i + 1]).abs())
+                .fold(0.0f32, f32::max);
+            // 半窗上从 1 走到 0 ⇒ 逐样本步长 ≈ 2/n；给 3× 余量
+            assert!(
+                step <= 6.0 / n as f32,
+                "{ms} ms：逐样本增益跳变 {step} 太大（上界 {}）—— 那是阶跃不是斜坡",
+                6.0 / n as f32
+            );
+        }
     }
 
     #[test]
@@ -4498,6 +4651,7 @@ mod s160q_f0_lerp_tests {
             ("UTAI_MG_VALLEY_ADAPT", "valadapt="),
             ("UTAI_MG_VALLEY_AFTER", "valafter="),
             ("UTAI_VALLEY_HUMAN", "valhuman="),
+            ("UTAI_REST_GATE_SHRINK", "restshrink="),
         ];
         // 只写文件、不改音频的诊断路径(见 `dump_donor_buffer` 的 doc)。
         const EXEMPT: &[&str] = &["UTAI_RANGE_DUMP_DONOR"];
