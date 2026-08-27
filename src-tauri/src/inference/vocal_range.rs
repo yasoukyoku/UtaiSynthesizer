@@ -4434,15 +4434,6 @@ pub fn tied_xfade_ms() -> f64 {
     parse_tied_xfade(std::env::var("UTAI_RANGE_TIED_XFADE").ok().as_deref())
 }
 
-/// ⚙ 出厂默认 = true —— `UTAI_RANGE_SEAM_RAMP=0` 关掉。**短间隙/重叠之后的窗淡入拉长**。
-/// 剂量曲线与靶子见 [`SEAM_RAMP_MS`]。
-pub fn seam_ramp_enabled() -> bool {
-    !matches!(
-        std::env::var("UTAI_RANGE_SEAM_RAMP").ok().as_deref().map(str::trim),
-        Some("0") | Some("off") | Some("false") | Some("no")
-    )
-}
-
 fn parse_tied_xfade(v: Option<&str>) -> f64 {
     v.and_then(|x| x.trim().parse::<f64>().ok())
         .filter(|t| t.is_finite() && (0.0..=400.0).contains(t))
@@ -4451,33 +4442,6 @@ fn parse_tied_xfade(v: Option<&str>) -> f64 {
 
 /// ⚙ 出厂默认。见 [`tied_xfade_ms`]。
 const TIED_XFADE_MS_DEFAULT: f64 = 120.0;
-
-/// ⭐⭐⭐⭐⭐ S163 v16 —— **短间隙/重叠之后的窗，淡入拉到这么宽**(ms)。
-///
-/// # 靶子(workflow `wf_70155c32-c0c`，四臂同 run 零噪声，11 agent / 234 次工具调用)
-/// ```text
-/// 短间隙族:间隙 ≤200 ms **且移调改变** = 97 个 / **1.376% 超 4 dB** / max 21.96 dB
-///           对照(>200 ms 且移调改变)195,809 格只有 **0.005%**  ⇒ **富集 ×275**
-///   ⭐ 排最前的三个正是用户 2026-08-25 报的坐标(agent **完全不知情**):
-///   `3:49.528 +12.21`(用户报 3:49.524)· `3:58.176 +11.54`(3:58.162)· `3:40.860 +7.86`(3:40.829)
-/// 重叠类:339 个窗过渡里 62 个 `gap<0`,负 gap **只有一个取值:恰好 −80 ms**;
-///         这类 ramp p50=0.0 ms、缝热率 **36.0%**(TIGHT 11.7% / MEDIUM 6.6%)
-/// ```
-///
-/// # 剂量曲线(这把刀的全部依据 —— 单调，而且 p 值很硬)
-/// ```text
-/// 缝上超额>4 dB 的比率，按 ramp(|nodip−base| 升到内部电平 50% 所需时间)分箱:
-///   **0-2 ms 34.9%**(n=62) / 2-5 ms 24.5% / 5-15 ms 29.4% / 15-30 ms 19.8% / **≥30 ms 5.9%**
-///   ramp<5 vs ≥30:31.3% vs 6.2%，MWU **p=1.2e-14**
-///   **Spearman(ramp, seam_dB) = −0.471, p=2.2e-20**
-/// ```
-/// ⇒ **donor 进得越慢，缝越不响。** 40 ms 落在「≥30 ms」那一档里，留了余量。
-///
-/// # ⛔ 为什么是拉长淡入，不是别的
-/// 三条硬约束夹着:**不许动 donor 选择**(用户令)、**不许切内容**
-/// (往窗里插别的内容两端必然造缝,S163 栽过三次)、**动窗边界副作用波及 98 秒**(v12 判负)。
-/// 而淡化**本身就是增益** ⇒ 这一刀天然落在唯一安全的那一层。
-const SEAM_RAMP_MS: f64 = 40.0;
 /// 交接最多往后挪这么久(ms)。⛔ 上限的理由:再久就等于让出去的那条 donor 唱下一个音
 /// 的一大截,而它的**落点**(音色)不是为那个音选的。
 /// ⚠ 它远小于 [`MERGE_BRIDGE_FRAMES`](25 帧 = 500 ms)留出来的片段余量 ⇒ 结构上够得着。
@@ -5435,11 +5399,6 @@ pub fn apply_dead_only_windows_with(
         // ⭐⭐⭐⭐ S163 §34 —— donor 静音坑回填（出厂 0 = 关 = 逐位不变）。
         dipfill_depth_db(),
         rest_base_enabled(),
-        if seam_ramp_enabled() {
-            (SEAM_RAMP_MS * f64::from(sample_rate) / 1000.0) as usize
-        } else {
-            0
-        },
     );
 
     if out.is_ok() {
@@ -5482,9 +5441,8 @@ pub fn apply_dead_only_windows_with(
                 notes,
                 tied_xf_samples,
                 0.0,
-                rest_base_enabled(),
-                // control arm: seam ramp OFF, everything else identical
-                0,
+                // control arm: rest gain OFF, everything else identical
+                false,
             ) {
                 Ok(()) => dump("nodip.f32", &buf),
                 Err(e) => tracing::warn!("range: same-run control arm failed: {e}"),
@@ -5687,8 +5645,6 @@ fn splice_kept(
     // ⭐⭐⭐⭐ S163 v8 —— 窗内的**休止**是否保持 `base`(见 [`REST_BASE_FADE_MS`])。
     //    ⛔ 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
     rest_base: bool,
-    // ⭐⭐⭐⭐⭐ S163 v16 —— 短间隙/重叠之后的窗淡入拉长(样本);`0` = 关。见 [`SEAM_RAMP_MS`]。
-    seam_ramp: usize,
 ) -> crate::Result<()> {
     // ⛔ `join_enabled` 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
     let n = base.len();
@@ -5738,42 +5694,6 @@ fn splice_kept(
             }
             join.insert(oi, t);
             xf_at.insert(oi + 1, tied_xf);
-        }
-        // ⭐⭐⭐⭐⭐ S163 v16 —— **短间隙/重叠之后的窗，淡入拉长**(见 [`SEAM_RAMP_MS`])。
-        //    靶子是 workflow 量出来的「短间隙族」(间隙 ≤200 ms 且移调改变 ⇒ 富集 **×275**),
-        //    杠杆是它同时给出的剂量曲线(ramp 0-2 ms → 34.9% 热,≥30 ms → **5.9%**;
-        //    Spearman **−0.471, p=2.2e-20**)。
-        //    ⛔ 与 tied 的拉长取 `max`,不互相覆盖。
-        if seam_ramp > 0 {
-            let mut n_ramp = 0usize;
-            for oi in 1..order.len() {
-                let (l, r) = (&jobs[order[oi - 1]], &jobs[order[oi]]);
-                // 移调没变 ⇒ 两侧是同一条 donor,不是这一族(实测位移差 0 的对照不热)
-                if l.shift == r.shift {
-                    continue;
-                }
-                // 间隙 ≤200 ms(10 帧)**或重叠**(负间隙,实测恰好都是 −80 ms)。
-                // ⛔ `gap == 0`(两窗紧邻)**不在靶子里** —— workflow 的定义是
-                //    「窗与窗之间夹的**一小段未救援 base**」,紧邻时中间根本没有 base。
-                //    ⚠ 这一条同时让 `tied_xfade_ms` 的判据保持隔离
-                //    (它的夹具正是 shift −4 → −9、gap = 0)。
-                let gap = r.start - l.end;
-                if gap == 0 || gap > 10 {
-                    continue;
-                }
-                let e = xf_at.entry(oi).or_insert(xf);
-                if *e < seam_ramp {
-                    *e = seam_ramp;
-                    n_ramp += 1;
-                }
-            }
-            if n_ramp > 0 {
-                tracing::info!(
-                    "range: {} seam(s) after a short gap widened to {:.0} ms of fade-in",
-                    n_ramp,
-                    seam_ramp as f64 * 1000.0 / f64::from(sample_rate)
-                );
-            }
         }
         if !xf_at.is_empty() {
             tracing::info!(
@@ -8251,7 +8171,7 @@ mod tests {
                 kept.push((0, lo, donor[lo..hi].to_vec()));
             }
             let xf = (SR as usize / 100).max(2);
-            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0, true, 0).unwrap();
+            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0, true).unwrap();
             b
         };
 
@@ -8533,9 +8453,9 @@ mod tests {
         let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left), (1, 0, right)];
 
         let mut off = base.clone();
-        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true, 0).unwrap();
+        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true).unwrap();
         let mut on = base.clone();
-        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0, true, 0).unwrap();
+        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0, true).unwrap();
 
         // ⓐ 关着 ⇒ 那个洞必须还在:52800 开窗之后是右 donor 的静音。
         assert!(
@@ -8639,7 +8559,7 @@ mod tests {
             (1, 53_000, right[53_000..(380 * 480)].to_vec()),
         ];
         let mut out = base.clone();
-        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0, true, 0).unwrap();
+        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0, true).unwrap();
         assert_eq!(out[0], -1.0, "窗外仍是 base");
         assert!((out[30_000] - 0.5).abs() < 1e-6, "左窗内仍是左 donor");
     }
@@ -10268,7 +10188,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s164p";
+        const TAG: &str = "s164i";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
