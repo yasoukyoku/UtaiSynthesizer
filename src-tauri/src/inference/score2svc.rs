@@ -1996,8 +1996,8 @@ fn apply_preroll_damp(
         if e <= s {
             continue; // 辅音本来就短于 keep ⇒ 全是真辅音，不碰
         }
-        // 参照：窗之后 50-150 ms 的稳态（= 那个音的元音）
         let ms = |v: f32| ((v / 1000.0) * sample_rate as f32).round().max(1.0) as usize;
+        // 参照：窗之后 50-150 ms 的稳态（= 那个音的元音）
         let rs = (e0 + ms(50.0)).min(audio.len());
         let re = (rs + ms(100.0)).min(audio.len());
         if re <= rs {
@@ -2017,10 +2017,26 @@ fn apply_preroll_damp(
         if rel_db <= f64::from(thresh_db) {
             continue; // 平台本来就安静 ⇒ 逐位不变
         }
-        // ⭐ 压幅受**窗长**约束：淡化要用掉半窗，而斜率有上限
-        //    ⇒ 窗短就少压，**绝不缩短淡化**（缩短淡化 = 造竖条纹，见 `PREROLL_DAMP_MAX_SLOPE_DB_PER_MS`）。
-        let half_ms = (e - s) as f64 / 2.0 / f64::from(sample_rate) * 1000.0;
-        let by_slope = f64::from(PREROLL_DAMP_MAX_SLOPE_DB_PER_MS) * half_ms;
+        // ⭐⭐ **淡入段伸进休止里** —— 那里本来就该静音，压什么都无所谓，
+        //    所以不必占用辅音区的长度。这让压幅从「0.6 × 半窗」放宽到「0.6 × 窗长」。
+        //    ⛔ 但**绝不能碰前一个音的释放**：向左只扩到「仍然很安静」的地方为止
+        //    （阈值取平台电平再低 12 dB；一遇到更响的样本就停）。
+        let quiet = (pe * 10f64.powf(-12.0 / 10.0)).sqrt();
+        let mut s2 = s;
+        let left_cap = ms(60.0);
+        while s2 > 0 && s - s2 < left_cap {
+            let v = f64::from(audio[s2 - 1]).abs();
+            if v > quiet {
+                break;
+            }
+            s2 -= 1;
+        }
+        // 右侧淡出必须在窗内完成（那一头挨着真辅音）；左侧现在有 `s − s2` 的额外空间。
+        let right_ms = (e - s) as f64 / f64::from(sample_rate) * 1000.0;
+        let left_ms = (s - s2) as f64 / f64::from(sample_rate) * 1000.0;
+        // 左侧多出来的空间对半分给上升沿 ⇒ 可用长度 = (左+右)/2；没有左空间时退回旧行为（右/2）。
+        let usable_ms = ((left_ms + right_ms) / 2.0).max(right_ms * 0.5);
+        let by_slope = f64::from(PREROLL_DAMP_MAX_SLOPE_DB_PER_MS) * usable_ms;
         let cut_db = (rel_db - f64::from(thresh_db))
             .min(f64::from(max_cut_db))
             .min(by_slope);
@@ -2031,8 +2047,9 @@ fn apply_preroll_damp(
         // 淡化长度**随压幅走**
         let fade_ms = cut_db / f64::from(PREROLL_DAMP_MAX_SLOPE_DB_PER_MS);
         let f = ((fade_ms / 1000.0) * f64::from(sample_rate)).round().max(1.0) as f64;
-        for i in s..e {
-            let edge = f64::from((i - s).min(e - 1 - i) as u32);
+        for i in s2..e {
+            // 左侧的上升沿从 `s2` 起（可能落在休止里），右侧的下降沿仍在 `e` 收住。
+            let edge = f64::from((i - s2).min(e - 1 - i) as u32);
             let ramp = (edge / f).min(1.0);
             // ⛔⛔ 在 **dB 域**插值，不是幅度域。
             //    幅度域线性（`1 + (gain−1)·ramp`）会让 **dB 斜率不均匀、末端更陡**：
@@ -3360,6 +3377,60 @@ mod tests {
             );
             last = cut;
         }
+    }
+
+    /// ⛔⛔ **承重**：淡入段伸进休止时，**绝不许碰前一个音的释放**。
+    /// 左扩只在「仍然很安静」的样本上进行，一遇到更响的就停。
+    #[test]
+    fn preroll_damp_left_extension_stops_at_the_previous_note_release() {
+        let sr = 44_100usize;
+        let keep = (PREROLL_KEEP_MS / 1000.0 * sr as f32) as usize;
+        let n = 120 * sr / 1000;
+        let pre = 80 * sr / 1000; // 窗之前的一段
+        let mut x = vec![0.0f32; pre + n + sr];
+        // 窗之前：前半是前一个音的释放（很响），后半是静音
+        for v in x[..pre / 2].iter_mut() {
+            *v = 0.4;
+        }
+        for v in x[pre..pre + n].iter_mut() {
+            *v = 0.5; // 平台
+        }
+        for v in x[pre + n + sr / 20..pre + n + sr / 20 + sr / 10].iter_mut() {
+            *v = 1.0; // 稳态参照
+        }
+        let before = x.clone();
+        apply_preroll_damp(&mut x, &[(pre, pre + n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, sr as u32);
+        // ⛔ 前一个音的释放一个字节不许动
+        assert_eq!(&x[..pre / 2], &before[..pre / 2], "左扩碰到了前一个音的释放");
+    }
+
+    /// ⭐ 左边有静音空间时，**压得更多**（淡入段搬到休止里，不占辅音区）。
+    #[test]
+    fn preroll_damp_uses_the_silent_room_on_its_left_to_cut_deeper() {
+        let sr = 44_100usize;
+        let keep = (PREROLL_KEEP_MS / 1000.0 * sr as f32) as usize;
+        // ⛔ 夹具要让**斜率**成为约束：窗短（60 ms ⇒ 有效 20 ms）且平台不太响
+        //    （太响会顶到 `PREROLL_DAMP_MAX_DB` 护栏，两边都是 18 dB ⇒ 判据恒真且零信息）。
+        let n = 60 * sr / 1000;
+        let cut_with = |left_ms: usize| -> f64 {
+            let pre = left_ms * sr / 1000;
+            let mut x = vec![0.0f32; pre + n + sr];
+            for v in x[pre..pre + n].iter_mut() {
+                *v = 0.05;
+            }
+            for v in x[pre + n + sr / 20..pre + n + sr / 20 + sr / 10].iter_mut() {
+                *v = 1.0;
+            }
+            apply_preroll_damp(&mut x, &[(pre, pre + n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, sr as u32);
+            // ⛔ 不能固定测 `pre + (n−keep)/2`：左扩之后压制区变成 `[s2, e]`，
+            //    **中心跟着左移**，那个点会落在下降沿上（实测读出 6.0 而真实压幅是 14）。
+            //    ⇒ 取区间内的**最大压幅**。
+            (pre..pre + n)
+                .map(|i| -20.0 * f64::from(x[i].abs() / 0.05).log10())
+                .fold(0.0f64, f64::max)
+        };
+        let (a, b) = (cut_with(0), cut_with(60));
+        assert!(b > a + 2.0, "左边有 60 ms 静音时该压得更多：{a:.1} → {b:.1} dB");
     }
 
     /// ⛔ flags：只标 **SP 之后的辅音串**，到元音为止；**AP（呼吸）不算休止**。
