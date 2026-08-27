@@ -17,6 +17,7 @@ pub mod formant;
 pub mod harmonicity;
 pub mod mdx;
 pub mod psola;
+pub mod shelf;
 pub mod stft;
 pub mod tempo;
 pub mod vr;
