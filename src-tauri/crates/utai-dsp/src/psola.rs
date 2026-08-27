@@ -1879,7 +1879,13 @@ fn box_average(x: &[f64], half: usize) -> Vec<f64> {
 /// whole mark train shifts phase. S153 rejected a whole-track version of this for exactly that
 /// reason — but that rejection was about comparing the island **interiors**; the **boundary** is
 /// what this is for, and it is the one thing that comparison can answer cleanly.
-fn bridge_unvoiced(f0: &[f32], hop: usize, sample_rate: u32, max_ms: f64) -> Vec<f32> {
+fn bridge_unvoiced(
+    f0: &[f32],
+    hop: usize,
+    sample_rate: u32,
+    max_ms: f64,
+    valley: Option<&[f32]>,
+) -> Vec<f32> {
     // ⛔⛔ **First version filled only the zero runs BETWEEN two voiced runs, bounded by `max_ms`.**
     // Measured on the real material: it changed **nothing** — island count 7→7 and 5→5 at 40/80 ms.
     // The gaps here are longer than 150 ms; the un-shifted attack is not a short consonant wedged
@@ -1924,18 +1930,62 @@ fn bridge_unvoiced(f0: &[f32], hop: usize, sample_rate: u32, max_ms: f64) -> Vec
         let right = if b < n { Some(f0[b]) } else { None };
         // The frame that must stay unvoiced so the two islands never touch.
         let keep = a + len / 2;
+        // S163 §40 —— **膨胀停在能量谷，而不是停在固定的 `ext`**。
+        //
+        // 固定宽度把岛边界撂在清辅音的**任意**位置（往往正是爆破上），而那道边界只有
+        // 0.25-3 ms 宽、两侧差 5-17 个半音 ⇒ 宽带瞬变。实测（鹅妈妈 × yachiyo，同一次 run）：
+        // PSOLA 造的 0-1k 竖线距岛边界 p50 **45 ms** vs 随机对照 158 ms（富集 3.5×），
+        // 其中 **9/12 条该处 f0 = 0**（清音段内）。
+        //
+        // 清辅音的能量剖面是「闭塞期(低) → 爆破(高) → 送气 → 元音(高)」，
+        // 谷就在爆破**之前** ⇒ 边界挪到谷上，音头(爆破+元音)照样在岛内
+        // （S160j 那条耳判拍板的效果不丢），接缝却落在能量最低处。
+        // ⛔ 只**收窄**不放宽：谷只在 `[.., ext]` 之内找 ⇒ 覆盖范围永远 ⊆ 固定 `ext` 的那一版。
+        let cell = hop.max(1);
+        let frame_rms = |k: usize| -> f64 {
+            let Some(x) = valley else { return f64::NAN };
+            let (lo, hi) = (k.saturating_mul(cell), (k + 1).saturating_mul(cell).min(x.len()));
+            if lo >= hi {
+                return f64::NAN;
+            }
+            let s: f64 = x[lo..hi].iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            (s / (hi - lo) as f64).sqrt()
+        };
+        // 右侧（= 后一个音的**音头**方向，治 S154 音头碎片的就是它）：
+        // 在 `[b-ext, b)` 里找能量最低帧，膨胀区取 `(j_r, b)`。
+        let j_r = if valley.is_some() && right.is_some() && b > a {
+            let lo = b.saturating_sub(ext).max(keep + 1).max(a);
+            (lo..b)
+                .filter(|k| frame_rms(*k).is_finite())
+                .min_by(|p, q| frame_rms(*p).total_cmp(&frame_rms(*q)))
+                .unwrap_or_else(|| b.saturating_sub(ext))
+        } else {
+            b.saturating_sub(ext)
+        };
+        // 左侧（= 前一个音的**释放**方向）：对称地在 `[a, a+ext)` 里找谷。
+        let j_l = if valley.is_some() && left.is_some() {
+            let hi = (a + ext).min(keep).min(b);
+            (a..hi)
+                .filter(|k| frame_rms(*k).is_finite())
+                .min_by(|p, q| frame_rms(*p).total_cmp(&frame_rms(*q)))
+                .map_or(a + ext, |k| k + 1)
+        } else {
+            a + ext
+        };
+        // ⛔ 谷可能把两侧推到相接 ⇒ 退回固定宽度，`keep` 那一帧照旧保证不浊。
+        let (j_l, j_r) = if j_l >= j_r { (a + ext, b.saturating_sub(ext)) } else { (j_l, j_r) };
         for (k, slot) in out.iter_mut().enumerate().take(b).skip(a) {
             if k == keep {
                 continue;
             }
             if k < keep {
                 if let Some(v) = left {
-                    if k - a < ext {
+                    if k < j_l {
                         *slot = v;
                     }
                 }
             } else if let Some(v) = right {
-                if b - 1 - k < ext {
+                if k > j_r {
                     *slot = v;
                 }
             }
@@ -2640,7 +2690,8 @@ pub fn psola_shift_win(
 ) -> (Vec<f32>, PsolaDiagnostics) {
     psola_shift_edge(
         x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
-        phase_lock, infrasonic, env_restore_ms, bridge_unvoiced_ms, win_periods, xgrain, lpc_order,
+        phase_lock, infrasonic, env_restore_ms, bridge_unvoiced_ms, false, win_periods, xgrain,
+        lpc_order,
         // ⛔ 最后一个 `false` = `tail_fade`:这个老的公开口**逐位不变**(测试在用)。
         // 生产走的是 `psola_shift_edge`,那边由 `vocal_range::tail_fade()` 决定。
         keep, false, 0.0, 0.0, false,
@@ -2693,6 +2744,9 @@ pub fn psola_shift_edge(
     infrasonic: Infrasonic,
     env_restore_ms: f64,
     bridge_unvoiced_ms: f64,
+    // S163 §40 —— 桥接的膨胀**停在能量谷**而不是停在固定的 `bridge_unvoiced_ms`。
+    // `false` = 逐位同旧。见 [`bridge_unvoiced`] 里那一段。
+    bridge_valley: bool,
     win_periods: f64,
     xgrain: f64,
     lpc_order: usize,
@@ -2762,7 +2816,13 @@ pub fn psola_shift_edge(
     };
     let bridged: Vec<f32>;
     let f0_hz: &[f32] = if bridge_unvoiced_ms > 0.0 {
-        bridged = bridge_unvoiced(f0_hz, f0_hop, sample_rate, bridge_unvoiced_ms);
+        bridged = bridge_unvoiced(
+            f0_hz,
+            f0_hop,
+            sample_rate,
+            bridge_unvoiced_ms,
+            if bridge_valley { Some(x) } else { None },
+        );
         &bridged
     } else {
         f0_hz
@@ -3635,7 +3695,7 @@ mod tests {
         let f0t = flat_f0(x.len(), hop, f0 as f32);
         let run = |st: f64, tilt: f64| {
             psola_shift_edge(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off,
-                             0.0, 0.0, 1.0, 0.0, 0, &[], false, 0.0, tilt, false).0
+                             0.0, 0.0, false, 1.0, 0.0, 0, &[], false, 0.0, tilt, false).0
         };
         // ⑴ tilt = 0 ⇒ 逐位同今天(出厂)
         for st in [2.0f64, 8.0, 14.0] {
@@ -3691,7 +3751,7 @@ mod tests {
         let f0 = flat_f0(x.len(), hop, 220.0);
         let run = |tf: bool| {
             psola_shift_edge(&x, sr, -6.0, 0.0, &f0, hop, false, 0.0, 0.0, Infrasonic::Off,
-                             0.0, 0.0, 1.0, 0.0, 0, &[], false, 0.0, 0.0, tf).0
+                             0.0, 0.0, false, 1.0, 0.0, 0, &[], false, 0.0, 0.0, tf).0
         };
         let a = run(false);
         let b = run(true);
@@ -3735,7 +3795,7 @@ mod tests {
         }
         let run2 = |tf: bool| {
             psola_shift_edge(&y, sr, -6.0, 0.0, &f0b2, hop, false, 0.0, 0.0, Infrasonic::Off,
-                             0.0, 0.0, 1.0, 0.0, 0, &[], false, 0.0, 0.0, tf).0
+                             0.0, 0.0, false, 1.0, 0.0, 0, &[], false, 0.0, 0.0, tf).0
         };
         assert_eq!(
             run2(false),
@@ -4380,7 +4440,8 @@ mod tests {
         let f0t = flat_f0(x.len(), hop, f0 as f32);
         let run = |st: f64, win: f64, fill: bool| {
             psola_shift_edge(
-                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, win, 0.0, 0,
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, false,
+                win, 0.0, 0,
                 // ⛔ 最后一个 `false` = `tail_fade`:这两条判据钉的是别的东西,
                 //    让新刀不许改变它们的读数(它自己有专门的判据)。
                 &[], fill, 0.0, 0.0, false,
@@ -5744,11 +5805,11 @@ mod tests {
         // fusing neighbouring notes into one rescue. Covering a note's own onset is the job;
         // merging notes is not, and no knob setting may turn one into the other.
         for ms in [5.0, 25.0, 60.0, 200.0, 500.0] {
-            let d = bridge_unvoiced(&f0t, hop, sr, ms);
+            let d = bridge_unvoiced(&f0t, hop, sr, ms, None);
             assert_eq!(islands_of(&d), 2, "{ms} ms dilation merged the islands");
         }
         // …and it still has to actually cover something: the frames just outside each run.
-        let d = bridge_unvoiced(&f0t, hop, sr, 25.0);
+        let d = bridge_unvoiced(&f0t, hop, sr, 25.0, None);
         assert!(d[g0] > 0.0, "the frame right after the first run must be covered");
         assert!(d[g1 - 1] > 0.0, "…and the one right before the second run");
         assert!(d[(g0 + g1) / 2] == 0.0, "…while the middle of the gap stays a gap");
@@ -5778,6 +5839,89 @@ mod tests {
     /// two envelopes are identical ⇒ every corrective gain is exactly 1.0. If this ever fails, the
     /// restoration is reaching outside the covered span or the envelope is being computed on
     /// different buffers than it claims.
+
+    /// ⛔ S163 §40 —— `valley = None`（= 出厂关）**逐位同旧**。
+    /// 这是这一刀唯一的免责声明：不开就什么都没变。
+    #[test]
+    fn bridge_valley_off_is_byte_for_byte_the_fixed_width_arm() {
+        let (sr, hop) = (44_100u32, 441usize); // 10 ms
+        // 浊 8 帧 → 缺口 20 帧 → 浊 8 帧
+        let mut f0 = vec![220.0f32; 8];
+        f0.extend(std::iter::repeat(0.0).take(20));
+        f0.extend(std::iter::repeat(196.0).take(8));
+        let n = f0.len() * hop;
+        // 缺口里放一个明显的能量谷（第 22 帧），若 valley 起作用会挪边界
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let fr = i / hop;
+                if (8..28).contains(&fr) && fr != 22 { 0.20 } else if fr == 22 { 0.000_01 } else { 0.5 }
+            })
+            .collect();
+        let off = bridge_unvoiced(&f0, hop, sr, 120.0, None);
+        let off2 = bridge_unvoiced(&f0, hop, sr, 120.0, None);
+        assert_eq!(off, off2, "同样输入两次结果必须相同");
+        let on = bridge_unvoiced(&f0, hop, sr, 120.0, Some(&x));
+        assert_ne!(on, off, "谷摆在那里，开着却什么都没改 —— 这条判据是空的");
+    }
+
+    /// ⛔⛔ S163 §40 —— **只收窄，永不放宽**。
+    /// 谷只在 `[.., ext]` 之内找 ⇒ 开着时被填成浊音的帧必须是关着时的**子集**。
+    /// 这条撑着「S160j 那条耳判拍板的音头覆盖不会被这一刀弄丢」——
+    /// 覆盖只会更小，而更小的那部分是从**能量谷**那一侧退回来的。
+    #[test]
+    fn bridge_valley_only_narrows_never_widens() {
+        let (sr, hop) = (44_100u32, 441usize);
+        for gap in [6usize, 12, 20, 40] {
+            for seed in 0..6u32 {
+                let mut f0 = vec![220.0f32; 6];
+                f0.extend(std::iter::repeat(0.0).take(gap));
+                f0.extend(std::iter::repeat(196.0).take(6));
+                let n = f0.len() * hop;
+                // 伪随机能量剖面，谷的位置随 seed 变
+                let x: Vec<f32> = (0..n)
+                    .map(|i| {
+                        let fr = (i / hop) as u32;
+                        let v = ((fr.wrapping_mul(2_654_435_761).wrapping_add(seed)) >> 8) % 1000;
+                        0.001 + v as f32 / 1000.0
+                    })
+                    .collect();
+                let off = bridge_unvoiced(&f0, hop, sr, 120.0, None);
+                let on = bridge_unvoiced(&f0, hop, sr, 120.0, Some(&x));
+                for (k, (a, b)) in on.iter().zip(off.iter()).enumerate() {
+                    if *a > 0.0 {
+                        assert!(
+                            *b > 0.0,
+                            "gap={gap} seed={seed} 帧 {k}: 开着填了浊音而关着没填 —— 放宽了覆盖"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// ⭐ S163 §40 —— 边界**真的落在能量最低的那一帧上**。
+    /// 若只是「随便挪一下」，这一刀就没有解释力：竖线富集在岛边界（p50 45 ms vs 随机 158），
+    /// 靠的正是把边界挪到**听不见的地方**。
+    #[test]
+    fn bridge_valley_puts_the_island_edge_on_the_quietest_frame() {
+        let (sr, hop) = (44_100u32, 441usize);
+        let quiet = 20usize; // 缺口 [6,26) 内的谷
+        let mut f0 = vec![220.0f32; 6];
+        f0.extend(std::iter::repeat(0.0).take(20));
+        f0.extend(std::iter::repeat(196.0).take(6));
+        let n = f0.len() * hop;
+        let x: Vec<f32> = (0..n)
+            .map(|i| if i / hop == quiet { 0.000_01 } else { 0.30 })
+            .collect();
+        let on = bridge_unvoiced(&f0, hop, sr, 120.0, Some(&x));
+        // 右侧膨胀区是 `(j_r, b)`，j_r 应当就是那一帧 ⇒ 它本身不浊、它右边一帧浊。
+        assert!(!(on[quiet] > 0.0), "谷那一帧被填成了浊音 —— 边界没落在谷上");
+        assert!(on[quiet + 1] > 0.0, "谷右边一帧没被填 —— 右侧膨胀没有停在谷上");
+        // 阴性对照：同样的 f0，没有音频 ⇒ 固定宽度，谷那一帧应当**被填**（ext=12 帧 ≥ 6）
+        let off = bridge_unvoiced(&f0, hop, sr, 120.0, None);
+        assert!(off[quiet] > 0.0, "固定宽度那一版本来就没填到谷 —— 这个夹具证不了东西");
+    }
+
     #[test]
     fn ratio_one_stays_the_identity_with_the_envelope_arm_on() {
         let sr = 44_100;

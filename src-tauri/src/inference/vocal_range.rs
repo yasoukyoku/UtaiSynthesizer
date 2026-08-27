@@ -7289,6 +7289,63 @@ fn parse_bridge_unvoiced_ms(v: Option<&str>) -> f64 {
 /// S154 原文(30 ms 那一版的出处)保留在下面。
 const BRIDGE_UNVOICED_MS_DEFAULT: f64 = 120.0;
 
+/// ⚙ S163 §40 —— `UTAI_PSOLA_BRIDGE_VALLEY=1` 让桥接的膨胀**停在能量谷**，
+/// 而不是停在固定的 [`BRIDGE_UNVOICED_MS_DEFAULT`]。
+///
+/// ## 缺陷（同一次 run 的四层分解，零渲染噪声；鹅妈妈 × yachiyo）
+///
+/// 尺子 = **0-1k 竖线**（逐 2 ms 比前后 12 ms 中位高 >8 dB）:
+/// 原 key **4** 条 / `base` 28 / 成品 **54**；而 0-1.5k 只多 15、0-3k 多 10、
+/// **2-16k −2** ⇒ 缺陷精确落在 0-1k。⭐ 这是一族**全新的**东西 ——
+/// S162 那次三层分解量的是 2-16 kHz 宽带竖线（结论：解码占 65-81%）。
+///
+/// | 层 | 条数 | 增量 |
+/// |---|---|---|
+/// | `base` | 14 | — |
+/// | `donor_pre` | 11 | **解码 −3** |
+/// | `donor_post` | 15 | **PSOLA +4**（同一份缓冲进出 ⇒ 铁的）|
+/// | 成品 | 20 | 拼接 +5 |
+///
+/// PSOLA 造的那 12 条，距 **膨胀后岛边界** p50 **45 ms**，随机对照 p50 158 ms
+/// ⇒ **富集 3.5×**；`<60 ms` 占 **75%**（随机 22%）；**9/12 条该处 f0 = 0**（清音段内）。
+///
+/// ## 机理
+///
+/// 桥接把每段浊音**向外膨胀 120 ms** 去盖住音头（治 S154 那条「音头留一截未移调、
+/// 低 9-14 个半音的碎片」），但宽度是**固定**的 ⇒ 岛的新边界撂在清辅音的任意位置，
+/// 往往正砸在爆破上。而 [`utai_dsp::psola::bridge_unvoiced`] 的 doc 写明那道边界只有
+/// **0.25-3 ms 宽**、两侧差 5-17 个半音 ⇒ 宽带瞬变，在清音里就是 0-1k 的竖线。
+/// ⇒ **桥接没有消除 S154 那道缝，只是把它从元音起点搬进了清辅音内部。**
+///
+/// ## 这一刀做什么
+///
+/// 膨胀**停在能量谷**。清辅音的能量剖面是「闭塞期(低) → 爆破(高) → 送气 → 元音(高)」，
+/// 谷在爆破**之前** ⇒ 音头（爆破+元音）照样落在岛内（S160j 那条用户耳判拍板的效果不丢），
+/// 而接缝落到了能量最低处。
+/// ⛔ **只收窄不放宽**：谷只在 `[.., ext]` 之内找 ⇒ 覆盖范围永远 ⊆ 固定宽度那一版。
+/// ⛔ 别改 `BRIDGE_UNVOICED_MS_DEFAULT` 本身 —— 120 是 S160j 用户耳判拍板的。
+/// ⛔ 别全曲高通：用户 2026-08-27 已否（「硬造低通影响音色不可取」），
+/// 而且上面那张表证明**解码层 −3**（模型侧没造）⇒ 高通会误伤模型唱对的低频。
+///
+/// 用户 2026-08-27 的两条原话（这一刀就是照着它们做的）:
+/// 「我觉得**中+低频部分的那玩意绝对是其中一个症状之一**」
+/// 「就算要硬救也得**先看看到底背后是什么造成的**吧；要不然直接开高通会误伤一些东西」
+const BRIDGE_VALLEY_DEFAULT: bool = false;
+
+/// ⚙ 出厂默认 = false —— `UTAI_PSOLA_BRIDGE_VALLEY=1` 打开。
+/// 机理、四层分解与阴性对照全在 [`BRIDGE_VALLEY_DEFAULT`] 的 doc 上。
+pub fn bridge_valley() -> bool {
+    parse_bridge_valley(std::env::var("UTAI_PSOLA_BRIDGE_VALLEY").ok().as_deref())
+}
+
+fn parse_bridge_valley(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => BRIDGE_VALLEY_DEFAULT,
+    }
+}
+
 /// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b/S82c streaming base): per
 /// window the voiced (> 20 Hz) median, UNquantized — an earlier semitone quantization (meant
 /// to merge windows into coarse runs) lost the user's 8-vs-9 A/B to the smooth track, whose
@@ -7465,6 +7522,8 @@ pub fn apply_inverse_windowed_with(
                 hp,
                 envfix,
                 bridge,
+                // S163 §40 —— 膨胀停在能量谷。见 `BRIDGE_VALLEY_DEFAULT`。
+                bridge_valley(),
                 win,
                 xg,
                 lpc,
@@ -10471,7 +10530,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s164u";
+        const TAG: &str = "s164v";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -10522,6 +10581,7 @@ mod tests {
             ("SEAM_ALIGN_MS_DEFAULT", "pub fn seam_align_ms("),
             ("ENV_RESTORE_MS_DEFAULT", "pub fn env_restore_ms("),
             ("BRIDGE_UNVOICED_MS_DEFAULT", "pub fn bridge_unvoiced_ms("),
+            ("BRIDGE_VALLEY_DEFAULT", "pub fn bridge_valley("),
             ("WINDOWED_INVERSE_DEFAULT", "pub fn windowed_inverse("),
             ("FORMANT_KNEE_DEFAULT", "pub fn formant_knee("),
             ("DEJITTER_DEFAULT", "pub fn dejitter("),
