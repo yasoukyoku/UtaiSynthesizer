@@ -656,6 +656,26 @@ fn dur_bucket(fr: i64) -> usize {
         2
     }
 }
+/// ⚙ 出厂默认 = true —— `UTAI_REST_BUCKET_TARGET=0` 关回「桶按被借音符的长度选」。
+///
+/// 见借用处那段注释：借的是休止就该按休止的长度选桶。实测省出的量：
+/// 休止 140 ms 时 `k` 6→4 帧（120→80 ms）、`w` 4→3 帧（80→60 ms），
+/// 多出来的 20-40 ms 还给 SP ⇒ `rest_gate` 够得着、模型也不再在那段渲辅音。
+/// ⛔ 辅音**位置不变**（仍紧贴音头结束），只是起点后移。
+const REST_BUCKET_TARGET_DEFAULT: bool = true;
+
+fn rest_bucket_target() -> bool {
+    parse_rest_bucket_target(std::env::var("UTAI_REST_BUCKET_TARGET").ok().as_deref())
+}
+
+pub(crate) fn parse_rest_bucket_target(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => REST_BUCKET_TARGET_DEFAULT,
+    }
+}
+
 fn onset_target_frames(p: &str, fr: i64) -> i64 {
     dur_prior(p).map(|(o, _, _)| o[dur_bucket(fr)]).unwrap_or(ONSET_TARGET_FALLBACK)
 }
@@ -1673,7 +1693,36 @@ fn assemble_arrays(
                         // the NUCLEUS starts on the beat (zero-sum: the timeline never moves).
                         // (the fr≤5 target cap is hoisted into `target`, shared with the InNote arm —
                         // same measured justification, same note-length key.)
-                        let want: i64 = ph[..onset_end].iter().map(|&p| target(p)).sum();
+                        // ⭐⭐⭐ S163 —— **借休止时，桶按【休止能给多少】选，不是按被借音符的长度**。
+                        //
+                        // `onset_target_frames(p, fr)` 的 `fr` 是**当前音符**的帧数：下一个音 420 ms
+                        // (21 帧) ⇒ long bucket ⇒ `w` 取 4 帧(80 ms)、`k` 取 6 帧(**120 ms**)。
+                        // 可它借的是那 140 ms 的**休止**，不是那个音符。
+                        // 短桶(≤7 帧)才是训练集里歌手在**短情境**下唱出来的值：`w`=3(60 ms)、`k`=4(80 ms)。
+                        //
+                        // 后果（用户 2026-08-28 报的那一族）：辅音吃掉几乎整个休止 ⇒
+                        // ① `chunk_sp_windows` 只剩 20-60 ms ⇒ `rest_gate` 需要 ≥2·fade(80 ms) 才关得严
+                        //    ⇒ **门关不严**；② 模型在那多出来的几十毫秒里**渲辅音**（本该是静音）。
+                        // 实测(`diag_sp_phone_dur_after_preroll`)：休止 140 ms + 「か」⇒ SP 只剩 **20 ms**、
+                        // k 占 120 ms；+「うぉ」⇒ SP 剩 60 ms、w 占 80 ms；而 +「お」(纯元音) ⇒ SP 完整 140 ms。
+                        //
+                        // ⛔ **辅音的位置不动** —— 它仍然紧贴音头结束，只是起点往后挪；
+                        //    用户 2026-08-28 明确：「辅音时序肯定是渲出来的辅音位置啊。
+                        //    那他妈要明知道 120ms 是错的还他妈非得坚持那 120ms 那我是傻逼吗？」
+                        // ⛔ 只在**紧邻前一个是休止**时生效：从唱音借的场景一个字节不变。
+                        let rest_bucket_fr = match (phon.last(), pdur.last()) {
+                            (Some(&("SP" | "AP")), Some(&d)) if d > 0 => Some(d),
+                            _ => None,
+                        };
+                        let want: i64 = ph[..onset_end]
+                            .iter()
+                            .map(|&p| match rest_bucket_fr {
+                                Some(rf) if rest_bucket_target() => {
+                                    target(p).min(onset_target_frames(p, rf))
+                                }
+                                _ => target(p),
+                            })
+                            .sum();
                         // ★S92d — the borrow walks BACK over the preceding phones instead of inspecting
                         // only the immediately previous one. S92c fed a starved onset from its own nucleus,
                         // which works but delays the vowel — and "the nucleus starts on the beat" is this
@@ -4108,9 +4157,15 @@ mod tests {
         };
         let arr = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), evt], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(arr.phon, vec!["SP", "ɹ", "ə", "f", "aɪ", "n", "d"]);
-        // onset ɹ pre-rolls its long-bucket 7 from the rest; medial vowel ə keeps the small share;
-        // medial f takes its own onset target 7 (was ≤4); codas n/d at 4/3; aɪ gets the remainder.
-        assert_eq!(arr.phone_dur, vec![3, 7, 4, 7, 32, 4, 3]);
+        // ⭐⭐ S163 改：onset ɹ 现在按**休止自己的长度**选桶（休止 10 帧 ⇒ 中桶 4），
+        //    而不是按被借音符的长度（50 帧 ⇒ long bucket 7）。见 `REST_BUCKET_TARGET_DEFAULT`。
+        //    ⇒ `SP 3, ɹ 7` 变成 `SP 6, ɹ 4`：**辅音位置没动**（仍紧贴 ə），
+        //      省下的 3 帧还给休止，`rest_gate` 才够得着（用户 2026-08-28 报的那一族）。
+        //    medial vowel ə 的小份额、medial f 的 onset 目标 7、codas n/d 4/3 全部不变
+        //    —— 它们不是从休止借的，这一刀碰不到。
+        //    ⚠ 这是**英语**夹具，而这条线上我没有英语耳判（记忆：de/fr/es/it 无耳裁）。
+        //      逻辑本身是语言无关的（借的是休止就按休止选桶），但英语侧只有仪器背书。
+        assert_eq!(arr.phone_dur, vec![6, 4, 4, 7, 32, 4, 3]);
         assert_eq!(arr.phone_dur.iter().sum::<i64>(), 60, "frame-conserving");
     }
 

@@ -1057,7 +1057,7 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{},{},{},{},{} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{},{},{},{},{} restbucket={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
@@ -1082,6 +1082,8 @@ pub(crate) fn production_defaults_fingerprint() -> String {
         PREROLL_DAMP_LEFT_SLOPE_DB_PER_MS,
         PREROLL_DAMP_LEFT_BORROW_MS,
         PREROLL_PEAK_WIN_MS,
+        // ⭐ S163 —— 借休止时桶按休止长度选（`score2cv`）。出厂开 ⇒ 改音频 ⇒ 必须 bump。
+        super::score2cv::parse_rest_bucket_target(None),
         // ⛔⛔ S161b —— **类深度与槽形也进指纹**。S161 只登记了旋钮,而这一场改的是**常量**
         //    (浊塞音 11.7 → 20 窄槽、闪音 6.8 → 8):旋钮没动、指纹没动、音频却变了 ⇒ 又是零红。
         //    ⇒ 凡是这几个常量被改,这条闸当场红,红的措辞会指到那三处版本字面量。
@@ -3463,6 +3465,78 @@ mod tests {
         assert!(cut > 6.0, "响段只压了 {cut:.1} dB —— 闸还是在看平均");
     }
 
+    /// ⭐⭐⭐ S163 —— 借休止时桶按**休止**长度选（`REST_BUCKET_TARGET_DEFAULT`）。
+    ///
+    /// ⛔⛔ **承重①：辅音的【位置】不许动。** 用户 2026-08-28 划的红线：
+    /// 「辅音时序肯定是渲出来的辅音位置啊。那他妈要明知道 120ms 是错的还非得坚持那 120ms
+    ///  那我是傻逼吗？」⇒ 允许缩短分配，**不许移动**。
+    /// 判法：总帧数不变（零和）且辅音**紧贴音头结束**（它后面直接就是元音）。
+    ///
+    /// ⭐ 承重②：省下来的帧**真的还给了 SP**（不是被别人吃掉）。
+    #[test]
+    fn rest_bucket_target_shortens_the_onset_and_gives_the_frames_back_to_the_rest() {
+        // (谱, 期望 SP 帧, 期望辅音帧) —— 期望值来自 `diag_sp_phone_dur_after_preroll` 实测
+        let cases: &[(&str, i64, i64)] = &[
+            ("うぉ", 7, 3), // 改前 SP 6 / w 4
+            ("わ", 7, 3),   // 改前 SP 6 / w 4
+            ("か", 5, 5),   // 改前 SP 4 / k 6
+            ("た", 6, 4),   // 改前 SP 5 / t 5
+        ];
+        for &(kana, want_sp, want_cons) in cases {
+            let score = [("あ", 69, 20), ("R", 0, 10), (kana, 71, 20)];
+            let arr = daw_ja(&score);
+            let total: i64 = arr.phone_dur.iter().sum();
+            assert_eq!(total, 50, "{kana}: 总帧数变了 —— 借用不再是零和（时间线被移动了）");
+
+            let sp_i = arr.phon.iter().position(|p| *p == "SP").expect("SP");
+            assert_eq!(arr.phone_dur[sp_i], want_sp, "{kana}: SP 帧数 {:?}", arr.phon);
+            // 辅音串 = SP 之后、第一个元音之前
+            let cons: i64 = arr.phone_dur[sp_i + 1..arr.phon.len() - 1].iter().sum();
+            assert_eq!(cons, want_cons, "{kana}: 辅音帧数 {:?}", arr.phon);
+
+            // ⛔ 位置不变：辅音后面**直接就是**那个音的元音（没有被挪走、也没插进别的）
+            assert!(
+                super::super::score2cv_tables::VOWEL_SET.contains(&arr.phon[arr.phon.len() - 1]),
+                "{kana}: 最后一个音素不是元音 {:?}",
+                arr.phon
+            );
+            // ⛔ 元音的帧数一个字节没动（省下来的没被它吃掉）
+            assert_eq!(arr.phone_dur[arr.phon.len() - 1], 20, "{kana}: 元音帧数被动了");
+        }
+    }
+
+    /// ⛔ 承重③：**纯元音开头不受影响**（没有 onset 要借）——
+    /// 它是这一刀的结构性阴性对照。
+    #[test]
+    fn rest_bucket_target_leaves_vowel_initial_notes_alone() {
+        for kana in ["あ", "お", "を"] {
+            let arr = daw_ja(&[("あ", 69, 20), ("R", 0, 10), (kana, 71, 20)]);
+            let sp_i = arr.phon.iter().position(|p| *p == "SP").expect("SP");
+            assert_eq!(arr.phone_dur[sp_i], 10, "{kana}: 元音开头的音不该动 SP {:?}", arr.phon);
+        }
+    }
+
+    /// ⛔ 承重④：**从唱音借**的场景一个字节不变（这一刀只在紧邻前一个是休止时生效）。
+    #[test]
+    fn rest_bucket_target_does_not_touch_borrows_from_a_sung_note() {
+        // 没有休止：あ → か，onset 从前一个唱音借
+        let arr = daw_ja(&[("あ", 69, 20), ("か", 71, 20)]);
+        let total: i64 = arr.phone_dur.iter().sum();
+        assert_eq!(total, 40, "总帧数变了");
+        // k 应当拿到它**按音符长度**的目标（long bucket = 6），不被休止桶影响
+        let k_i = arr.phon.iter().position(|p| *p == "k").expect("k");
+        assert_eq!(arr.phone_dur[k_i], 6, "从唱音借时 k 的目标被改了 {:?}", arr.phon);
+    }
+
+    /// ⛔ 旋钮本身：`0` 关、`1` 开、其它回默认（出厂 true）。
+    #[test]
+    fn rest_bucket_target_knob_parses() {
+        assert!(super::super::score2cv::parse_rest_bucket_target(None));
+        assert!(super::super::score2cv::parse_rest_bucket_target(Some("1")));
+        assert!(!super::super::score2cv::parse_rest_bucket_target(Some("0")));
+        assert!(super::super::score2cv::parse_rest_bucket_target(Some("x")));
+    }
+
     /// ⛔ flags：只标 **SP 之后的辅音串**，到元音为止；**AP（呼吸）不算休止**。
     /// ⛔ 判「辅音」用的是不在 VOWEL_SET 里，**不是**「清辅音」——
     /// 用户报的坐标全是「うぉ」= `w`+`o`，`w` 是浊近音，按清浊分类会整条链漏掉（S163 §45.3）。
@@ -5171,7 +5245,10 @@ mod s160q_f0_lerp_tests {
         // 只写文件、不改音频的诊断路径(见 `dump_donor_buffer` 的 doc)。
         const EXEMPT: &[&str] = &["UTAI_RANGE_DUMP_DONOR"];
         // 指纹里**不由 env 驱动**的格:纯常量默认,没有对应的环境变量。
-        const CONST_ONLY: &[&str] = &["filluv=", "valdb=", "valenv="];
+        // ⚠ `restbucket=` 由 `UTAI_REST_BUCKET_TARGET` 驱动，但那个 env 读在 **score2cv.rs**，
+        //    而这条判据只扫本文件 ⇒ 它扫不到，只能登记在这里。
+        //    ⛔ 它**不是**纯常量：改它会改音频，所以照样要配版本 bump（已配 s165e → s165f）。
+        const CONST_ONLY: &[&str] = &["filluv=", "valdb=", "valenv=", "restbucket="];
 
         let src = include_str!("score2svc.rs");
         let mut found: Vec<&str> = Vec::new();
