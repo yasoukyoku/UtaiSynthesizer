@@ -4058,7 +4058,20 @@ fn parse_usag_dim(v: Option<&str>) -> f32 {
 /// ⚙ 出厂默认。见 [`landing_usag_dim_cap`]。
 const USAG_DIM_CAP_DEFAULT: f32 = 3.0;
 
-/// ⚙ 出厂默认 = 12.0（**开**）。`UTAI_RANGE_DIPFILL=0` 关掉 ——
+/// ⚙ 出厂默认 = 0.0（**关**）。`UTAI_RANGE_DIPFILL=<dB>` 打开 ——
+///
+/// # ⛔⛔⛔ S163 v8 撤回出厂（用户 2026-08-27 听出新咔哒）
+/// 两条独立的硬伤:
+/// ⑴ **79% 的填充落在【休止】上**(yachiyo 402 段里 318 段;akiko 54 段里 24 段)
+///    —— 谱面上那些格是 `R`,`donor` 在那里静音**是对的**,往里填 `base`
+///    = **在空拍里塞声音**。这一刀在 v7 之前从头到尾**没看过谱面**。
+///    我甚至把其中两处(`ぴゃ` / `3:40.829`)报成过「改善 +9.8 / +6.1」。
+/// ⑵ 填充边界留下**台阶**:坑外 donor − 填进去的 base,四模型 552 段
+///    p50 3.0 / p90 **18.3** / max **109** dB,而 `DIPFILL_FADE_MS = 10` 压不住。
+///    ⛔ 单加台阶门槛分不开:听着改善那几处(16.1)与咔哒那几处(17.6)读数重叠。
+///
+/// ⇒ 证据不足 + 造伪影 ⇒ 撤回出厂。判据与机理全部保留在这里,
+///   要再用它,先补上**休止闸**(坑必须整段落在 `sung` 音符内)与**电平匹配**。
 /// **donor 静音坑回填**:donor 相对它自己在该窗内的中位低过这么多 dB 时,把 `base` 混回来。
 ///
 /// # 靶子(四模型共 194 个,用户 2026-08-27 点名 akiko 2:05.252 是其中之一)
@@ -4100,11 +4113,82 @@ fn parse_dipfill(v: Option<&str>) -> f32 {
 }
 
 /// ⚙ 出厂默认。见 [`dipfill_depth_db`]。
-const DIPFILL_DEPTH_DEFAULT: f32 = 12.0;
+const DIPFILL_DEPTH_DEFAULT: f32 = 0.0;
 
 /// ⭐ S163 —— 回填段的最大宽度(ms)。比这更宽的不是「坑」,是「整段没救到」,
 /// 那种情况填 `base` 等于把整段救援退掉 ⇒ 不碰。
 const DIPFILL_MAX_MS: f32 = 80.0;
+
+/// ⭐⭐⭐⭐ S163 v8 —— **窗内休止段回到 `base`** 时两端的过渡宽度(ms)。
+///
+/// # 缺陷(用户 2026-08-27:「那几个位置应该是短暂空拍,不应该有东西」)
+/// 救援窗把「两个唱不上去的音之间的休止」整段包进来,于是**休止里写的是 donor**。
+/// 而 `join_rests` 出厂是**关**的(`JOIN_RESTS_DEFAULT = false`)
+/// ⇒ 在 v8 之前,休止**根本没有被任何一层处理过**。
+///
+/// 实测(同一次 run,零噪声,谱面对照):
+/// ```text
+/// yachiyo(鹅妈妈) 窗**覆盖**的休止 51 格:成品−base p90 **+8.4** / max **+21.6** dB
+///                                        >3 dB 的 **14/51 (27%)**
+///                 窗**未覆盖**的休止 140 格(阴性对照):p90 +2.7,>3 dB 的 13/140 (**9%**)
+/// 用户点名:1:23.081 base −36.8 → 成品 −28.4(**+8.4**,窗覆盖)
+///           3:40.829 base −30.5 → 成品 −24.9(**+5.7**,窗覆盖)
+/// ```
+/// ⇒ 被抬高的比例是未覆盖的 **3 倍** ⇒ 归因锁死在「窗覆盖」这一件事上。
+///
+/// ⚠ 过渡不许硬切:休止两侧是被救援的唱音,硬切会在空拍边缘造新的咔哒。
+const REST_BASE_FADE_MS: f32 = 10.0;
+
+/// ⭐⭐⭐⭐ S163 v10 —— 休止段**增益渐变**的头部宽度(ms)。
+///
+/// # v8/v9 判负：内容切换 = 缝
+/// 往窗里插一段 `base`,两端**必然**造缝。实测(同一次 run,零噪声):
+/// ```text
+/// yachiyo 3:55.266 音头跳变:v8(不动) 16.3 dB → v9 **25.8 dB**(放大 9.5)
+///         3:46.605          19.3 → 25.6
+/// ```
+/// v8 留 80 ms tail guard ⇒ 短休止(120 ms)全被吃掉、**什么都没做**;
+/// v9 tail guard 归零 ⇒ 缝正好挪到**音头**上 ⇒ 用户听到竖线。
+/// **两版同一个根。**
+///
+/// # v10 改成只压电平
+/// 休止段仍然是 **donor**(音色、辅音、时序一个字节不动),只把增益压到 `base` 的电平。
+/// 没有内容跳变 ⇒ 没有缝。
+const REST_GAIN_FADE_MS: f32 = 20.0;
+
+/// ⭐ S163 v10 —— 休止增益的下限(dB)。`base` 在空拍里也不是绝对静音,
+/// 压过头会把休止压成数字静音,反而在两侧留下新的落差。
+const REST_GAIN_MIN_DB: f32 = -18.0;
+
+/// S163 v8 -- rest head guard (ms): the previous note's natural release lives here.
+/// The previous note IS rescued, so its tail must stay donor.
+const REST_HEAD_GUARD_MS: f32 = 40.0;
+
+/// S163 v8 -- rest tail guard (ms): `consonant_preroll` moves the NEXT note's
+/// voiceless consonant earlier, so it lands inside this rest.
+/// Japanese voiceless consonants run 50-80 ms; 80 ms keeps the whole preroll on donor.
+/// ⛔ 铁律:辅音时序一个字节不许动。这条 guard 就是为它留的。
+/// ⭐ S163 v10 —— 休止**尾部**增益从 `g` 回到 1 的宽度(ms)。
+/// `consonant_preroll` 把下一个音的清辅音提前进这段休止 ⇒ 尾部必须已经回到原电平,
+/// 否则辅音被压弱。⛔ 铁律:辅音时序一个字节不许动 —— v10 连内容都不动,只动增益。
+const REST_TAIL_GUARD_MS: f32 = 40.0;
+
+// ⛔ S163 v9 —— tail guard 从 80 降到 0。理由(实测):
+//    用户点名的那几格休止是 **120 ms**(yachiyo 82.980..83.100 / 220.820..220.940),
+//    而 head 40 + tail 80 = 正好 120 ⇒ 中段为零 ⇒ **这一刀在它们身上什么都没做**
+//    (闸开/闸关读数逐位相同:+10.5 → +10.5、+5.9 → +5.9)。
+//    而「辅音时序一个字节不许动」管的是**不许改 preroll 参数**;
+//    `base` 与 `donor` 用的是**同一份谱面、同一套时序**,在辅音区改用 `base`
+//    不改变任何时序,只是把那一段的**内容**从移调臂换回原生臂。
+
+/// ⚙ 出厂默认 = true —— `UTAI_RANGE_REST_BASE=0` 关掉。窗内的**休止**保持 `base`,
+/// 救援不碰空拍。机理与读数见 [`REST_BASE_FADE_MS`]。
+pub fn rest_base_enabled() -> bool {
+    !matches!(
+        std::env::var("UTAI_RANGE_REST_BASE").ok().as_deref().map(str::trim),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
 
 /// ⭐⭐⭐⭐ S163 v2 —— **谐波收益闸**:`base` 在坑段的上方谐波强度
 /// (`upper_harmonic_level_db`,2-8×f0)必须比 donor 高过这么多 dB,否则**不填**。
@@ -5314,6 +5398,7 @@ pub fn apply_dead_only_windows_with(
         tied_xf_samples,
         // ⭐⭐⭐⭐ S163 §34 —— donor 静音坑回填（出厂 0 = 关 = 逐位不变）。
         dipfill_depth_db(),
+        rest_base_enabled(),
     );
 
     if out.is_ok() {
@@ -5356,6 +5441,8 @@ pub fn apply_dead_only_windows_with(
                 notes,
                 tied_xf_samples,
                 0.0,
+                // control arm: rest gain OFF, everything else identical
+                false,
             ) {
                 Ok(()) => dump("nodip.f32", &buf),
                 Err(e) => tracing::warn!("range: same-run control arm failed: {e}"),
@@ -5555,6 +5642,9 @@ fn splice_kept(
     // ⭐⭐⭐⭐ S163 §34 —— donor 静音坑回填的门限(dB);`0` = 关 = 逐位不变。
     //    见 [`dipfill_depth_db`]。
     dipfill_db: f32,
+    // ⭐⭐⭐⭐ S163 v8 —— 窗内的**休止**是否保持 `base`(见 [`REST_BASE_FADE_MS`])。
+    //    ⛔ 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
+    rest_base: bool,
 ) -> crate::Result<()> {
     // ⛔ `join_enabled` 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
     let n = base.len();
@@ -5821,6 +5911,64 @@ fn splice_kept(
                 }
                 keep
             };
+            // ⭐⭐⭐⭐ S163 v8 —— **救援不许碰空拍**(见 [`REST_BASE_FADE_MS`])。
+            //    先把这条窗里的休止段找出来(少数几段),逐样本只查这几段。
+            let rest_spans: Vec<(usize, usize)> = if rest_base {
+                notes
+                    .iter()
+                    .filter(|nd| !nd.sung)
+                    .filter_map(|nd| {
+                        let x = ((nd.start.max(0) as f64) * spf) as usize;
+                        let y = (((nd.start + nd.frames).max(0) as f64) * spf) as usize;
+                        // ⭐ v10:整格都参与,头尾各留一段做**增益渐变**(不是裁掉)。
+                        let hg = (f64::from(sample_rate) * f64::from(REST_HEAD_GUARD_MS) / 1000.0) as usize;
+                        let x = x.saturating_add(hg).max(a);
+                        let y = y.min(b);
+                        (y > x).then_some((x, y))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // ⭐⭐⭐⭐ S163 v10 —— 每段休止一个**增益**(压到 `base` 的电平),不换内容。
+            //    ⛔ 只在这里算一次,不许放进逐样本循环。
+            let hf = ((f64::from(sample_rate) * f64::from(REST_GAIN_FADE_MS) / 1000.0) as usize).max(1);
+            let tf = ((f64::from(sample_rate) * f64::from(REST_TAIL_GUARD_MS) / 1000.0) as usize).max(1);
+            let rest_g: Vec<f32> = rest_spans
+                .iter()
+                .map(|&(x, y)| {
+                    let e = |v: &[f32]| -> f64 {
+                        if v.is_empty() {
+                            return 0.0;
+                        }
+                        v.iter().map(|&z| f64::from(z) * f64::from(z)).sum::<f64>() / v.len() as f64
+                    };
+                    // donor 在这段休止上(`seg` 坐标,带对齐偏移 `d`)
+                    let sx = (x as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize) as usize;
+                    let sy = (y as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize) as usize;
+                    let dn = if sy > sx { e(&seg[sx..sy]) } else { 0.0 };
+                    let bs = e(&base[x.min(base.len())..y.min(base.len())]);
+                    if dn <= 0.0 || bs <= 0.0 {
+                        return 1.0;
+                    }
+                    // ⛔ 只压不抬:抬会把 donor 的伪影一起放大。
+                    let g_db = (10.0 * (bs / dn).log10()) as f32 * 0.5;
+                    10f32.powf(g_db.clamp(REST_GAIN_MIN_DB, 0.0) / 20.0)
+                })
+                .collect();
+            // 头 `hf` 从 1 渐变到 g;尾 `tf` 从 g 回到 1(辅音 preroll 落在尾部,必须原电平)。
+            let rest_w = |k: usize| -> f32 {
+                let mut out = 1.0f32;
+                for (&(x, y), &g) in rest_spans.iter().zip(&rest_g) {
+                    if k >= x && k < y {
+                        let head = ((k - x) as f32 / hf as f32).min(1.0);
+                        let tail = ((y - 1 - k) as f32 / tf as f32).min(1.0);
+                        let t = head.min(tail);
+                        out = out.min(1.0 + (g - 1.0) * t);
+                    }
+                }
+                out
+            };
             for k in a..b {
                 let w = if fade_in && k < a + xfw {
                     0.5 - 0.5 * (std::f32::consts::PI * (k - a) as f32 / xfw as f32).cos()
@@ -5832,7 +5980,9 @@ fn splice_kept(
                 // S159zm —— 带上对齐偏移 `d`;越界时退回 0(不挪),而不是 panic。
                 let si = (k as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize - 1);
                 let w = w * dip_keep(si as usize);
-                base[k] = base[k] * (1.0 - w) + seg[si as usize] * w;
+                // ⭐ v10 —— 休止段:donor **压电平**,不换内容 ⇒ 没有内容跳变 ⇒ 没有缝。
+                let rg = rest_w(k);
+                base[k] = base[k] * (1.0 - w) + seg[si as usize] * w * rg;
             }
         }
     Ok(())
@@ -6035,8 +6185,23 @@ const JOIN_QUIET_DBFS: f32 = -50.0;
 /// 「电平台阶」与「最安静切换点」两把,它们都会把这个洞**加深**。
 const JOIN_MIN_GAIN_DB: f32 = 6.0;
 
-/// ⚙ 出厂默认 = false —— 关
+/// ⚙ 出厂默认 = false —— 关(S163 v11 翻过又判负,见下)
 /// `UTAI_RANGE_JOIN=1` 打开「异位移短休止按音频接上」。**默认关 ⇒ 生产逐位不变。**
+///
+/// # ⛔ S163 v11 判负(同一次 run,零噪声,只差 join 一个变量)
+/// 用户点名的六个坐标 **Δ 全部 = +0.0 dB**;三处音头 ±60 ms 内**逐位差异 0 样本**
+/// ⇒ 它在这些地方**一个样本都没动**。那些休止只有 **120-140 ms**,
+/// 不满足这个函数自己的前置条件。⛔ 别再重试,除非先改前置条件。
+///
+/// # S163 v11 为什么翻它
+/// 用户 2026-08-27 点名的空拍伪影,归因锁死在**窗边界**上:
+/// ```text
+/// yachiyo 1:23.081  休止 120 ms 被两条窗切开:shift −5(前 40 ms) / −17(后 60 ms) ← 差 12 半音
+///         3:40.829  shift −5 / −10
+///         1:58.380  shift −10 / −13
+/// ```
+/// 空拍里坐着**两条位移差 5-12 半音的 donor 的交接** —— 正是这个函数写来解决的那件事。
+/// ⚠ S152 判负它时,靶子(46.041 s)是个非事件;这一次的靶子是**用户亲耳点名的坐标**。
 /// ⛔ 翻它必须成对 bump `RANGE_ALGO_VERSION` 与 `audition_cache_tag`,而且要盲测过
 /// (S146 protocol;⚠ 改窗集合会让每条 donor 的 chunk 选择变、整条换一个相位实现,
 /// 所以那次 A/B **必须带同臂两跑的地板**)。
@@ -6052,6 +6217,21 @@ fn parse_join_rests(v: Option<&str>) -> bool {
 }
 
 const JOIN_RESTS_DEFAULT: bool = false;
+
+// ⭐⭐⭐⭐ S163 v11 —— 出厂从 false 翻到 true。
+//
+// # 为什么现在翻(S152 判负它时的靶子是个非事件,现在的靶子是用户亲耳点名的)
+// 用户 2026-08-27 点名的空拍伪影,归因已经锁死到**窗边界**上:
+// ```text
+// yachiyo 1:23.081  休止 120 ms 被两条窗切开:shift −5(前 40 ms) / −17(后 60 ms) ← 差 12 半音
+//         3:40.829  shift −5 / −10
+//         1:58.380  shift −10 / −13
+// ```
+// 空拍里坐着**两条位移差 5-12 半音的 donor 的交接**,而 `join_rests` 正是为
+// 「两个位移不同、中间只隔休止的窗」写的:把切换点放到休止里**两侧电平最接近**的那一点,
+// 而不是让两条窗各写一半。
+//
+// ⚠ 它与休止增益(v10)不冲突:join 管**切换点**,增益管**电平**。
 
 /// κ — how much of the inverse's pitch move the FORMANTS follow:
 ///   κ=0  formants stay where the model put them — the source timbre. Under TD-PSOLA this is
@@ -7991,7 +8171,7 @@ mod tests {
                 kept.push((0, lo, donor[lo..hi].to_vec()));
             }
             let xf = (SR as usize / 100).max(2);
-            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0).unwrap();
+            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0, true).unwrap();
             b
         };
 
@@ -8273,9 +8453,9 @@ mod tests {
         let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left), (1, 0, right)];
 
         let mut off = base.clone();
-        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0).unwrap();
+        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true).unwrap();
         let mut on = base.clone();
-        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0).unwrap();
+        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0, true).unwrap();
 
         // ⓐ 关着 ⇒ 那个洞必须还在:52800 开窗之后是右 donor 的静音。
         assert!(
@@ -8379,7 +8559,7 @@ mod tests {
             (1, 53_000, right[53_000..(380 * 480)].to_vec()),
         ];
         let mut out = base.clone();
-        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0).unwrap();
+        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0, true).unwrap();
         assert_eq!(out[0], -1.0, "窗外仍是 base");
         assert!((out[30_000] - 0.5).abs() < 1e-6, "左窗内仍是左 donor");
     }
@@ -9991,7 +10171,7 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=12 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -10008,7 +10188,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s164a";
+        const TAG: &str = "s164i";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
