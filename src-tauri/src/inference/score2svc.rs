@@ -2414,8 +2414,12 @@ fn apply_rest_gate_with(audio: &mut [f32], windows: &[(usize, usize)], fade: usi
         // * 淡化仍是**线性连续**的(不是阶跃),窗再短也不会自己造出咔哒。
         // ⛔ `edge` 的最大值是 `(n−1)/2`（`min(i−s, e−1−i)`），不是 `n/2` ——
         //    收缩到 `n/2` 会差一个样本，中心停在 `keep = 1/fade` 而不是 0（判据抓到过）。
+        // ⛔ `edge` 的最大值是 `(n−1)/2`（`min(i−s, e−1−i)`），不是 `n/2`。
+        // ⛔⛔ 而且**收缩到 `edge_max` 只会让【中心一两个样本】到 0，不是一段平底** ——
+        //    那样连「≥2 ms 的零区」都测不出来（S163 实测：两臂零区间逐段完全相同）。
+        //    ⇒ 收缩到 `edge_max/2`，让中间**一半窗长**是真正的零。
         let edge_max = ((e - s).saturating_sub(1)) / 2;
-        let fade = if shrink { fade0.min(edge_max.max(1)) } else { fade0 } as f32;
+        let fade = if shrink { fade0.min((edge_max / 2).max(1)) } else { fade0 } as f32;
         for i in s..e {
             let edge = (i - s).min(e - 1 - i) as f32;
             let keep = (1.0 - edge / fade).max(0.0);
@@ -2994,6 +2998,37 @@ mod tests {
     /// DAW build over a JA triple fixture (rests uncapped + borrow-time).
     fn daw_ja(score: &[(&str, i64, i64)]) -> ScoreArrays {
         build_arrays_daw(&ja_evts(score), &NoDicts, ArticulationTiming::Auto).unwrap()
+    }
+
+    /// 诊断（S163）：短休止的 SP 音素在 `build_arrays_daw` 之后还剩多少帧。
+    /// 用户报「很短的休止中间会漏出伪影」，而实测 0-150 ms 的休止 **80/102 完全没有零区**
+    /// ⇒ 怀疑 `consonant_preroll` 把短休止的 SP 时长吃光了 ⇒ `chunk_sp_windows` 收不到窗。
+    #[test]
+    #[ignore = "诊断用，打印 SP 时长分配"]
+    fn diag_sp_phone_dur_after_preroll() {
+        // 音 / 休止(R) / 以清辅音开头的音 —— 正是 preroll 会伸手的形状
+        for rest_frames in [3i64, 5, 7, 10, 12, 20] {
+            for nxt in ["か", "た", "さ", "あ", "うぉ", "わ", "を", "お"] {
+                let score = [("あ", 69, 20), ("R", 0, rest_frames), (nxt, 71, 20)];
+                let arr = daw_ja(&score);
+                let sp: Vec<(usize, &str, i64)> = arr
+                    .phon
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (i, *p, arr.phone_dur[i]))
+                    .collect();
+                let sp_total: i64 = sp.iter().filter(|(_, p, _)| *p == "SP").map(|(_, _, d)| *d).sum();
+                println!(
+                    "休止 {:>2} 帧({:>3} ms) 下一个音 {} ⇒ SP 剩 **{} 帧({} ms)**   全部: {:?}",
+                    rest_frames,
+                    rest_frames * 20,
+                    nxt,
+                    sp_total,
+                    sp_total * 20,
+                    sp
+                );
+            }
+        }
     }
 
     #[test]
@@ -3698,11 +3733,10 @@ mod tests {
     fn rest_gate_is_bit_identical_on_windows_long_enough_for_the_full_fade() {
         let sr = 44_100u32;
         let fade = rest_gate_fade_samples(sr); // 40 ms
-        // ⛔ 严格条件是 `edge_max = (n−1)/2 ≥ fade`，即 **n ≥ 2·fade+1**；
-        //    n 恰好 = 2·fade 时旧行为的中心是 `1/fade`（≈5.7e-5）而不是 0，
-        //    收缩会把它压成真 0 —— 那是修好，不是回归，所以这条判据从 2·fade+1 起算。
+        // ⛔ 收缩到 `edge_max/2` 之后，`min` 不起作用的严格条件是 `((n−1)/2)/2 ≥ fade`，
+        //    即 **n ≥ 4·fade+1**（比 2·fade+1 严，因为要留出中间一半窗长的平底）。
         for extra in [1usize, 2, 100] {
-            let n = fade * 2 + extra;
+            let n = fade * 4 + extra;
             let src: Vec<f32> = (0..n + 200)
                 .map(|i| ((i * 7919 % 1000) as f32 / 500.0) - 1.0)
                 .collect();
@@ -3710,7 +3744,7 @@ mod tests {
             let mut b = src.clone();
             apply_rest_gate_with(&mut a, &[(100, 100 + n)], fade, true);
             apply_rest_gate_with(&mut b, &[(100, 100 + n)], fade, false);
-            assert_eq!(a, b, "窗长 2·fade+{extra}：收缩版与固定版必须逐位相同");
+            assert_eq!(a, b, "窗长 4·fade+{extra}：收缩版与固定版必须逐位相同");
         }
     }
 
@@ -3741,6 +3775,25 @@ mod tests {
         }
     }
 
+    /// ⛔⛔ 短窗归零必须是**一段平底**，不是一两个样本 ——
+    /// 第一版收缩到 `edge_max`，中心只有一两个样本真的到 0，
+    /// 实机上两臂的零区间**逐段完全相同**（105 段 / 37.96 s），等于什么都没做。
+    #[test]
+    fn rest_gate_short_window_gets_a_real_flat_bottom_not_a_single_zero_sample() {
+        let sr = 44_100u32;
+        let fade = rest_gate_fade_samples(sr);
+        for ms in [10usize, 20, 40, 60] {
+            let n = (ms * sr as usize) / 1000;
+            let mut x = vec![1.0f32; n + 200];
+            apply_rest_gate_with(&mut x, &[(100, 100 + n)], fade, true);
+            let zeros = (100..100 + n).filter(|&i| x[i] == 0.0).count();
+            assert!(
+                zeros as f32 >= n as f32 * 0.25,
+                "{ms} ms 窗：只有 {zeros}/{n} 个样本归零 —— 那是一个点不是平底"
+            );
+        }
+    }
+
     /// ⛔ 收缩之后**淡化仍然是连续的**（不是阶跃）——
     /// 窗再短也不许自己造出一个咔哒。判据：相邻样本的增益差有界。
     #[test]
@@ -3759,9 +3812,9 @@ mod tests {
                 .fold(0.0f32, f32::max);
             // 半窗上从 1 走到 0 ⇒ 逐样本步长 ≈ 2/n；给 3× 余量
             assert!(
-                step <= 6.0 / n as f32,
+                step <= 12.0 / n as f32,
                 "{ms} ms：逐样本增益跳变 {step} 太大（上界 {}）—— 那是阶跃不是斜坡",
-                6.0 / n as f32
+                12.0 / n as f32
             );
         }
     }
