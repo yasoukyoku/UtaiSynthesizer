@@ -3023,7 +3023,7 @@ fn dead_group_windows_raw(
             let pre = if gap_prev > 0 && gap_prev <= SHORT_REST_NO_EXTEND_FRAMES {
                 0
             } else if gap_prev > 0 {
-                4.min(gap_prev / 2)
+                REST_PRE_FRAMES.min(gap_prev / 2)
             } else if g.start > 0 && !unreachable_here(g.start - 1, g.shift) {
                 GUARD_FRAMES.min((cum[g.start] - cum[g.start - 1]) / 2)
             } else {
@@ -3032,7 +3032,7 @@ fn dead_group_windows_raw(
             let post = if gap_next > 0 && gap_next <= SHORT_REST_NO_EXTEND_FRAMES {
                 0
             } else if gap_next > 0 {
-                2.min(gap_next / 2)
+                REST_POST_FRAMES.min(gap_next / 2)
             } else if g.end + 1 < note_nums.len() && !unreachable_here(g.end + 1, g.shift) {
                 GUARD_FRAMES.min((cum[g.end + 2] - cum[g.end + 1]) / 2)
             } else {
@@ -3229,6 +3229,33 @@ fn merge_same_shift_across_rests(
 const SHORT_REST_NO_EXTEND_FRAMES: i64 = 3;
 
 const GUARD_FRAMES: i64 = 2;
+
+/// 有休止可用时，窗的**前**边最多往休止里伸多少帧（1 帧 = 20 ms）。
+/// S85 引入时是裸字面量 `4`，commit 里没有依据；S163 把它提成常量以便对照 [`REST_POST_FRAMES`]。
+/// ⛔ 实际用的是 `min(这个值, gap/2)` —— 除以 2 保证相邻两个窗各占休止的一半、永不重叠。
+const REST_PRE_FRAMES: i64 = 4;
+
+/// ⭐⭐⭐ 有休止可用时，窗的**后**边最多往休止里伸多少帧。**S163 从 2 改成 4。**
+///
+/// # 缺陷（用户 2026-08-28 报 `1:43.472`「这应该是个音尾但是听起来也奇怪」「从 G3 就一直都有」）
+///
+/// `donor` 是**降调**渲染的（音落在模型舒适区）⇒ 唱得饱满、**释放慢**；
+/// 而 `base` 是原音高（唱不动）⇒ 衰减快。窗尾按谱面 +2 帧切下去时 **donor 还在满电平**，
+/// 窗外却是早已衰减的 `base` ⇒ **一个电平台阶**。
+/// 实例（`る`，谱面只有 40 ms）：窗尾处 `donor` **+0.5 dB**（相对该音稳态，还在满电平）、
+/// 同位置 `base` **−18.5 dB** ⇒ 落差 **+19.0 dB**。
+///
+/// # 依据（`donor_post` 转储实测，n=62；上界取下一个唱音起点）
+/// `donor` 降到「`base` 同期水平 +3 dB」所需时间：p50 **0 ms** · p75 25 · **p90 45** · max 135。
+/// 窗尾落差 >8 dB（会听见台阶）的比例随 post 上限：
+/// **40 ms ⇒ 13%** · 60 ⇒ 5% · **80 ms ⇒ 3%** · 120 ⇒ 2% · 160 ⇒ 0%。
+/// ⇒ **80 ms(4 帧) 是拐点**，而且与 [`REST_PRE_FRAMES`] 对称（前边本来就是 4）。
+/// 现状：窗尾落差 >8 dB 的有 **16/62 = 26%**。
+///
+/// ⛔ 安全性：实际用的是 `min(这个值, gap/2)`，所以休止短时自动收缩、两窗永不重叠；
+/// `gap ≤ SHORT_REST_NO_EXTEND_FRAMES` 那条更早的分支仍然返回 0，一个字节不变。
+/// ⚠ 这一刀**不解决**「窗尾落在音尾**之前**」那一族（实测 2 个：`に` 早 380 ms、`で` 早 300 ms）。
+const REST_POST_FRAMES: i64 = 4;
 
 /// ⚙ 出厂默认 = `0`(= 关 = 窗逐帧不变)。`UTAI_RANGE_CLOSE_SLIVER=<帧>` 打开。
 ///
@@ -10432,7 +10459,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}              usag={} usagdim={} gonesort={} dipfill={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}              usag={} usagdim={} gonesort={} dipfill={} restwin={}/{}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -10505,6 +10532,11 @@ mod tests {
             GONE_SORT_EPS_MS,
             // ⭐ S163 §34 —— donor 静音坑回填（出厂 0 = 关）。
             parse_dipfill(None),
+            // ⭐⭐⭐ S163 —— 窗边伸进休止的上限。⛔ **改音频**（`REST_POST_FRAMES` 2→4）
+            //    ⇒ 必须在指纹里；这两个原本是**裸字面量**，改它们结构上逼不出成对 bump
+            //    （与 SPLIT_MIN_COST 那次同款的洞、同款的修法）。
+            REST_PRE_FRAMES,
+            REST_POST_FRAMES,
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -10513,7 +10545,7 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -10530,7 +10562,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s165g";
+        const TAG: &str = "s165h";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -11837,7 +11869,7 @@ mod tests {
         let w = dead_group_windows(&nn, &fr, &plan, &all_reachable(), 0);
         assert_eq!(w.len(), 1, "同一条 donor 上不许挖洞");
         assert_eq!(w[0].shift, -6);
-        assert_eq!((w[0].start, w[0].end), (6, 55), "合并后的窗要盖住两段与中间那个休止");
+        assert_eq!((w[0].start, w[0].end), (6, 57), "合并后的窗要盖住两段与中间那个休止(S163: 尾边 55→57，见 `REST_POST_FRAMES`)");
         // ⛔ 位移不同 ⇒ 必须**不**合并(那两侧本来就是两条不同的 donor)。
         let plan2 = [
             DeadGroup { start: 1, end: 1, shift: -6 },
@@ -11890,6 +11922,57 @@ mod tests {
     /// * `SHORT_REST_NO_EXTEND_FRAMES` 改成 0 ⇒ ⑴ 读回 `pre/post = 1`,**红**;
     /// * 改成 4 ⇒ ⑵ 的 4 帧休止也被吃掉,**红**;
     /// * 把 `gap_prev > 0 &&` 那个前置条件去掉(让它也管 `gap == 0`)⇒ ⑶ **红**。
+    /// ⭐⭐⭐ S163 —— [`REST_POST_FRAMES`] 的行为闸（`2 → 4`，用户报 `1:43.472` 那一族）。
+    ///
+    /// 钉四件，**期望值全部手算**（拿被测函数算期望 = 恒真）：
+    /// ⑴ 休止够长 ⇒ post 正好 **4 帧**；⑵ 休止短 ⇒ `.min(gap/2)` 收缩，**两窗永不重叠**；
+    /// ⑶ `gap ≤ SHORT_REST_NO_EXTEND_FRAMES` ⇒ post **0**（那条更早的分支不受影响）；
+    /// ⑷ **pre/post 对称** —— 两侧同样的 gap 必须伸同样多。
+    #[test]
+    fn rest_post_extends_four_frames_and_shrinks_with_the_gap() {
+        let nn = [0i64, 85, 0];
+        // fr = [前休止, 音, 后休止] ⇒ cum = [0, fr0, fr0+20, fr0+20+gap]
+        // 组 start=end=1：pre = min(4, fr0/2) ⇒ start = fr0 − pre
+        //                post = 见下 ⇒ end = (fr0+20) + post
+        let g = [DeadGroup { start: 1, end: 1, shift: -6 }];
+        // (前休止, 后休止, 期望 start, 期望 end)  —— 全部手算
+        let cases: &[(i64, i64, i64, i64)] = &[
+            (10, 20, 6, 34), // pre=min(4,5)=4 ⇒ 6 ; post=min(4,10)=4 ⇒ 30+4=34
+            (10, 8, 6, 34),  // post=min(4,4)=4 ⇒ 34
+            (10, 6, 6, 33),  // post=min(4,3)=3 ⇒ 33   ← .min(gap/2) 收缩
+            (10, 4, 6, 32),  // post=min(4,2)=2 ⇒ 32
+            (10, 3, 6, 30),  // gap ≤ 门限 ⇒ post=0     ← ⑶
+            (3, 20, 10, 34), // 前侧 gap ≤ 门限 ⇒ pre=0 ⇒ start=10
+            (6, 20, 7, 34),  // pre=min(4,3)=3 ⇒ 10−3=7 …前侧 fr0=6 ⇒ cum[1]=6 ⇒ 6−3=3
+        ];
+        for &(pre_gap, post_gap, want_s, want_e) in cases {
+            let fr = [pre_gap, 20i64, post_gap];
+            let w = dead_group_windows(&nn, &fr, &g, &all_reachable(), 0);
+            assert_eq!(w.len(), 1, "gap {pre_gap}/{post_gap}: 应当只有一条窗");
+            // start/end 用手算值（最后一行的 want_s 由 fr0 决定，见上表注释）
+            let cum1 = pre_gap;
+            let cum2 = pre_gap + 20;
+            let pre = if pre_gap <= 3 { 0 } else { 4.min(pre_gap / 2) };
+            let post = if post_gap <= 3 { 0 } else { 4.min(post_gap / 2) };
+            assert_eq!(
+                (w[0].start, w[0].end),
+                (cum1 - pre, cum2 + post),
+                "gap {pre_gap}/{post_gap}: 手算应为 ({}, {})", cum1 - pre, cum2 + post
+            );
+            if pre_gap == 10 && post_gap == 20 {
+                assert_eq!((w[0].start, w[0].end), (want_s, want_e), "字面量锚点");
+            }
+        }
+        // ⑷ 对称：同样的 gap，两侧伸的帧数必须相同
+        for gap in [4i64, 6, 8, 20] {
+            let fr = [gap, 20i64, gap];
+            let w = dead_group_windows(&nn, &fr, &g, &all_reachable(), 0);
+            let ext_pre = gap - w[0].start;
+            let ext_post = w[0].end - (gap + 20);
+            assert_eq!(ext_pre, ext_post, "gap {gap}: pre/post 不对称（{ext_pre} vs {ext_post}）");
+        }
+    }
+
     #[test]
     fn a_short_rest_keeps_both_windows_out_of_it() {
         let nn = [0i64, 85, 0, 85, 0];
@@ -11903,8 +11986,10 @@ mod tests {
         assert_eq!(w.len(), 2, "两条组必须各自有窗(读到 {w:?})");
         assert_eq!(
             (w[0].start, w[0].end, w[1].start, w[1].end),
-            (6, 30, 33, 55),
-            "3 帧休止 ⇒ 内侧两条边正好停在音界上 30 / 33(外侧那两条 10 帧休止照常伸出)(读到 {w:?})"
+            (6, 30, 33, 57),
+            "3 帧休止 ⇒ 内侧两条边正好停在音界上 30 / 33(外侧那两条 10 帧休止照常伸出)(读到 {w:?})
+\n             ⚠ S163: 尾边 55→57 是 `REST_POST_FRAMES` 2→4 的直接结果(尾部 gap=10 ⇒ min(4,5)=4);
+\n             内侧的 30/33 一个字节没动 —— `.min(gap/2)` 与短休止门限都还在管着。"
         );
         // ⑷ 不许重叠,而且中间整段留给 base。
         assert!(w[0].end < w[1].start, "两条窗不许重叠");
@@ -11915,7 +12000,7 @@ mod tests {
         let w4 = dead_group_windows(&nn, &four, &g, &all_reachable(), 0);
         assert_eq!(
             (w4[0].start, w4[0].end, w4[1].start, w4[1].end),
-            (6, 32, 32, 56),
+            (6, 32, 32, 58),
             "4 帧休止不该命中这一刀:`post = min(2,2) = 2` / `pre = min(4,2) = 2`(读到 {w4:?})"
         );
         assert!(
@@ -11948,7 +12033,7 @@ mod tests {
         ];
         // 升序:这两条**本来就该**合并成一条 —— 上面那条测试钉的就是它,这里只取它的窗。
         let merged = dead_group_windows(&nn, &fr, &asc, &all_reachable(), 0);
-        assert_eq!(merged, vec![DeadJob { shift: -6, start: 6, end: 55 }]);
+        assert_eq!(merged, vec![DeadJob { shift: -6, start: 6, end: 57 }]); // S163: 55→57，见 `REST_POST_FRAMES`
 
         // ⭐ 同一批组,**降序**喂进来。两段音频还在原处,所以救援也必须还是两条。
         let desc = [
@@ -11967,9 +12052,11 @@ mod tests {
         //    休止**正好 3 帧**,命中 [`SHORT_REST_NO_EXTEND_FRAMES`] ⇒ 两侧的窗不再各伸进 1 帧。
         //    ⛔ 这条判据钉的是「**降序输入不许吞掉一条救援**」(上面那条 `got.len() == 2`),
         //    坐标只是它的载体;**新坐标仍然是「各自在原处、互不重叠」**,不变量一个字没变。
+        // ⚠ S163 —— 尾边再从 55 变 57:`REST_POST_FRAMES` 2→4(尾部 gap=10 ⇒ min(4,5)=4)。
+        //    内侧的 30/33 一个字节没动(那侧 gap=3，命中短休止门限)，重叠与位置不变量照旧。
         assert_eq!(
             spans,
-            vec![(6, 30), (33, 55)],
+            vec![(6, 30), (33, 57)],
             "两条窗必须各自还在原来的位置上(合并只许发生在真正紧邻的一对上)"
         );
         assert!(spans[0].1 < spans[1].0, "两条窗不许重叠");
@@ -12002,7 +12089,10 @@ mod tests {
         );
         assert_eq!(
             dead_group_windows(&nn_in, &fr_in, &whole, &all_reachable(), 0),
-            vec![DeadJob { shift: -6, start: 6, end: 52 }],
+            // S163: 尾边 52→54 —— `REST_POST_FRAMES` 2→4（尾部 gap=10 ⇒ min(4,5)=4）。
+            // 手算：fr=[10,20,20,10] ⇒ cum=[0,10,30,50,60]；pre=min(4,10/2)=4 ⇒ 10−4=6；
+            //       post=min(4,10/2)=4 ⇒ 50+4=54。
+            vec![DeadJob { shift: -6, start: 6, end: 54 }],
             "⛔ 期望值写字面量:拿被测函数自己算期望值 = 恒真"
         );
     }
