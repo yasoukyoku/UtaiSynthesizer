@@ -4160,6 +4160,41 @@ const REST_GAIN_FADE_MS: f32 = 20.0;
 /// 压过头会把休止压成数字静音,反而在两侧留下新的落差。
 const REST_GAIN_MIN_DB: f32 = -18.0;
 
+/// ⭐⭐⭐⭐⭐ S163 v17 —— **起音形状整形**的作用长度(ms，从音头起算)。
+///
+/// # 归因（【7a】，同一次 run 四层分解，零噪声）
+/// ```text
+/// 逐层增量(配对中位;清辅音开头 + 窗覆盖的音头;ya n=217 / aki n=128)
+///                         模型侧(pre−base)   **PSOLA(post−pre)**   拼接(成品−post)
+/// 起音陡度(ms,负=更硬)  ya  **−8.00**            **+0.00**            +0.00
+///                       aki **−23.95**           **+0.00**           +21.95
+/// 过冲(dB,正=更硬)      ya  **−2.63**            **+0.00**            +0.00
+///                       aki **−8.19**            **+0.00**           +7.74
+/// ⛔阴性对照(窗未覆盖):base 起音 18.0 ms → 成品 18.0 ms ⇒ Δ **+0.00**
+/// ```
+/// ⇒ **PSOLA 那一列全是 +0.00** —— 硬是**模型侧**造的
+///   (降调唱出来的 donor 起音本来就比 `base` 陡 8-24 ms、过冲高 2.6-8.2 dB)。
+/// 用户 2026-08-28:「重点还是最开始**辅音处的那几十毫秒**;听起来就是**很硬**。」
+///
+/// # ⛔ 与三把判负的刀的区别(别重造)
+/// * **v14**:压到 `base + 6 dB` 以内 ⇒ **砍电平**(p10 −9.91 dB,单点 −15.2)
+/// * **v15**:v14 + 能量归一化 ⇒ 地基(flux 比值尺子)被推翻
+/// * **v16**:拉长淡入 ⇒ 只是**整体延后 30 ms**,120 ms 极端剂量用户仍听不出 ⇒ 与「硬」无关
+/// * **v17(本刀)**:量的是**上升曲线的形状** —— 两侧各自**归一化到自己的稳态**之后再比,
+///   ⇒ **稳态电平一个字节不动**,只把 0-N ms 的爬升速度改成 `base` 的。
+const ONSET_FIT_MS: f32 = 60.0;
+
+/// ⭐ S163 v17 —— 形状整形的增益限幅(dB)。
+/// ⛔ 不能太大:`base` 在那些音上本来就是「唱不上去的破音」,
+/// 完全照抄它的形状会把破音的抖动也搬过来。
+const ONSET_FIT_MAX_DB: f32 = 9.0;
+
+/// ⭐ S163 v17 —— 稳态电平的取样窗(ms，从音头起算)。归一化用它，所以它决定
+/// 「形状差」和「电平差」怎么分开。⛔ 太靠前会把起音本身算进稳态。
+const ONSET_FIT_STEADY_LO_MS: f32 = 50.0;
+/// 见 [`ONSET_FIT_STEADY_LO_MS`]。
+const ONSET_FIT_STEADY_HI_MS: f32 = 150.0;
+
 /// S163 v8 -- rest head guard (ms): the previous note's natural release lives here.
 /// The previous note IS rescued, so its tail must stay donor.
 const REST_HEAD_GUARD_MS: f32 = 40.0;
@@ -4183,6 +4218,15 @@ const REST_TAIL_GUARD_MS: f32 = 40.0;
 
 /// ⚙ 出厂默认 = true —— `UTAI_RANGE_REST_BASE=0` 关掉。窗内的**休止**保持 `base`,
 /// 救援不碰空拍。机理与读数见 [`REST_BASE_FADE_MS`]。
+/// ⚙ 出厂默认 = true —— `UTAI_RANGE_ONSET_FIT=0` 关掉。**起音形状整形**:
+/// 把 donor 起音的上升曲线拉回 `base` 的形状(稳态电平不动)。见 [`ONSET_FIT_MS`]。
+pub fn onset_fit_enabled() -> bool {
+    !matches!(
+        std::env::var("UTAI_RANGE_ONSET_FIT").ok().as_deref().map(str::trim),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
 pub fn rest_base_enabled() -> bool {
     !matches!(
         std::env::var("UTAI_RANGE_REST_BASE").ok().as_deref().map(str::trim),
@@ -4477,7 +4521,15 @@ const TIED_XFADE_MS_DEFAULT: f64 = 120.0;
 /// 三条硬约束夹着:**不许动 donor 选择**(用户令)、**不许切内容**
 /// (往窗里插别的内容两端必然造缝,S163 栽过三次)、**动窗边界副作用波及 98 秒**(v12 判负)。
 /// 而淡化**本身就是增益** ⇒ 这一刀天然落在唯一安全的那一层。
-const SEAM_RAMP_MS: f64 = 40.0;
+const SEAM_RAMP_MS: f64 = 0.0;
+
+// ⛔⛔ S163 v16 判负并关闭（用户 2026-08-28 实听：「这个确实可以关了，它确实和硬无关」）。
+//    它做的事其实是**把起音整体延后 30 ms**，不是「消除咔哒」：
+//    对齐后逐点 Δ 是**单调递增**的（−0.5 → −12.1），而整段只差 0.15-1.33 dB
+//    ⇒ 听感上就是「起音慢了」。120 ms 极端剂量（起音压低 15-30 dB）用户**仍然听不出**
+//    ⇒ **这根轴与用户说的「硬」无关。**
+//    ⚠ 上面那些靶子数据（短间隙族 ×275、ramp 剂量曲线）仍然成立，
+//      只是「拉长淡入」这个**做法**解决不了「硬」。
 /// 交接最多往后挪这么久(ms)。⛔ 上限的理由:再久就等于让出去的那条 donor 唱下一个音
 /// 的一大截,而它的**落点**(音色)不是为那个音选的。
 /// ⚠ 它远小于 [`MERGE_BRIDGE_FRAMES`](25 帧 = 500 ms)留出来的片段余量 ⇒ 结构上够得着。
@@ -5440,6 +5492,7 @@ pub fn apply_dead_only_windows_with(
         } else {
             0
         },
+        onset_fit_enabled(),
     );
 
     if out.is_ok() {
@@ -5483,8 +5536,13 @@ pub fn apply_dead_only_windows_with(
                 tied_xf_samples,
                 0.0,
                 rest_base_enabled(),
-                // control arm: seam ramp OFF, everything else identical
-                0,
+                if seam_ramp_enabled() {
+                    (SEAM_RAMP_MS * f64::from(sample_rate) / 1000.0) as usize
+                } else {
+                    0
+                },
+                // control arm: onset shape fit OFF, everything else identical
+                false,
             ) {
                 Ok(()) => dump("nodip.f32", &buf),
                 Err(e) => tracing::warn!("range: same-run control arm failed: {e}"),
@@ -5689,6 +5747,8 @@ fn splice_kept(
     rest_base: bool,
     // ⭐⭐⭐⭐⭐ S163 v16 —— 短间隙/重叠之后的窗淡入拉长(样本);`0` = 关。见 [`SEAM_RAMP_MS`]。
     seam_ramp: usize,
+    // ⭐⭐⭐⭐⭐ S163 v17 —— **起音形状整形**(见 [`ONSET_FIT_MS`])。
+    onset_fit: bool,
 ) -> crate::Result<()> {
     // ⛔ `join_enabled` 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
     let n = base.len();
@@ -6049,6 +6109,78 @@ fn splice_kept(
                 }
                 out
             };
+            // ⭐⭐⭐⭐⭐ S163 v17 —— **起音形状整形**(见 [`ONSET_FIT_MS`])。
+            //    逐 2 ms 比较 `base` 与 donor **各自归一化到自己稳态之后**的上升曲线,
+            //    把 donor 的形状拉回 `base` 的 ⇒ **稳态电平一个字节不动**。
+            //    ⛔ 这正是 v14(砍电平)/v16(整体延后)做错的地方。
+            let ofit_cell = ((f64::from(sample_rate) * 0.002) as usize).max(1);
+            let ofit: Vec<f32> = if onset_fit {
+                let span = (f64::from(sample_rate) * f64::from(ONSET_FIT_MS) / 1000.0) as usize;
+                let s_lo = (f64::from(sample_rate) * f64::from(ONSET_FIT_STEADY_LO_MS) / 1000.0) as usize;
+                let s_hi = (f64::from(sample_rate) * f64::from(ONSET_FIT_STEADY_HI_MS) / 1000.0) as usize;
+                let ncell = (b - a) / ofit_cell + 1;
+                let mut g = vec![1.0f32; ncell];
+                let e = |v: &[f32]| -> f64 {
+                    if v.is_empty() {
+                        return 0.0;
+                    }
+                    v.iter().map(|&z| f64::from(z) * f64::from(z)).sum::<f64>() / v.len() as f64
+                };
+                let si_of = |k: usize| -> usize {
+                    (k as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize - 1) as usize
+                };
+                for nd in notes.iter().filter(|n| n.sung) {
+                    let on = ((nd.start.max(0) as f64) * spf) as usize;
+                    if on < a || on + span > b {
+                        continue;
+                    }
+                    // 稳态：两侧各自取自己的
+                    let (q0, q1) = ((on + s_lo).min(b), (on + s_hi).min(b));
+                    if q1 <= q0 {
+                        continue;
+                    }
+                    let sb = e(&base[q0.min(base.len())..q1.min(base.len())]);
+                    let sd = e(&seg[si_of(q0)..si_of(q1).max(si_of(q0) + 1)]);
+                    if sb <= 0.0 || sd <= 0.0 {
+                        continue;
+                    }
+                    let mut p = on;
+                    while p < on + span {
+                        let q = (p + ofit_cell).min(b);
+                        if q <= p {
+                            break;
+                        }
+                        let eb = e(&base[p.min(base.len())..q.min(base.len())]);
+                        let ed = e(&seg[si_of(p)..si_of(q).max(si_of(p) + 1)]);
+                        if eb > 0.0 && ed > 0.0 {
+                            // 各自归一化到自己的稳态 ⇒ 只剩**形状**差
+                            let shape = ((eb / sb) / (ed / sd)).sqrt() as f32;
+                            let idx = (p - a) / ofit_cell;
+                            if idx < g.len() {
+                                let db = 20.0 * shape.max(1e-6).log10();
+                                // ⛔⛔ **只压不抬**：上限硬钉在 0 dB。
+                                //    v17 第一版允许 +9 dB ⇒ donor 本来就贴着满刻度，
+                                //    一放大就削：splice 后峰值 **+8.83 dBFS**、
+                                //    **39193 个样本 |x|≥0.999**，后续归一化为容纳它
+                                //    把整条压了 **7 dB**，16-24 kHz 因削波失真 **+21.5 dB**。
+                                //    ⇒ 这正是 v14 已经写过的教训，我又丢了一次。
+                                g[idx] = 10f32.powf(db.clamp(-ONSET_FIT_MAX_DB, 0.0) / 20.0);
+                            }
+                        }
+                        p = q;
+                    }
+                }
+                // 10 ms 移动平均:增益自己不许跳变(4 ms 时 16-24 kHz 涨了 21.5 dB)
+                let half = ((0.005 * f64::from(sample_rate)) as usize / ofit_cell.max(1)).max(1);
+                let src = g.clone();
+                for i in 0..g.len() {
+                    let (l, r) = (i.saturating_sub(half), (i + half + 1).min(src.len()));
+                    g[i] = src[l..r].iter().copied().sum::<f32>() / (r - l) as f32;
+                }
+                g
+            } else {
+                Vec::new()
+            };
             for k in a..b {
                 let w = if fade_in && k < a + xfw {
                     0.5 - 0.5 * (std::f32::consts::PI * (k - a) as f32 / xfw as f32).cos()
@@ -6062,7 +6194,22 @@ fn splice_kept(
                 let w = w * dip_keep(si as usize);
                 // ⭐ v10 —— 休止段:donor **压电平**,不换内容 ⇒ 没有内容跳变 ⇒ 没有缝。
                 let rg = rest_w(k);
-                base[k] = base[k] * (1.0 - w) + seg[si as usize] * w * rg;
+                // ⭐ v17 —— 起音**形状**整形(稳态不动,只改上升曲线)。
+                // ⛔⛔ **逐样本线性插值,不许用格值阶梯**。
+                //    v17a 用 `ofit[(k-a)/cell]` 取格值 ⇒ 每 2 ms 一个阶梯边缘,
+                //    那本身就是宽带瞬变:整曲频谱 **16-24 kHz +21.5 dB**
+                //    (0-16 kHz 已经正常 ⇒ 与削波无关,是增益调制自己产生的高频)。
+                let og = if ofit.is_empty() {
+                    1.0
+                } else {
+                    let t = (k - a) as f32 / ofit_cell as f32;
+                    let i0 = t as usize;
+                    let f = t - i0 as f32;
+                    let g0 = ofit.get(i0).copied().unwrap_or(1.0);
+                    let g1 = ofit.get(i0 + 1).copied().unwrap_or(g0);
+                    g0 + (g1 - g0) * f
+                };
+                base[k] = base[k] * (1.0 - w) + seg[si as usize] * w * rg * og;
             }
         }
     Ok(())
@@ -7651,6 +7798,55 @@ mod tests {
     }
 
     #[test]
+    /// ⛔⛔⛔ S163 v17a —— **起音整形只许压，不许抬**。
+    ///
+    /// v17 第一版把增益 clamp 在 ±9 dB,而 `donor` 本来就贴着满刻度:
+    /// ```text
+    /// splice 后峰值 **+8.83 dBFS**、**39193 个样本 |x|≥0.999**
+    /// ⇒ 后续归一化为了容纳那个峰,把**整条音频压了 7 dB**
+    /// ⇒ 16-24 kHz 因削波失真 **+21.5 dB**
+    /// ```
+    /// 这条判据把「输出峰值不许超过输入峰值」钉死 —— 它是**结构性**的,
+    /// 与具体音频无关:整形只改增益且增益 ≤ 1 ⇒ 峰值只可能变小。
+    fn onset_fit_never_amplifies() {
+        let sr = 48000u32;
+        let n = (sr as usize) / 2;
+        // 一条贴着满刻度的信号 + 一个陡起音
+        let mut x: Vec<f32> = (0..n)
+            .map(|i| 0.98 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / sr as f32).sin())
+            .collect();
+        for (i, v) in x.iter_mut().enumerate().take(sr as usize / 100) {
+            *v *= (i as f32 / (sr as f32 / 100.0)).min(1.0).powf(0.1); // 极陡起音
+        }
+        let peak_in = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        // `base` 起音慢得多 ⇒ 整形会想把 donor 的早期压下去(而不是把晚期抬起来)
+        let base: Vec<f32> = (0..n)
+            .map(|i| {
+                let r = (i as f32 / (sr as f32 * 0.05)).min(1.0);
+                0.5 * r * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / sr as f32).sin()
+            })
+            .collect();
+        let notes = vec![NoteSpan { start: 0, frames: 25, sung: true, hz: 300.0, tied: false }];
+        let jobs = vec![DeadJob { shift: -2, start: 0, end: 25 }];
+        let kept = vec![(0i64, 0usize, x.clone())];
+        let mut out = base.clone();
+        splice_kept(
+            &mut out, sr, (sr as f64) / 50.0, &jobs, &kept,
+            (sr as usize) / 100, false, 0, 0.0, &notes, 0, 0.0, true, 0, true,
+        )
+        .unwrap();
+        let peak_out = out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            peak_out <= peak_in + 1e-6,
+            "起音整形把峰值从 {peak_in:.4} 抬到了 {peak_out:.4} —— 只压不抬这条被破坏了"
+        );
+        assert!(
+            out.iter().all(|v| v.abs() <= 1.0 + 1e-6),
+            "整形把样本推出了满刻度"
+        );
+    }
+
+    #[test]
     fn dipfill_refuses_to_fill_when_base_has_no_upper_harmonics() {
         let sr = 44_100u32;
         let f0 = 300.0f32;
@@ -8251,7 +8447,7 @@ mod tests {
                 kept.push((0, lo, donor[lo..hi].to_vec()));
             }
             let xf = (SR as usize / 100).max(2);
-            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0, true, 0).unwrap();
+            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0, true, 0, false).unwrap();
             b
         };
 
@@ -8533,9 +8729,9 @@ mod tests {
         let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left), (1, 0, right)];
 
         let mut off = base.clone();
-        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true, 0).unwrap();
+        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true, 0, false).unwrap();
         let mut on = base.clone();
-        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0, true, 0).unwrap();
+        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0, true, 0, false).unwrap();
 
         // ⓐ 关着 ⇒ 那个洞必须还在:52800 开窗之后是右 donor 的静音。
         assert!(
@@ -8639,7 +8835,7 @@ mod tests {
             (1, 53_000, right[53_000..(380 * 480)].to_vec()),
         ];
         let mut out = base.clone();
-        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0, true, 0).unwrap();
+        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0, true, 0, false).unwrap();
         assert_eq!(out[0], -1.0, "窗外仍是 base");
         assert!((out[30_000] - 0.5).abs() < 1e-6, "左窗内仍是左 donor");
     }
@@ -10268,7 +10464,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s164p";
+        const TAG: &str = "s164t";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
