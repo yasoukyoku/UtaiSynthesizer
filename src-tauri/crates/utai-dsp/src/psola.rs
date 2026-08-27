@@ -433,6 +433,29 @@ const TILT_TABLE: [(i64, [f32; 9]); 5] = [
 ];
 
 /// 按救援深度取还原曲线(dB),含膝盖淡入与表内线性插值。
+/// ⭐⭐ S163 —— tilt 开始淡出的 target MIDI（及以下全额）。
+///
+/// 表在 target **73-78** 上拟，而频带是绝对频率 ⇒ target 越高，谐波越往表的
+/// 最高档（`14k`，系数 **−5.16**）里跑。实测零交叉在 **87** 附近，
+/// 所以 85 以下保持全额（那里实测还是 +2.08…+9.15 的大益）。
+const TILT_FADE_LO: f64 = 85.0;
+
+/// ⭐⭐ S163 —— tilt 归零的 target MIDI。实测 90 上 tilt 把上方谐波压 **−4.01 dB**
+/// （akiko のぴゃ独立读 −3.05），而那正是用户报的那个病。
+const TILT_FADE_HI: f64 = 90.0;
+
+/// 位移 → 频率比。
+///
+/// ⛔ `psola_shift_*` 收到的 `semitones` 是**音频自己要移多少**（`semis = -(shift)`，
+/// 见 `vocal_range.rs` 那一行）—— 救援时 `shift` 是负的（模型唱低），所以这里是 **正**的。
+/// ⇒ target f0 = donor f0 × `2^(semitones/12)`。
+/// ⚠ 第一版写成了 `2^(-s/12)` ⇒ のぴゃ（donor 622 Hz, +13）算出 target 302 Hz / MIDI 62
+/// ⇒ `atten` 恒为 1 ⇒ **淡出根本不触发**（实测读数一字未动）。
+#[inline]
+fn ratio_of(semitones: f64) -> f64 {
+    2f64.powf(semitones / 12.0)
+}
+
 fn tilt_curve(depth_semitones: f64, strength: f64) -> [f64; 9] {
     let d = depth_semitones.abs();
     // ⛔ S162:这里**曾经**还乘一个膝盖 `((d − 6)/4).clamp(0,1)`。换表之后它是**二次衰减** ——
@@ -476,7 +499,16 @@ fn tilt_curve(depth_semitones: f64, strength: f64) -> [f64; 9] {
 ///
 /// ⛔ 只改**幅度**,相位一个字节不动 ⇒ 不搬共振峰、不动时间结构。
 /// ⛔ 全 0 曲线 ⇒ 逐位恒等(判据钉住)。
-fn apply_spectral_tilt(x: &mut [f32], sample_rate: u32, curve: &[f64; 9]) {
+fn apply_spectral_tilt(
+    x: &mut [f32],
+    sample_rate: u32,
+    curve: &[f64; 9],
+    // ⭐⭐⭐ S163 —— **逐帧**的强度衰减（按样本位置）。
+    // ⛔ 为什么必须逐帧：`apply_inverse_windowed` 对**整条 donor 只调一次** psola，
+    //    而 target 音高是**逐音**变的。第一版拿全曲中位 f0 算一个常数，
+    //    结果被低音拉回 1.0，**淡出根本不触发**（实测のぴゃ −36.23 一字未动）。
+    atten_at: &dyn Fn(usize) -> f64,
+) {
     if curve.iter().all(|v| v.abs() < 1e-9) || x.len() < 4096 {
         return;
     }
@@ -487,7 +519,8 @@ fn apply_spectral_tilt(x: &mut [f32], sample_rate: u32, curve: &[f64; 9]) {
         .collect();
     // 逐 bin 增益:在 log-f 上对表插值
     let sr = f64::from(sample_rate);
-    let gain: Vec<f64> = (0..=N / 2)
+    // ⭐ S163 —— 存 **dB**（不是线性），因为逐帧要乘上 `atten`。
+    let gain_db: Vec<f64> = (0..=N / 2)
         .map(|k| {
             let f = k as f64 * sr / N as f64;
             let g_db = if f <= f64::from(TILT_F[0]) {
@@ -506,7 +539,7 @@ fn apply_spectral_tilt(x: &mut [f32], sample_rate: u32, curve: &[f64; 9]) {
                 }
                 v
             };
-            10f64.powf(g_db / 20.0)
+            g_db
         })
         .collect();
     let n = x.len();
@@ -529,8 +562,10 @@ fn apply_spectral_tilt(x: &mut [f32], sample_rate: u32, curve: &[f64; 9]) {
         // 那样的臂拿去耳判,「更好」会和「更响」分不开(听音测试最经典的混杂),
         // 而且会和乐句级电平匹配(只压不抬)互相抵消。
         let p_before: f64 = (0..=N / 2).map(|k| re[k] * re[k] + im[k] * im[k]).sum();
+        // ⭐ S163 —— 这一帧的衰减（按帧中心的 target 音高）。
+        let at = atten_at(pos + N / 2);
         for k in 0..=N / 2 {
-            let g = gain[k];
+            let g = 10f64.powf(gain_db[k] * at / 20.0);
             re[k] *= g;
             im[k] *= g;
             if k > 0 && k < N / 2 {
@@ -3411,8 +3446,45 @@ pub fn psola_shift_edge(
     //   `donor_post` 相对 `base` 的包络差,而那正是这一整条链跑完之后的东西。
     //   ⛔ 只改幅度、不动相位 ⇒ 不搬共振峰(κ 才搬,而实测 α ≈ 0.005 ⇒ 平移是错的算子)。
     {
+        // ⭐⭐⭐ S163 —— **高音上把 tilt 淡出**（见 [`TILT_FADE_LO`] / [`TILT_FADE_HI`]）。
+        // ⛔ 表是在 **target MIDI 73-78** 上拟的，而频带是**绝对频率**：
+        //   73-78（f0 554-740 Hz）的 H4-H10 落在 `2.6k/4.1k/6.5k` 档（表给 +4.89/+2.27/+0.41，全是**抬**）；
+        //   MIDI 90（f0 1480 Hz）的 H4-H10 落在 `6.5k/10k/14k` 档（+0.41/+4.53/**−5.16**，最高档是**压**）。
+        // ⇒ 同一张表对低音是抬、对高音是压。实测（`inverse_probe`，同一份 donor 进两条臂）
+        //   yuyuko 上方谐波 H4..H10 的 Δ（tilt=1 减 tilt=0）按 target 音高：
+        //   68 **+9.15** · 71 +7.84 · 75 +5.31 · 78 +3.65 · 80 +2.91 · 82/83 +2.08 ·
+        //   **87 −0.84** · **90 −4.01** ⇒ 单调递减、在 87 附近穿过零；
+        //   akiko のぴゃ（MIDI 90）独立读到 **−3.05** ⇒ **两个模型对上了**。
+        // ⭐ 而用户报的のぴゃ的病正是**上方谐波弱** ⇒ 出厂的 tilt 正在往下压它。
+        // ⚠ 低音侧**一字不动**（那里 tilt 是大益：68 上 +9.15）。
+        // ⭐⭐⭐ S163 —— **逐帧**算 target 音高，高音处把 tilt 淡出。
+        // ⛔ 表在 target **MIDI 73-78** 上拟，频带是**绝对频率**：
+        //   73-78（f0 554-740 Hz）的 H4-H10 落在 `2.6k/4.1k/6.5k`（+4.89/+2.27/+0.41，全是**抬**）；
+        //   MIDI 90（f0 1480 Hz）落在 `6.5k/10k/14k`（+0.41/+4.53/**−5.16**，最高档是**压**）。
+        // 实测（`inverse_probe`，同一份 donor 进两条臂）上方谐波 Δ（tilt=1 减 tilt=0）：
+        //   yuyuko 68 **+9.15** · 71 +7.84 · 75 +5.31 · 78 +3.65 · 80 +2.91 · 82/83 +2.08 ·
+        //   **87 −0.84** · **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
+        // ⇒ 单调递减、在 **87** 附近穿零，而用户报のぴゃ的病正是**上方谐波弱**。
+        // ⚠⚠ **低音侧一字不动**：`midi ≤ TILT_FADE_LO` 全额，而那里 tilt 是 +2.08…+9.15 的大益。
+        let ratio = ratio_of(semitones);
+        let hop_f = f0_hop.max(1);
+        let atten_at = |sample: usize| -> f64 {
+            let fi = sample / hop_f;
+            let f = f0_hz.get(fi).copied().unwrap_or(0.0);
+            if !(f > 20.0) {
+                return 1.0;
+            }
+            let midi = 69.0 + 12.0 * ((f64::from(f) * ratio) / 440.0).log2();
+            if midi <= TILT_FADE_LO {
+                1.0
+            } else if midi >= TILT_FADE_HI {
+                0.0
+            } else {
+                (TILT_FADE_HI - midi) / (TILT_FADE_HI - TILT_FADE_LO)
+            }
+        };
         let curve = tilt_curve(semitones, tilt);
-        apply_spectral_tilt(&mut out, sample_rate, &curve);
+        apply_spectral_tilt(&mut out, sample_rate, &curve, &atten_at);
     }
     (out, diag)
 }
@@ -3431,6 +3503,59 @@ mod tests {
     /// ## ⛔ 判据里的阴性对照
     /// 只钉「RMS 不变」是**空判据** —— 一个什么都不做的实现照样过。
     /// 所以同一条里还要钉住**谱形状确实变了**(低带被压、中带被抬)。
+    /// ⭐⭐⭐ S163 —— **tilt 在高音上淡出，而低音一字不动。**
+    ///
+    /// ## 靶子
+    /// [`TILT_TABLE`] 在 target **MIDI 73-78** 上拟，频带是**绝对频率** ⇒
+    /// 73-78（f0 554-740 Hz）的 H4-H10 落在 `2.6k/4.1k/6.5k`（+4.89/+2.27/+0.41，**抬**）；
+    /// MIDI 90（f0 1480 Hz）落在 `6.5k/10k/14k`（+0.41/+4.53/**−5.16**，最高档是**压**）。
+    /// 实测（`inverse_probe`，同一份 donor 进两条臂）上方谐波 Δ（tilt 开减关）：
+    /// yuyuko 68 **+9.15** · 71 +7.84 · 75 +5.31 · 78 +3.65 · 80 +2.91 · 82/83 +2.08 ·
+    /// **87 −0.84** · **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
+    ///
+    /// ## 这条钉两半（缺一半都是空判据）
+    /// ① 高音（≥ [`TILT_FADE_HI`]）强度归零；
+    /// ② ⛔ **低音（≤ [`TILT_FADE_LO`]）完全不变** —— 用户 2026-08-27：
+    ///   「那 tilt 原本的作用呢？你别又修这个坏别的啊」。
+    #[test]
+    fn tilt_fades_out_on_high_targets_and_leaves_low_ones_untouched() {
+        // 直接打在那个映射上（与生产里逐帧算的那一段逐字相同）。
+        let atten = |donor_f0: f64, semis: f64| -> f64 {
+            let midi = 69.0 + 12.0 * ((donor_f0 * ratio_of(semis)) / 440.0).log2();
+            if midi <= TILT_FADE_LO {
+                1.0
+            } else if midi >= TILT_FADE_HI {
+                0.0
+            } else {
+                (TILT_FADE_HI - midi) / (TILT_FADE_HI - TILT_FADE_LO)
+            }
+        };
+        let f_of = |midi: f64| 440.0 * 2f64.powf((midi - 69.0) / 12.0);
+        // ⛔ 符号：`psola_shift_*` 收到的是 `semis = -(shift)` ⇒ 救援时为**正**。
+        //    第一版把 `ratio_of` 写反了 ⇒ target 算成低八度 ⇒ **淡出恒不触发**。
+        assert!(
+            (ratio_of(13.0) - 2f64.powf(13.0 / 12.0)).abs() < 1e-12,
+            "ratio_of 的符号反了 ⇒ 淡出永远不会触发"
+        );
+        // ① 高音：donor 唱 77、升 13 ⇒ target 90 ⇒ 归零
+        let hi = atten(f_of(77.0), 13.0);
+        assert!(hi < 1e-9, "target MIDI 90 上 tilt 必须归零（读到 {hi:.3}）");
+        // ② 低音：donor 唱 66、升 14 ⇒ target 80 ⇒ 全额
+        let lo = atten(f_of(66.0), 14.0);
+        assert!(
+            (lo - 1.0).abs() < 1e-9,
+            "target MIDI 80 上 tilt 必须**一字不动**（读到 {lo:.3}）——              那里实测 tilt 是 +2.91 dB 的大益"
+        );
+        // ③ 中间单调，而且在 87.5 上恰好一半
+        let mid = atten(f_of(74.5), 13.0); // target 87.5
+        assert!(
+            (mid - 0.5).abs() < 0.02,
+            "target 87.5 上应该恰好一半（读到 {mid:.3}）"
+        );
+        // ④ ⛔ 夹具有效性：两端必须真的不同，否则 ①② 可能都是恒真
+        assert!(lo > hi + 0.9, "两端必须拉开（低 {lo:.3} vs 高 {hi:.3}）");
+    }
+
     #[test]
     fn the_spectral_tilt_keeps_loudness_and_only_moves_the_shape() {
         let sr = 44100u32;
@@ -3478,7 +3603,7 @@ mod tests {
         let b_mid = band(&x, 1500.0, 1700.0);
 
         let mut y = x.clone();
-        apply_spectral_tilt(&mut y, sr, &tilt_curve(14.0, 1.0));
+        apply_spectral_tilt(&mut y, sr, &tilt_curve(14.0, 1.0), &|_| 1.0);
         let after = rms(&y[lo..hi]);
 
         // ⭐ 等响:整体 RMS 变化必须很小

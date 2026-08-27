@@ -3767,6 +3767,17 @@ const LANDING_REPAIR_MS_DEFAULT: f32 = 200.0;
 /// ⛔ **中位数不单调**（次怪比最怪还糊）—— 同一条旧训：长尾上用中位数会造假的非单调。
 ///
 /// ⚠ 只在**同一个音的两个候选**之间比（同 f0）—— 跨音高时谐波密度不同，读数不可比。
+/// ⛔⛔ **而且它不是中性的 —— 开着会把音弄塌。**
+/// 实测 akiko 炌心 +7 的 `[490]ら`（2:08.004，与 0:55 那个 `[232]ら` **谱面完全相同**）：
+/// | 臂 | 配置 | `[490]` 峰值 | `[490]` RMS | 相对 `[232]` |
+/// |---|---|---|---|---|
+/// | K1 / U1 | 出厂（旋钮全 0）| −5.96 / −5.94 | −13.62 | **+1.58 dB（更响）** |
+/// | R1 | `floor=12` + `eps=1.6` | −7.77 | −18.84 | **−4.65 dB（塌）** |
+/// | T1 | 同上 + `RADIUS=2` | −7.75 | −18.81 | **−4.62 dB（塌）** |
+/// ⇒ 用户 2026-08-27 亲耳报「2:07 这里也没声了」—— **看的正是 T1**。
+/// ⭐ 出厂（两个旋钮 0）上这个音**一点事没有**，而一旦把它们开到能真正触发的档位，
+///   它就把一个本来健康的音选进了更差的候选。⛔ **这才是它出厂必须是 0 的真正理由。**
+///
 /// ⛔⛔⛔ **S163 实测：这一条干预链全线判负（人群面纹丝不动）—— 别重造。**
 ///
 /// 四条臂逐步把路打通，每一步都确认“真的在跑”，而结果一直是 0：
@@ -8882,7 +8893,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -8944,6 +8955,10 @@ mod tests {
             //    进指纹的意义是「下一个人翻它的时候必须来这里改一行」。
             parse_landing_width(None),
             parse_landing_width_floor(None),
+            // ⭐⭐ S163 —— tilt 在高音上的淡出区间。⛔ **改音频**（实测 MIDI 90 上
+            //    tilt 本来把上方谐波压 −4.01 dB，现在归零）⇒ 与它一起 bump。
+            85,
+            90,
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -8952,7 +8967,7 @@ mod tests {
         let fp = format!("{fp} | {}", super::super::score2svc::production_defaults_fingerprint());
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -8964,7 +8979,12 @@ mod tests {
         // ⛔ S163f —— s163e 的**两条行为改动当天被回滚**(`neighbour_ok` 恢复否决 ·
         //    `split_cost` 回 3000,账见 [`SPLIT_MIN_COST_DEFAULT`] 的 doc)。
         //    ⚠ 必须再 bump 一次:s163e 已经渲过一批产物,**同一个 tag 不许对应两种行为**。
-        const TAG: &str = "s163g";
+        // ⛔ S163h 盖着：**tilt 在高音 target 上淡出**（`TILT_FADE_LO/HI` = 85/90）。
+        //    实测：tilt 对上方谐波的 Δ 随 target 音高**单调递减**，在 87 穿零：
+        //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
+        //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
+        //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
+        const TAG: &str = "s163h";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
