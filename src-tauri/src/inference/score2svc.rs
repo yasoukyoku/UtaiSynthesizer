@@ -1057,7 +1057,7 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{},{} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
@@ -1078,6 +1078,7 @@ pub(crate) fn production_defaults_fingerprint() -> String {
         parse_preroll_damp(None),
         PREROLL_KEEP_MS,
         PREROLL_DAMP_THRESH_DB,
+        PREROLL_DAMP_MAX_SLOPE_DB_PER_MS,
         // ⛔⛔ S161b —— **类深度与槽形也进指纹**。S161 只登记了旋钮,而这一场改的是**常量**
         //    (浊塞音 11.7 → 20 窄槽、闪音 6.8 → 8):旋钮没动、指纹没动、音频却变了 ⇒ 又是零红。
         //    ⇒ 凡是这几个常量被改,这条闸当场红,红的措辞会指到那三处版本字面量。
@@ -1405,7 +1406,7 @@ pub fn render_score_sovits(
                 keep,
                 PREROLL_DAMP_THRESH_DB,
                 PREROLL_DAMP_MAX_DB,
-                emphasis_fade_samples(m.sample_rate),
+                m.sample_rate,
             );
         }
         // S97 ②a 刀: restore phrase-final sonorant codas swallowed by the release ramp
@@ -1686,7 +1687,7 @@ pub fn render_score_rvc(
                 keep,
                 PREROLL_DAMP_THRESH_DB,
                 PREROLL_DAMP_MAX_DB,
-                emphasis_fade_samples(m.sample_rate),
+                m.sample_rate,
             );
         }
         // S97 ②a 刀: restore phrase-final sonorant codas swallowed by the release ramp
@@ -1915,6 +1916,18 @@ const PREROLL_DAMP_THRESH_DB: f32 = -40.0;
 /// 最多压多少 dB（护栏，不是参数）。
 const PREROLL_DAMP_MAX_DB: f32 = 18.0;
 
+/// ⭐⭐ 增益的**斜率上限**（dB/ms）。用户 2026-08-28 实听第一版：「**3:40.861 应该是压出竖条纹了**」。
+///
+/// 第一版直接复用了 `emphasis_fade_samples`（**5 ms**）——而 `apply_emphasis` 只抬 2.5 dB，
+/// 这一刀却压 10-18 dB ⇒ 窗边界上 **2.5 dB/ms** 的增益台阶 = 宽带瞬变 = 竖条纹。
+/// 实测该处：平台压了 **17 dB**（顶到上限），Δ 在 **6 ms 内从 −15 跳回 0**。
+///
+/// ⇒ 淡化长度**随压幅走**（`fade = cut_db / 这个斜率`），
+///   而且**压幅反过来受窗长约束**（`cut ≤ 斜率 × 半窗`）——窗短就少压，绝不缩短淡化。
+/// ⚠ 这一条与 S163 的另一条同源血训并列：**任何逐格/逐窗增益都必须给斜率封顶**
+///   （v17a 的 2 ms 阶梯把 16-24 kHz 抬了 21.5 dB，也是这个形状）。
+const PREROLL_DAMP_MAX_SLOPE_DB_PER_MS: f32 = 0.6;
+
 fn preroll_damp_enabled() -> bool {
     parse_preroll_damp(std::env::var("UTAI_PREROLL_DAMP").ok().as_deref())
 }
@@ -1970,7 +1983,7 @@ fn apply_preroll_damp(
     keep: usize,
     thresh_db: f32,
     max_cut_db: f32,
-    fade: usize,
+    sample_rate: u32,
 ) -> usize {
     let mut hit = 0usize;
     for &(s, e0) in windows {
@@ -1984,8 +1997,9 @@ fn apply_preroll_damp(
             continue; // 辅音本来就短于 keep ⇒ 全是真辅音，不碰
         }
         // 参照：窗之后 50-150 ms 的稳态（= 那个音的元音）
-        let rs = (e0 + fade).min(audio.len());
-        let re = (rs + fade * 20).min(audio.len());
+        let ms = |v: f32| ((v / 1000.0) * sample_rate as f32).round().max(1.0) as usize;
+        let rs = (e0 + ms(50.0)).min(audio.len());
+        let re = (rs + ms(100.0)).min(audio.len());
         if re <= rs {
             continue;
         }
@@ -2003,14 +2017,28 @@ fn apply_preroll_damp(
         if rel_db <= f64::from(thresh_db) {
             continue; // 平台本来就安静 ⇒ 逐位不变
         }
-        let cut_db = (rel_db - f64::from(thresh_db)).min(f64::from(max_cut_db));
-        let gain = 10f64.powf(-cut_db / 20.0) as f32;
+        // ⭐ 压幅受**窗长**约束：淡化要用掉半窗，而斜率有上限
+        //    ⇒ 窗短就少压，**绝不缩短淡化**（缩短淡化 = 造竖条纹，见 `PREROLL_DAMP_MAX_SLOPE_DB_PER_MS`）。
+        let half_ms = (e - s) as f64 / 2.0 / f64::from(sample_rate) * 1000.0;
+        let by_slope = f64::from(PREROLL_DAMP_MAX_SLOPE_DB_PER_MS) * half_ms;
+        let cut_db = (rel_db - f64::from(thresh_db))
+            .min(f64::from(max_cut_db))
+            .min(by_slope);
+        if cut_db <= 0.1 {
+            continue; // 窗太短，压不了几个 dB ⇒ 不如不动（也就不会造边界台阶）
+        }
         hit += 1;
-        let f = fade.max(1) as f32;
+        // 淡化长度**随压幅走**
+        let fade_ms = cut_db / f64::from(PREROLL_DAMP_MAX_SLOPE_DB_PER_MS);
+        let f = ((fade_ms / 1000.0) * f64::from(sample_rate)).round().max(1.0) as f64;
         for i in s..e {
-            let edge = (i - s).min(e - 1 - i) as f32;
+            let edge = f64::from((i - s).min(e - 1 - i) as u32);
             let ramp = (edge / f).min(1.0);
-            audio[i] *= 1.0 + (gain - 1.0) * ramp;
+            // ⛔⛔ 在 **dB 域**插值，不是幅度域。
+            //    幅度域线性（`1 + (gain−1)·ramp`）会让 **dB 斜率不均匀、末端更陡**：
+            //    幅度 1→0.25 线性时前半只掉 4 dB、后半掉 8 dB ⇒ 实测 1.13 dB/ms，
+            //    是斜率上限 0.6 的近两倍（判据 `preroll_damp_never_exceeds_the_slope_cap` 当场抓到）。
+            audio[i] = (f64::from(audio[i]) * 10f64.powf(-cut_db * ramp / 20.0)) as f32;
         }
     }
     hit
@@ -3228,7 +3256,7 @@ mod tests {
             *v = 1.0;                       // 稳态参照
         }
         let before = x.clone();
-        let hit = apply_preroll_damp(&mut x, &[(0, n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, fade);
+        let hit = apply_preroll_damp(&mut x, &[(0, n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, sr as u32);
         assert_eq!(hit, 0, "安静平台不该被判为要压");
         assert_eq!(x, before, "阈值以下必须逐位不变");
     }
@@ -3248,7 +3276,7 @@ mod tests {
             *v = 1.0;
         }
         let tail_before: Vec<f32> = x[n - keep..n].to_vec();
-        let hit = apply_preroll_damp(&mut x, &[(0, n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, fade);
+        let hit = apply_preroll_damp(&mut x, &[(0, n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, sr as u32);
         assert_eq!(hit, 1, "响平台必须被判为要压");
         // 前部中心被压下去了
         let mid = (n - keep) / 2;
@@ -3258,6 +3286,80 @@ mod tests {
         // ⛔ 压幅有护栏
         let cut_db = 20.0 * (0.5f32 / x[mid].abs().max(1e-9)).log10();
         assert!(cut_db <= PREROLL_DAMP_MAX_DB + 0.5, "压过头了：{cut_db} dB");
+    }
+
+    /// ⛔⛔ **承重**：增益的斜率必须封顶。
+    /// 用户 2026-08-28 实听第一版：「**3:40.861 应该是压出竖条纹了**」——
+    /// 那一版复用了 `emphasis` 的 5 ms 淡化，而压幅 10-18 dB ⇒ **2.5 dB/ms** 的边界台阶。
+    /// 实测该处：平台压 17 dB，Δ 在 **6 ms 内从 −15 跳回 0**。
+    #[test]
+    fn preroll_damp_never_exceeds_the_slope_cap() {
+        let sr = 44_100usize;
+        let keep = (PREROLL_KEEP_MS / 1000.0 * sr as f32) as usize;
+        // 窗从很短到很长都试；平台一律很响（远超阈值）⇒ 它总想压满
+        for win_ms in [50usize, 80, 120, 200, 400] {
+            let n = win_ms * sr / 1000;
+            if n <= keep + 4 {
+                continue;
+            }
+            let mut x = vec![0.0f32; n + sr];
+            for v in x[..n].iter_mut() {
+                *v = 0.5;
+            }
+            for v in x[n + sr / 20..n + sr / 20 + sr / 10].iter_mut() {
+                *v = 1.0;
+            }
+            let before = x.clone();
+            apply_preroll_damp(&mut x, &[(0, n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, sr as u32);
+            // 逐 1 ms 的增益（dB）跳变必须 ≤ 斜率上限（给 1.6× 余量：离散化 + 端点）
+            let cell = sr / 1000;
+            let g: Vec<f64> = (0..(n - keep) / cell)
+                .map(|i| {
+                    let (a, b) = (i * cell, (i + 1) * cell);
+                    let e0: f64 = before[a..b].iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+                    let e1: f64 = x[a..b].iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+                    10.0 * ((e1 + 1e-30) / (e0 + 1e-30)).log10()
+                })
+                .collect();
+            let step = g.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f64, f64::max);
+            assert!(
+                step <= f64::from(PREROLL_DAMP_MAX_SLOPE_DB_PER_MS) * 1.6,
+                "{win_ms} ms 窗：增益斜率 {step:.2} dB/ms 超过上限 {} —— 那就是竖条纹",
+                PREROLL_DAMP_MAX_SLOPE_DB_PER_MS
+            );
+        }
+    }
+
+    /// ⭐ 窗越短压得越少（因为淡化要用掉半窗，而斜率封顶）——**绝不缩短淡化去换压幅**。
+    #[test]
+    fn preroll_damp_cut_is_bounded_by_the_window_length() {
+        let sr = 44_100usize;
+        let keep = (PREROLL_KEEP_MS / 1000.0 * sr as f32) as usize;
+        let mut last = 0.0f64;
+        for win_ms in [50usize, 80, 120, 200] {
+            let n = win_ms * sr / 1000;
+            if n <= keep + 4 {
+                continue;
+            }
+            let mut x = vec![0.0f32; n + sr];
+            for v in x[..n].iter_mut() {
+                *v = 0.5;
+            }
+            for v in x[n + sr / 20..n + sr / 20 + sr / 10].iter_mut() {
+                *v = 1.0;
+            }
+            apply_preroll_damp(&mut x, &[(0, n)], keep, PREROLL_DAMP_THRESH_DB, PREROLL_DAMP_MAX_DB, sr as u32);
+            let mid = (n - keep) / 2;
+            let cut = -20.0 * f64::from(x[mid].abs() / 0.5).log10();
+            assert!(cut >= last - 0.5, "窗 {win_ms} ms 压 {cut:.1} dB，比更短的窗还少");
+            let half_ms = (n - keep) as f64 / 2.0 / sr as f64 * 1000.0;
+            assert!(
+                cut <= f64::from(PREROLL_DAMP_MAX_SLOPE_DB_PER_MS) * half_ms + 1.0,
+                "窗 {win_ms} ms 压了 {cut:.1} dB，超过半窗允许的 {:.1}",
+                f64::from(PREROLL_DAMP_MAX_SLOPE_DB_PER_MS) * half_ms
+            );
+            last = cut;
+        }
     }
 
     /// ⛔ flags：只标 **SP 之后的辅音串**，到元音为止；**AP（呼吸）不算休止**。
