@@ -281,8 +281,255 @@ pub fn comb_depth_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> Option<f32> {
     Some(vals[vals.len() / 2])
 }
 
+/// ⭐⭐⭐⭐ S163 —— **上方谐波在音【内】被抽干多少**(dB;负 = 中段比音头弱)。
+///
+/// 量 `2·f0 .. 4·f0` 这一带(H2-H4)的能量随时间怎么走:中段中位 − 音头中位。
+///
+/// # 它治什么(用户 2026-08-27 亲口把两件事合成一件)
+/// 「ぴゃ那里……**也是中间塌缩了**」「**那个音的中间电平弱就是差在了上方谐波上**」。
+/// 分频带实测 akiko `[685]ぴゃ`(MIDI 90):落点 78 时 H2-H3 在音内塌 **22.0 dB**、
+/// 落点 76 时 **+0.7**,而 `base` 自己只塌 5.4 ⇒ **救援把它放大了 4 倍**。
+///
+/// # ⛔ 为什么不是别的量
+/// * **整音 RMS / 谐波占比**:量整个音的标量,音**内**的形状结构上看不见;
+/// * **`comb_depth_db`**:量谐波之间有多空,不看谐波自己随时间怎么变;
+/// * **`harmonic_peak_width_pct`**:量每根谐波糊不糊,同样没有时间轴;
+/// * **全带电平的音内 Δ**:被清辅音起头的音污染(か/が 这类读到 40-75 dB 全是辅音动态)。
+///   ⇒ 只看 `2..4·f0` 一带,并且掐掉首帧与尾部 15%(起音瞬态 / 释放曲线)。
+///
+/// # 口径
+/// * STFT 2048 点、40 ms 跳距;不足 8 帧 ⇒ `None`(短音上这个量是噪声);
+/// * 音头 = 前 1/5 的中位(跳过第 0 帧,窗淡入落在那里);中段 = 25%-75% 的中位;
+/// * **与绝对电平无关**(带内自比)、**不需要参照**。
+///
+/// # ⚠ 只在同一个音的多个候选之间比
+/// donor 逆变换后回到原音高 ⇒ 各候选 f0 相同 ⇒ 合法。**跨音高比一律无效。**
+pub fn upper_harmonic_sag_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> Option<f32> {
+    const N: usize = 2048;
+    if !(f0_hz > 20.0) || sample_rate == 0 {
+        return None;
+    }
+    let hop = (sample_rate as usize / 25).max(1); // 40 ms
+    if x.len() < N + hop {
+        return None;
+    }
+    let (lo, hi) = (2.0 * f64::from(f0_hz), 4.0 * f64::from(f0_hz));
+    let bin = f64::from(sample_rate) / N as f64;
+    let (k0, k1) = ((lo / bin).floor() as usize, (hi / bin).ceil() as usize);
+    let k1 = k1.min(N / 2);
+    if k1 <= k0 {
+        return None;
+    }
+    let win: Vec<f64> = (0..N)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos())
+        .collect();
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(N);
+    let mut row: Vec<f32> = Vec::new();
+    let mut i = 0usize;
+    while i + N <= x.len() {
+        let mut buf: Vec<Complex<f64>> =
+            (0..N).map(|j| Complex::new(f64::from(x[i + j]) * win[j], 0.0)).collect();
+        fft.process(&mut buf);
+        let e: f64 = (k0..k1).map(|k| buf[k].norm_sqr()).sum();
+        row.push((10.0 * (e + 1e-30).log10()) as f32);
+        i += hop;
+    }
+    if row.len() < 8 {
+        return None;
+    }
+    // ⛔ 掐掉第 0 帧(窗淡入)与尾部 15%(释放曲线是设计行为,不是缺陷)
+    let end = ((row.len() as f64) * 0.85) as usize;
+    let row = &row[1..end.max(3).min(row.len())];
+    if row.len() < 6 {
+        return None;
+    }
+    let med = |v: &[f32]| -> f32 {
+        let mut w = v.to_vec();
+        w.sort_by(f32::total_cmp);
+        w[w.len() / 2]
+    };
+    let head = med(&row[..(row.len() / 5).max(2)]);
+    let mid = med(&row[row.len() / 4..(3 * row.len()) / 4]);
+    Some(mid - head)
+}
+
+/// ⭐⭐⭐ S163 —— **上方谐波的绝对强度**:`2..8·f0` 的能量 − `0.7..1.6·f0`(基频区)的能量,dB。
+///
+/// # 它是 [`upper_harmonic_sag_db`] 的**对手轴**
+/// `upper_harmonic_sag_db` 量上方谐波在音内**稳不稳**,这一根量**强不强**。
+/// 只看前者会换来一个**平但闷**的档:实测 akiko `[687]く` 换档后音内塌陷只改善 **0.98 dB**
+/// 却把上方谐波压掉 **6.25 dB**;而 S163 §11 早就记过同一个方向
+/// (akiko ぴゃ 的落点 76 上方谐波比 77 弱 **6.6 dB**)。
+///
+/// ⇒ ⛔ **凡是用 `upper_harmonic_sag_db` 做决策的地方,都必须同时查这一根。**
+///
+/// # 口径
+/// 整段一次(4096 点、半重叠、累加谱),**相对基频区**而不是绝对值 ⇒ 与电平无关。
+pub fn upper_harmonic_level_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> Option<f32> {
+    const N: usize = 4096;
+    if !(f0_hz > 20.0) || sample_rate == 0 || x.len() < N {
+        return None;
+    }
+    let bin = f64::from(sample_rate) / N as f64;
+    let k = |hz: f64| -> usize { ((hz / bin).round() as usize).min(N / 2) };
+    let (lo0, lo1) = (k(0.7 * f64::from(f0_hz)), k(1.6 * f64::from(f0_hz)));
+    let (hi0, hi1) = (k(2.0 * f64::from(f0_hz)), k(8.0 * f64::from(f0_hz)));
+    if lo1 <= lo0 || hi1 <= hi0 {
+        return None;
+    }
+    let win: Vec<f64> = (0..N)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos())
+        .collect();
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(N);
+    let mut acc = vec![0f64; N / 2 + 1];
+    let mut i = 0usize;
+    let mut frames = 0usize;
+    while i + N <= x.len() {
+        let mut buf: Vec<Complex<f64>> =
+            (0..N).map(|j| Complex::new(f64::from(x[i + j]) * win[j], 0.0)).collect();
+        fft.process(&mut buf);
+        for (a, b) in acc.iter_mut().zip(buf.iter()) {
+            *a += b.norm_sqr();
+        }
+        i += N / 2;
+        frames += 1;
+    }
+    if frames == 0 {
+        return None;
+    }
+    let up: f64 = acc[hi0..hi1].iter().sum();
+    let lo: f64 = acc[lo0..lo1].iter().sum();
+    if !(lo > 0.0) {
+        return None;
+    }
+    Some((10.0 * ((up + 1e-30) / lo).log10()) as f32)
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// ⛔ 钉住 [`upper_harmonic_level_db`] 与 [`upper_harmonic_sag_db`] **测的不是一件事** ——
+    /// 这正是它作为「对手轴」的全部价值。
+    ///
+    /// * `bright` 与 `dark` 上方谐波强度差 ~12 dB,而两者**都恒定** ⇒ `sag` 读数应该都 ≈ 0;
+    /// * `drained` 上方谐波随时间衰减 ⇒ `sag` 明显负,而**整段平均强度**介于两者之间。
+    #[test]
+    fn upper_level_and_upper_sag_measure_different_things() {
+        let sr = 44_100u32;
+        let f0 = 300.0f32;
+        let n = sr as usize;
+        let mk = |amp: &dyn Fn(f64) -> f64| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f64 / f64::from(sr);
+                    let p = 2.0 * std::f64::consts::PI * f64::from(f0) * t;
+                    (0.3 * p.sin() + amp(t) * (2.0 * p).sin() + amp(t) * 0.7 * (3.0 * p).sin())
+                        as f32
+                })
+                .collect()
+        };
+        let bright = mk(&|_t| 0.25f64);
+        let dark = mk(&|_t| 0.0625f64);
+        let drained = mk(&|t| 0.25f64 * 10f64.powf(-30.0 * t / 20.0));
+
+        let (lb, ld) = (
+            upper_harmonic_level_db(&bright, sr, f0).expect("bright"),
+            upper_harmonic_level_db(&dark, sr, f0).expect("dark"),
+        );
+        assert!(
+            lb - ld > 8.0,
+            "强度轴必须分得开亮/暗 —— bright {lb:.1} vs dark {ld:.1} dB"
+        );
+        let (sb, sd) = (
+            upper_harmonic_sag_db(&bright, sr, f0).expect("bright"),
+            upper_harmonic_sag_db(&dark, sr, f0).expect("dark"),
+        );
+        assert!(
+            sb.abs() < 1.0 && sd.abs() < 1.0,
+            "⛔ 两条都恒定 ⇒ sag 必须都 ≈ 0（否则它就不是「音内」的量了）—— {sb:.2} / {sd:.2}"
+        );
+        let s_dr = upper_harmonic_sag_db(&drained, sr, f0).expect("drained");
+        assert!(
+            s_dr < -5.0,
+            "而衰减的那条 sag 必须明显为负 —— {s_dr:.2} dB"
+        );
+    }
+
+
+    /// ⛔⛔ 这条钉的是 [`upper_harmonic_sag_db`] **只对「上方谐波随时间被抽干」有反应**,
+    /// 而对「整体音量的起伏」和「清辅音起头」**没有**反应 —— 后两者是本场已经栽过的两个坑:
+    /// * 全带 p90−p10 被 か/が 这类清辅音起头的音读到 40-75 dB(那是辅音动态,不是缺陷);
+    /// * 整音标量(RMS / 谐波占比)结构上看不见音**内**的形状。
+    ///
+    /// 三条信号,同一个 f0、同样的长度:
+    /// * `flat`   —— 谐波恒定 ⇒ Δ ≈ 0;
+    /// * `drained`—— **只有 H2/H3 随时间衰减**,H1 不动 ⇒ Δ 必须明显为负;
+    /// * `dimmed` —— **整体**(含 H1)一起衰减同样的量 ⇒ 带内自比 ⇒ Δ 仍然明显为负
+    ///               (这是对的:上方谐波确实弱了),但**幅度不该超过 `drained`**。
+    /// * `louder` —— 整体乘 10 倍 ⇒ Δ 必须**逐位不变**(证明它与绝对电平无关)。
+    #[test]
+    fn upper_harmonic_sag_sees_drained_harmonics_not_loudness() {
+        let sr = 44_100u32;
+        let f0 = 300.0f32;
+        let n = sr as usize; // 1 s
+        let mk = |h1: &dyn Fn(f64) -> f64, up: &dyn Fn(f64) -> f64| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f64 / f64::from(sr);
+                    let p = 2.0 * std::f64::consts::PI * f64::from(f0) * t;
+                    (h1(t) * p.sin()
+                        + up(t) * (2.0 * p).sin() * 0.6
+                        + up(t) * (3.0 * p).sin() * 0.4) as f32
+                })
+                .collect()
+        };
+        let one = |_t: f64| 0.3f64;
+        // ⛔ 衰减率写陡一点是有理由的:STFT 窗本身在平均,而口径又掐掉了尾部 15%
+        //    ⇒ 读出来的 Δ 必然**小于**信号真实的端到端衰减量。这里断言的是
+        //    「与 flat 拉开距离」而不是某个硬数值 —— 硬数值会变成拿测试拟合实现。
+        let fade = |t: f64| 0.3f64 * 10f64.powf(-30.0 * t / 20.0); // 1 s 内衰 30 dB
+        let flat = mk(&one, &one);
+        let drained = mk(&one, &fade);
+        let dimmed = mk(&fade, &fade);
+
+        let s_flat = upper_harmonic_sag_db(&flat, sr, f0).expect("flat");
+        let s_drain = upper_harmonic_sag_db(&drained, sr, f0).expect("drained");
+        let s_dim = upper_harmonic_sag_db(&dimmed, sr, f0).expect("dimmed");
+
+        assert!(
+            s_flat.abs() < 1.0,
+            "恒定谐波的 Δ 必须 ≈ 0 —— 实测 {s_flat:.2} dB"
+        );
+        assert!(
+            s_drain < s_flat - 3.0,
+            "上方谐波被抽干必须与恒定谐波**拉开距离** —— flat {s_flat:.2} vs drained {s_drain:.2} dB"
+        );
+        assert!(
+            s_drain < -5.0,
+            "而且必须是明确的负值(不是噪声) —— 实测 {s_drain:.2} dB"
+        );
+        assert!(
+            (s_dim - s_drain).abs() < 3.0,
+            "带内自比 ⇒ 整体一起衰减与只衰上方谐波读数应接近 —— {s_dim:.2} vs {s_drain:.2}"
+        );
+
+        // ⛔ 电平不变性:整体乘 10,读数必须不动
+        let louder: Vec<f32> = drained.iter().map(|v| v * 10.0).collect();
+        let s_loud = upper_harmonic_sag_db(&louder, sr, f0).expect("louder");
+        assert!(
+            (s_loud - s_drain).abs() < 0.05,
+            "必须与绝对电平无关 —— {s_drain:.3} vs {s_loud:.3}"
+        );
+
+        // 太短必须 None，不许拿噪声读数当真话
+        assert!(
+            upper_harmonic_sag_db(&drained[..4096], sr, f0).is_none(),
+            "帧数不足必须 None"
+        );
+    }
+
     use super::*;
 
     fn stack(f0: f32, sr: u32, secs: f32, harmonics: usize, amp: f32) -> Vec<f32> {
