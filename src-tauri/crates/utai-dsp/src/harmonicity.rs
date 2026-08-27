@@ -407,8 +407,123 @@ pub fn upper_harmonic_level_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> Optio
     Some((10.0 * ((up + 1e-30) / lo).log10()) as f32)
 }
 
+/// ⭐⭐⭐ S163 —— **逐周期峰值的相对起伏**(shimmer),单位 dB。
+///
+/// 把信号按 `f0` 切成整周期,取每周期的峰值,报 `20·log10(peak / median)` 的
+/// **绝对值 p75**。
+///
+/// # ⛔⛔ 这是一把**双向**的尺子 —— 唯一正确的用法是拿 `base` 当靶子
+/// * **太高** = 用户 2026-08-26 点名的「卡痰」:`donor_pre` 上 **9.41**,而 `base` **7.24**;
+/// * **太低** = 用户 2026-08-27 点破的另一头:「**那里除了 f0 剩下的部分都没声了,电都没了**」——
+///   纯正弦的逐周期峰值完全相同 ⇒ shimmer 必然趋近 **0**。深救援 −11 上实测 **0.41**。
+///
+/// ⇒ 调用方**必须**算 `|shimmer(donor) − shimmer(base)|`,
+///   ⛔ **绝不许写成「越小越好」** —— 那会把落点直接推进最坏的那一档。
+///
+/// # 口径
+/// * 周期数 <8 ⇒ `None`(样本不够,读数是噪声);
+/// * 丢掉峰值 <最大峰 5% 的周期(静音尾巴会把中位拖垮);
+/// * 报 p75 而不是标准差:**离群的几个周期才是听得见的那部分**,而 std 会被它们拖着走。
+///
+/// # ⚠ 与另外三根轴测的不是一件事
+/// `harmonic_energy_fraction_db` 量谐波占**总能量**的比例、`comb_depth_db` 量谐波**之间**有多空、
+/// `harmonic_peak_width_pct` 量每根谐波**自己**糊不糊 —— 它们全是**频域**的。
+/// shimmer 是**时域逐周期**的,一个频谱完全正常但每个周期忽大忽小的信号只有它看得见。
+pub fn shimmer_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> Option<f32> {
+    if !(f0_hz > 20.0) || sample_rate == 0 {
+        return None;
+    }
+    let p = (f64::from(sample_rate) / f64::from(f0_hz)).round() as usize;
+    if p < 8 || x.len() < 8 * p {
+        return None;
+    }
+    let k = x.len() / p;
+    let mut pk: Vec<f64> = (0..k)
+        .map(|i| {
+            x[i * p..(i + 1) * p]
+                .iter()
+                .fold(0.0f64, |a, &v| a.max(f64::from(v).abs()))
+        })
+        .collect();
+    let mx = pk.iter().fold(0.0f64, |a, &v| a.max(v));
+    if !(mx > 0.0) {
+        return None;
+    }
+    pk.retain(|&v| v > mx * 0.05);
+    if pk.len() < 8 {
+        return None;
+    }
+    let mut sorted = pk.clone();
+    sorted.sort_by(f64::total_cmp);
+    let med = sorted[sorted.len() / 2];
+    if !(med > 0.0) {
+        return None;
+    }
+    let mut d: Vec<f64> = pk.iter().map(|&v| (20.0 * (v / med).log10()).abs()).collect();
+    d.sort_by(f64::total_cmp);
+    let i = (d.len() * 3) / 4;
+    Some(d[i.min(d.len() - 1)] as f32)
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// ⛔⛔ 这条钉的是 [`shimmer_db`] **两个方向**都要动 —— 一把只在一头有反应的尺子,
+    /// 拿来当「贴近 base」的判据时会静默地把落点推向另一头。
+    ///
+    /// 三条信号,同一个 `f0`、同一个平均电平:
+    /// * `flat`  = 纯正弦 ⇒ 逐周期峰值完全相同 ⇒ shimmer ≈ 0 = **「电都没了」那一头**;
+    /// * `mid`   = 峰值 ±12% 起伏 ⇒ 中间;
+    /// * `rough` = 峰值 ±45% 起伏 ⇒ **「卡痰」那一头**。
+    ///
+    /// ⚠ 变异检查:把 p75 换成 p50、或者不丢静音周期,`flat` 与 `mid` 会挤到一起。
+    #[test]
+    fn shimmer_moves_in_both_directions_and_is_level_invariant() {
+        let sr = 44_100u32;
+        let f0 = 220.0f32;
+        let p = (f64::from(sr) / f64::from(f0)).round() as usize;
+        let build = |amp: &dyn Fn(usize) -> f64| -> Vec<f32> {
+            let mut v = Vec::with_capacity(p * 40);
+            for i in 0..p * 40 {
+                let a = amp(i / p);
+                v.push(
+                    (a * (2.0 * std::f64::consts::PI * f64::from(f0) * i as f64
+                        / f64::from(sr))
+                        .sin()) as f32,
+                );
+            }
+            v
+        };
+        let flat = build(&|_| 0.5);
+        let mid = build(&|c| if c % 2 == 0 { 0.5 } else { 0.44 });
+        let rough = build(&|c| if c % 2 == 0 { 0.5 } else { 0.275 });
+
+        let s_flat = shimmer_db(&flat, sr, f0).expect("flat");
+        let s_mid = shimmer_db(&mid, sr, f0).expect("mid");
+        let s_rough = shimmer_db(&rough, sr, f0).expect("rough");
+
+        assert!(
+            s_flat < 0.2,
+            "纯正弦的 shimmer 必须趋近 0（这一头就是「电都没了」）—— 实测 {s_flat:.3}"
+        );
+        assert!(
+            s_mid > s_flat + 0.5 && s_rough > s_mid + 1.0,
+            "三档必须单调且拉得开 —— flat {s_flat:.2} < mid {s_mid:.2} < rough {s_rough:.2}"
+        );
+
+        // ⛔ 电平不变性:整体乘 0.1 读数必须不动(否则它会变成一把「谁轻谁赢」的尺子 ——
+        //    S163 §7 已经栽过一次)。
+        let quiet: Vec<f32> = rough.iter().map(|v| v * 0.1).collect();
+        let s_quiet = shimmer_db(&quiet, sr, f0).expect("quiet");
+        assert!(
+            (s_quiet - s_rough).abs() < 0.05,
+            "shimmer 必须与电平无关 —— {s_rough:.3} vs {s_quiet:.3}"
+        );
+
+        // 周期数不够时必须 None，不许返回一个噪声读数当真话
+        assert!(shimmer_db(&rough[..p * 4], sr, f0).is_none(), "周期不足必须 None");
+    }
+
 
     /// ⛔ 钉住 [`upper_harmonic_level_db`] 与 [`upper_harmonic_sag_db`] **测的不是一件事** ——
     /// 这正是它作为「对手轴」的全部价值。
