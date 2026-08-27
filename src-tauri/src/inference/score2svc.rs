@@ -3465,76 +3465,62 @@ mod tests {
         assert!(cut > 6.0, "响段只压了 {cut:.1} dB —— 闸还是在看平均");
     }
 
-    /// ⭐⭐⭐ S163 —— 借休止时桶按**休止**长度选（`REST_BUCKET_TARGET_DEFAULT`）。
+    /// ⭐⭐⭐ S163 —— 借休止时桶按**休止**长度选（`onset_want_frames`）。
     ///
-    /// ⛔⛔ **承重①：辅音的【位置】不许动。** 用户 2026-08-28 划的红线：
-    /// 「辅音时序肯定是渲出来的辅音位置啊。那他妈要明知道 120ms 是错的还非得坚持那 120ms
-    ///  那我是傻逼吗？」⇒ 允许缩短分配，**不许移动**。
-    /// 判法：总帧数不变（零和）且辅音**紧贴音头结束**（它后面直接就是元音）。
-    ///
-    /// ⭐ 承重②：省下来的帧**真的还给了 SP**（不是被别人吃掉）。
+    /// ⛔ 直接测纯函数、**两种模式都测**，不碰 env（env 会污染并发跑的其它测试）。
+    /// 依据：`onset_target_frames` 的桶原本按**被借音符**的长度选，可借的是**休止**——
+    /// 下一个音 420 ms(21 帧) ⇒ long bucket ⇒ `w` 4 帧(80 ms)、`k` 6 帧(120 ms)；
+    /// 而休止只有 7 帧 ⇒ 短桶 ⇒ `w` 3、`k` 4。短桶是训练集(44947 clips)里**短情境**的真实值。
     #[test]
-    fn rest_bucket_target_shortens_the_onset_and_gives_the_frames_back_to_the_rest() {
-        // (谱, 期望 SP 帧, 期望辅音帧) —— 期望值来自 `diag_sp_phone_dur_after_preroll` 实测
-        let cases: &[(&str, i64, i64)] = &[
-            ("うぉ", 7, 3), // 改前 SP 6 / w 4
-            ("わ", 7, 3),   // 改前 SP 6 / w 4
-            ("か", 5, 5),   // 改前 SP 4 / k 6
-            ("た", 6, 4),   // 改前 SP 5 / t 5
-        ];
-        for &(kana, want_sp, want_cons) in cases {
-            let score = [("あ", 69, 20), ("R", 0, 10), (kana, 71, 20)];
-            let arr = daw_ja(&score);
-            let total: i64 = arr.phone_dur.iter().sum();
-            assert_eq!(total, 50, "{kana}: 总帧数变了 —— 借用不再是零和（时间线被移动了）");
-
-            let sp_i = arr.phon.iter().position(|p| *p == "SP").expect("SP");
-            assert_eq!(arr.phone_dur[sp_i], want_sp, "{kana}: SP 帧数 {:?}", arr.phon);
-            // 辅音串 = SP 之后、第一个元音之前
-            let cons: i64 = arr.phone_dur[sp_i + 1..arr.phon.len() - 1].iter().sum();
-            assert_eq!(cons, want_cons, "{kana}: 辅音帧数 {:?}", arr.phon);
-
-            // ⛔ 位置不变：辅音后面**直接就是**那个音的元音（没有被挪走、也没插进别的）
-            assert!(
-                super::super::score2cv_tables::VOWEL_SET.contains(&arr.phon[arr.phon.len() - 1]),
-                "{kana}: 最后一个音素不是元音 {:?}",
-                arr.phon
-            );
-            // ⛔ 元音的帧数一个字节没动（省下来的没被它吃掉）
-            assert_eq!(arr.phone_dur[arr.phon.len() - 1], 20, "{kana}: 元音帧数被动了");
+    fn rest_bucket_target_picks_the_bucket_from_the_rest_not_from_the_note() {
+        use super::super::score2cv::onset_want_frames;
+        let long_note = 21i64; // 420 ms ⇒ long bucket
+        let rest7 = Some(7i64); // 140 ms ⇒ short bucket
+        for (ph, want_off, want_on) in [
+            (["w"].as_slice(), 4, 3),  // w: onset [3,3,4]
+            (["k"].as_slice(), 6, 4),  // k: onset [4,5,6]
+            (["t"].as_slice(), 5, 3),  // t: onset [3,4,5]
+        ] {
+            let off = onset_want_frames(ph, 1, long_note, rest7, false, false);
+            let on = onset_want_frames(ph, 1, long_note, rest7, false, true);
+            assert_eq!(off, want_off, "{ph:?} 关：应当按音符的 long bucket");
+            assert_eq!(on, want_on, "{ph:?} 开：应当按休止的 short bucket");
+            assert!(on <= off, "{ph:?} 这一刀只该**缩短**，绝不许变长");
         }
     }
 
-    /// ⛔ 承重③：**纯元音开头不受影响**（没有 onset 要借）——
-    /// 它是这一刀的结构性阴性对照。
+    /// ⛔ 承重：**只在借休止时生效**。`rest_fr = None`（从唱音借）⇒ 两种模式**完全相同**。
     #[test]
-    fn rest_bucket_target_leaves_vowel_initial_notes_alone() {
-        for kana in ["あ", "お", "を"] {
-            let arr = daw_ja(&[("あ", 69, 20), ("R", 0, 10), (kana, 71, 20)]);
-            let sp_i = arr.phon.iter().position(|p| *p == "SP").expect("SP");
-            assert_eq!(arr.phone_dur[sp_i], 10, "{kana}: 元音开头的音不该动 SP {:?}", arr.phon);
+    fn rest_bucket_target_is_inert_when_not_borrowing_from_a_rest() {
+        use super::super::score2cv::onset_want_frames;
+        for fr in [4i64, 8, 21] {
+            for ph in [["w"].as_slice(), ["k"].as_slice(), ["s"].as_slice()] {
+                let off = onset_want_frames(ph, 1, fr, None, false, false);
+                let on = onset_want_frames(ph, 1, fr, None, false, true);
+                assert_eq!(off, on, "{ph:?}@{fr}: 不是从休止借时不许有任何差别");
+            }
         }
     }
 
-    /// ⛔ 承重④：**从唱音借**的场景一个字节不变（这一刀只在紧邻前一个是休止时生效）。
+    /// ⛔ 休止**比音符还长**时不该反过来放宽（`min` 的方向）。
     #[test]
-    fn rest_bucket_target_does_not_touch_borrows_from_a_sung_note() {
-        // 没有休止：あ → か，onset 从前一个唱音借
-        let arr = daw_ja(&[("あ", 69, 20), ("か", 71, 20)]);
-        let total: i64 = arr.phone_dur.iter().sum();
-        assert_eq!(total, 40, "总帧数变了");
-        // k 应当拿到它**按音符长度**的目标（long bucket = 6），不被休止桶影响
-        let k_i = arr.phon.iter().position(|p| *p == "k").expect("k");
-        assert_eq!(arr.phone_dur[k_i], 6, "从唱音借时 k 的目标被改了 {:?}", arr.phon);
+    fn rest_bucket_target_never_lengthens_the_onset() {
+        use super::super::score2cv::onset_want_frames;
+        // 短音符(4 帧 ⇒ short bucket) + 长休止(21 帧 ⇒ long bucket)
+        for ph in [["w"].as_slice(), ["k"].as_slice(), ["ɕ"].as_slice()] {
+            let off = onset_want_frames(ph, 1, 4, None, false, false);
+            let on = onset_want_frames(ph, 1, 4, Some(21), false, true);
+            assert!(on <= off, "{ph:?}: 长休止把 onset 放宽了 {off} → {on}");
+        }
     }
 
-    /// ⛔ 旋钮本身：`0` 关、`1` 开、其它回默认（出厂 true）。
+    /// ⛔ 旋钮：`0` 关、`1` 开、其它回默认（**出厂 false** —— 效果未经耳判证明，见常量 doc）。
     #[test]
     fn rest_bucket_target_knob_parses() {
-        assert!(super::super::score2cv::parse_rest_bucket_target(None));
+        assert!(!super::super::score2cv::parse_rest_bucket_target(None));
         assert!(super::super::score2cv::parse_rest_bucket_target(Some("1")));
         assert!(!super::super::score2cv::parse_rest_bucket_target(Some("0")));
-        assert!(super::super::score2cv::parse_rest_bucket_target(Some("x")));
+        assert!(!super::super::score2cv::parse_rest_bucket_target(Some("x")));
     }
 
     /// ⛔ flags：只标 **SP 之后的辅音串**，到元音为止；**AP（呼吸）不算休止**。

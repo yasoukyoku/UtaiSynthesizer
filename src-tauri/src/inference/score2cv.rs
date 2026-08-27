@@ -662,7 +662,39 @@ fn dur_bucket(fr: i64) -> usize {
 /// 休止 140 ms 时 `k` 6→4 帧（120→80 ms）、`w` 4→3 帧（80→60 ms），
 /// 多出来的 20-40 ms 还给 SP ⇒ `rest_gate` 够得着、模型也不再在那段渲辅音。
 /// ⛔ 辅音**位置不变**（仍紧贴音头结束），只是起点后移。
-const REST_BUCKET_TARGET_DEFAULT: bool = true;
+/// S163 —— onset 想要多少帧。**借休止时桶按休止长度选**（`rest_fr`），否则按被借音符（`fr`）。
+///
+/// 提成纯函数是为了判据能同时测两种模式，而**不用碰 env**（env 会污染并发跑的其它测试）。
+pub(crate) fn onset_want_frames(
+    ph: &[&str],
+    onset_end: usize,
+    fr: i64,
+    rest_fr: Option<i64>,
+    short_cap: bool,
+    enabled: bool,
+) -> i64 {
+    ph[..onset_end]
+        .iter()
+        .map(|&p| {
+            let t = {
+                let t = onset_target_frames(p, fr);
+                if short_cap { t.min(2) } else { t }
+            };
+            match rest_fr {
+                Some(rf) if enabled => t.min(onset_target_frames(p, rf)),
+                _ => t,
+            }
+        })
+        .sum()
+}
+
+/// ⛔ **出厂关**（S163 收线判断）：逻辑是对的、判据是绿的，但**效果未被耳判证明**——
+/// 零区覆盖(0-150 ms 档) 21% → 29%、休止中段电平 **−0.1 dB**、`predamp` 命中只降 2.3%；
+/// 而它**波及所有语言**、改了一条既有英语判据、并且带一个副作用：
+/// 某个 donor 峰值 +22% ⇒ 最终 `peak_normalize` 把**整条压了 2 dB**（内容没退化，但响度变了，
+/// 而更轻本身会被耳朵听成"更干净" ⇒ 不做等响就没法判）。
+/// ⇒ 收益/风险比不支持出厂开。`UTAI_REST_BUCKET_TARGET=1` 打开。
+const REST_BUCKET_TARGET_DEFAULT: bool = false;
 
 fn rest_bucket_target() -> bool {
     parse_rest_bucket_target(std::env::var("UTAI_REST_BUCKET_TARGET").ok().as_deref())
@@ -1714,15 +1746,14 @@ fn assemble_arrays(
                             (Some(&("SP" | "AP")), Some(&d)) if d > 0 => Some(d),
                             _ => None,
                         };
-                        let want: i64 = ph[..onset_end]
-                            .iter()
-                            .map(|&p| match rest_bucket_fr {
-                                Some(rf) if rest_bucket_target() => {
-                                    target(p).min(onset_target_frames(p, rf))
-                                }
-                                _ => target(p),
-                            })
-                            .sum();
+                        let want: i64 = onset_want_frames(
+                            ph,
+                            onset_end,
+                            fr,
+                            rest_bucket_fr,
+                            fr <= 5 && !nucleus_held_by_next,
+                            rest_bucket_target(),
+                        );
                         // ★S92d — the borrow walks BACK over the preceding phones instead of inspecting
                         // only the immediately previous one. S92c fed a starved onset from its own nucleus,
                         // which works but delays the vowel — and "the nucleus starts on the beat" is this
@@ -4165,7 +4196,7 @@ mod tests {
         //    —— 它们不是从休止借的，这一刀碰不到。
         //    ⚠ 这是**英语**夹具，而这条线上我没有英语耳判（记忆：de/fr/es/it 无耳裁）。
         //      逻辑本身是语言无关的（借的是休止就按休止选桶），但英语侧只有仪器背书。
-        assert_eq!(arr.phone_dur, vec![6, 4, 4, 7, 32, 4, 3]);
+        assert_eq!(arr.phone_dur, vec![3, 7, 4, 7, 32, 4, 3]);
         assert_eq!(arr.phone_dur.iter().sum::<i64>(), 60, "frame-conserving");
     }
 
