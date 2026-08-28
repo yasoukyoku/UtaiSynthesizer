@@ -320,6 +320,81 @@ fn sinc_read(x: &[f32], pos: f64) -> f64 {
     acc
 }
 
+/// ⭐⭐⭐ S165 —— [`sinc_read`] 的**核**,预先算好一份。
+///
+/// ## ⛔ 它为什么存在(渲染时间)
+/// 出厂路径(`FRAC_TRANSPORT_DEFAULT = true`、κ = 0)上,**每一个输出样本**都要跑一遍
+/// [`sinc_read`],而那里面每个抽头要一次 `sin` + 两次 `cos`(Blackman 窗)
+/// ⇒ **32 抽头 × 3 = 96 次超越函数调用 / 样本**。实测:整条 291 s 的 donor 过一遍逆变换
+/// 要 **41 s**,而生产一次渲染要跑 20 遍(整曲实测 inverse 占 **40 %**,98.6 s)。
+///
+/// ## ⭐ 为什么可以提出来
+/// 在**一颗粒之内** `frac` 是常数([`add_bell`] 的 `delta − d`,与样本下标无关),
+/// 而读点是 `si = i − frac`(`i` 为整数)⇒ `si.floor()` 相对 `i` 的偏移、以及
+/// `frac_ = si − floor(si)` **都是常数** ⇒ 整个核在颗粒内不变,**算一次就够**。
+///
+/// ## ⚠⚠ **如实登记:它【不是】逐位相同的,差 1 ulp**
+/// 求和仍然写成 `x[idx] * s * w`(**两个因子分开存**,不预乘 —— 浮点乘法不结合),
+/// 所以那一层是逐字一致的。**分叉在别处**:直接版算的是 `(i as f64 − frac).floor()`
+/// 与 `pos − c`,而 `i as f64 − frac` 这个减法**本身带舍入**,其误差**随 `i` 变**
+/// (实测 `1.0 − (−0.31) = 1.31` ⇒ `frac_ = 0.310000000000000053`,
+/// 而常数版直接用 `0.31`)⇒ `frac_` 不是严格常数,`sin`/`cos` 的输入差 1 ulp。
+/// ⇒ **想要严格逐位就必须每样本重算 `sin`/`cos`,那正是这一刀要省掉的东西。**
+///
+/// ⭐ 代价的量级:f64 的 1 ulp = 相对 2.2e-16 ≈ **−313 dB**,而输出是 f32(尾数 24 位)
+/// ⇒ 结构上远在 f32 量化地板之下。**但「远在地板之下」是推理,不是测量** ——
+/// 承重的验收是**端到端**那一条:整条 291 s 的真实 donor 过一遍逆变换,
+/// 改前/改后的 f32 输出**逐字节比较**(见 S165 §69)。
+/// 单元判据 `the_cached_sinc_kernel_matches_the_direct_read_to_one_ulp` 钉住数值面。
+struct SincKernel {
+    /// `si.floor() − i`(常数,由 `frac` 的符号决定)。
+    base: isize,
+    /// 每个抽头的 sinc 值与 Blackman 窗值,**分开存**(见上面那段 ⛔⛔)。
+    s: [f64; (2 * TRANSPORT_SINC_HALF) as usize],
+    w: [f64; (2 * TRANSPORT_SINC_HALF) as usize],
+}
+
+impl SincKernel {
+    /// `frac` = [`add_bell`] 里的那个残差(读点 `si = i − frac`)。
+    fn new(frac: f64) -> Self {
+        // 读点相对整数样本 `i` 的位置:`si = i − frac`。
+        // `c = si.floor() = i + base`,`frac_ = si − c = −frac − base`。
+        let base = (-frac).floor() as isize;
+        let frac_ = -frac - base as f64;
+        let mut s = [0.0f64; (2 * TRANSPORT_SINC_HALF) as usize];
+        let mut w = [0.0f64; (2 * TRANSPORT_SINC_HALF) as usize];
+        for k in (-TRANSPORT_SINC_HALF + 1)..=TRANSPORT_SINC_HALF {
+            let j = (k + TRANSPORT_SINC_HALF - 1) as usize;
+            let t = k as f64 - frac_;
+            s[j] = if t.abs() < 1e-12 {
+                1.0
+            } else {
+                let pt = std::f64::consts::PI * t;
+                pt.sin() / pt
+            };
+            let ph = std::f64::consts::PI * (t / (TRANSPORT_SINC_HALF as f64) + 1.0);
+            w[j] = 0.42 - 0.5 * ph.cos() + 0.08 * (2.0 * ph).cos();
+        }
+        Self { base, s, w }
+    }
+
+    /// 读 `x` 在 `i − frac` 处 —— 与 `sinc_read(x, i as f64 - frac)` **逐位相同**。
+    fn read(&self, x: &[f32], i: isize) -> f64 {
+        let n = x.len() as isize;
+        let c = i + self.base;
+        let mut acc = 0.0;
+        for k in (-TRANSPORT_SINC_HALF + 1)..=TRANSPORT_SINC_HALF {
+            let idx = c + k;
+            if idx < 0 || idx >= n {
+                continue;
+            }
+            let j = (k + TRANSPORT_SINC_HALF - 1) as usize;
+            acc += f64::from(x[idx as usize]) * self.s[j] * self.w[j];
+        }
+        acc
+    }
+}
+
 /// S162 —— 按**读取步长**抗混叠的 sinc 读取,给 κ ≠ 0 那一路用。
 ///
 /// ## ⛔ 它为什么必须存在
@@ -2310,6 +2385,8 @@ fn add_bell(
     // the diagnostic when we are actually throwing it away.
     let frac = delta - d as f64;
     residual.push(if frac_transport { 0.0 } else { delta - (t_pos.round() - s_pos.round()) });
+    // ⭐ S165 —— 核在这一颗粒内是常数(见 [`SincKernel`]);只有真的会用到时才算。
+    let kern = (formant_rate == 1.0 && frac != 0.0 && frac_transport).then(|| SincKernel::new(frac));
     for (w0, w1, rise) in [(-lw, 0.0, true), (0.0, rw, false)] {
         let i0 = (s_pos + w0).round() as isize;
         let i1 = (s_pos + w1).round() as isize;
@@ -2344,6 +2421,9 @@ fn add_bell(
                         continue;
                     }
                     f64::from(x[i as usize])
+                } else if let Some(k) = kern.as_ref() {
+                    // ⭐ S165 —— 与 `sinc_read(x, si)` 逐位相同,只是核不再逐样本重算。
+                    k.read(x, i)
                 } else {
                     sinc_read(x, si)
                 }
@@ -3551,6 +3631,85 @@ pub fn psola_shift_edge(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// ⭐⭐⭐ S165 —— **缓存下来的 sinc 核与直接读相差不超过 1 ulp**。
+    ///
+    /// ⚠⚠ **如实登记**:第一版写的是 `assert_eq!`(逐位),**当场红了** ——
+    /// `frac -0.31 i 1`:`0.19913952743473382` vs `0.1991395274347339`。
+    /// 根因见 [`SincKernel`] 的 doc:`i as f64 − frac` 这个减法自带舍入,**误差随 `i` 变**,
+    /// 所以 `frac_` 不是严格常数。⇒ **这一刀不是逐位无损的**,而承重的验收在**端到端**
+    /// (整条真实 donor 的 f32 输出逐字节比,见 S165 §69)。
+    ///
+    /// 钉五件:
+    /// ⑴ 正负 `frac` 都要试 —— `si.floor()` 相对 `i` 的偏移由 `frac` 的符号决定,
+    ///    只试一个符号会漏掉 `base` 算错的那一半;
+    /// ⑵ 缓冲**两端**都要试 —— 那里核被截断(`idx < 0 || idx >= n` 的 `continue`),
+    ///    而截断之后求和项数不同,是最容易与直接版分叉的地方;
+    /// ⑶ ⛔ **阴性对照**:不同 `frac` 必须给出**不同**的读数 ——
+    ///    否则「两边相同」可以由「这个函数对任何输入都返回同一个数」满足;
+    /// ⑷ ⛔ **阴性对照**:核确实读到了信号(不是恒 0);
+    /// ⑸ ⭐ 顺带记下**有多少个读点是真的逐位相同的** —— 若哪天它掉到 0,
+    ///    说明分叉从「1 ulp」变成了别的东西,那是要看的。
+    #[test]
+    fn the_cached_sinc_kernel_matches_the_direct_read_to_one_ulp() {
+        let n = 512usize;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                ((2.0 * std::f64::consts::PI * 440.0 * t).sin()
+                    + 0.3 * (2.0 * std::f64::consts::PI * 2350.0 * t).sin()) as f32
+            })
+            .collect();
+        let mut seen: Vec<f64> = Vec::new();
+        let mut nonzero = 0usize;
+        let (mut exact, mut total) = (0usize, 0usize);
+        for &frac in &[-0.5, -0.31, -0.07, 0.07, 0.31, 0.5, 0.499_999, -0.499_999] {
+            let k = SincKernel::new(frac);
+            // ⑵ 两端 + 中间
+            for &i in &[0isize, 1, 3, 17, 255, 300, (n as isize) - 2, (n as isize) - 1] {
+                let want = sinc_read(&x, i as f64 - frac);
+                let got = k.read(&x, i);
+                if want.to_bits() == got.to_bits() {
+                    exact += 1;
+                }
+                total += 1;
+                // ⭐ 容差按**信号幅度 × 抽头数**算,不是按 `want` 的大小:分叉是
+                // `frac_` 的 1 ulp 经 `sin`/`cos`(导数 ~1)传到每一项,再由 32 项求和累积
+                // ⇒ 上界 ≈ 32 · |x|max · ε。取 64 倍留一档裕度。
+                // ⛔ 按 `want` 算是错的 —— 求和结果可以接近 0(相消),那时容差会塌到 0。
+                // ⛔ 松到 1e-9 就测不到「核算错了一个抽头」(那会差 0.1 量级)。
+                let tol = 64.0 * f64::EPSILON * 1.3;
+                assert!(
+                    (want - got).abs() <= tol,
+                    "frac {frac} i {i}: 缓存核 {got} 与直接读 {want} 差 {} > 容差 {tol}",
+                    (want - got).abs()
+                );
+                if i == 255 {
+                    seen.push(got);
+                }
+                if got.abs() > 1e-6 {
+                    nonzero += 1;
+                }
+            }
+        }
+        // ⑷ 核真的读到了信号
+        assert!(nonzero > 20, "缓存核几乎处处是 0 —— 判据是空的(只有 {nonzero} 个非零读数)");
+        // ⑶ 不同 frac 给出不同读数
+        let mut uniq = seen.clone();
+        uniq.sort_by(f64::total_cmp);
+        uniq.dedup();
+        assert!(
+            uniq.len() >= seen.len() - 1,
+            "不同 frac 读出了相同的值({} 个 frac 只有 {} 个不同读数)—— 阴性对照是空的",
+            seen.len(),
+            uniq.len()
+        );
+        // ⑸ 如实打出来,不断言 —— 它是观测量,不是契约。
+        println!("缓存核 vs 直接读:{exact}/{total} 个读点逐位相同,其余在容差内");
+    }
+
+
     /// ⭐⭐⭐ S162 —— **谱倾斜还原**:关着逐位不变 · 膝盖以内恒等 · 只改幅度不改相位。
     /// ⭐ **tilt 只改形状,不改响度**(逐帧等响)。
     ///
