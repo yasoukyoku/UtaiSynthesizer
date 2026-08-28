@@ -727,8 +727,182 @@ pub fn harmonic_level_jitter_pairs(
     out
 }
 
+/// ⭐⭐⭐⭐ S165 —— **候选唱的是不是目标音高**:返回实测 `f0` 相对 `target_hz` 的**音分差**。
+///
+/// # 为什么必须有它
+/// `decide_group` 的**所有**轴(`rel`/`harm`/`gone`/`comb`/`width`/`usag`/`h2`/失配)
+/// **没有一根在检查音高**。用户 2026-08-29 听出的那个灾难就是这么来的:
+/// 「ぴゃ」(4:03.10,midi 83 ⇒ +7 = **90**,目标 **1480 Hz**)在成品里
+/// **f0 掉到 320 Hz(≈ −27 个半音)**、RMS −13.05 dB、梳深 61.5 → 14.8 ——
+/// **不是变哑,是唱错音**。
+/// ⛔ 而塌掉的 donor 在别的轴上**未必难看**:**音高塌了之后谐波反而更「协调」**
+/// ⇒ 它可以毫无阻碍地被选中,甚至在失配轴上得高分。
+///
+/// # ⛔ 为什么用**谐波梳匹配**而不是找最强峰
+/// 塌掉的音低频能量很大(基频以下那层噪声本来就在训练数据里),单看最强峰容易误判。
+/// 这里对一组候选基频(`target` 的 1/5、1/4、1/3、1/2、1、2 倍)各自算**谐波系列的能量和**,
+/// 谁的梳齿最实谁就是真正的 `f0`。
+///
+/// # 口径
+/// * 谐波窗 `±0.06·f`,取窗内峰值;只累加**前 6 根**(更高次容易被噪声抬起来);
+/// * 每根谐波要**比它两侧的谐波间背景高 3 dB** 才计入 —— 否则「哪里都有能量」会让所有候选都赢;
+/// * 返回 `1200·log2(实测 / target)`,正 = 唱高了;测不到 ⇒ `None`(**不许瞎猜**)。
+pub fn pitch_error_cents(x: &[f32], sample_rate: u32, target_hz: f32) -> Option<f32> {
+    const N: usize = 8192;
+    if !(target_hz > 20.0) || sample_rate == 0 || x.len() < N {
+        return None;
+    }
+    let sr = f64::from(sample_rate);
+    let tgt = f64::from(target_hz);
+    let win: Vec<f64> = (0..N)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos())
+        .collect();
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(N);
+    let mut acc = vec![0f64; N / 2 + 1];
+    let (mut i, mut frames) = (0usize, 0usize);
+    while i + N <= x.len() {
+        let mut buf: Vec<Complex<f64>> =
+            (0..N).map(|j| Complex::new(f64::from(x[i + j]) * win[j], 0.0)).collect();
+        fft.process(&mut buf);
+        for (a, b) in acc.iter_mut().zip(buf.iter()) {
+            *a += b.norm_sqr();
+        }
+        i += N / 2;
+        frames += 1;
+    }
+    if frames == 0 {
+        return None;
+    }
+    let bin = sr / N as f64;
+    let nyq = sr / 2.0;
+    // 某个基频假设下,前 6 根谐波里「确实冒出背景」的能量和。
+    let comb_score = |f: f64| -> f64 {
+        if !(f > 30.0) {
+            return 0.0;
+        }
+        let mut total = 0.0;
+        for k in 1..=6usize {
+            let c = f * k as f64;
+            if c * 1.1 >= nyq {
+                break;
+            }
+            let peak_of = |lo: f64, hi: f64| -> f64 {
+                let (a, b) = (
+                    ((lo / bin).floor().max(1.0)) as usize,
+                    (((hi / bin).ceil()) as usize).min(N / 2),
+                );
+                if b <= a {
+                    return 0.0;
+                }
+                (a..=b).map(|j| acc[j]).fold(0.0f64, f64::max)
+            };
+            let p = peak_of(c * 0.94, c * 1.06);
+            // 两侧的谐波间背景(半个谐波间隔处)
+            let bg = 0.5 * (peak_of(c + 0.35 * f, c + 0.65 * f) + peak_of(c - 0.65 * f, c - 0.35 * f));
+            if p > 0.0 && bg > 0.0 && 10.0 * (p / bg).log10() >= 3.0 {
+                total += p;
+            }
+        }
+        total
+    };
+    // ⛔ 候选基频:目标本身,以及它塌成 1/2、1/3、1/4、1/5 或翻高一倍的情况。
+    let cands = [tgt, tgt / 2.0, tgt / 3.0, tgt / 4.0, tgt / 5.0, tgt * 2.0];
+    let mut best = (0.0f64, 0.0f64); // (score, f)
+    for &f in &cands {
+        let s = comb_score(f);
+        if s > best.0 {
+            best = (s, f);
+        }
+    }
+    if !(best.0 > 0.0) {
+        return None;
+    }
+    // 在赢家附近做一次细化(±6%),避免整倍数假设带来的量化误差。
+    let mut refined = best.1;
+    let mut top = best.0;
+    let step = best.1 * 0.01;
+    for m in -6i32..=6 {
+        let f = best.1 + step * f64::from(m);
+        let s = comb_score(f);
+        if s > top {
+            top = s;
+            refined = f;
+        }
+    }
+    Some((1200.0 * (refined / tgt).log2()) as f32)
+}
+
 #[cfg(test)]
 mod tests {
+    /// ⭐⭐⭐⭐ S165 —— [`pitch_error_cents`]:**唱错音必须被认出来**,而唱对的不许误伤。
+    ///
+    /// 夹具照**用户 2026-08-29 听出来的真实灾难**造:「ぴゃ」(midi 83 ⇒ +7 = 90,目标 **1480 Hz**)
+    /// 在成品里 **f0 掉到 320 Hz**(≈ −27 个半音)。
+    /// ⛔ 而 `decide_group` 的八根轴没有一根看得见它 —— 塌掉的音**谐波反而更「协调」**。
+    #[test]
+    fn pitch_error_catches_a_collapsed_note_and_does_not_flag_a_correct_one() {
+        let sr = 48_000u32;
+        let n = 24_000usize;
+        let tone = |f0: f32, nh: u32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / sr as f32;
+                    let mut y = 0.0f32;
+                    for k in 1..=nh {
+                        y += (2.0 * std::f32::consts::PI * f0 * k as f32 * t).sin() / k as f32;
+                    }
+                    0.2 * y
+                })
+                .collect()
+        };
+        // ⑴ 唱对 ⇒ 误差 ≈ 0
+        let ok = pitch_error_cents(&tone(1480.0, 6), sr, 1480.0).expect("唱对的该读得到");
+        assert!(ok.abs() < 60.0, "唱对的被判成偏 {ok:.0} 分");
+
+        // ⑵ ⛔ **真实灾难**:目标 1480,实际唱 320 ⇒ 必须报出巨大的负偏差。
+        let bad = pitch_error_cents(&tone(320.0, 6), sr, 1480.0).expect("塌掉的也该读得到");
+        assert!(
+            bad < -1000.0,
+            "目标 1480 而实唱 320(≈ −2650 分),却只报 {bad:.0} 分 —— 音高闸拦不住这种炸法"
+        );
+
+        // ⑶ 塌一个八度(最常见的形态)也要抓住
+        let oct = pitch_error_cents(&tone(740.0, 6), sr, 1480.0).expect("八度塌陷该读得到");
+        assert!(oct < -900.0, "塌八度只报 {oct:.0} 分");
+
+        // ⑷ ⛔ 不许误伤:轻微跑调(±40 分,颤音范围内)不该被当成塌陷。
+        for cents in [-40.0f32, -20.0, 20.0, 40.0] {
+            let f = 1480.0 * 2f32.powf(cents / 1200.0);
+            let e = pitch_error_cents(&tone(f, 6), sr, 1480.0).expect("轻微跑调该读得到");
+            assert!(
+                (e - cents).abs() < 60.0,
+                "{cents:+.0} 分的跑调被读成 {e:+.0} 分 —— 误差太大会造成误伤"
+            );
+        }
+
+        // ⑸ 与整体响度无关(闸不许变成「谁轻谁出局」)。
+        let loud = tone(320.0, 6);
+        let quiet: Vec<f32> = loud.iter().map(|v| v * 0.02).collect();
+        let a = pitch_error_cents(&loud, sr, 1480.0).unwrap();
+        let b = pitch_error_cents(&quiet, sr, 1480.0).unwrap();
+        assert!((a - b).abs() < 30.0, "读数被响度影响:{a:.0} vs {b:.0}");
+
+        // ⑹ 纯噪声 ⇒ None(不许瞎猜)。
+        let noise: Vec<f32> = {
+            let mut s = 12345u32;
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((s >> 16) as f32 / 32768.0 - 1.0) * 0.05
+                })
+                .collect()
+        };
+        if let Some(e) = pitch_error_cents(&noise, sr, 1480.0) {
+            assert!(e.abs() > 300.0, "纯噪声被判成唱对了({e:.0} 分)");
+        }
+    }
+
     /// ⭐⭐⭐ S165 —— [`harmonic_level_jitter_pairs`]:**尺子自己不许造斜率**,而且要读得回已知调制。
     ///
     /// ⛔ 这一条钉住的是本场最贵的教训之一:一个独立排查用「全曲矩形 FFT 掩膜」做带通,

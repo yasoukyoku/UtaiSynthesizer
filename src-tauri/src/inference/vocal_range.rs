@@ -1256,6 +1256,29 @@ fn decide_group(
             }
         }
     }
+    // ⭐⭐⭐⭐ S165 —— **音高闸(硬否决)**,排在所有排序轴之前。
+    //
+    // ⛔ 唱错音是**质的失败**,不参与任何权衡:一个塌了八度的候选可能在 `rel`/`usag`/失配上
+    //    全都好看(音高塌了之后谐波反而更协调)。用户 2026-08-29 听到的那个「炸得非常烂」
+    //    正是这么来的 —— 目标 1480 Hz 而实唱 **320 Hz**。
+    // ⛔ **只在还有别的候选活着时才否决** —— 全部都跑调时不能把一组清空
+    //    (那会让 `mine.first()` 拿不到东西,整组失去救援)。
+    if mine.len() > 1 {
+        let ok: Vec<usize> =
+            mine.iter().copied().filter(|&c| cand[c].4.worst_pitch_err() <= PITCH_GATE_CENTS).collect();
+        if !ok.is_empty() && ok.len() < mine.len() {
+            tracing::warn!(
+                "range: pitch gate dropped {} of {} candidates for job {ji} (worst errors {:?} cents)",
+                mine.len() - ok.len(),
+                mine.len(),
+                mine.iter()
+                    .filter(|&&c| cand[c].4.worst_pitch_err() > PITCH_GATE_CENTS)
+                    .map(|&c| (cand[c].1, cand[c].4.worst_pitch_err().round() as i32))
+                    .collect::<Vec<_>>()
+            );
+            mine = ok;
+        }
+    }
     if harm_eps > 0.0 && mine.len() > 1 {
         let loses: Vec<usize> = mine
             .iter()
@@ -4360,6 +4383,17 @@ fn note_mismatch(
     worst
 }
 
+/// ⭐⭐⭐⭐ S165 —— **音高闸**:候选里任何一个音的实测 `f0` 偏离目标超过这么多**音分** ⇒ 整个候选出局。
+///
+/// # ⛔ 为什么必须是硬否决(而不是又一根排序轴)
+/// 唱错音是**质的失败**,不是「差一点」——它跟别的轴不可比:
+/// 一个塌了八度的候选可能在 `rel`/`usag`/失配上全都好看(**音高塌了之后谐波反而更协调**)。
+/// 实测那个灾难:目标 1480 Hz 而实唱 **320 Hz**(≈ **−2650 分**)。
+///
+/// ⚙ **150 分**(一个半半音):远大于颤音与正常跑调(±40 分内),
+/// 远小于最轻的塌陷(半八度 = 600 分)。⛔ 别调到 100 以下 —— 会开始误伤颤音重的音。
+const PITCH_GATE_CENTS: f32 = 150.0;
+
 /// ⭐⭐⭐ S165 —— **失配**超过这个值 ⇒ 这一组走修补遍,并且用 [`MISM_REPAIR_RADIUS`] 的宽半径。
 ///
 /// # ⛔ 为什么必须有它:候选池太小,失配轴根本没得选
@@ -4369,9 +4403,13 @@ fn note_mismatch(
 /// ⇒ **离线在转储里看到的那些更好的候选,引擎压根没渲出来** ⇒ 落点 **0 变化**。
 /// ⚠ 这与 `h2` 撞的是同一堵墙(当时的解法是 [`H2_REPAIR_RADIUS`]),而失配轴原本没有对应的东西。
 ///
-/// ⚙ 门限 1.5:实测两首谱上 `worst mismatch` 的分布是 **−0.16 … +4.59**,1.5 落在中段。
+/// ⚙ 门限 **0.8**(第一版 1.5 ⇒ **太严**):用户点名的 4:36 那个音失配 **1.17 < 1.5**,
+/// 实测 yachiyo `13816` 那组**触发次数 0** —— 该管的没管上。
+/// ⭐ **正确形状:触发要松(多渲候选)、换档要严(少动)**。第一版把两者做反了:
+/// `FLOOR=1.5` 太严 + `eps=0.3` 太松(gap 分布 0.34-2.48 ⇒ 几乎全过门)
+/// ⇒ 修补遍 7→**50**、8 组换 6 组,**该管的没管上、不该动的全动了**。
 /// ⚠ 触发率要实测,别照搬 —— 用户 2026-08-29:「**别对着一个模型硬改**」。
-const MISM_REPAIR_FLOOR: f32 = 1.5;
+const MISM_REPAIR_FLOOR: f32 = 0.8;
 
 /// ⭐⭐⭐ S165 —— 失配触发的组用这个半径。理由同 [`H2_REPAIR_RADIUS`]:
 /// 好落点常常离当前档 **2-9 个半音**,`REPAIR_RADIUS = 2` 结构上够不着。
@@ -4488,6 +4526,11 @@ pub fn landing_mismatch_eps() -> f32 {
 
 /// ⚙ 出厂默认。见 [`landing_mismatch_eps`]。
 const LANDING_MISMATCH_EPS_DEFAULT: f32 = 0.0;
+
+/// ⭐⭐ S165 —— 建议的换档门限(**出厂关**时用不到,写在这里是给调参与文档看的)。
+/// 实测 gap 分布 **0.34-2.48**(两首谱同量级),p75 ≈ **1.10** ⇒ **1.2** 只让上四分位过门。
+/// ⛔ 第一版用 **0.3** ⇒ 几乎全部过门 ⇒ 大幅换档 ⇒ 把「ぴゃ」炸了。
+const MISMATCH_EPS_SUGGESTED: f32 = 1.2;
 
 fn parse_mismatch_eps(v: Option<&str>) -> f32 {
     match v {
@@ -5252,6 +5295,14 @@ struct CandScore {
     /// ⛔ **「最差」不是「平均」**——这一条搞反整把刀会反向(实测四种口径见 [`note_mismatch`] 的表:
     /// 三种「整体距离」全都选中用户判为最差的那一档)。
     mism: Vec<(usize, f32)>,
+    /// ⭐⭐⭐⭐ S165 —— (音下标, **音高误差** 音分)。见 [`utai_dsp::harmonicity::pitch_error_cents`]。
+    ///
+    /// ⛔ 在此之前,`decide_group` 的**所有**轴都不检查「这个候选唱的是不是目标音高」。
+    /// 用户 2026-08-29 听出的灾难:「ぴゃ」(目标 **1480 Hz**)在成品里 **f0 掉到 320 Hz**
+    /// (≈ −27 个半音)、RMS −13.05 dB、梳深 61.5 → 14.8 —— **不是变哑,是唱错音**。
+    /// ⚠ 而塌掉的音在别的轴上**未必难看**:**音高塌了之后谐波反而更「协调」**,
+    /// 它甚至能在失配轴上得高分。
+    pitch: Vec<(usize, f32)>,
     /// ⭐⭐⭐ S163 —— (音下标, **上方谐波的绝对强度** dB:`2..8·f0` 相对 `0.7..1.6·f0`)。
     ///
     /// ⛔ 它是 [`CandScore::usag`] 的**对手轴**:`usag` 量「稳不稳」,它量「强不强」。
@@ -5294,6 +5345,12 @@ impl CandScore {
     /// (S162 的 oracle 用的就是这个口径)。
     fn worst_usag(&self) -> f32 {
         self.usag.iter().map(|&(_, v)| v).fold(0.0f32, f32::min)
+    }
+
+    /// ⭐⭐⭐⭐ S165 —— 组内**音高错得最离谱**的那个音(绝对音分)。没量到 ⇒ `0.0`
+    /// (= 没有证据说它坏;⛔ 不许当成「坏」,否则量不到就全被否决了)。
+    fn worst_pitch_err(&self) -> f32 {
+        self.pitch.iter().map(|&(_, v)| v.abs()).fold(0.0f32, f32::max)
     }
 
     /// ⭐⭐⭐ S165 —— 组内**失配最严重**的那个音。没量到 ⇒ `NEG_INFINITY`
@@ -5866,6 +5923,14 @@ pub fn apply_dead_only_windows_with(
                                     sc.mism.push((ni, m));
                                 }
                             }
+                            // ⭐⭐⭐⭐ S165 —— **音高误差**,第 1 处。⛔ 三处填充点了,漏一处这道闸就静默失效。
+                            if let Some(pe) = utai_dsp::harmonicity::pitch_error_cents(
+                                seg,
+                                sample_rate,
+                                nd.hz,
+                            ) {
+                                sc.pitch.push((ni, pe));
+                            }
                         }
                         let g = silence_run_ms(seg, sample_rate);
                         if g > 0.0 {
@@ -6145,6 +6210,16 @@ pub fn apply_dead_only_windows_with(
                                         {
                                             sc.mism.push((ni, m));
                                         }
+                                    }
+                                    // ⭐⭐⭐⭐ S165 —— **音高误差**,第 2 处。
+                                    //    ⛔⛔ 这一处尤其要紧:**炸掉的候选正是修补遍(宽半径)新渲出来的**,
+                                    //    漏了它,音高闸对最危险的那批候选完全失效。
+                                    if let Some(pe) = utai_dsp::harmonicity::pitch_error_cents(
+                                        seg,
+                                        sample_rate,
+                                        nd.hz,
+                                    ) {
+                                        sc.pitch.push((ni, pe));
                                     }
                                 }
                                 if nd.hz > 0.0 {
@@ -12610,6 +12685,7 @@ mod tests {
                     usag: Vec::new(),
                     h2: Vec::new(),
                     mism: Vec::new(),
+                    pitch: Vec::new(),
                     uplev: Vec::new(),
                 },
             )
@@ -12692,11 +12768,50 @@ mod tests {
             "出厂门限下该选 A(唱对音高的那个),读到 {on:.2},A={a_db:.2} B={b_db:.2}"
         );
 
-        // ⑵ ⛔ 阴性对照:门限 = 0 ⇒ 只剩电平轴 ⇒ 选 B
-        let off = mid_db(&run(0.0), 5, spf);
+        // ⑵ ⛔⛔ S165 —— **音高闸现在会先把 B 拦下来**(B 唱 660 而目标 440 = 高 700 音分),
+        //    所以「关掉谐波否决 ⇒ 退回电平轴 ⇒ 选 B」这条阴性对照**不再成立**。
+        //    ⇒ 改用一个**音高正确、只是谐波差**的 B′ 来隔离那一个变量。
+        //    (这不是回归:唱错音是**质的失败**,本来就该被更早、更直接地拦住,
+        //     不该等谐波否决去间接发现。)
+        let run_pitch_ok = |eps: f32| -> Vec<f32> {
+            let mut b = base0.clone();
+            apply_dead_only_windows_with(
+                &mut b, 44100, total, &jobs, &alts, &notes, false, false, 0, eps, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                |s, _| {
+                    Ok(if s == -8 {
+                        stack(440.0, 0.0537, base0.len())
+                    } else {
+                        // B′:**唱对音高** 440,只是响、而且谐波结构差(只有 2 根)
+                        let mut d = vec![0.0f32; base0.len()];
+                        for i in 4..7usize {
+                            let (aa, bb) = ((i * 10) * spf, ((i + 1) * 10) * spf);
+                            for (t, v) in d[aa..bb].iter_mut().enumerate() {
+                                let tt = t as f32 / 44100.0;
+                                let y = (2.0 * std::f32::consts::PI * 440.0 * tt).sin()
+                                    + 0.5 * (2.0 * std::f32::consts::PI * 880.0 * tt).sin();
+                                *v = 0.0851 * y;
+                            }
+                        }
+                        d
+                    })
+                },
+            )
+            .unwrap();
+            b
+        };
+        let off = mid_db(&run_pitch_ok(0.0), 5, spf);
         assert!(
-            (off - b_db).abs() < 0.8,
-            "关掉谐波否决就只剩电平轴,该选 B,读到 {off:.2},A={a_db:.2} B={b_db:.2}"
+            off > a_db + 1.0,
+            "关掉谐波否决、且候选音高正确时,该退回电平轴选那个更响的,读到 {off:.2},A={a_db:.2}"
+        );
+
+        // ⑶ ⭐⭐⭐⭐ S165 —— **音高闸拦得住唱错音的候选**,而且**不依赖谐波否决**。
+        //    用户 2026-08-29 听到的灾难就是这一类:目标 1480 Hz 而实唱 320 Hz。
+        //    这里 B 唱 660 而目标 440(高 700 音分,远超 PITCH_GATE_CENTS)。
+        let gated = mid_db(&run(0.0), 5, spf);
+        assert!(
+            (gated - a_db).abs() < 0.8,
+            "⛔ 谐波否决**关掉**时,音高闸仍必须把唱 660 的 B 拦下来 ⇒ 选 A;             读到 {gated:.2},A={a_db:.2} B={b_db:.2}"
         );
     }
 
