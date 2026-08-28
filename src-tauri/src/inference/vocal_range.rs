@@ -4489,6 +4489,31 @@ fn parse_handover(v: Option<&str>) -> f32 {
 /// ⚙ 出厂默认。见 [`handover_deficit_db`]。
 const HANDOVER_DEFICIT_DB_DEFAULT: f32 = 15.0;
 
+/// ⚙ 出厂默认 = **false(关)** —— `UTAI_RANGE_HANDOVER_FADEWIN=1` 打开。
+///
+/// ## ⭐⭐⭐ 交接点体检**看错了那一段**
+/// [`defer_dead_handover`] 的评估窗一直是「交接点**往后** [`HANDOVER_WIN_MS`](40 ms)」,
+/// 而 [`tied_xfade_ms`] 那一族把右窗的淡入起点**往前拉 120 ms** ——
+/// **两段完全不重叠**,体检结构上看不见自己该拦的那一段。
+///
+/// 实测(用户 2026-08-28 点名 yuyuko × 炉心 **4:36.319**「接缝不干净 / f0 附近多出面状」):
+/// ```text
+/// 往后 40 ms(今天看的)  : 出去 −10.11 / 进来 −15.39 ⇒ 落差 **5.27 dB**,门限 15 够不着
+/// 往前 120 ms(真淡入区): 出去  −8.56 / 进来 −21.11 ⇒ 落差 **12.55 dB**
+/// 成品实测 −14.75,而等增益淡化在 w=0.5 的功率 ≈ 0.25·Pa = **−14.58** ⇒ 几乎完全吻合
+/// ```
+/// ⇒ 凹陷就是「把输出交给一条弱 12.55 dB 的 donor」的必然结果,不是相位相消
+///   (相位那条已经查过并收回,见 [`seam_align_wide`])。
+///
+/// ⛔ 出厂**关**,等验收:这一刀会让 handover 在 tied 缝上更容易触发,而延后交接的代价
+///   (出去那条多唱一截,它的落点音色不是为下一个音选的)必须先量过。
+pub fn handover_fade_window() -> bool {
+    matches!(
+        std::env::var("UTAI_RANGE_HANDOVER_FADEWIN").ok().as_deref().map(str::trim),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
 /// ⚙ 出厂默认 = 120.0(**毫秒**,见 [`TIED_XFADE_MS_DEFAULT`])。`UTAI_RANGE_TIED_XFADE=0`
 /// 关掉 ⇒ 所有接缝都用 10 ms,逐位回到今天。
 ///
@@ -5724,22 +5749,50 @@ fn defer_dead_handover(
     kept: &[(i64, usize, Vec<f32>)],
     order: &[usize],
     deficit: f32,
+    // ⭐⭐⭐ S165 —— 音符表 + 长音延续的淡化宽度 + 基础淡化宽度。
+    //    用来认出「这条缝的淡入区其实在交接点**往前** `tied_xf`」那一族。见 `handover_fade_window`。
+    //    ⛔ 参数不是 env —— 判据不许读进程环境(S151 笔1)。
+    notes: &[NoteSpan],
+    tied_xf: usize,
+    xf: usize,
+    fade_window: bool,
 ) -> std::collections::HashMap<usize, usize> {
     let mut out = std::collections::HashMap::new();
     if deficit <= 0.0 || order.len() < 2 {
         return out;
     }
-    let w = (f64::from(sample_rate) * HANDOVER_WIN_MS / 1000.0) as usize;
+    let w0 = (f64::from(sample_rate) * HANDOVER_WIN_MS / 1000.0) as usize;
     let step = (f64::from(sample_rate) * 0.010) as usize;
     let max_defer = (f64::from(sample_rate) * HANDOVER_MAX_MS / 1000.0) as usize;
     let slice = |ji: usize| kept.iter().find(|(i, _, _)| *i == ji as i64);
-    let lvl = |lo: usize, seg: &[f32], a: usize| -> f32 {
-        if a < lo || a + w > lo + seg.len() {
+    // ⭐⭐⭐ S165 —— 评估窗现在带**偏移**:`off < 0` = 在交接点**往前**取(那才是
+    //    `tied_xfade` 那一族真正的淡入区)。`off = 0` = 今天的行为(往后 40 ms)。
+    let lvl = |lo: usize, seg: &[f32], a: usize, off: isize, w: usize| -> f32 {
+        let lo_i = a as isize + off;
+        if lo_i < lo as isize || (lo_i as usize) + w > lo + seg.len() {
             return f32::NEG_INFINITY;
         }
-        let s = &seg[a - lo..a - lo + w];
+        let s = &seg[(lo_i as usize) - lo..(lo_i as usize) - lo + w];
         let e: f64 = s.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / w as f64;
         (10.0 * (e + 1e-20).log10()) as f32
+    };
+    // ⭐⭐⭐ S165 —— 这条缝的淡入区在哪:与 `xf_at` 的 `tied_here` **同一套判定**
+    //    (交接点落在延续音的头上 ±40 ms,或落在一个音的肚子里)。⛔ 两处判定必须一致,
+    //    否则「体检看的那一段」与「真正淡化的那一段」又会错开 —— 这一刀治的正是那个错开。
+    let tol = (sample_rate as usize) / 25; // 40 ms
+    let tied_here = |t: usize| -> bool {
+        tied_xf > xf
+            && notes.iter().any(|nd| {
+                if !nd.sung {
+                    return false;
+                }
+                let s0 = ((nd.start as f64) * spf) as usize;
+                let s1 = (((nd.start + nd.frames) as f64) * spf) as usize;
+                if s1 <= s0 {
+                    return false;
+                }
+                (nd.tied && t + tol >= s0 && t <= s0 + tol) || (t > s0 + tol && t + tol < s1)
+            })
     };
     for oi in 0..order.len() - 1 {
         let (l, r) = (order[oi], order[oi + 1]);
@@ -5749,7 +5802,20 @@ fn defer_dead_handover(
         let (Some((_, llo, lseg)), Some((_, rlo, rseg))) = (slice(l), slice(r)) else { continue };
         // 今天的交接就在右窗起点
         let t0 = ((jobs[r].start.max(0) as f64) * spf) as usize;
-        let (lv0, rv0) = (lvl(*llo, lseg, t0), lvl(*rlo, rseg, t0));
+        // ⭐⭐⭐ S165 —— **体检窗对准这条缝真正的淡入区**。
+        //
+        // ⛔ 病:`tied_xfade` 把右窗的淡入起点**往前拉 `tied_xf`(120 ms)**,而体检一直
+        //    只看交接点**往后 40 ms**。实测用户点名的 yuyuko × 炉心 4:36.319:
+        //    往后 40 ms 落差只有 **5.27 dB**(门限 15 够不着),而**真正的淡入区**
+        //    (交接点往前 120 ms)落差是 **12.55 dB** ⇒ **它结构上看不见自己该拦的那一段**。
+        //    而那 120 ms 等增益淡化的功率 ≈ `0.25·Pa` = −14.58 dB,成品实测 −14.75 ⇒ 几乎吻合
+        //    ⇒ 凹陷就是「把输出交给一条弱 12.55 dB 的 donor」的必然结果(S165 §54.7)。
+        let (off, w) = if fade_window && tied_here(t0) {
+            (-(tied_xf as isize), tied_xf)
+        } else {
+            (0isize, w0)
+        };
+        let (lv0, rv0) = (lvl(*llo, lseg, t0, off, w), lvl(*rlo, rseg, t0, off, w));
         if !lv0.is_finite() || !rv0.is_finite() {
             continue;
         }
@@ -5761,7 +5827,7 @@ fn defer_dead_handover(
         let mut fixed = None;
         while t + step <= t0 + max_defer {
             t += step;
-            let (lv, rv) = (lvl(*llo, lseg, t), lvl(*rlo, rseg, t));
+            let (lv, rv) = (lvl(*llo, lseg, t, off, w), lvl(*rlo, rseg, t, off, w));
             if !lv.is_finite() || !rv.is_finite() {
                 break;
             }
@@ -5835,7 +5901,18 @@ fn splice_kept(
     order.sort_by_key(|&i| (jobs[i].start, jobs[i].end));
     let mut join = join_rests(base, sample_rate, spf, jobs, kept, &order, xf, join_enabled);
     // ⭐⭐ S163 —— 交接点体检**优先**:它治的是「掉进静音」,比「缝落在哪儿」严重一个量级。
-    join.extend(defer_dead_handover(sample_rate, spf, jobs, kept, &order, handover_db));
+    join.extend(defer_dead_handover(
+        sample_rate,
+        spf,
+        jobs,
+        kept,
+        &order,
+        handover_db,
+        notes,
+        tied_xf,
+        xf,
+        handover_fade_window(),
+    ));
     // ⭐⭐ S163 —— **长音延续处的接缝改成长交叉淡化**(用户:「一个长音三个听感 / 长音割裂」)。
     // ⛔ 做法必须走 `join` 那一套:左窗**硬写到交接点**(不淡出)、右窗**从交接点往前**
     //    一个淡化宽度开始淡入 ⇒ 淡入区里另一侧是**左窗的 donor**。
@@ -8632,6 +8709,75 @@ mod tests {
         )
         .unwrap();
         assert_ne!(b0, run(false), "对齐半径 0 与 48 必须给出不同结果 —— 否则这个夹具测不到对齐");
+    }
+
+    /// ⭐⭐⭐ S165 —— 交接点体检**看的那一段**必须是这条缝真正的淡入区。
+    ///
+    /// ⛔ 病:`tied_xfade` 把右窗的淡入起点**往前拉 120 ms**,而体检一直只看交接点
+    /// **往后 40 ms** —— 两段完全不重叠,体检结构上看不见自己该拦的那一段
+    /// (实测 yuyuko × 炉心 4:36.319:往后 40 ms 落差 5.27 dB 门限够不着,
+    ///  往前 120 ms 落差 **12.55 dB**)。
+    ///
+    /// 夹具就照着那个形状造:进来的那条 donor 在交接点**之前**是静音、之后立刻恢复
+    /// ⇒ **今天的窗(往后)看不见它,往前的窗看得见**。
+    #[test]
+    fn the_handover_check_looks_at_the_actual_fade_in_window() {
+        const SR: u32 = 48_000;
+        const FR: i64 = 100; // 100 帧
+        let spf = 480.0f64; // 每帧 480 样本 ⇒ 10 ms/帧
+        let n = (FR as f64 * spf) as usize;
+        // 两条窗:左 [0,50)、右 [50,100),shift 不同 ⇒ 是一条跨 shift 的缝。
+        let jobs = [DeadJob { shift: -6, start: 0, end: 50 }, DeadJob { shift: -9, start: 50, end: 100 }];
+        let order = [0usize, 1usize];
+        let t0 = (50.0 * spf) as usize; // 交接点 = 右窗起点
+        let tied_xf = (SR as usize) * 120 / 1000; // 120 ms
+        let xf = (SR as usize) / 100; // 10 ms
+
+        // 左 donor:全程响亮。
+        let lseg: Vec<f32> = (0..n).map(|i| 0.3 * ((i % 97) as f32 / 97.0 - 0.5)).collect();
+        // 右 donor:交接点**之前** tied_xf 那一段是静音,之后立刻恢复。
+        let rseg: Vec<f32> = (0..n)
+            .map(|i| {
+                if i + tied_xf >= t0 && i < t0 {
+                    0.0
+                } else {
+                    0.3 * ((i % 89) as f32 / 89.0 - 0.5)
+                }
+            })
+            .collect();
+        let kept = vec![(0i64, 0usize, lseg), (1i64, 0usize, rseg)];
+        // 一个横跨交接点的**延续**长音 ⇒ `tied_here(t0)` 成立。
+        let notes = [NoteSpan { start: 20, frames: 60, sung: true, hz: 440.0, tied: true }];
+
+        let run = |fade_window: bool| {
+            defer_dead_handover(SR, spf, &jobs, &kept, &order, 15.0, &notes, tied_xf, xf, fade_window)
+        };
+
+        // ⑴ 今天的窗(往后 40 ms):那里右 donor 已经恢复 ⇒ **看不见** ⇒ 不该触发。
+        assert!(
+            run(false).is_empty(),
+            "往后 40 ms 的窗里进来的那条已经恢复了 —— 今天的体检本就该看不见它(这是病,不是判据)"
+        );
+        // ⑵ 对准淡入区(往前 120 ms):那里右 donor 是静音 ⇒ **必须触发**。
+        let fixed = run(true);
+        assert!(
+            !fixed.is_empty(),
+            "对准淡入区之后,进来的那条在整段淡入里都是静音 —— 体检必须拦住它"
+        );
+        // ⑶ 挪的方向必须是**往后**(让出去的那条多唱一截),而且不许超过上限。
+        let t = fixed[&0usize];
+        assert!(t > t0, "交接点必须往后挪 —— 拿到 {t} vs 原来的 {t0}");
+        let max_defer = (f64::from(SR) * HANDOVER_MAX_MS / 1000.0) as usize;
+        assert!(t <= t0 + max_defer, "挪的量不许超过 HANDOVER_MAX_MS —— {t} vs {}", t0 + max_defer);
+
+        // ⑷ ⛔ 阴性对照:同一个夹具,但那个音**不是延续音也不横跨交接点**
+        //    ⇒ `tied_here` 不成立 ⇒ 开关开着也必须退回今天的窗 ⇒ 不触发。
+        let notes_off = [NoteSpan { start: 0, frames: 10, sung: true, hz: 440.0, tied: false }];
+        assert!(
+            defer_dead_handover(SR, spf, &jobs, &kept, &order, 15.0, &notes_off, tied_xf, xf, true)
+                .is_empty(),
+            "不是 tied 缝时,这一刀必须退回今天的窗 —— 否则它会波及所有接缝"
+        );
     }
 
     fn the_splicer_aligns_the_two_arms_before_it_crossfades() {
