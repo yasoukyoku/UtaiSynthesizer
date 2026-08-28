@@ -465,8 +465,190 @@ pub fn shimmer_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> Option<f32> {
     Some(d[i.min(d.len() - 1)] as f32)
 }
 
+/// ⭐⭐⭐ S165 —— **第二谐波(2·f0)相对基频的电平**,单位 dB。
+///
+/// # 它是干什么的
+/// 用户 2026-08-28 指着三张频谱图说 yachiyo 的谐波线「**非常小段的忽明忽暗、不是一条干净的
+/// 连续线**」,断得最明显的是「**基频上面那条**」(= `2·f0`)。本场先后造了**八把**量
+/// 「沿时间的变化」的尺子(归一包络 std/mean · 包络谱尖峰度 · STFT 条纹 · 短窗峰宽 ·
+/// 谐波间填充 · 存在率 · 40-60 Hz 调制占比 · log 域绝对快抖),**八把全部读反或分不开**。
+///
+/// 换轴之后一次命中 —— 三条臂最大的差异根本不在「沿时间」,而在「**跨谐波的幅度分布**」:
+///
+/// | 目标音(炉心 `[794]あ`,f0 987.8 Hz) | `2·f0` 相对 `f0` | 偏离「左右两根连线」 |
+/// |---|---|---|
+/// | yachiyo(用户说**油**) | **−17.0 dB** | **−3.3**(凹进去) |
+/// | yuyuko(用户说好) | −5.2 dB | +11.6(凸出来) |
+/// | SV(用户说好) | +0.9 dB | +13.1(凸出来) |
+///
+/// 而 `3·f0` 上三条臂**一致**(−11.6 / −12.3 / −16.3 都是谷)⇒ **只有这一根把它们分开**,落差 15 dB。
+/// ⇒ ⭐ **「忽明忽暗」是低电平的后果不是原因**:一根本来就暗 12-18 dB 的线叠上**正常**的抖动,
+///   在频谱图上就是断续的;亮的线抖同样多却看着是实心的。
+///
+/// # ⛔ 为什么 [`upper_harmonic_level_db`] 看不见它
+/// 那一根量的是 **`2..8·f0` 的整体能量**;`2·f0` 只是其中一根,
+/// **12 dB 的缺口被 7 根谐波一平均只剩 ~1.7 dB** ⇒ 它结构上拦不住这件事。
+///
+/// # ⛔ 口径(每一条都是本场栽出来的)
+/// * **窄窗 `±0.08·f0`**:实测同一份 `base`,窗宽从 `0.15` 放到 `0.20·f0`
+///   让读数跳 **14.7 dB**(−21.9 → −7.2,后者是假的 —— 它抓到了 1800 Hz 附近的**非谐波**能量);
+/// * **验峰位**:峰偏离 `2·f0` 超过 `1.5%` ⇒ 返回 `None`(**「这根谐波不存在」不许读成一个数**)。
+///   实测 `base`(模型硬唱、音高不准)正是这种情况,偏离 −2.1%;
+/// * 与响度无关(比值),所以不吃「谁轻谁赢」的亏。
+///
+/// # ⚠ 这**不是**一把「越高越好」的尺子
+/// 用户 2026-08-28 说 yuyuko 整体「**像大电流音刺耳**」—— 那一条的 `2·f0` 恰恰是最强的。
+/// 而实测把落点从 −8 换到 −13 虽然把这根从 −17.0 拉到 −5.2,却把 `5·f0` **弄坏 24 dB**。
+/// ⇒ ⛔ **调用方必须配对手轴闸**;⛔ 绝不许写成单向的「越大越好」。
+pub fn second_harmonic_level_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> Option<f32> {
+    const N: usize = 4096;
+    const TOL: f64 = 0.08;
+    const MAX_OFF: f64 = 0.015;
+    if !(f0_hz > 20.0) || sample_rate == 0 || x.len() < N {
+        return None;
+    }
+    let sr = f64::from(sample_rate);
+    let f0 = f64::from(f0_hz);
+    if 2.0 * f0 * (1.0 + TOL) >= sr / 2.0 {
+        return None;
+    }
+    let bin = sr / N as f64;
+    let win: Vec<f64> = (0..N)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos())
+        .collect();
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(N);
+    let mut acc = vec![0f64; N / 2 + 1];
+    let mut i = 0usize;
+    let mut frames = 0usize;
+    while i + N <= x.len() {
+        let mut buf: Vec<Complex<f64>> =
+            (0..N).map(|j| Complex::new(f64::from(x[i + j]) * win[j], 0.0)).collect();
+        fft.process(&mut buf);
+        for (a, b) in acc.iter_mut().zip(buf.iter()) {
+            *a += b.norm_sqr();
+        }
+        i += N / 2;
+        frames += 1;
+    }
+    if frames == 0 {
+        return None;
+    }
+    // 在 `c·(1±TOL)` 里找峰,并把峰所在的频率一起带出来验位。
+    let peak = |c: f64| -> Option<(f64, f64)> {
+        let lo = ((c * (1.0 - TOL)) / bin).floor().max(1.0) as usize;
+        let hi = (((c * (1.0 + TOL)) / bin).ceil() as usize).min(N / 2);
+        if hi <= lo {
+            return None;
+        }
+        let (mut bj, mut bv) = (lo, acc[lo]);
+        for j in lo..=hi {
+            if acc[j] > bv {
+                bv = acc[j];
+                bj = j;
+            }
+        }
+        Some((bj as f64 * bin, bv))
+    };
+    let (f_lo, p_lo) = peak(f0)?;
+    let (f_hi, p_hi) = peak(2.0 * f0)?;
+    if !(p_lo > 0.0) || !(p_hi > 0.0) {
+        return None;
+    }
+    // ⛔ 峰位验证:两根都得真的在它们该在的地方。
+    if ((f_lo - f0) / f0).abs() > MAX_OFF || ((f_hi - 2.0 * f0) / (2.0 * f0)).abs() > MAX_OFF {
+        return None;
+    }
+    Some((10.0 * (p_hi / p_lo).log10()) as f32)
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// ⭐⭐⭐ S165 —— [`second_harmonic_level_db`] 的口径:**窄窗 + 验峰位 + 与响度无关**。
+    ///
+    /// 每一条都钉住本场实际栽过的坑,不是凑数的断言。
+    #[test]
+    fn the_second_harmonic_ruler_reads_that_one_harmonic_and_refuses_when_it_is_not_there() {
+        let sr = 48_000u32;
+        let f0 = 987.8f32;
+        let n = 48_000usize;
+        let mk = |h2_gain: f32, off_pct: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / sr as f32;
+                    let a = (2.0 * std::f32::consts::PI * f0 * t).sin();
+                    let b = (2.0 * std::f32::consts::PI * 2.0 * f0 * (1.0 + off_pct) * t).sin();
+                    0.3 * (a + h2_gain * b)
+                })
+                .collect()
+        };
+
+        // ⑴ 等幅 ⇒ 0 dB;按已知增益缩放 ⇒ 读回那个增益。
+        let v0 = second_harmonic_level_db(&mk(1.0, 0.0), sr, f0).expect("等幅该读得到");
+        assert!(v0.abs() < 0.5, "等幅该读 0 dB,实际 {v0:.2}");
+        for g in [0.5f32, 0.1, 0.03] {
+            let v = second_harmonic_level_db(&mk(g, 0.0), sr, f0).expect("有峰就该读得到");
+            let want = 20.0 * g.log10();
+            assert!((v - want).abs() < 1.0, "增益 {g} 该读 {want:.1} dB,实际 {v:.1}");
+        }
+
+        // ⑵ ⛔ 峰位验证:第二谐波偏离 5% ⇒ 必须 `None`,**不许读成一个数**。
+        //    实测 `base`(模型硬唱、音高不准)正是这种情况(偏离 −2.1%)。
+        assert!(
+            second_harmonic_level_db(&mk(1.0, 0.05), sr, f0).is_none(),
+            "峰偏离 5% 还给读数 ⇒ 「这根谐波不存在」被读成了「它很强」"
+        );
+
+        // ⑶ ⛔ 与响度无关 —— 它是比值,不许变成「谁轻谁赢」的尺子。
+        let loud = mk(0.3, 0.0);
+        let quiet: Vec<f32> = loud.iter().map(|v| v * 0.05).collect();
+        let a = second_harmonic_level_db(&loud, sr, f0).unwrap();
+        let b = second_harmonic_level_db(&quiet, sr, f0).unwrap();
+        assert!((a - b).abs() < 0.2, "读数被响度影响了:{a:.2} vs {b:.2}");
+
+        // ⑷ ⭐ 与 `upper_harmonic_level_db` **测的不是一件事**:
+        //    只把 2·f0 挖掉、3..8·f0 全部保留 ⇒ 这一根必须塌,而那一根几乎不动
+        //    (这正是「12 dB 的缺口被 7 根谐波平均成 1.7 dB」的复现)。
+        let full: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let mut y = (2.0 * std::f32::consts::PI * f0 * t).sin();
+                for k in 2..=8u32 {
+                    y += (2.0 * std::f32::consts::PI * f0 * k as f32 * t).sin();
+                }
+                0.1 * y
+            })
+            .collect();
+        let dug: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let mut y = (2.0 * std::f32::consts::PI * f0 * t).sin();
+                for k in 2..=8u32 {
+                    let g = if k == 2 { 0.06 } else { 1.0 }; // 只把 2·f0 挖掉 ~24 dB
+                    y += g * (2.0 * std::f32::consts::PI * f0 * k as f32 * t).sin();
+                }
+                0.1 * y
+            })
+            .collect();
+        let (s_full, s_dug) = (
+            second_harmonic_level_db(&full, sr, f0).unwrap(),
+            second_harmonic_level_db(&dug, sr, f0).unwrap(),
+        );
+        let (u_full, u_dug) = (
+            upper_harmonic_level_db(&full, sr, f0).unwrap(),
+            upper_harmonic_level_db(&dug, sr, f0).unwrap(),
+        );
+        assert!(
+            s_full - s_dug > 18.0,
+            "只挖 2·f0,这一根该塌 >18 dB:{s_full:.1} → {s_dug:.1}"
+        );
+        assert!(
+            (u_full - u_dug) < 6.0,
+            "⭐ 这正是要钉的盲区:`upper_harmonic_level_db` 把 2·f0 的缺口平均掉了,\
+             不该塌这么多({u_full:.1} → {u_dug:.1})—— 若它也塌了,说明两根轴重复了"
+        );
+    }
 
     /// ⛔⛔ 这条钉的是 [`shimmer_db`] **两个方向**都要动 —— 一把只在一头有反应的尺子,
     /// 拿来当「贴近 base」的判据时会静默地把落点推向另一头。
