@@ -4505,8 +4505,17 @@ const HANDOVER_DEFICIT_DB_DEFAULT: f32 = 15.0;
 /// ⇒ 凹陷就是「把输出交给一条弱 12.55 dB 的 donor」的必然结果,不是相位相消
 ///   (相位那条已经查过并收回,见 [`seam_align_wide`])。
 ///
+/// ## ⛔⛔ 它是**额外**看一段,不是**替换**
+/// 第一版写成「tied 缝改用往前的窗」,实测当场退化:`290.680` 那一处
+/// (本 doc 自己举的例子,往后 40 ms 落差 27-45 dB)在关着时被拦住并挪后 110 ms,
+/// 而开着**反而不触发了** —— 因为往前那 120 ms 里进来的那条并不弱。
+/// ⇒ 现在两个窗都算,**取缺口最大的那个**,并用它决定往后找恢复点时看哪一段。
+///
 /// ⛔ 出厂**关**,等验收:这一刀会让 handover 在 tied 缝上更容易触发,而延后交接的代价
 ///   (出去那条多唱一截,它的落点音色不是为下一个音选的)必须先量过。
+/// ⚠ 已知它**单靠自己还够不着靶子**:用户点名的 4:36.319 在淡入区上的落差是 **12.55 dB**,
+///   而 [`HANDOVER_DEFICIT_DB_DEFAULT`] 是 **15** ⇒ 窗改对了、门限仍够不着。
+///   降门限是另一件事,必须单独量(它会波及所有接缝)。
 pub fn handover_fade_window() -> bool {
     matches!(
         std::env::var("UTAI_RANGE_HANDOVER_FADEWIN").ok().as_deref().map(str::trim),
@@ -5810,16 +5819,28 @@ fn defer_dead_handover(
         //    (交接点往前 120 ms)落差是 **12.55 dB** ⇒ **它结构上看不见自己该拦的那一段**。
         //    而那 120 ms 等增益淡化的功率 ≈ `0.25·Pa` = −14.58 dB,成品实测 −14.75 ⇒ 几乎吻合
         //    ⇒ 凹陷就是「把输出交给一条弱 12.55 dB 的 donor」的必然结果(S165 §54.7)。
-        let (off, w) = if fade_window && tied_here(t0) {
-            (-(tied_xf as isize), tied_xf)
+        // ⛔⛔ **两个窗取最差,不是替换。** 第一版写成替换,实测当场退化:
+        //    290.680 那一处(HANDOVER 的 doc 自己举的例子,往后 40 ms 落差 27-45 dB)
+        //    在 OFF 臂被拦住、挪后 110 ms,而 ON 臂**反而不触发了** —— 因为往前那 120 ms
+        //    里进来的那条并不弱。⇒ 淡入区是**额外**要看的一段,不是替代原来那一段。
+        let cands: [(isize, usize); 2] = if fade_window && tied_here(t0) {
+            [(0isize, w0), (-(tied_xf as isize), tied_xf)]
         } else {
-            (0isize, w0)
+            [(0isize, w0), (0isize, w0)]
         };
-        let (lv0, rv0) = (lvl(*llo, lseg, t0, off, w), lvl(*rlo, rseg, t0, off, w));
-        if !lv0.is_finite() || !rv0.is_finite() {
-            continue;
+        let mut pick: Option<(isize, usize, f32, f32)> = None;
+        for (o, ww) in cands {
+            let (lv, rv) = (lvl(*llo, lseg, t0, o, ww), lvl(*rlo, rseg, t0, o, ww));
+            if !lv.is_finite() || !rv.is_finite() || lv <= HANDOVER_ALIVE_DBFS {
+                continue;
+            }
+            // 取**缺口最大**的那个窗:它决定这条缝该不该被拦,以及往后找恢复点时看哪一段。
+            if pick.map_or(true, |(_, _, l, r)| lv - rv > l - r) {
+                pick = Some((o, ww, lv, rv));
+            }
         }
-        if lv0 <= HANDOVER_ALIVE_DBFS || lv0 - rv0 <= deficit {
+        let Some((off, w, lv0, rv0)) = pick else { continue };
+        if lv0 - rv0 <= deficit {
             continue;
         }
         // 往后找第一个「进来的那条追上来」的点
@@ -8777,6 +8798,30 @@ mod tests {
             defer_dead_handover(SR, spf, &jobs, &kept, &order, 15.0, &notes_off, tied_xf, xf, true)
                 .is_empty(),
             "不是 tied 缝时,这一刀必须退回今天的窗 —— 否则它会波及所有接缝"
+        );
+
+        // ⑸ ⛔⛔ **回归判据**:这一刀是【额外看一段】,不许把原本拦得住的那一处放走。
+        //    第一版写成「tied 缝改用往前的窗」,实测当场退化:`290.680` 那一处
+        //    (往后 40 ms 落差 27-45 dB)关着时被拦住,开着**反而不触发了**。
+        //    夹具就照那个形状造:进来的那条在交接点**之后**弱、**之前**不弱。
+        let rseg_after: Vec<f32> = (0..n)
+            .map(|i| {
+                if i >= t0 && i < t0 + (SR as usize) * 60 / 1000 {
+                    0.0
+                } else {
+                    0.3 * ((i % 89) as f32 / 89.0 - 0.5)
+                }
+            })
+            .collect();
+        let kept_after = vec![(0i64, 0usize, kept[0].2.clone()), (1i64, 0usize, rseg_after)];
+        let hit_off =
+            defer_dead_handover(SR, spf, &jobs, &kept_after, &order, 15.0, &notes, tied_xf, xf, false);
+        let hit_on =
+            defer_dead_handover(SR, spf, &jobs, &kept_after, &order, 15.0, &notes, tied_xf, xf, true);
+        assert!(!hit_off.is_empty(), "往后那一段是静音 —— 今天的体检本来就拦得住它");
+        assert!(
+            !hit_on.is_empty(),
+            "⛔ 开着之后反而放走了原本拦得住的缝 —— 这一刀是【额外看一段】,不是替换那一段"
         );
     }
 
