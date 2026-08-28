@@ -4489,7 +4489,8 @@ fn parse_handover(v: Option<&str>) -> f32 {
 /// ⚙ 出厂默认。见 [`handover_deficit_db`]。
 const HANDOVER_DEFICIT_DB_DEFAULT: f32 = 15.0;
 
-/// ⚙ 出厂默认 = **0.0(关)** —— `UTAI_RANGE_HANDOVER_GAIN=<dB>` 打开**收益驱动**。
+/// ⚙ 出厂默认 = 1.5 —— dB；`UTAI_RANGE_HANDOVER_GAIN=0` 退回纯门限逻辑。
+/// 出厂值的出处见 [`HANDOVER_GAIN_DB_DEFAULT`]。
 ///
 /// ## ⛔ 它替掉的是什么:一个**照着靶子调出来的**绝对门限
 /// [`handover_deficit_db`] 问的是「进来那条比出去那条弱了多少 dB」,答案要跟一个**常量**比
@@ -4510,20 +4511,49 @@ const HANDOVER_DEFICIT_DB_DEFAULT: f32 = 15.0;
 /// ## 出厂值的出处
 /// 建议值 **2.7 dB** = 这条线上量过的**可闻阈**(S148 承重一组:~2.7 dB 听得出 / ≤0.46 dB 听不出)
 /// ⇒ 「只在听得出的地方动手」,而不是「弱到某个绝对值就动手」。
-/// ⛔ 出厂 **0.0 = 关**,走今天的纯门限逻辑 ⇒ 逐位不变;要跨模型验收过才翻。
+/// ⭐ S165 翻默认 = **1.5**(用户耳判通过)。⚠ 跨模型只验过 yuyuko / yachiyo 两个 RVC 模型 ——
+///   akiko 与东雪莲在这个仓里只有 sovits 版,那条链没走过。
 pub fn handover_gain_db() -> f32 {
     std::env::var("UTAI_RANGE_HANDOVER_GAIN")
         .ok()
         .and_then(|x| x.trim().parse::<f32>().ok())
         .filter(|t| t.is_finite() && (0.0..=30.0).contains(t))
-        .unwrap_or(0.0)
+        .unwrap_or(HANDOVER_GAIN_DB_DEFAULT)
 }
+
+/// ⚙ 出厂默认 = 1.5 —— dB。
+///
+/// ## ⛔ 这个数是怎么来的 —— **不是照靶子调的**
+/// 用户 2026-08-28 点破上一版:「那你现在不又是照着单个靶子胡乱调么」——
+/// 那时 [`handover_deficit_db`] 被一路试(15 → 12 → 6),每一格都在追一个坐标。
+/// 这一版把判据换成收益驱动之后,只剩「改善多少才值得动手」这一个数,而它由
+/// **三个耳判过的点 + 剂量拐点**共同夹出来(全曲 29 条跨 shift 缝):
+/// ```text
+/// 290.790 收益 2.99  用户没抱怨(修了也没变坏)
+/// 276.320 收益 2.10  4:36 —— 用户确认「基本上真好了」
+/// 269.250 收益 1.66  4:29 —— 用户听得见「哑了一下」
+///
+/// 门槛 2.7 ⇒ 命中 2 条(只覆盖 290.68)
+/// 门槛 2.0 ⇒ 命中 6 条(差 4:29)
+/// 门槛 1.5 ⇒ 命中 9 条  ← 三个耳判点全覆盖
+/// 门槛 1.2 ⇒ 命中 18 条 ← 波及面翻倍
+/// ```
+/// ⇒ **下限由「必须咬住 4:29 的 1.66」定,上限由「再降一格翻倍」定,1.5 是唯一窗口。**
+///
+/// ## ⚠ 已知代价(必须一起记住)
+/// 挪 4 条缝(门限那版只挪 2 条)之后,**没被碰的 700 个音在音头/音尾口径上统计可分**:
+/// MWU **z = +10.49 / +6.26**(上一版 +0.48 / +0.95)。拆开看是 **p50 被顶高**
+/// (音头 0.007 → 0.014)**而不是尾部**(max 4.33 → 4.34 几乎重合);
+/// 变轻 >1 dB 音头 6 / 音尾 24,变响 >0.5 dB 13 / 37(**变响的比变轻的多**)。
+/// ⇒ 取舍是「多修两处靶子 vs 全曲多一层 0.01 dB 量级的抖动」,由**耳朵**拍板,不是仪器。
+const HANDOVER_GAIN_DB_DEFAULT: f32 = 1.5;
 
 /// 收益驱动时的**粗筛**:落差连这个都够不到就不必算收益(纯省开销,不决定结果)。
 /// 取 3.0 dB —— 略高于可闻阈 2.7,再小的落差不可能产生 ≥2.7 dB 的收益。
 const HANDOVER_COARSE_DB: f32 = 3.0;
 
-/// ⚙ 出厂默认 = **false(关)** —— `UTAI_RANGE_HANDOVER_FADEWIN=1` 打开。
+/// ⚙ 出厂默认 = **true(开)** —— `UTAI_RANGE_HANDOVER_FADEWIN=0` 关掉。
+/// ⭐ S165 翻默认:用户 2026-08-28 耳判「4:36 基本上真好了」;4:29 也从 −17.61 抬到 −9.19。
 ///
 /// ## ⭐⭐⭐ 交接点体检**看错了那一段**
 /// [`defer_dead_handover`] 的评估窗一直是「交接点**往后** [`HANDOVER_WIN_MS`](40 ms)」,
@@ -4551,9 +4581,9 @@ const HANDOVER_COARSE_DB: f32 = 3.0;
 ///   而 [`HANDOVER_DEFICIT_DB_DEFAULT`] 是 **15** ⇒ 窗改对了、门限仍够不着。
 ///   降门限是另一件事,必须单独量(它会波及所有接缝)。
 pub fn handover_fade_window() -> bool {
-    matches!(
+    !matches!(
         std::env::var("UTAI_RANGE_HANDOVER_FADEWIN").ok().as_deref().map(str::trim),
-        Some("1") | Some("on") | Some("true") | Some("yes")
+        Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
 
@@ -10947,7 +10977,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s165h";
+        const TAG: &str = "s165i";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -11011,6 +11041,7 @@ mod tests {
             ("LANDING_WIDTH_EPS_DEFAULT", "pub fn landing_width_eps("),
             ("LANDING_WIDTH_FLOOR_DEFAULT", "pub fn landing_width_floor("),
             ("HANDOVER_DEFICIT_DB_DEFAULT", "pub fn handover_deficit_db("),
+            ("HANDOVER_GAIN_DB_DEFAULT", "pub fn handover_gain_db("),
             ("TIED_XFADE_MS_DEFAULT", "pub fn tied_xfade_ms("),
             ("USAG_EPS_DEFAULT", "pub fn landing_usag_eps("),
             ("USAG_DIM_CAP_DEFAULT", "pub fn landing_usag_dim_cap("),
