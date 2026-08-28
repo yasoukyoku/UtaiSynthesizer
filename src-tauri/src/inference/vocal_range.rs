@@ -1303,6 +1303,20 @@ fn decide_group(
             //    所有候选在它上面一样差时不发言是**对的**。
             let gx = -cand[x].4.worst_mism();
             let gy = -cand[y].4.worst_mism();
+            MISM_STAT.with(|st| {
+                let mut b = st.borrow_mut();
+                b.0 += 1;
+                if gx.is_finite() && gy.is_finite() {
+                    let g = (gx - gy).abs();
+                    if g > b.4 {
+                        b.4 = g;
+                    }
+                    let w = (-gx).max(-gy);
+                    if w > b.5 {
+                        b.5 = w;
+                    }
+                }
+            });
             if gx.is_finite() && gy.is_finite() && (gx - gy).abs() > mism_eps {
                 // ⛔⛔ 对手轴闸 —— 用户 2026-08-28 的上线警告:
                 //    「小心这个新条件**别再把那个哑音和伪影引回来**」。
@@ -1313,6 +1327,15 @@ fn decide_group(
                 } else {
                     true
                 };
+                MISM_STAT.with(|st| {
+                    let mut b = st.borrow_mut();
+                    b.1 += 1;
+                    if dim_ok {
+                        b.2 += 1
+                    } else {
+                        b.3 += 1
+                    }
+                });
                 if dim_ok {
                     // 改善大的靠前
                     return gy.partial_cmp(&gx).unwrap_or(std::cmp::Ordering::Equal);
@@ -1449,11 +1472,34 @@ fn alt_shift_for(g: &DeadGroup, alt_plan: &[DeadGroup]) -> Option<i64> {
 thread_local! {
     /// ⛔ 防止「算候选」自己再去算候选(那会指数爆炸)。见 `dead_only_plan_with_alts` 末尾。
     static ALT_PLAN_REENTRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// ⭐⭐ S165 —— **失配**这一支的诊断:
+    /// `(被问几次, gap>eps 几次, 闸放行, 闸拦住, 见过的最大 gap, 见过的最大失配值)`。
+    /// ⛔ 存在的理由:第一版 `eps=0.5` 是照 **Python 侧的尺度**定的,而 Rust 侧用一阶零相位低通,
+    /// 读数小约 2 倍(参照曲线 Python 1.60→1.38 vs Rust 0.62→0.33)⇒ **门限相对读数太大,
+    /// 几乎永远不触发** ⇒ 整轮渲染白跑。**先让引擎自己报分布,别再猜。**
+    static MISM_STAT: std::cell::RefCell<(u64, u64, u64, u64, f32, f32)> =
+        const { std::cell::RefCell::new((0, 0, 0, 0, 0.0, f32::NEG_INFINITY)) };
     /// ⭐ S165 —— `2·f0` 这一支的诊断计数:
     /// `(被问几次, 差距过 eps 几次, 闸放行, 闸拦住, 见过的最大差距, 那次闸放没放行)`。
     /// ⛔ 存在的理由:实机「47 次触发 / 0 条落点改变」连着两轮无法归因。
     static H2_STAT: std::cell::RefCell<(u64, u64, u64, u64, f32, bool)> =
         const { std::cell::RefCell::new((0, 0, 0, 0, 0.0, false)) };
+}
+
+/// ⭐⭐ S165 —— 打印并清空**失配**那一支的诊断。
+fn log_mism_stat(where_: &str) {
+    MISM_STAT.with(|st| {
+        let mut b = st.borrow_mut();
+        if b.0 == 0 {
+            return;
+        }
+        tracing::info!(
+            "range: mismatch-axis [{}] asked {} times, gap>eps {} times, gate PASSED {} / BLOCKED {},              largest gap {:.3}, worst mismatch seen {:.3}",
+            where_, b.0, b.1, b.2, b.3, b.4,
+            if b.5 > f32::NEG_INFINITY { b.5 } else { 0.0 }
+        );
+        *b = (0, 0, 0, 0, 0.0, f32::NEG_INFINITY);
+    });
 }
 
 /// ⭐ S165 —— 打印并清空 `2·f0` 那一支的诊断计数。
@@ -6103,6 +6149,7 @@ pub fn apply_dead_only_windows_with(
                     mism_eps,
                 );
                 log_h2_stat("repair");
+                log_mism_stat("repair");
                 if let Some(&c) = mine.first() {
                     tracing::info!(
                         "range: group[{}..{}] repair — {:?} ⇒ kept {:+} (silence {:.0} ms)",
