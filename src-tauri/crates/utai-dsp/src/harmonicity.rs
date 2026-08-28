@@ -606,19 +606,6 @@ pub fn harmonic_level_jitter_pairs(
     }
     let sr = f64::from(sample_rate);
     let f0 = f64::from(f0_hz);
-    // ⭐ S165 性能:**最多取中间 1.0 s**。抖动是统计量(log 包络在 30-90 Hz 的能量),
-    //    1 s 里有 30-90 个周期,足够稳定;而全长解调是 O(len) 复数乘 + 双向滤波 × 每根谐波,
-    //    在长音上是整个打分流程最大的开销。
-    //    ⚠ 电平读数也跟着只用这一段 —— 两个读数**必须来自同一段**,否则配对就错位了。
-    let x = {
-        let need = (sr as usize).min(x.len());
-        if x.len() > need {
-            let mid = x.len() / 2;
-            &x[mid - need / 2..mid + need / 2]
-        } else {
-            x
-        }
-    };
     let n = x.len();
     let nf = n.next_power_of_two();
     let win: Vec<f64> = (0..n)
@@ -767,17 +754,6 @@ pub fn pitch_error_cents(x: &[f32], sample_rate: u32, target_hz: f32) -> Option<
     }
     let sr = f64::from(sample_rate);
     let tgt = f64::from(target_hz);
-    // ⭐ S165 性能:**最多看中间 6 帧**(≈ 0.5 s @48k)。判「有没有塌八度」不需要整段 ——
-    //    塌陷是整音级的,不是零星几帧。实测这一处把长音上的开销降到原来的几分之一。
-    let x = {
-        let need = N * 4;
-        if x.len() > need {
-            let mid = x.len() / 2;
-            &x[mid - need / 2..mid + need / 2]
-        } else {
-            x
-        }
-    };
     let win: Vec<f64> = (0..N)
         .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos())
         .collect();
@@ -842,11 +818,19 @@ pub fn pitch_error_cents(x: &[f32], sample_rate: u32, target_hz: f32) -> Option<
     if !(best.0 > 0.0) {
         return None;
     }
-    // ⭐ S165 性能:**不做细化**。这道闸的门限是 **150 音分**,而候选基频之间最小间隔是
-    //    一个八度(1200 音分)⇒ 1% 级的精度对判定毫无影响,而细化要多跑 13 次谱峰扫描
-    //    (每次 6 根谐波 × 3 段)= 整个函数最大的开销。
-    //    ⛔ 若哪天有人要拿它当「精确测音高」用,得先把门限一起改掉,再把细化加回来。
-    Some((1200.0 * (best.1 / tgt).log2()) as f32)
+    // 在赢家附近做一次细化(±6%),避免整倍数假设带来的量化误差。
+    let mut refined = best.1;
+    let mut top = best.0;
+    let step = best.1 * 0.01;
+    for m in -6i32..=6 {
+        let f = best.1 + step * f64::from(m);
+        let s = comb_score(f);
+        if s > top {
+            top = s;
+            refined = f;
+        }
+    }
+    Some((1200.0 * (refined / tgt).log2()) as f32)
 }
 
 #[cfg(test)]
