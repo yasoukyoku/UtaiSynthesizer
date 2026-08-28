@@ -4360,6 +4360,23 @@ fn note_mismatch(
     worst
 }
 
+/// ⭐⭐⭐ S165 —— **失配**超过这个值 ⇒ 这一组走修补遍,并且用 [`MISM_REPAIR_RADIUS`] 的宽半径。
+///
+/// # ⛔ 为什么必须有它:候选池太小,失配轴根本没得选
+/// 实测(`eps=0.05` 几乎不设限的一轮):失配轴每组只被问 **2-6 次**,
+/// 而 `decide_group` 只看得到**修补遍实际渲出来的**候选 —— 默认 `REPAIR_RADIUS = 2`,
+/// 那几组的原落点是 −1/−4/−9/−11,±2 够到的全是相邻档。
+/// ⇒ **离线在转储里看到的那些更好的候选,引擎压根没渲出来** ⇒ 落点 **0 变化**。
+/// ⚠ 这与 `h2` 撞的是同一堵墙(当时的解法是 [`H2_REPAIR_RADIUS`]),而失配轴原本没有对应的东西。
+///
+/// ⚙ 门限 1.5:实测两首谱上 `worst mismatch` 的分布是 **−0.16 … +4.59**,1.5 落在中段。
+/// ⚠ 触发率要实测,别照搬 —— 用户 2026-08-29:「**别对着一个模型硬改**」。
+const MISM_REPAIR_FLOOR: f32 = 1.5;
+
+/// ⭐⭐⭐ S165 —— 失配触发的组用这个半径。理由同 [`H2_REPAIR_RADIUS`]:
+/// 好落点常常离当前档 **2-9 个半音**,`REPAIR_RADIUS = 2` 结构上够不着。
+const MISM_REPAIR_RADIUS: i64 = 6;
+
 /// ⭐⭐ S165 —— `2·f0` 这一支的对手轴闸(dB)。见 [`landing_h2_eps`]。
 ///
 /// ⛔ 比 [`LANDING_USAG_DIM_CAP_DEFAULT`] 松,而且是**用户耳判定的**:
@@ -5975,6 +5992,10 @@ pub fn apply_dead_only_windows_with(
                         //   yachiyo 的落点候选产出率是 **0%** ⇒ 不先渲出来,排序永远没有输入。
                         //   ⚙ 门限 −12 dB 由实测触发率定(yachiyo 24% / yuyuko 17%)。
                         || (h2_eps > 0.0 && cand[c].4.worst_h2() < H2_REPAIR_FLOOR)
+                        // ⭐⭐⭐⭐ S165 —— ⑧ **失配**(响度 ↔ 抖动)超标。
+                        //   ⛔ 与 ⑥⑦ 同理:这是让失配轴**有候选可选**的唯一通路 ——
+                        //   实测不加它时,失配轴每组只被问 2-6 次,落点 0 变化。
+                        || (mism_eps > 0.0 && cand[c].4.worst_mism() > MISM_REPAIR_FLOOR)
                 }) || spread(ji) > REPAIR_SPREAD_DB
             })
             .collect();
@@ -6001,12 +6022,16 @@ pub fn apply_dead_only_windows_with(
                 //   ⛔ 用户点名的那个音今天在 **−8**(`2·f0` −17.0 dB),好格是 **−13**(−5.2,
                 //   与用户说「好」的 yuyuko **完全一致**)⇒ `REPAIR_RADIUS = 2` 从 −8 只够到 −10,
                 //   **结构上够不着**。⚠ 代价只有触发的那 17-24% 的组付。
-                let radius = if h2_eps > 0.0
-                    && chosen[ji].is_some_and(|c| cand[c].4.worst_h2() < H2_REPAIR_FLOOR)
-                {
-                    H2_REPAIR_RADIUS
-                } else {
-                    REPAIR_RADIUS
+                //   ⭐ S165 —— `h2` 与**失配**各自的宽半径;两者都触发时取宽的那个。
+                let h2_wide = h2_eps > 0.0
+                    && chosen[ji].is_some_and(|c| cand[c].4.worst_h2() < H2_REPAIR_FLOOR);
+                let mism_wide = mism_eps > 0.0
+                    && chosen[ji].is_some_and(|c| cand[c].4.worst_mism() > MISM_REPAIR_FLOOR);
+                let radius = match (h2_wide, mism_wide) {
+                    (true, true) => H2_REPAIR_RADIUS.max(MISM_REPAIR_RADIUS),
+                    (true, false) => H2_REPAIR_RADIUS,
+                    (false, true) => MISM_REPAIR_RADIUS,
+                    (false, false) => REPAIR_RADIUS,
                 };
                 // ⭐⭐⭐ S163 —— **搜索半径从 ±1 扩到 ±[`REPAIR_RADIUS`]**。
                 //    ⛔ 实测（R 臂，两个旋钮成对开）：修补遍触发 32/48 次、峰宽否决
@@ -8997,6 +9022,25 @@ mod tests {
         ];
         let n = decide_group(&blind, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
         assert_eq!(blind[n[0]].1, -8, "量不到失配时这根轴必须闭嘴(best_mism_vs 给 −inf)");
+
+        // ⑻ ⛔⛔ **失配触发 + 宽半径**:没有它,失配轴结构上无候选可选。
+        //    实测(`eps=0.05` 几乎不设限):失配轴每组只被问 **2-6 次**,落点 **0 变化** ——
+        //    因为 `decide_group` 只看得到修补遍渲出来的候选,而默认 `REPAIR_RADIUS = 2`
+        //    从 −1/−4/−9/−11 只够到相邻档,离线转储里那些更好的候选根本没渲出来。
+        //    这条钉住三件事:门限的方向(失配**大**才触发)、宽半径比默认大、两个轴同时触发时取宽的。
+        assert!(
+            MISM_REPAIR_FLOOR > 0.0,
+            "失配是「越大越差」⇒ 触发门限必须是正的(写成负数会变成永远触发)"
+        );
+        assert!(
+            MISM_REPAIR_RADIUS > REPAIR_RADIUS,
+            "宽半径 {MISM_REPAIR_RADIUS} 必须大于默认 {REPAIR_RADIUS},否则这条通路等于没有"
+        );
+        // 门限要落在实测分布内:两首谱上 worst mismatch 的范围是 −0.16 … +4.59。
+        assert!(
+            (0.5..=3.0).contains(&MISM_REPAIR_FLOOR),
+            "门限 {MISM_REPAIR_FLOOR} 落在实测分布(−0.16…+4.59)之外 —— 要么永不触发,要么全触发"
+        );
 
         // ⑺ 参照曲线的内插:两端取端点,中间线性。
         let r = vec![(-45.0f32, 1.6f32), (-19.0, 1.44), (4.0, 0.9)];
