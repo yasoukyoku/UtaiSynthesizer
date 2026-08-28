@@ -2747,6 +2747,40 @@ mod tests {
 
     // ② vocal DAW render (S53): `build_arrays_daw` keeps the FULL rest so the stem aligns to the
     // timeline; `build_arrays` (parity) caps it (CAP_MID=70 mid / CAP_LEAD=25 first/last).
+    /// ⭐⭐⭐⭐ S165 —— **「同元音相接」与「延音记号」给模型的序列到底一不一样?**
+    ///
+    /// 用户 2026-08-29:「我们应该是**没让模型知道 な 和 あ 应该连上**吧」
+    /// 「如果所有都没连上那其实好办,那就是**传谱**时候出了问题」。
+    ///
+    /// ⇒ 这条判据把那个问题**测掉**,而不是靠读代码推断:
+    /// 同一段旋律,一遍写成 `な` + `あ`(两个音节,同元音相接),
+    /// 一遍写成 `な` + `ー`(延音记号 = 词典公认的「连上」),
+    /// 比较 `build_arrays_daw` 吐出来的**每一个数组**。
+    ///
+    /// ⚠ 结果按实测登记在断言里 —— 这条判据的价值在于:无论相同还是不同,
+    ///   下一个人都不用再猜「传谱层有没有把连音传下去」。
+    #[test]
+    fn a_same_vowel_junction_and_a_sustain_mark_reach_the_model_identically() {
+        let join = daw_ja(&[("な", 60, 40), ("あ", 60, 40)]).unwrap();
+        let sust = daw_ja(&[("な", 60, 40), ("ー", 60, 40)]).unwrap();
+        println!("同元音相接 な+あ:phon={:?} dur={:?} pitch={:?} evt={:?}",
+                 join.phon, join.phone_dur, join.note_pitch, join.evt);
+        println!("延音记号   な+ー:phon={:?} dur={:?} pitch={:?} evt={:?}",
+                 sust.phon, sust.phone_dur, sust.note_pitch, sust.evt);
+        // 阴性对照:一个**真正不同**的相接(异元音)必须与上面两者都不同 ——
+        // 否则「相同」可能只是因为这个比较对任何输入都成立。
+        let diff = daw_ja(&[("な", 60, 40), ("い", 60, 40)]).unwrap();
+        println!("异元音相接 な+い:phon={:?} dur={:?}", diff.phon, diff.phone_dur);
+        assert_ne!(join.phon, diff.phon, "阴性对照失效:异元音相接与同元音相接音素相同");
+        assert_eq!(join.phon, sust.phon, "音素串不同");
+        assert_eq!(join.phone_dur, sust.phone_dur, "音素时长不同");
+        assert_eq!(join.note_pitch, sust.note_pitch, "音高不同");
+        assert_eq!(join.evt, sust.evt, "事件归属不同");
+        assert_eq!(join.note_to_phone, sust.note_to_phone, "音符→音素映射不同");
+        assert_eq!(join.note_dur, sust.note_dur, "音符时长不同");
+        assert_eq!(join.phonemes, sust.phonemes, "音素 id 不同");
+    }
+
     #[test]
     fn build_arrays_daw_uncaps_rests() {
         let score = [("か", 60, 80), ("R", 0, 300), ("お", 67, 80)];
