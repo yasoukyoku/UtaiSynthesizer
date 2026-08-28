@@ -1304,6 +1304,11 @@ fn decide_group(
             //    编译器的 `method best_h2_vs is never used` 当场指出了它。
             let hx = cand[x].4.best_h2_vs(&cand[y].4);
             let hy = cand[y].4.best_h2_vs(&cand[x].4);
+            // ⭐ S165 —— 诊断:这一支**被问了几次、几次差距过 eps、闸放行/拦住几次**。
+            //    ⛔ 没有它,实机「47 次触发 / 0 条落点改变」连着两轮**无法归因**
+            //    (日志里 `worst_h2` 差 14 dB 的组也没换,而 `best_h2_vs` 是**逐音**的,
+            //     两个候选各自最差的可能是**不同的音** ⇒ 逐音增益可能根本不到 eps)。
+            H2_STAT.with(|st| st.borrow_mut().0 += 1);
             if (hx - hy).abs() > h2_eps {
                 // ⛔⛔ 对手轴闸 —— **每一根参与排序的轴都要配**(S163 §32 的血训:
                 //    `gone` 那一支当初没配,直接造出全曲唯一一个变闷 >2.7 的音)。
@@ -1313,8 +1318,15 @@ fn decide_group(
                 } else {
                     true
                 };
+                H2_STAT.with(|st| {
+                    let mut b = st.borrow_mut();
+                    b.1 += 1;
+                    if dim_ok { b.2 += 1 } else { b.3 += 1 }
+                    let gap = (hx - hy).abs();
+                    if gap > b.4 { b.4 = gap; b.5 = dim_ok; }
+                });
                 if dim_ok {
-                    // 越接近 0(`2·f0` 越实)越靠前
+                    // 逐音增益大的靠前
                     return hy.partial_cmp(&hx).unwrap_or(std::cmp::Ordering::Equal);
                 }
             }
@@ -1403,6 +1415,27 @@ fn alt_shift_for(g: &DeadGroup, alt_plan: &[DeadGroup]) -> Option<i64> {
 thread_local! {
     /// ⛔ 防止「算候选」自己再去算候选(那会指数爆炸)。见 `dead_only_plan_with_alts` 末尾。
     static ALT_PLAN_REENTRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// ⭐ S165 —— `2·f0` 这一支的诊断计数:
+    /// `(被问几次, 差距过 eps 几次, 闸放行, 闸拦住, 见过的最大差距, 那次闸放没放行)`。
+    /// ⛔ 存在的理由:实机「47 次触发 / 0 条落点改变」连着两轮无法归因。
+    static H2_STAT: std::cell::RefCell<(u64, u64, u64, u64, f32, bool)> =
+        const { std::cell::RefCell::new((0, 0, 0, 0, 0.0, false)) };
+}
+
+/// ⭐ S165 —— 打印并清空 `2·f0` 那一支的诊断计数。
+fn log_h2_stat(where_: &str) {
+    H2_STAT.with(|st| {
+        let mut b = st.borrow_mut();
+        if b.0 == 0 {
+            return;
+        }
+        tracing::info!(
+            "range: h2-axis [{}] asked {} times, gap>eps {} times, gate PASSED {} / BLOCKED {}, largest gap {:.1} dB ({})",
+            where_, b.0, b.1, b.2, b.3, b.4,
+            if b.5 { "passed" } else { "BLOCKED" }
+        );
+        *b = (0, 0, 0, 0, 0.0, false);
+    });
 }
 
 /// S159z —— **句内拆组**:一段夹在两个死音【之间】的可唱音,至少这么多个音才值得把组拆开。
@@ -5797,6 +5830,7 @@ pub fn apply_dead_only_windows_with(
                     usag_dim_cap,
                     h2_eps,
                 );
+                log_h2_stat("repair");
                 if let Some(&c) = mine.first() {
                     tracing::info!(
                         "range: group[{}..{}] repair — {:?} ⇒ kept {:+} (silence {:.0} ms)",
@@ -8652,6 +8686,39 @@ mod tests {
         assert_eq!(
             pinned[saved[0]].1, -13,
             "组里有个音在所有候选上都读 −30(气声),但另一个音差 11.8 dB ——              这根轴必须逐音看,不许被那个音钉死(实机 47/54 次触发 0 改变就是这么来的)"
+        );
+
+        // ⑻ ⛔⛔ **实机第二个洞:两个候选量到 h2 的【音集合不相交】**。
+        //    `best_h2_vs` 只对双方都量到的音求差,交集为空时 `fold(0.0, max)` 返回 **0.0**
+        //    ⇒ 两边都是 0 ⇒ 差 0 < eps ⇒ 这根轴又不发言。
+        //    实机日志(yuyuko,H1 臂)里就有这种组:
+        //    `[(-6, h2=-21.4), …, (-2, h2=-7.4), …] ⇒ kept -6` —— 差 14 dB 却没换。
+        //    ⛔ 峰位验证会按候选各自拒绝一部分音 ⇒ **集合不同是常态,不是边角情况**。
+        let mk3 = |shift: i64, rel: f32, notes: &[(usize, f32)]| {
+            let mut sc = CandScore::default();
+            sc.rel.push((0, rel));
+            for &(i, v) in notes {
+                sc.h2.push((i, v));
+                sc.uplev.push((i, 0.0));
+            }
+            (0usize, shift, 0usize, Vec::<f32>::new(), sc)
+        };
+        // 候选 A 只在音 0 上量到,候选 B 只在音 1 上量到 ⇒ 交集为空。
+        let disjoint = vec![mk3(-6, 4.2, &[(0, -21.4)]), mk3(-2, 5.9, &[(1, -7.4)])];
+        let picked = decide_group(&disjoint, 0, -6, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        assert_eq!(
+            disjoint[picked[0]].1, -6,
+            "⛔ 交集为空时这根轴必须**闭嘴**(回落到今天的 rel),而不是拿 0.0 当两边都一样 ——              若哪天改成「交集为空也敢比」,这条会红"
+        );
+        // 而只要有**一个**共同的音,它就必须发言。
+        let shared = vec![
+            mk3(-6, 4.2, &[(0, -21.4), (1, -3.0)]),
+            mk3(-2, 5.9, &[(0, -7.4), (2, -3.0)]),
+        ];
+        let fixed2 = decide_group(&shared, 0, -6, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        assert_eq!(
+            shared[fixed2[0]].1, -2,
+            "音 0 上 −2 比 −6 好 14 dB(共同的音只有它一个)⇒ 必须换"
         );
 
         // ⑹ ⛔ 阴性对照:**量不到 h2 的候选**(峰位验证失败 ⇒ 空 Vec)不许被当成「很差」。
