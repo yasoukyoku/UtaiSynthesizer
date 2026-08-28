@@ -1294,7 +1294,16 @@ fn decide_group(
         //    `usag`/`gone` 决策整个盖掉。实测这根轴的候选间差距**要么很小、要么十几 dB**
         //    (目标音 −8 是 −17.0 而 −13 是 −5.2)⇒ 大 eps 不会漏掉真正要救的。
         if h2_eps > 0.0 {
-            let (hx, hy) = (cand[x].4.worst_h2(), cand[y].4.worst_h2());
+            // ⛔⛔ S165 —— **必须逐音比,不能用 `worst_h2()` 的差**。
+            //    第一版就是那么写的,结果 47/54 次修补遍触发**一条落点都没改**:
+            //    `worst_h2` 是「组内最差的那个音」,而组里常有一个音(气声/清音)在**所有**候选上
+            //    都读得很差 ⇒ 它把整组的 `worst_h2` 钉死 ⇒ 候选之间差 < eps ⇒ 这根轴永远不发言。
+            //    ⇒ 改用 [`CandScore::best_h2_vs`]:逐音配对取**最大增益** —— 这根轴本来就是来救
+            //    「**某一个音**被掏空」的,组里其它音本来就好。
+            //    ⚠ `best_h2_vs` 那段 doc 早就写明了这个理由,是**接线时没接上**;
+            //    编译器的 `method best_h2_vs is never used` 当场指出了它。
+            let hx = cand[x].4.best_h2_vs(&cand[y].4);
+            let hy = cand[y].4.best_h2_vs(&cand[x].4);
             if (hx - hy).abs() > h2_eps {
                 // ⛔⛔ 对手轴闸 —— **每一根参与排序的轴都要配**(S163 §32 的血训:
                 //    `gone` 那一支当初没配,直接造出全曲唯一一个变闷 >2.7 的音)。
@@ -5794,7 +5803,10 @@ pub fn apply_dead_only_windows_with(
                         jobs[ji].start,
                         jobs[ji].end,
                         mine.iter()
-                            .map(|&x| (cand[x].1, cand[x].4.worst_gone()))
+                            // ⭐ S165 —— 把 `2·f0` 一并打出来。⛔ 没有它的时候
+                            //    「47 次触发 / 0 条落点改变」这种结果**无法归因**
+                            //    (是候选都不够好,还是这根轴根本没发言?)。
+                            .map(|&x| (cand[x].1, cand[x].4.worst_gone(), cand[x].4.worst_h2()))
                             .collect::<Vec<_>>(),
                         cand[c].1,
                         cand[c].4.worst_gone()
@@ -8620,6 +8632,26 @@ mod tests {
         assert_eq!(
             both[win[0]].1, -13,
             "h2 与 usag 指向相反时 h2 必须赢 —— 它排在 usag 之前就是为了这个"
+        );
+
+        // ⑺ ⛔⛔ **真实形状:组里有一个音在【所有】候选上都很差**(气声/清音读不出干净的 f1)。
+        //    实机上 47/54 次修补遍触发**一条落点都没改**,就死在这里:第一版排序用
+        //    `worst_h2()`(组内最差),而那个音把整组钉死 ⇒ 候选之间差 0 ⇒ 这根轴永远不发言。
+        //    ⇒ 必须逐音配对取最大增益(`best_h2_vs`)。
+        let mk2 = |shift: i64, rel: f32, h2_bad: f32, h2_good: f32| {
+            let mut sc = CandScore::default();
+            sc.rel.push((0, rel));
+            sc.h2.push((0, h2_bad)); // 音 0:气声,两个候选上都很差
+            sc.h2.push((1, h2_good)); // 音 1:真正要救的那个
+            sc.uplev.push((0, 0.0));
+            sc.uplev.push((1, 0.0));
+            (0usize, shift, 0usize, Vec::<f32>::new(), sc)
+        };
+        let pinned = vec![mk2(-8, 4.2, -30.0, -17.0), mk2(-13, 5.9, -30.0, -5.2)];
+        let saved = decide_group(&pinned, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        assert_eq!(
+            pinned[saved[0]].1, -13,
+            "组里有个音在所有候选上都读 −30(气声),但另一个音差 11.8 dB ——              这根轴必须逐音看,不许被那个音钉死(实机 47/54 次触发 0 改变就是这么来的)"
         );
 
         // ⑹ ⛔ 阴性对照:**量不到 h2 的候选**(峰位验证失败 ⇒ 空 Vec)不许被当成「很差」。
