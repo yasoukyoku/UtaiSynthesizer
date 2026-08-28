@@ -5527,6 +5527,7 @@ pub fn apply_dead_only_windows_with(
             0
         },
         onset_fit_enabled(),
+        seam_align_wide(),
     );
 
     if out.is_ok() {
@@ -5577,6 +5578,7 @@ pub fn apply_dead_only_windows_with(
                 },
                 // control arm: onset shape fit OFF, everything else identical
                 false,
+                seam_align_wide(),
             ) {
                 Ok(()) => dump("nodip.f32", &buf),
                 Err(e) => tracing::warn!("range: same-run control arm failed: {e}"),
@@ -5590,6 +5592,43 @@ pub fn apply_dead_only_windows_with(
 /// 片段,所以窗边可以由音频决定(`join_rests`),而不是只能由帧数规则决定。
 /// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`。
 /// 机理、实测与为什么它不是 S151d 那条判负,全在 [`seam_align_ms`] 的 doc。
+/// ⚙ 出厂默认 = **false(关)** —— `UTAI_RANGE_SEAM_ALIGN_WIDE=1` 打开。
+///
+/// ## 它改的是什么
+/// 拼接前的对齐(见 [`seam_align_ms`])原本用**基础淡化宽度 `xf`(10 ms)**当搜索窗,
+/// 却把整个片段按搜出来的 lag **整体平移** —— 而 `tied_xfade` 那一族的淡入是 **120 ms**。
+/// 10 ms @ 40 kHz 在 f0≈500 Hz 上只有 5 个周期 ⇒ 互相关**有周期歧义**,会锁到错的周期。
+///
+/// ## ⛔ 为什么出厂**关**:方向对,但效应没验出来
+/// 用户 2026-08-28 点名 yuyuko × 炉心 4:29.265 / 4:36.319「接缝不干净 / f0 附近多出面状」。
+/// 离线量到 120 ms 窗上的真 lag 是 **+21 / +154** 样本,而生产挪的是 **−48 / +73**,
+/// 挪完相干度**变成负的**(−0.209 / −0.065,比不挪的 0.322 / −0.177 还差)。
+/// 打开之后生产挪的量确实靠近了真值(#73 **+137** vs 真值 +154),但**成品几乎不动**:
+///
+/// | | R0 关对齐 | R1 开(4 ms) | R2 开(2 ms) |
+/// |---|---|---|---|
+/// | 4:29 落差 | 3.92 | 3.91 | 4.03 |
+/// | 4:36 落差 | 6.92 | **5.75** | 5.79 |
+/// | 全曲 `interh` 超噪声底(好/坏) | — | 39/47 | 30/22 |
+///
+/// ⇒ 只有 4:36 改善 1.17 dB,4:29 纹丝不动,全曲还略净差 ⇒ **不足以翻默认**。
+///
+/// ## ⭐ 因为凹陷的主体根本不是相消
+/// `donor−11` −8.56 / `donor−4` −21.11(差 **12.55 dB**),等增益淡化在 w=0.5 的功率
+/// ≈ `0.25·Pa` = **−14.58 dB**,而成品实测 **−14.75** ⇒ **几乎完全吻合**。
+/// 那个凹陷是 **120 ms 等增益淡化的固有结果**,与相位对不对齐关系不大。
+/// ⇒ 真正该动的是 [`handover_deficit_db`] 的**评估窗位置**:它看交接点**往后 40 ms**
+///   (那里落差只有 5.27 dB,门限 15 够不着),而 `tied_xfade` 的淡入区在交接点
+///   **往前 120 ms**(那里落差 **12.55 dB**)⇒ **它结构上看不见自己该拦的那一段**。
+pub fn seam_align_wide() -> bool {
+    matches!(
+        std::env::var("UTAI_RANGE_SEAM_ALIGN_WIDE").ok().as_deref().map(str::trim),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// ⛔ S165 —— **试过 4.0,实测与 2.0 没有区别,收回**(靶子 4:36 5.75 vs 5.79、4:29 3.91 vs 4.03)。
+/// 单独加大半径更是无效(§54.5:align=8 在别处 `interh` 净变坏 坏56/好28)。
 const SEAM_ALIGN_MS_DEFAULT: f64 = 2.0;
 
 /// ⚙ 出厂默认 = 2.0 —— `UTAI_RANGE_SEAM_ALIGN=<ms>` 在**拼接之前先把两条臂对齐**。
@@ -5783,6 +5822,9 @@ fn splice_kept(
     seam_ramp: usize,
     // ⭐⭐⭐⭐⭐ S163 v17 —— **起音形状整形**(见 [`ONSET_FIT_MS`])。
     onset_fit: bool,
+    // ⭐ S165 —— 对齐的搜索窗用**这一条缝实际的淡化宽度**(见 `seam_align_wide`)。
+    //    ⛔ 参数不是 env —— 判据不许读进程环境(S151 笔1)。
+    wide_align: bool,
 ) -> crate::Result<()> {
     // ⛔ `join_enabled` 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
     let n = base.len();
@@ -5911,7 +5953,28 @@ fn splice_kept(
             // ⚠ 整窗一起挪 ⇒ 时序漂移 ≤ 旋钮的毫秒数;窗的另一头有它自己那条缝,
             //   会在轮到它时相对**挪过之后的** base 再对一次 ⇒ 自洽。
             let d: isize = if align > 0 && a > 0 && a >= *seg_lo {
-                let w = xf.min(b.saturating_sub(a));
+                // ⭐⭐⭐ S165 —— **搜索窗必须是【这一条缝实际的淡化宽度】,不是基础的 10 ms。**
+                //
+                // ⛔ 这一行原本是 `xf.min(...)`,而 `tied_xfade` 那一族的淡入是 **120 ms**:
+                //    拿 10 ms 的窗搜出一个 lag,却把整个 120 ms 的片段按它整体平移。
+                //    10 ms @ 40 kHz 在 f0≈500 Hz 上只有 **5 个周期** ⇒ 互相关有**周期歧义**,
+                //    锁到错的周期。实测用户点名的两处(yuyuko × 炉心 4:29.265 / 4:36.319):
+                //
+                //    | | 120 ms 窗上的最佳 lag | 对齐后 r | 不挪 r | 生产挪的量 | 挪完 r |
+                //    |---|---|---|---|---|---|
+                //    | 4:29 | +21 | 0.854 | 0.322 | **−48** | **−0.209** |
+                //    | 4:36 | **+154** | 0.800 | −0.177 | **+73** | **−0.065** |
+                //
+                //    ⇒ **挪完比不挪还相消**,谐波被削掉、噪声底露出来 =
+                //      用户在频谱上看到的「f0 附近突然多出面状噪声」(S165 §54)。
+                //
+                // ⚠ 半径也要跟着够:4:36 需要 154 样本 = 3.85 ms,而出厂半径是 2.0 ms。
+                //   **两者必须一起改** —— 只加大半径实测无效(§54.5:4:29 反而 5.66 → 6.32)。
+                let w = if wide_align {
+                    xf_at.get(&oi).copied().unwrap_or(xf).min(b.saturating_sub(a))
+                } else {
+                    xf.min(b.saturating_sub(a))
+                };
                 let r = align as isize;
                 let dot = |off: isize| -> f64 {
                     let lo = a as isize + off - *seg_lo as isize;
@@ -7925,7 +7988,7 @@ mod tests {
         let mut out = base.clone();
         splice_kept(
             &mut out, sr, (sr as f64) / 50.0, &jobs, &kept,
-            (sr as usize) / 100, false, 0, 0.0, &notes, 0, 0.0, true, 0, true,
+            (sr as usize) / 100, false, 0, 0.0, &notes, 0, 0.0, true, 0, true, false,
         )
         .unwrap();
         let peak_out = out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -8516,6 +8579,61 @@ mod tests {
     ///
     /// ⛔ 变异(写这条判据时逐个真跑过,读数记在各行后面)。
     #[test]
+    /// ⭐ S165 —— `seam_align_wide` 的两条不变量。
+    ///
+    /// ⛔ 它存在的理由:对齐原本用**基础淡化宽度 `xf`(10 ms)**当搜索窗,却把整个片段
+    /// 按搜出来的 lag **整体平移** —— 而 `tied_xfade` 那一族的淡入是 **120 ms**。
+    /// 10 ms 在 f0≈500 Hz 上只有 5 个周期 ⇒ 互相关有**周期歧义**,会锁到错的周期
+    /// (实测生产挪 −48 / +73,而 120 ms 窗上的真值是 +21 / +154,挪完相干度变成负的)。
+    ///
+    /// ⚠ 出厂**关**:方向对但成品几乎不动(§54.7)⇒ 这条判据锁的是
+    /// 「**关着时逐位不变**」与「**没有长淡化时开关无意义**」,不是它有没有用。
+    #[test]
+    fn wide_seam_align_is_a_no_op_without_a_long_crossfade() {
+        const SR: u32 = 48_000;
+        const N: usize = 48_000;
+        let wave = |i: usize| -> f32 {
+            let t = i as f64 / f64::from(SR);
+            ((2.0 * std::f64::consts::PI * 220.0 * t).sin()
+                + 0.5 * (2.0 * std::f64::consts::PI * 517.0 * t).sin()) as f32
+        };
+        let base0: Vec<f32> = (0..N).map(wave).collect();
+        let donor: Vec<f32> = (0..N).map(|i| if i < 13 { 0.0 } else { wave(i - 13) }).collect();
+        let jobs = [DeadJob { shift: -6, start: 20, end: 60 }];
+        let spf = base0.len() as f64 / 100.0;
+        let xf = (SR as usize / 100).max(2);
+        let run = |wide: bool| -> Vec<f32> {
+            let mut b = base0.clone();
+            let mut kept: Vec<(i64, usize, Vec<f32>)> = Vec::new();
+            if let Some((lo, hi)) = donor_read_span(&jobs[0], spf, b.len(), MERGE_BRIDGE_FRAMES) {
+                kept.push((0, lo, donor[lo..hi].to_vec()));
+            }
+            // ⚠ `tied_xf = 0` ⇒ `xf_at` 恒空 ⇒ 宽窗退化成 `xf` ⇒ 两档必须逐位相同。
+            splice_kept(
+                &mut b, SR, spf, &jobs, &kept, xf, false, 48, 0.0, &[], 0, 0.0, true, 0, false, wide,
+            )
+            .unwrap();
+            b
+        };
+        assert_eq!(
+            run(false),
+            run(true),
+            "没有长交叉淡化时 `xf_at` 是空的 ⇒ 宽窗退化成 `xf` ⇒ 两档必须逐位相同"
+        );
+
+        // ⛔ 阴性对照:这个夹具本身要能分辨「对齐有没有在做事」,否则上面那条是恒真的。
+        let mut b0 = base0.clone();
+        let mut kept: Vec<(i64, usize, Vec<f32>)> = Vec::new();
+        if let Some((lo, hi)) = donor_read_span(&jobs[0], spf, b0.len(), MERGE_BRIDGE_FRAMES) {
+            kept.push((0, lo, donor[lo..hi].to_vec()));
+        }
+        splice_kept(
+            &mut b0, SR, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true, 0, false, false,
+        )
+        .unwrap();
+        assert_ne!(b0, run(false), "对齐半径 0 与 48 必须给出不同结果 —— 否则这个夹具测不到对齐");
+    }
+
     fn the_splicer_aligns_the_two_arms_before_it_crossfades() {
         const SR: u32 = 48_000;
         const N: usize = 48_000;
@@ -8540,7 +8658,7 @@ mod tests {
                 kept.push((0, lo, donor[lo..hi].to_vec()));
             }
             let xf = (SR as usize / 100).max(2);
-            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0, true, 0, false).unwrap();
+            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0, true, 0, false, false).unwrap();
             b
         };
 
@@ -8822,9 +8940,9 @@ mod tests {
         let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left), (1, 0, right)];
 
         let mut off = base.clone();
-        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true, 0, false).unwrap();
+        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true, 0, false, false).unwrap();
         let mut on = base.clone();
-        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0, true, 0, false).unwrap();
+        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0, true, 0, false, false).unwrap();
 
         // ⓐ 关着 ⇒ 那个洞必须还在:52800 开窗之后是右 donor 的静音。
         assert!(
@@ -8928,7 +9046,7 @@ mod tests {
             (1, 53_000, right[53_000..(380 * 480)].to_vec()),
         ];
         let mut out = base.clone();
-        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0, true, 0, false).unwrap();
+        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0, true, 0, false, false).unwrap();
         assert_eq!(out[0], -1.0, "窗外仍是 base");
         assert!((out[30_000] - 0.5).abs() < 1e-6, "左窗内仍是左 donor");
     }
