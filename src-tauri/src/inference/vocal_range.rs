@@ -1193,6 +1193,9 @@ fn decide_group(
     // ⭐⭐⭐ S165 —— `2·f0` 电平当排序键的 eps(dB);`0` = 关 = 逐位回到今天。
     //    见 [`landing_h2_eps`]。
     h2_eps: f32,
+    // ⭐⭐⭐⭐ S165 —— **失配**(响度 ↔ 抖动)当排序键的 eps(dB);`0` = 关。
+    //    见 [`landing_mismatch_eps`]。
+    mism_eps: f32,
 ) -> Vec<usize> {
     let mut mine: Vec<usize> = (0..cand.len()).filter(|&c| cand[c].0 == ji).collect();
     if mine.len() < 2 {
@@ -1285,6 +1288,37 @@ fn decide_group(
         // ⛔ 为什么要 eps:两个候选只差零点几 dB 时这根轴和噪声底分不开,而用户给的两个
         //    「听起来正常」的对照正好落在那个区间(候选间只差 2.0 dB),
         //    三个缺陷点则差 17.9 / 7.6 / 6.6 dB ⇒ eps ≈ 3 时缺陷全动、对照全不动。
+        // ⭐⭐⭐⭐ S165 —— **失配**(响度 ↔ 抖动)。用户 2026-08-28 定案的那根轴。
+        //
+        // ⛔ **相对判据**:比的是「这个候选相对那个候选,在**某一个音**上最多能把失配改善多少」,
+        //    而不是各自的绝对失配值 —— 绝对门限会把「当前虽差但没有更好替代」也否掉。
+        // ⛔ **最差口径**在 [`CandScore::worst_mism`] / [`note_mismatch`] 里,别改成平均。
+        if mism_eps > 0.0 {
+            // ⛔⛔ 比的是**各自最差那个音**的失配,不是「逐音最大改善」。
+            //    第一版写成 `best_mism_vs`(逐音取最大改善),被判据当场抓住:
+            //    夹具里 −8 在音 0 上比 −15 好 2.0、在音 1 上差 1.60 ⇒ 「最大改善」让 −8 赢了,
+            //    而**决定听感的是最差的那个音**,不是它在哪一根上赢得最多。
+            // ⚠ 与 `h2` 那次「被组里的气声音钉死」看似像、其实相反:那里某个音在所有候选上都差
+            //    ⇒ 它掩盖了**别的音**的改善;而这里**最差的音本身就是决定听感的那个**,
+            //    所有候选在它上面一样差时不发言是**对的**。
+            let gx = -cand[x].4.worst_mism();
+            let gy = -cand[y].4.worst_mism();
+            if gx.is_finite() && gy.is_finite() && (gx - gy).abs() > mism_eps {
+                // ⛔⛔ 对手轴闸 —— 用户 2026-08-28 的上线警告:
+                //    「小心这个新条件**别再把那个哑音和伪影引回来**」。
+                //    `UTAI_RANGE_H2` 那次哑音时诊断计数是 `BLOCKED 0 次` = 闸形同虚设。
+                let dim_ok = if usag_dim_cap > 0.0 {
+                    let (w, l) = if gx > gy { (x, y) } else { (y, x) };
+                    cand[w].4.worst_dim_vs(&cand[l].4) <= usag_dim_cap
+                } else {
+                    true
+                };
+                if dim_ok {
+                    // 改善大的靠前
+                    return gy.partial_cmp(&gx).unwrap_or(std::cmp::Ordering::Equal);
+                }
+            }
+        }
         // ⭐⭐⭐ S165 —— **`2·f0` 电平**:排在 `usag` 之前,但 eps 更大(只在差得很多时发言)。
         //
         // ⛔ 为什么排最前:用户 2026-08-28 听过 `−8 → −13` 的探针臂后说
@@ -4150,6 +4184,136 @@ const H2_REPAIR_FLOOR: f32 = -12.0;
 /// ⚠ 代价:只有触发的那 17-24% 的组付,其余一个字节不动。
 const H2_REPAIR_RADIUS: i64 = 6;
 
+/// ⭐⭐⭐ S165 —— **失配参照**:从 `base` 里**没被任何救援窗碰过**的音,统计
+/// 「某个电平的谐波**该抖多少**」。返回 `(电平档中心, 该档的抖动中位)`,按电平升序。
+///
+/// # 为什么靶子是「它自己的未救援段」
+/// 用户 2026-08-28 定案:「油」= **响度与抖动失配**;而「不退化」的正确定义是
+/// **让救援段像这个模型自己没被救援时的样子**,不是「更好听」。
+/// 用户听过三个候选之后的原话:
+/// 「和『同模型的未救援段』最像的**可能确实是 −15**;−13 确实更好但对 yachiyo 来说
+///  **可能太干净了**;这算是 yachiyo 模型自己的问题…… **遵从原音色特征**可能是对的」。
+/// ⇒ 靶子是**同模型、同音色、同录音条件**,零混杂;而且它直接度量「我们做坏了多少」。
+///
+/// # ⛔ 用 `base` 而不是成品
+/// 未救援处**成品 = `base` × 一个全曲常数**(实测 0.824376,残差 −40.3 dB),
+/// 而这两个读数都是**相对量**(电平相对 `f0`、抖动是 log 包络的起伏)⇒ 常数增益不影响。
+/// 用 `base` 的好处是这一步能在**拼接之前**做完。
+///
+/// # ⚠ 参照本身可能是歪的
+/// 实测 yachiyo 的未救援段曲线**几乎是平的**(1.60→1.38→1.54)——**它自己就是失配的那个模型**;
+/// yuyuko 则有正常的斜率(1.85→0.93)。⇒ 对 yachiyo 这根轴只能做到「别更差」,
+/// 这与用户「yachiyo 是模型底子、救不了」的判断一致。
+fn mismatch_reference(
+    base: &[f32],
+    sample_rate: u32,
+    spf: f64,
+    jobs: &[DeadJob],
+    notes: &[NoteSpan],
+) -> Vec<(f32, f32)> {
+    const EDGES: [f32; 8] = [-60.0, -30.0, -22.0, -16.0, -11.0, -7.0, -3.0, 10.0];
+    let mut pairs: Vec<(f32, f32)> = Vec::new();
+    for (ni, nd) in notes.iter().enumerate() {
+        if !(nd.hz > 0.0) || nd.frames <= 0 {
+            continue;
+        }
+        let a = ((nd.start as f64) * spf).round().max(0.0) as usize;
+        let b = (((nd.start + nd.frames) as f64) * spf).round().max(0.0) as usize;
+        if b <= a || b > base.len() || b - a < 4096 {
+            continue;
+        }
+        // ⛔ 只要这个音落在**任何**救援组的范围里就跳过 —— 参照必须是「没被我们碰过」的。
+        //    (`DeadJob::start`/`end` 是**音符下标**,不是帧。)
+        if jobs.iter().any(|j| ni as i64 >= j.start && ni as i64 <= j.end) {
+            continue;
+        }
+        let seg = &base[a..b];
+        let e: f64 = seg.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / (b - a) as f64;
+        if e.sqrt() < 0.01 {
+            continue;
+        }
+        pairs.extend(utai_dsp::harmonicity::harmonic_level_jitter_pairs(
+            seg,
+            sample_rate,
+            nd.hz,
+            6,
+        ));
+    }
+    let mut out = Vec::new();
+    for w in EDGES.windows(2) {
+        let (lo, hi) = (w[0], w[1]);
+        let mut v: Vec<f32> =
+            pairs.iter().filter(|(l, _)| *l >= lo && *l < hi).map(|(_, j)| *j).collect();
+        if v.len() < 8 {
+            continue;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        out.push(((lo + hi) * 0.5, v[v.len() / 2]));
+    }
+    tracing::info!(
+        "range: mismatch reference built from {} unrescued harmonic points ⇒ {} level bins {:?}",
+        pairs.len(),
+        out.len(),
+        out.iter().map(|(c, m)| format!("{c:.0}→{m:.2}")).collect::<Vec<_>>()
+    );
+    out
+}
+
+/// ⭐ S165 —— 在参照曲线上查「这个电平该抖多少」(线性内插,两端取端点值)。
+fn mismatch_expect(reference: &[(f32, f32)], level_db: f32) -> Option<f32> {
+    if reference.is_empty() {
+        return None;
+    }
+    if level_db <= reference[0].0 {
+        return Some(reference[0].1);
+    }
+    if level_db >= reference[reference.len() - 1].0 {
+        return Some(reference[reference.len() - 1].1);
+    }
+    for w in reference.windows(2) {
+        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+        if level_db >= x0 && level_db <= x1 && (x1 - x0).abs() > 1e-6 {
+            return Some(y0 + (y1 - y0) * (level_db - x0) / (x1 - x0));
+        }
+    }
+    Some(reference[reference.len() - 1].1)
+}
+
+/// ⭐⭐⭐ S165 —— 一个音的**失配度** = 逐根谐波 `抖动 − 该电平该有的抖动` 的**最大值**。
+///
+/// # ⛔ 为什么是「最差」而不是「平均」——这一条如果搞反,整把刀会反向
+/// 实测 4:36 那个音(用户听过三个候选)的四种口径:
+///
+/// | shift | 平均偏离 | 均方距离 | 抖动分布距离 | **最差偏离** |
+/// |---|---|---|---|---|
+/// | **−8(出厂,用户判最差)** | **0.684 最小** | **0.753 最小** | **0.315 最小** | **+1.17 最大** |
+/// | −13(用户:更好但太干净) | 0.959 | 1.017 | 0.888 | +0.36 |
+/// | **−15(用户:最像它自己)** | 0.810 | 0.872 | 0.885 | **−0.43 最小** |
+///
+/// ⇒ **三种「整体距离」口径全都选中 −8**,只有「最差」选 −15。
+/// 机理:−8 的大部分谐波都贴着参照,**只有一根(f5)严重失配 +1.17**,一平均就被稀释掉了;
+/// 而听感**对异常敏感、不对平均敏感**。
+/// ⚠ 还有一层:yachiyo 的参照本身就「抖」⇒ **最抖的候选反而「整体最像它」**
+/// ⇒ 拿一个本身失配的模型当靶子时,整体口径会**奖励失配**。
+fn note_mismatch(
+    seg: &[f32],
+    sample_rate: u32,
+    f0_hz: f32,
+    reference: &[(f32, f32)],
+) -> Option<f32> {
+    if reference.is_empty() {
+        return None;
+    }
+    let pairs = utai_dsp::harmonicity::harmonic_level_jitter_pairs(seg, sample_rate, f0_hz, 6);
+    let mut worst: Option<f32> = None;
+    for (lv, jt) in pairs {
+        let Some(e) = mismatch_expect(reference, lv) else { continue };
+        let d = jt - e;
+        worst = Some(worst.map_or(d, |w: f32| w.max(d)));
+    }
+    worst
+}
+
 /// ⭐⭐ S165 —— `2·f0` 这一支的对手轴闸(dB)。见 [`landing_h2_eps`]。
 ///
 /// ⛔ 比 [`LANDING_USAG_DIM_CAP_DEFAULT`] 松,而且是**用户耳判定的**:
@@ -4229,6 +4393,48 @@ fn parse_usag_dim(v: Option<&str>) -> f32 {
             .ok()
             .filter(|x| x.is_finite() && *x >= 0.0 && *x <= 40.0)
             .unwrap_or(USAG_DIM_CAP_DEFAULT),
+    }
+}
+
+/// ⚙ 出厂默认 = 0.0(**关**)—— **失配**这根轴的 eps(dB);`0` = 整根轴关掉。
+///
+/// # 它在修什么
+/// 用户 2026-08-28 定案:「油」= **响度与抖动失配**(「不是说『响就是好』或者『抖就是不好』……
+/// **失配了才奇怪**」)。实测**匹配斜率**(抖动 ~ 谐波电平):
+/// **yachiyo −0.0043 / yuyuko −0.0170 / SV −0.0134**(Welch PSD 口径)——
+/// SV 与 yuyuko 的抖动随谐波变强而降,**yachiyo 几乎不降** = 强谐波本该稳却还在抖。
+///
+/// # ⛔ 它是**相对判据 + 最差口径**,两条都不许改
+/// * **相对**:只在 `失配(当前) − 失配(最好候选) > eps` 时才动 ⇒ 被动的组数**天然等于能改善的组数**。
+///   绝对门限会把「当前虽差但没有更好替代」也否掉(实测否掉 41% 候选而只有 10 组能改善)。
+/// * **最差**:一个失配的音毁一整组。⛔ 用「平均/均方/分布距离」会**选中用户判为最差的那一档**
+///   (见 [`note_mismatch`] 的四口径对照表)。
+///
+/// # ⚠ 靶子是**同模型的未救援段**,不是「更好听」
+/// 用户听过三个候选后:「和『同模型的未救援段』最像的**可能确实是 −15**;
+/// −13 确实更好但**可能太干净了**…… **遵从原音色特征**可能是对的」。
+/// ⇒ 目标是**像它自己**,不是把音色改好看。
+///
+/// # ⚙ 出厂 0(关),等 A/B 整曲耳判
+/// ⚠ 上线前必须带用户 2026-08-28 的两条警告:**保留对手轴闸**
+/// (`UTAI_RANGE_H2` 那次哑音时诊断计数是 `BLOCKED 0 次` = 闸形同虚设)、
+/// **验收看局部不看中位**(那次灾难在全曲中位上是 Δ +0.00 dB)。
+pub fn landing_mismatch_eps() -> f32 {
+    parse_mismatch_eps(std::env::var("UTAI_RANGE_MISMATCH").ok().as_deref())
+}
+
+/// ⚙ 出厂默认。见 [`landing_mismatch_eps`]。
+const LANDING_MISMATCH_EPS_DEFAULT: f32 = 0.0;
+
+fn parse_mismatch_eps(v: Option<&str>) -> f32 {
+    match v {
+        None | Some("") => LANDING_MISMATCH_EPS_DEFAULT,
+        Some(x) => x
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(LANDING_MISMATCH_EPS_DEFAULT),
     }
 }
 
@@ -4974,6 +5180,15 @@ struct CandScore {
     /// 「**f1『强』/『实』确实在听感上更好,即使它把 f4 炸了**」——
     /// 因为 `2·f0`=1975 Hz 落在耳朵最敏感的区间,而 `5·f0`=4939 Hz 感知权重低得多。
     h2: Vec<(usize, f32)>,
+    /// ⭐⭐⭐⭐ S165 —— (音下标, **失配度** dB) = 逐根谐波 `抖动 − 该电平该有的抖动` 的**最大值**。
+    ///
+    /// 见 [`note_mismatch`] 与 [`mismatch_reference`]。用户 2026-08-28 定案:
+    /// 「本身也不是说『**响就是好**』或者『**抖就是不好**』…… **失配了才奇怪**」。
+    /// ⇒ 本场判负的十几把尺子**要么只量响度、要么只量抖动**,没有一把量两者的关系。
+    ///
+    /// ⛔ **「最差」不是「平均」**——这一条搞反整把刀会反向(实测四种口径见 [`note_mismatch`] 的表:
+    /// 三种「整体距离」全都选中用户判为最差的那一档)。
+    mism: Vec<(usize, f32)>,
     /// ⭐⭐⭐ S163 —— (音下标, **上方谐波的绝对强度** dB:`2..8·f0` 相对 `0.7..1.6·f0`)。
     ///
     /// ⛔ 它是 [`CandScore::usag`] 的**对手轴**:`usag` 量「稳不稳」,它量「强不强」。
@@ -5016,6 +5231,35 @@ impl CandScore {
     /// (S162 的 oracle 用的就是这个口径)。
     fn worst_usag(&self) -> f32 {
         self.usag.iter().map(|&(_, v)| v).fold(0.0f32, f32::min)
+    }
+
+    /// ⭐⭐⭐ S165 —— 组内**失配最严重**的那个音。没量到 ⇒ `NEG_INFINITY`
+    /// (= 没有证据说它坏,而且在「取最好」的比较里永远输)。
+    ///
+    /// ⛔ 与 [`CandScore::worst_h2`] 同一个理由取最差:**一个失配的音就毁了一整组**。
+    fn worst_mism(&self) -> f32 {
+        self.mism.iter().map(|&(_, v)| v).fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    /// ⭐ S165 —— 某个音上的失配度。
+    fn mism_of(&self, i: usize) -> Option<f32> {
+        self.mism.iter().find(|&&(j, _)| j == i).map(|&(_, v)| v)
+    }
+
+    /// ⭐⭐⭐ S165 —— `self` 相对 `other` 在**任何一个音**上的最大失配**改善**(正 = self 更好)。
+    ///
+    /// ⛔⛔ **排序不用它** —— 第一版用了,被判据抓住:它让「在某一根上赢得最多」的候选获胜,
+    /// 而决定听感的是**最差的那个音**(见排序分支里的注释)。留着是给诊断用的。
+    #[allow(dead_code)]
+    ///
+    /// ⛔ 逐音配对,和 [`CandScore::best_h2_vs`] 同款理由:这根轴是来救「**某一个音**失配」的。
+    /// ⚠ 而且这是**相对判据** —— 只在「存在明显更好的候选」时才动,
+    /// 绝对门限会把「当前虽差但没有更好替代」也否掉(实测那样会否掉 41% 的候选而只有 10 组能改善)。
+    fn best_mism_vs(&self, other: &CandScore) -> f32 {
+        self.mism
+            .iter()
+            .filter_map(|&(i, mine)| other.mism_of(i).map(|theirs| theirs - mine))
+            .fold(f32::NEG_INFINITY, f32::max)
     }
 
     /// ⭐ S165 —— 组内**第二谐波最弱**的那个音(最负的)。没量到 ⇒ `0.0`(= 没有证据说它坏)。
@@ -5399,7 +5643,9 @@ pub fn apply_dead_only_windows_with(
             // S163 -- usag alone must also enter scoring, or both fill points are skipped.
             || landing_usag_eps() > 0.0
             // S165 -- same for the h2 axis: without this the two fill points never run.
-            || landing_h2_eps() > 0.0)
+            || landing_h2_eps() > 0.0
+            // S165 -- and for the mismatch axis, same reason.
+            || landing_mismatch_eps() > 0.0)
             && !notes.is_empty();
     let (note_lv, note_cov) = if scoring {
         note_levels_and_coverage(base, spf, jobs, notes)
@@ -5416,6 +5662,15 @@ pub fn apply_dead_only_windows_with(
     let usag_dim_cap = landing_usag_dim_cap();
     // S165 second-harmonic sort eps (factory 0 = off = bit-identical).
     let h2_eps = if scoring { landing_h2_eps() } else { 0.0 };
+    // ⭐⭐⭐⭐ S165 —— **失配**轴的 eps 与它的参照曲线。
+    //    ⛔ 参照必须在**拼接之前**从 `base` 建(那时它还是「没被我们碰过」的),
+    //    而且只用**没落在任何救援组里**的音 —— 靶子是「这个模型自己没被救援时的样子」。
+    let mism_eps = if scoring { landing_mismatch_eps() } else { 0.0 };
+    let mism_ref: Vec<(f32, f32)> = if mism_eps > 0.0 {
+        mismatch_reference(base, sample_rate, spf, jobs, notes)
+    } else {
+        Vec::new()
+    };
     // 每个窗**正身**里的音 = 被这个窗盖住 ≥80% 的唱音(它的好坏由这个窗的落点决定)。
     let job_notes: Vec<Vec<usize>> = if scoring {
         jobs.iter()
@@ -5542,6 +5797,12 @@ pub fn apply_dead_only_windows_with(
                             ) {
                                 sc.h2.push((ni, h));
                             }
+                            // ⭐⭐⭐⭐ S165 —— **失配度**,第 1 处(主评估)。⛔ 同样是两处填充点。
+                            if !mism_ref.is_empty() {
+                                if let Some(m) = note_mismatch(seg, sample_rate, nd.hz, &mism_ref) {
+                                    sc.mism.push((ni, m));
+                                }
+                            }
                         }
                         let g = silence_run_ms(seg, sample_rate);
                         if g > 0.0 {
@@ -5605,6 +5866,7 @@ pub fn apply_dead_only_windows_with(
             usag_eps,
             usag_dim_cap,
             h2_eps,
+            mism_eps,
         );
         log_pick(&cand, &mine, ji, jobs);
         chosen[ji] = mine.first().copied();
@@ -5804,6 +6066,15 @@ pub fn apply_dead_only_windows_with(
                                     {
                                         sc.h2.push((ni, h));
                                     }
+                                    // ⭐⭐⭐⭐ S165 —— **失配度**,第 2 处(修补遍后重评估)。
+                                    //    ⛔ 漏这一处 = 修补遍渲出来的新候选没有失配分 ⇒ 排序拿不到它。
+                                    if !mism_ref.is_empty() {
+                                        if let Some(m) =
+                                            note_mismatch(seg, sample_rate, nd.hz, &mism_ref)
+                                        {
+                                            sc.mism.push((ni, m));
+                                        }
+                                    }
                                 }
                                 if nd.hz > 0.0 {
                                 if let Some(c) =
@@ -5829,6 +6100,7 @@ pub fn apply_dead_only_windows_with(
                     usag_eps,
                     usag_dim_cap,
                     h2_eps,
+                    mism_eps,
                 );
                 log_h2_stat("repair");
                 if let Some(&c) = mine.first() {
@@ -8609,6 +8881,85 @@ mod tests {
     /// * 把比较写成 `ux.partial_cmp(&uy)`(方向反) ⇒ ⑵ 失守;
     /// * 把 `> usag_eps` 写成 `>= 0.0`(等于取消 eps) ⇒ ⑶ 失守,对照组被动;
     /// * 少填一处 `sc.usag.push` ⇒ `worst_usag()` 恒 0 ⇒ ⑵ 失守。
+    /// ⭐⭐⭐⭐ S165 —— **失配轴**:出厂不变 · 相对判据 · **最差口径**(不是平均)· 对手轴闸 · 阴性对照。
+    ///
+    /// 夹具照**实测坐标**造(yachiyo × 炉心 4:36 那个音,用户听过三个候选):
+    /// 逐根谐波「抖动 − 该电平该有的抖动」的最大值 =
+    /// **−8 → +1.17(用户判最差)· −13 → +0.36 · −15 → −0.43(用户:最像它自己)**。
+    #[test]
+    fn the_mismatch_axis_uses_the_worst_note_and_only_moves_when_a_better_candidate_exists() {
+        // 每个候选给两个音:音 0 是「组里本来就一般」的,音 1 是真正分胜负的那个。
+        let mk = |shift: i64, rel: f32, m0: f32, m1: f32, uplev: f32| {
+            let mut sc = CandScore::default();
+            sc.rel.push((0, rel));
+            sc.mism.push((0, m0));
+            sc.mism.push((1, m1));
+            sc.uplev.push((0, uplev));
+            sc.uplev.push((1, uplev));
+            (0usize, shift, 0usize, Vec::<f32>::new(), sc)
+        };
+        // 真实形状:rel 偏好今天的 −8,而失配说 −15 好 1.60。
+        let cand = vec![mk(-8, 4.2, -0.3, 1.17, 0.0), mk(-15, 5.9, -0.5, -0.43, 0.0)];
+
+        // ⑴ ⛔ eps = 0 ⇒ **逐位回到今天**(出厂关 = 不改音频的保证)
+        let today = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(cand[today[0]].1, -8, "eps=0 必须逐位回到今天的 rel 排序");
+
+        // ⑵ 改善 1.60 > eps 0.5 ⇒ 按失配选 −15,哪怕 rel 指向 −8
+        let fixed = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
+        assert_eq!(
+            cand[fixed[0]].1, -15,
+            "失配能改善 1.60 dB 时必须压过 rel —— 用户耳判 −15 最像它自己"
+        );
+
+        // ⑶ ⛔⛔ **最差口径**:−8 在音 0 上更好(−0.3 vs −0.5),但音 1 上差 1.60。
+        //    若哪天改成「平均」,平均差只有 (0.2+1.60)/2 ≈ 0.9,而且**方向会被音 0 拉回去** ——
+        //    实测三种「整体距离」口径全都选中了用户判为最差的那一档。这一条钉住它。
+        let avg_trap = vec![
+            mk(-8, 4.2, -2.0, 1.17, 0.0),  // 音 0 极好,音 1 极差
+            mk(-15, 5.9, 0.0, -0.43, 0.0), // 音 0 一般,音 1 好
+        ];
+        let picked = decide_group(&avg_trap, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
+        assert_eq!(
+            avg_trap[picked[0]].1, -15,
+            "⛔ 一个音失配 +1.17 就该换,不许被组里另一个音的 −2.0 平均掉"
+        );
+
+        // ⑷ ⛔ 相对判据:两个候选都不好但**差不多** ⇒ 不动(避免绝对门限的误伤)。
+        //    实测绝对门限会否掉 41% 的候选而只有 10 组能真正改善。
+        let both_bad = vec![mk(-8, 4.2, 0.9, 1.10, 0.0), mk(-15, 5.9, 1.0, 1.05, 0.0)];
+        let kept = decide_group(&both_bad, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
+        assert_eq!(
+            both_bad[kept[0]].1, -8,
+            "两个候选都失配但差 <eps ⇒ 必须回落 rel,不许瞎换"
+        );
+
+        // ⑸ ⛔⛔ **对手轴闸**(用户上线警告:别把哑音引回来)。
+        //    赢家把上方谐波压掉超过 `usag_dim_cap` ⇒ 不许换。
+        let costly = vec![mk(-8, 4.2, -0.3, 1.17, 6.0), mk(-15, 5.9, -0.5, -0.43, 0.0)];
+        let held = decide_group(&costly, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
+        assert_eq!(
+            costly[held[0]].1, -8,
+            "赢家把上方谐波压了 6 dB(> usag_dim_cap 3)⇒ 必须拦住 —— 这是 h2 那次哑音的教训"
+        );
+
+        // ⑹ ⛔ 阴性对照:**两边都量不到失配**(参照建不起来 / 峰位验证全失败)⇒ 这根轴必须闭嘴。
+        let blind = vec![
+            (0usize, -8i64, 0usize, Vec::<f32>::new(), CandScore::default()),
+            (0usize, -15i64, 0usize, Vec::<f32>::new(), CandScore::default()),
+        ];
+        let n = decide_group(&blind, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
+        assert_eq!(blind[n[0]].1, -8, "量不到失配时这根轴必须闭嘴(best_mism_vs 给 −inf)");
+
+        // ⑺ 参照曲线的内插:两端取端点,中间线性。
+        let r = vec![(-45.0f32, 1.6f32), (-19.0, 1.44), (4.0, 0.9)];
+        assert_eq!(mismatch_expect(&r, -60.0), Some(1.6), "低于最低档 ⇒ 取端点");
+        assert_eq!(mismatch_expect(&r, 20.0), Some(0.9), "高于最高档 ⇒ 取端点");
+        let mid = mismatch_expect(&r, -32.0).unwrap();
+        assert!((mid - 1.52).abs() < 0.02, "中间该线性内插,实际 {mid:.3}");
+        assert_eq!(mismatch_expect(&[], 0.0), None, "参照空 ⇒ None(不许瞎猜)");
+    }
+
     /// ⭐⭐⭐ S165 —— `2·f0` 电平这根轴:**出厂不变 · 真坐标能修好 · 对照不许动 · 对手轴闸拦得住**。
     ///
     /// 夹具全部照**实测坐标**造(yachiyo × 炉心融解 +7,`[794]あ`,f0 987.8 Hz):
@@ -8628,11 +8979,11 @@ mod tests {
         let cand = vec![mk(-8, 4.2, -17.0, 0.0), mk(-13, 5.9, -5.2, -3.0)];
 
         // ⑴ ⛔ eps = 0 ⇒ **逐位回到今天**(这是「出厂关 = 不改音频」的保证)
-        let today = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let today = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(cand[today[0]].1, -8, "eps=0 必须逐位回到今天的 rel 排序");
 
         // ⑵ 差 11.8 dB > eps 6.0 ⇒ 按 h2 选 −13,哪怕 rel 指向 −8
-        let fixed = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        let fixed = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
         assert_eq!(
             cand[fixed[0]].1, -13,
             "h2 差 11.8 dB 时必须压过 rel —— 用户耳判确认 −13 更好听"
@@ -8642,14 +8993,14 @@ mod tests {
         //    实测两个模型的 h2 中位是 −4.8 / −6.5,大量音就在这个区间里,
         //    eps 若设小了会把它们全部翻一遍。
         let ctrl = vec![mk(-8, 4.2, -5.0, 0.0), mk(-13, 5.9, -7.5, -3.0)];
-        let kept = decide_group(&ctrl, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        let kept = decide_group(&ctrl, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
         assert_eq!(ctrl[kept[0]].1, -8, "h2 只差 2.5 dB 时必须回落 rel");
 
         // ⑷ ⛔⛔ **对手轴闸**:赢家把上方谐波压掉超过 `H2_DIM_CAP` ⇒ 不许换。
         //    S163 §32 的血训:`gone` 那一支当初没配对手轴闸,直接造出全曲唯一一个变闷 >2.7 的音
         //    ⇒ **每一根参与排序的轴都要配**。
         let costly = vec![mk(-8, 4.2, -17.0, 6.0), mk(-13, 5.9, -5.2, -8.0)];
-        let held = decide_group(&costly, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        let held = decide_group(&costly, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
         assert_eq!(
             costly[held[0]].1, -8,
             "赢家把上方谐波压了 14 dB(> H2_DIM_CAP {H2_DIM_CAP})⇒ 必须拦住"
@@ -8662,7 +9013,7 @@ mod tests {
         a.4.usag.push((0, 1.0)); // 今天这档 usag 更好
         b.4.usag.push((0, -6.0)); // 好格 usag 更差,差 7 dB > usag_eps 3
         let both = vec![a, b];
-        let win = decide_group(&both, 0, -8, 0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 6.0);
+        let win = decide_group(&both, 0, -8, 0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 6.0, 0.0);
         assert_eq!(
             both[win[0]].1, -13,
             "h2 与 usag 指向相反时 h2 必须赢 —— 它排在 usag 之前就是为了这个"
@@ -8682,7 +9033,7 @@ mod tests {
             (0usize, shift, 0usize, Vec::<f32>::new(), sc)
         };
         let pinned = vec![mk2(-8, 4.2, -30.0, -17.0), mk2(-13, 5.9, -30.0, -5.2)];
-        let saved = decide_group(&pinned, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        let saved = decide_group(&pinned, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
         assert_eq!(
             pinned[saved[0]].1, -13,
             "组里有个音在所有候选上都读 −30(气声),但另一个音差 11.8 dB ——              这根轴必须逐音看,不许被那个音钉死(实机 47/54 次触发 0 改变就是这么来的)"
@@ -8705,7 +9056,7 @@ mod tests {
         };
         // 候选 A 只在音 0 上量到,候选 B 只在音 1 上量到 ⇒ 交集为空。
         let disjoint = vec![mk3(-6, 4.2, &[(0, -21.4)]), mk3(-2, 5.9, &[(1, -7.4)])];
-        let picked = decide_group(&disjoint, 0, -6, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        let picked = decide_group(&disjoint, 0, -6, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
         assert_eq!(
             disjoint[picked[0]].1, -6,
             "⛔ 交集为空时这根轴必须**闭嘴**(回落到今天的 rel),而不是拿 0.0 当两边都一样 ——              若哪天改成「交集为空也敢比」,这条会红"
@@ -8715,7 +9066,7 @@ mod tests {
             mk3(-6, 4.2, &[(0, -21.4), (1, -3.0)]),
             mk3(-2, 5.9, &[(0, -7.4), (2, -3.0)]),
         ];
-        let fixed2 = decide_group(&shared, 0, -6, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        let fixed2 = decide_group(&shared, 0, -6, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
         assert_eq!(
             shared[fixed2[0]].1, -2,
             "音 0 上 −2 比 −6 好 14 dB(共同的音只有它一个)⇒ 必须换"
@@ -8727,7 +9078,7 @@ mod tests {
             (0usize, -8i64, 0usize, Vec::<f32>::new(), CandScore::default()),
             (0usize, -13i64, 0usize, Vec::<f32>::new(), CandScore::default()),
         ];
-        let n = decide_group(&blind, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        let n = decide_group(&blind, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
         assert_eq!(
             blind[n[0]].1, -8,
             "两边都量不到 h2 ⇒ 这根轴必须闭嘴(worst_h2 都是 0.0,差 0 < eps)"
@@ -8746,14 +9097,14 @@ mod tests {
         let cand = vec![mk(0, -2, 4.48, -10.8), mk(0, -4, 5.96, -3.2)];
 
         // ⑴ eps = 0 ⇒ 逐位回到今天(rel 最小的 −2 在前)
-        let today = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let today = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[today[0]].1, -2,
             "eps=0 必须逐位回到今天的 rel 排序 —— 这是「出厂不变」的保证"
         );
 
         // ⑵ 差 7.6 dB > eps 3.0 ⇒ 按 usag 选 −4，哪怕 rel 指向 −2
-        let fixed = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0);
+        let fixed = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[fixed[0]].1, -4,
             "usag 差 7.6 dB 时必须压过 rel —— 实测那一组 rel 的方向是反的"
@@ -8762,7 +9113,7 @@ mod tests {
         // ⑶ 对照组的形状:usag 只差 2.0 dB(< eps) ⇒ 回落 rel ⇒ **不动**
         //    (用户点名的 0:40.901 与 0:43.641 两个「听起来正常」的音就是这个形状)
         let ctrl = vec![mk(0, -2, 4.90, 1.3), mk(0, -4, 5.80, 3.3)];
-        let kept = decide_group(&ctrl, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0);
+        let kept = decide_group(&ctrl, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0);
         assert_eq!(
             ctrl[kept[0]].1, -2,
             "usag 只差 2.0 dB 时必须回落 rel ⇒ 听起来正常的那些音一个都不许动"
@@ -8781,7 +9132,7 @@ mod tests {
                 sc
             }),
         ];
-        let n = decide_group(&none, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0);
+        let n = decide_group(&none, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0);
         assert_eq!(
             none[n[0]].1, -2,
             "量不到 usag 的组必须原样走 rel —— 短音上这根轴是噪声,不许拿它决策"
@@ -11331,7 +11682,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}              usag={} usagdim={} gonesort={} dipfill={} restwin={}/{} h2={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}              usag={} usagdim={} gonesort={} dipfill={} restwin={}/{} h2={} mism={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -11416,6 +11767,10 @@ mod tests {
             //    于是不得不读 `landing_h2_eps` 那段 doc 与它的三个常量
             //    (`H2_REPAIR_FLOOR` / `H2_REPAIR_RADIUS` / `H2_DIM_CAP`)」。
             parse_h2_eps(None),
+            // ⭐⭐⭐ S165 —— **失配**轴的 eps。⚠ 出厂 0 = 关 = 逐位不变 ⇒ 加它**不该**触发版本 bump;
+            //    进指纹的意义是「下一个人想把它变成默认之前,必须先来这里改一行,
+            //    于是不得不读 `landing_mismatch_eps` 那段 doc —— 特别是**相对判据 + 最差口径**那两条」。
+            parse_mismatch_eps(None),
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -11428,7 +11783,7 @@ mod tests {
             //    它**会改音频**（所以在指纹里、不在 `EXEMPT` 里），但**出厂没设 ⇒ off ⇒ 不改音频**
             //    ⇒ 按本判据自己的规矩（“若它出厂关 = 不改音频，就不要 bump 版本号”）**不跟着 bump**，
             //    与 `valhuman=` 当初同例。进指纹的意义是：下一个人想把它变成默认之前，必须先来这里改一行。
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 h2=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true donorin=false valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 h2=0 mism=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true donorin=false valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -11515,6 +11870,7 @@ mod tests {
             ("USAG_DIM_CAP_DEFAULT", "pub fn landing_usag_dim_cap("),
             ("DIPFILL_DEPTH_DEFAULT", "pub fn dipfill_depth_db("),
             ("LANDING_H2_EPS_DEFAULT", "pub fn landing_h2_eps("),
+            ("LANDING_MISMATCH_EPS_DEFAULT", "pub fn landing_mismatch_eps("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
@@ -12162,6 +12518,7 @@ mod tests {
                     width: vec![(0, width)],
                     usag: Vec::new(),
                     h2: Vec::new(),
+                    mism: Vec::new(),
                     uplev: Vec::new(),
                 },
             )
@@ -12170,7 +12527,7 @@ mod tests {
         // B = 候选 −4：电平差一点（2.0 dB）但谱峰很清晰（1%）
         let cand = vec![mk(-8, 0.2, 12.0), mk(-4, 2.0, 1.0)];
         // ① 开着（eps = 2.0）⇒ 12% > 1% × 2 ⇒ 剔掉 A ⇒ 选 B
-        let on = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0);
+        let on = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[on[0]].1,
             -4,
@@ -12178,7 +12535,7 @@ mod tests {
             cand[on[0]].1
         );
         // ② ⛔ 阴性对照：关掉 ⇒ 只剩电平轴 ⇒ 选 A（糊的）
-        let off = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let off = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[off[0]].1,
             -8,
