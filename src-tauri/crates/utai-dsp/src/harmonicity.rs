@@ -562,8 +562,252 @@ pub fn second_harmonic_level_db(x: &[f32], sample_rate: u32, f0_hz: f32) -> Opti
     Some((10.0 * (p_hi / p_lo).log10()) as f32)
 }
 
+/// ⭐⭐⭐ S165 —— **逐谐波的「响度 ↔ 抖动」配对**:返回 `[(相对 f0 的电平 dB, 30-90 Hz 抖动 dB), …]`。
+///
+/// # 为什么要成对返回,而不是各返回一个数
+/// 用户 2026-08-28 定案:「本身也不是说『**响就是好**』或者『**抖就是不好**』…… **失配了才奇怪**」。
+/// 本场先后判负了**十几把**尺子,它们**要么只量响度、要么只量抖动**,没有一把量两者的关系
+/// (归一包络 std/mean · 包络谱尖峰度 · STFT 条纹 · 短窗峰宽 · 谐波间填充 · 存在率 ·
+///  40-60 Hz 调制占比 · log 域绝对快抖 · 逐根凹陷度 · 高次谐波抖动 · 梳深 · `2·f0` 电平)。
+///
+/// 实测(同一**谐波电平档**内比抖动,消掉「音色不同 ⇒ 电平不同」的混杂):
+///
+/// | 谐波电平 | yachiyo(用户说油) | yuyuko | SV |
+/// |---|---|---|---|
+/// | −60..−30 dB(弱) | 1.91 | 1.91 | **1.60** |
+/// | **−3..+10 dB(强)** | **1.65** | 1.09 | **0.89** |
+///
+/// ⇒ **SV 的抖动随谐波变强而降下来,yachiyo 几乎不降** —— 强谐波本该稳,它却还在抖。
+/// 换成与滤波器无关的 Welch PSD 重算,「yachiyo 最平」不变(−0.0043 / −0.0170 / −0.0134);
+/// 而合成台上(强弱谐波给**同样**的调制深度)读 **−0.0000** ⇒ **这把尺子自己不造斜率**。
+///
+/// # ⛔ 口径(每一条都是本场栽出来的)
+/// * **窄窗 `±0.08·f0` + 逐根验峰位**(偏离 >1.5% ⇒ 跳过那一根)——
+///   窗宽放到 `0.20·f0` 会抓到非谐波能量,同一份素材读数跳 **14.7 dB**;
+/// * 抖动 = **log 包络**(去均值)在 **30-90 Hz** 的能量平方根 —— log 域才对应「频谱图上亮度的起伏」;
+/// * 解调低通 `min(300, 0.35·f0)` —— 固定 300 Hz 会串进相邻谐波,低 f0 的音天然读高;
+/// * 电平**相对 `f0`** —— 与整体响度无关,免得变成「谁轻谁赢」。
+///
+/// # ⚠ 它不是「越大越好」或「越小越好」的尺子
+/// 调用方必须自己提供「这个电平该抖多少」的**参照**(本场用**同模型的未救援段**),再看偏离。
+/// ⛔ 绝不许写成「抖动越小越好」——用户明说 yuyuko 整体「像大电流音刺耳」,
+/// 那正是抖动被压没的听感。
+pub fn harmonic_level_jitter_pairs(
+    x: &[f32],
+    sample_rate: u32,
+    f0_hz: f32,
+    max_harmonic: usize,
+) -> Vec<(f32, f32)> {
+    const TOL: f64 = 0.08;
+    const MAX_OFF: f64 = 0.015;
+    let mut out = Vec::new();
+    if !(f0_hz > 20.0) || sample_rate == 0 || x.len() < 4096 || max_harmonic < 2 {
+        return out;
+    }
+    let sr = f64::from(sample_rate);
+    let f0 = f64::from(f0_hz);
+    let n = x.len();
+    let nf = n.next_power_of_two();
+    let win: Vec<f64> = (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos())
+        .collect();
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(nf);
+    let mut buf: Vec<Complex<f64>> = (0..nf)
+        .map(|i| {
+            if i < n {
+                Complex::new(f64::from(x[i]) * win[i], 0.0)
+            } else {
+                Complex::new(0.0, 0.0)
+            }
+        })
+        .collect();
+    fft.process(&mut buf);
+    let bin = sr / nf as f64;
+    let peak = |c: f64| -> Option<(f64, f64)> {
+        let lo = ((c * (1.0 - TOL)) / bin).floor().max(1.0) as usize;
+        let hi = (((c * (1.0 + TOL)) / bin).ceil() as usize).min(nf / 2);
+        if hi <= lo {
+            return None;
+        }
+        let (mut bj, mut bv) = (lo, buf[lo].norm());
+        for j in lo..=hi {
+            let v = buf[j].norm();
+            if v > bv {
+                bv = v;
+                bj = j;
+            }
+        }
+        Some((bj as f64 * bin, bv))
+    };
+    let Some((f_ref, a_ref)) = peak(f0) else { return out };
+    if ((f_ref - f0) / f0).abs() > MAX_OFF || !(a_ref > 0.0) {
+        return out;
+    }
+    let ref_db = 20.0 * a_ref.log10();
+    let lp = (0.35 * f0).min(300.0);
+    let nyq = sr / 2.0;
+    if !(lp > 0.0) || lp >= nyq {
+        return out;
+    }
+    // 一阶低通系数(等价 RC);双向各跑一遍 ⇒ 零相位,包络不会被延迟拖斜。
+    let alpha = {
+        let dt = 1.0 / sr;
+        let rc = 1.0 / (2.0 * std::f64::consts::PI * lp);
+        dt / (rc + dt)
+    };
+    for k in 2..=max_harmonic {
+        let c = f0 * k as f64;
+        if c * (1.0 + TOL) >= nyq {
+            break;
+        }
+        let Some((fk, ak)) = peak(c) else { continue };
+        if ((fk - c) / c).abs() > MAX_OFF || !(ak > 0.0) {
+            continue;
+        }
+        let lv = (20.0 * ak.log10() - ref_db) as f32;
+        let (mut re, mut im) = (vec![0f64; n], vec![0f64; n]);
+        let w = 2.0 * std::f64::consts::PI * c / sr;
+        for (i, v) in x.iter().enumerate() {
+            let p = w * i as f64;
+            re[i] = f64::from(*v) * p.cos();
+            im[i] = -f64::from(*v) * p.sin();
+        }
+        for ch in [&mut re, &mut im] {
+            let mut acc = ch[0];
+            for v in ch.iter_mut() {
+                acc += alpha * (*v - acc);
+                *v = acc;
+            }
+            let mut acc = ch[n - 1];
+            for v in ch.iter_mut().rev() {
+                acc += alpha * (*v - acc);
+                *v = acc;
+            }
+        }
+        let edge = ((0.03 * sr) as usize).min(n / 4);
+        if n <= 2 * edge + 256 {
+            continue;
+        }
+        let env: Vec<f64> =
+            (edge..n - edge).map(|i| (re[i] * re[i] + im[i] * im[i]).sqrt()).collect();
+        let m = env.len();
+        let mean = env.iter().sum::<f64>() / m as f64;
+        if !(mean > 0.0) {
+            continue;
+        }
+        let mut ldb: Vec<f64> = env.iter().map(|v| 20.0 * v.max(1e-12).log10()).collect();
+        let lm = ldb.iter().sum::<f64>() / m as f64;
+        for v in ldb.iter_mut() {
+            *v -= lm;
+        }
+        let mf = m.next_power_of_two();
+        let fft2 = planner.plan_fft_forward(mf);
+        let mut b2: Vec<Complex<f64>> = (0..mf)
+            .map(|i| {
+                if i < m {
+                    let wv = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / m as f64).cos();
+                    Complex::new(ldb[i] * wv, 0.0)
+                } else {
+                    Complex::new(0.0, 0.0)
+                }
+            })
+            .collect();
+        fft2.process(&mut b2);
+        let bin2 = sr / mf as f64;
+        let lo2 = (30.0 / bin2).ceil() as usize;
+        let hi2 = ((90.0 / bin2).floor() as usize).min(mf / 2);
+        if hi2 <= lo2 {
+            continue;
+        }
+        let scale = 2.0 / m as f64;
+        let e: f64 = (lo2..=hi2).map(|j| (b2[j].norm() * scale).powi(2)).sum();
+        out.push((lv, e.sqrt() as f32));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    /// ⭐⭐⭐ S165 —— [`harmonic_level_jitter_pairs`]:**尺子自己不许造斜率**,而且要读得回已知调制。
+    ///
+    /// ⛔ 这一条钉住的是本场最贵的教训之一:一个独立排查用「全曲矩形 FFT 掩膜」做带通,
+    /// 在**真值恰好为 0** 的素材上读出与被测效应同量级的假读数(p50 0.078 / max 0.470),
+    /// 于是它整条发现被自己的对抗验证推倒。
+    #[test]
+    fn the_level_jitter_pairs_do_not_invent_a_slope_and_read_back_known_modulation() {
+        let sr = 48_000u32;
+        let f0 = 500.0f32;
+        let n = 48_000usize;
+        // 强弱差 34 dB 的谐波,**全部给同样的调制深度** ⇒ 真值斜率 = 0。
+        let mk = |amp: f32, depth_db: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / sr as f32;
+                    let m = 10f32
+                        .powf((depth_db / 2.0) * (2.0 * std::f32::consts::PI * 55.0 * t).sin() / 20.0);
+                    let mut y = (2.0 * std::f32::consts::PI * f0 * t).sin();
+                    for k in 2..=6u32 {
+                        y += amp * m * (2.0 * std::f32::consts::PI * f0 * k as f32 * t).sin();
+                    }
+                    0.2 * y
+                })
+                .collect()
+        };
+        let mut all: Vec<(f32, f32)> = Vec::new();
+        for amp in [1.0f32, 0.5, 0.2, 0.06, 0.02] {
+            all.extend(harmonic_level_jitter_pairs(&mk(amp, 0.5), sr, f0, 6));
+        }
+        assert!(all.len() >= 15, "样本太少:{}", all.len());
+        let nn = all.len() as f32;
+        let mx = all.iter().map(|p| p.0).sum::<f32>() / nn;
+        let my = all.iter().map(|p| p.1).sum::<f32>() / nn;
+        let num: f32 = all.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+        let den: f32 = all.iter().map(|p| (p.0 - mx) * (p.0 - mx)).sum();
+        let slope = num / den.max(1e-9);
+        assert!(
+            slope.abs() < 0.006,
+            "⛔ 强弱谐波给了**同样**的调制深度,尺子却读出斜率 {slope:+.4} —— 它在无中生有"
+        );
+
+        // ⑵ 读得回已知深度:0 深度读数接近 0,且随深度单调上升。
+        let med_of = |v: &[(f32, f32)]| -> f32 {
+            let mut j: Vec<f32> = v.iter().map(|p| p.1).collect();
+            j.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            j[j.len() / 2]
+        };
+        let mut prev = -1.0f32;
+        for d in [0.0f32, 0.5, 2.0, 6.0] {
+            let v = harmonic_level_jitter_pairs(&mk(1.0, d), sr, f0, 6);
+            let m = med_of(&v);
+            if d == 0.0 {
+                assert!(m < 0.2, "零调制该读 ≈0,实际 {m:.3}");
+            }
+            assert!(m > prev, "深度 {d} 读 {m:.3},没有比上一档 {prev:.3} 大");
+            prev = m;
+        }
+
+        // ⑶ ⛔ 与整体响度无关(两个读数都是比值/相对量)——不许变成「谁轻谁赢」。
+        let loud = mk(1.0, 2.0);
+        let quiet: Vec<f32> = loud.iter().map(|v| v * 0.05).collect();
+        let a = harmonic_level_jitter_pairs(&loud, sr, f0, 6);
+        let b = harmonic_level_jitter_pairs(&quiet, sr, f0, 6);
+        assert_eq!(a.len(), b.len(), "响度变了却少读了几根谐波");
+        for (p, q) in a.iter().zip(b.iter()) {
+            assert!((p.0 - q.0).abs() < 0.3, "电平读数被响度影响:{:.2} vs {:.2}", p.0, q.0);
+            assert!((p.1 - q.1).abs() < 0.25, "抖动读数被响度影响:{:.2} vs {:.2}", p.1, q.1);
+        }
+
+        // ⑷ 峰位验证:问错音高 ⇒ 读到的谐波变少(而不是给一堆垃圾读数)。
+        let wrong = harmonic_level_jitter_pairs(&mk(1.0, 2.0), sr, f0 * 1.07, 6);
+        assert!(
+            wrong.len() < a.len(),
+            "问错音高还读出同样多的谐波({} vs {})—— 峰位验证没起作用",
+            wrong.len(),
+            a.len()
+        );
+    }
+
 
     /// ⭐⭐⭐ S165 —— [`second_harmonic_level_db`] 的口径:**窄窗 + 验峰位 + 与响度无关**。
     ///
