@@ -1057,7 +1057,7 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{},{},{},{},{} restbucket={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{},{},{},{},{} restbucket={} donorin={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
@@ -1084,6 +1084,11 @@ pub(crate) fn production_defaults_fingerprint() -> String {
         PREROLL_PEAK_WIN_MS,
         // ⭐ S163 —— 借休止时桶按休止长度选（`score2cv`）。出厂开 ⇒ 改音频 ⇒ 必须 bump。
         super::score2cv::parse_rest_bucket_target(None),
+        // ⭐ S165 —— 外部逆变换臂(见 `external_donor`)。**它会改音频**,所以它在指纹里、
+        //    不在 `EXEMPT` 里(`UTAI_RANGE_DUMP_DONOR` 能豁免是因为那条只写文件)。
+        //    出厂**没设 ⇒ off ⇒ 不改音频** ⇒ 加它不该触发 bump;进指纹的意义是
+        //    「下一个人想把它变成默认之前,必须先来这里改一行」。
+        std::env::var_os("UTAI_RANGE_DONOR_IN").is_some(),
         // ⛔⛔ S161b —— **类深度与槽形也进指纹**。S161 只登记了旋钮,而这一场改的是**常量**
         //    (浊塞音 11.7 → 20 窄槽、闪音 6.8 → 8):旋钮没动、指纹没动、音频却变了 ⇒ 又是零红。
         //    ⇒ 凡是这几个常量被改,这条闸当场红,红的措辞会指到那三处版本字面量。
@@ -2951,7 +2956,11 @@ fn apply_range_inverse(
         );
     }
     // ⚠ stem 只在转储开着时算(它会往一个进程内的表里插一条)。
-    let stem = std::env::var_os("UTAI_RANGE_DUMP_DONOR").map(|_| dump_stem(range_shift, dump_group));
+    // ⚠ stem 只算**一次**(`dump_stem` 有副作用:往进程内的去重表里插一条)。
+    //    转储与外部 donor 两条路都要用它,分别算会让第二条拿到 `_2` 后缀 ⇒ 对不上文件。
+    let stem = (std::env::var_os("UTAI_RANGE_DUMP_DONOR").is_some()
+        || std::env::var_os("UTAI_RANGE_DONOR_IN").is_some())
+    .then(|| dump_stem(range_shift, dump_group));
     if let Some(st) = &stem {
         dump_donor_buffer("pre", st, &audio, note_hz);
     }
@@ -2971,7 +2980,70 @@ fn apply_range_inverse(
     if let (Ok(y), Some(st)) = (&out, &stem) {
         dump_donor_buffer("post", st, y, note_hz);
     }
-    out
+    // ⭐ S165 —— **外部逆变换臂**:整曲耳判用(见 `external_donor`)。
+    // ⚠ 放在 dump **之后**:那份 dump 的语义是「**我们自己**的逆变换输出」,
+    //    换成外部的会让「我们 vs 外部」的对拍失去参照。
+    match (out, &stem) {
+        (Ok(y), Some(st)) => external_donor(y, st),
+        (other, _) => other,
+    }
+}
+
+/// ⭐ S165 —— `UTAI_RANGE_DONOR_IN=<dir>`:把**我们的**逆变换输出整个换成外部算好的一份。
+///
+/// # 它为什么存在
+/// 「换 praat / 换别的逆变换内核」这个决定**只能靠耳朵**收(用户 2026-08-28:
+/// 「开 praat 之前得先确认 praat 听起来会不会给音色染色或者像 WORLD 一样造出什么离谱问题来」),
+/// 而耳判**一律交整曲**(用户说过三次)。可整曲又必须走完整条管线(拼接 / 电平 / 修补遍)——
+/// 离线在 python 里复现那条链既不准也不值。
+/// ⇒ 让外部算好 `donor_post_<stem>.f32` 丢进一个目录,这里读进来顶替,**其余一个字节不改**。
+/// 配合 `UTAI_RANGE_DUMP_DONOR` 先导出 `donor_pre_<stem>.f32`,外部只负责「pre → post」那一步。
+///
+/// ⛔ 它**会改音频**,所以它登记在指纹里(`donorin=`),不在 `EXEMPT` 里 ——
+///    `UTAI_RANGE_DUMP_DONOR` 能豁免是因为那条只写文件。
+///
+/// # ⛔ 长度不匹配一律报错,不许静默
+/// TD-PSOLA 按定义不改时长;外部实现要是改了长度,拼接层会**静默错位**,
+/// 而错位的症状(音节糊在一起)极容易被读成「这个内核音质差」。
+/// ⇒ 宁可让这一遍**渲不出来**,也不给出一个看着正常的错答案(S129 铁律:
+///    「跑不起来」不许被读成「通过」)。
+fn external_donor(y: Vec<f32>, stem: &str) -> crate::Result<Vec<f32>> {
+    let Some(dir) = std::env::var_os("UTAI_RANGE_DONOR_IN") else { return Ok(y) };
+    let p = std::path::PathBuf::from(dir).join(format!("donor_post_{stem}.f32"));
+    if !p.exists() {
+        // 这一组外部没给 ⇒ 用我们自己的。**明写出来**,否则「只换了一半」会被读成「全换了」。
+        tracing::info!("range donor-in: {} absent — this group keeps our own inverse", p.display());
+        return Ok(y);
+    }
+    let bytes = std::fs::read(&p)
+        .map_err(|e| crate::UtaiError::Inference(format!("donor-in: cannot read {}: {e}", p.display())))?;
+    let v = decode_external_donor(&bytes, y.len())
+        .map_err(|e| crate::UtaiError::Inference(format!("donor-in: {}: {e}", p.display())))?;
+    tracing::info!("range donor-in: {} samples <- {}", v.len(), p.display());
+    Ok(v)
+}
+
+/// [`external_donor`] 的**纯**部分 —— 判据不许读进程环境,也不该去碰文件系统。
+///
+/// ⛔ 两条都必须是**硬错**,不许静默修正:
+/// * 字节数不是 4 的倍数 ⇒ 那不是一份 little-endian f32;
+/// * 样本数与我们的输出对不上 ⇒ 外部实现动了时长。TD-PSOLA 按定义不改时长,
+///   而拼接层拿的是**样本坐标** ⇒ 静默截断/补零会让整段音节错位,而那个症状
+///   (糊在一起)极容易被读成「这个内核音质差」—— 一次实现事故就变成了一条算法结论。
+fn decode_external_donor(bytes: &[u8], expect: usize) -> std::result::Result<Vec<f32>, String> {
+    if bytes.len() % 4 != 0 {
+        return Err(format!("not a whole number of f32 ({} bytes)", bytes.len()));
+    }
+    let n = bytes.len() / 4;
+    if n != expect {
+        return Err(format!(
+            "length {n} samples vs our inverse output {expect} — TD-PSOLA does not change              duration by definition; a mismatch means the external kernel did, and the splice              layer would silently misalign ⇒ refusing this pass"
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 /// S165 —— 这一次 donor 渲染的转储 stem(`pre` / `post` / `f0` 三个文件**共用**一个)。
@@ -3096,6 +3168,36 @@ mod mg_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── S165:外部逆变换臂 ──────────────────────────────────────────────────────────
+
+    /// ⛔ 长度对不上必须**报错**,不许静默截断或补零 —— 拼接层吃的是样本坐标,
+    /// 一次静默错位会把整段音节糊在一起,而那个症状会被读成「这个内核音质差」,
+    /// 于是一次实现事故就变成了一条算法结论。(range_rulers/README 开头那四个月就是这么来的。)
+    #[test]
+    fn external_donor_refuses_a_length_mismatch_instead_of_silently_fixing_it() {
+        let good: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect();
+        let bytes: Vec<u8> = good.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        // ⑴ 长度一致 ⇒ 逐位还原
+        let back = decode_external_donor(&bytes, good.len()).expect("同长度必须成功");
+        assert_eq!(back, good, "同长度的往返必须逐位相同");
+
+        // ⑵ 短一个 / 长一个 ⇒ 都必须 Err(而不是补零或截断)
+        for wrong in [good.len() - 1, good.len() + 1] {
+            let e = decode_external_donor(&bytes, wrong)
+                .expect_err("长度对不上必须报错,不许静默修正");
+            assert!(e.contains("length"), "错误措辞要指出是长度问题 —— {e}");
+        }
+
+        // ⑶ 字节数不是 4 的倍数 ⇒ Err
+        let e = decode_external_donor(&bytes[..bytes.len() - 1], good.len())
+            .expect_err("非 4 倍数必须报错");
+        assert!(e.contains("f32"), "错误措辞要指出不是 f32 —— {e}");
+
+        // ⑷ 阴性对照:空对空是合法的
+        assert!(decode_external_donor(&[], 0).expect("空对空是合法的").is_empty());
+    }
 
     // ── S165:donor 转储命名 ────────────────────────────────────────────────────────
 
@@ -5310,6 +5412,7 @@ mod s160q_f0_lerp_tests {
         // (env 变量名, 它在指纹里的 key)。⛔ 加旋钮不加这一行 ⇒ 当场红。
         const MAP: &[(&str, &str)] = &[
             ("UTAI_SCORE_F0_LERP", "f0lerp="),
+            ("UTAI_RANGE_DONOR_IN", "donorin="),
             ("UTAI_MG_FILL1", "fill1="),
             ("UTAI_MG_FILL_MAX", "fillmax="),
             ("UTAI_MG_UVGATE", "uvgate="),
@@ -5331,12 +5434,21 @@ mod s160q_f0_lerp_tests {
 
         let src = include_str!("score2svc.rs");
         let mut found: Vec<&str> = Vec::new();
-        for (i, _) in src.match_indices("env::var(\"UTAI_") {
-            let rest = &src[i + "env::var(\"".len()..];
-            if let Some(end) = rest.find('"') {
-                let name = &rest[..end];
-                if !found.contains(&name) && !EXEMPT.contains(&name) {
-                    found.push(name);
+        // ⛔⛔ S165 —— **两种读法都要扫**。这条判据原本只认 `var(` 那一种形式，
+        //    于是用 `var_os` 读的旋钮**结构上绕过它** —— 加一个改音频的旋钮，零红。
+        //    (`UTAI_RANGE_DUMP_DONOR` 一直用 `var_os`，只因为它在 `EXEMPT` 里才没暴露这个洞；
+        //     `UTAI_RANGE_DONOR_IN` 加进来的那一刻就撞上了。)
+        // ⚠ 这段注释**不许**写出被扫的那个字面量 —— 判据扫的是整份源码，注释也算，
+        //    我第一版就是被自己的注释扫红的。
+        for pat in ["env::var(\"UTAI_", "env::var_os(\"UTAI_"] {
+            let head = &pat[..pat.len() - "UTAI_".len()];
+            for (i, _) in src.match_indices(pat) {
+                let rest = &src[i + head.len()..];
+                if let Some(end) = rest.find('"') {
+                    let name = &rest[..end];
+                    if !found.contains(&name) && !EXEMPT.contains(&name) {
+                        found.push(name);
+                    }
                 }
             }
         }
