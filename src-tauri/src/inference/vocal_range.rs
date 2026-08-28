@@ -4489,6 +4489,40 @@ fn parse_handover(v: Option<&str>) -> f32 {
 /// ⚙ 出厂默认。见 [`handover_deficit_db`]。
 const HANDOVER_DEFICIT_DB_DEFAULT: f32 = 15.0;
 
+/// ⚙ 出厂默认 = **0.0(关)** —— `UTAI_RANGE_HANDOVER_GAIN=<dB>` 打开**收益驱动**。
+///
+/// ## ⛔ 它替掉的是什么:一个**照着靶子调出来的**绝对门限
+/// [`handover_deficit_db`] 问的是「进来那条比出去那条弱了多少 dB」,答案要跟一个**常量**比
+/// (出厂 15)。而这个常量没有任何自校准的成分 —— S165 为了咬住用户点名的两处,
+/// 它被一路往下试(15 → 12 → 6),**每一格都是照着那两个靶子调的**。
+/// 用户 2026-08-28 当场点破:「那你现在不又是照着单个靶子胡乱调么」。**他是对的**:
+/// 换个模型、换首歌,同一个 dB 数没有任何道理。
+///
+/// ## ⭐ 收益驱动:问「延后能不能让淡化区更接近【两条里较好的那条】」
+/// 对每个候选交接点 `t`,在这条缝**真正的淡化区**上算
+/// `mix_deficit(t) = max(出去, 进来) − 等增益混合后的电平`(越小越好);
+/// 取 `mix_deficit` 最小的 `t`,**收益 = mix_deficit(t0) − mix_deficit(t)**。
+/// 收益 ≥ 这个旋钮的 dB 数才动手 ⇒ **没有「弱多少算弱」的常量,只有「改善多少才值得」**。
+///
+/// ⚠ 混合电平按**不相干相加**估(`(Pl+Pr)/3` 是等增益淡化在 w∈[0,1] 上的平均功率)——
+/// 实测这两条 donor 的相干度只有 0.15-0.32,接近不相干,这个近似是站得住的。
+///
+/// ## 出厂值的出处
+/// 建议值 **2.7 dB** = 这条线上量过的**可闻阈**(S148 承重一组:~2.7 dB 听得出 / ≤0.46 dB 听不出)
+/// ⇒ 「只在听得出的地方动手」,而不是「弱到某个绝对值就动手」。
+/// ⛔ 出厂 **0.0 = 关**,走今天的纯门限逻辑 ⇒ 逐位不变;要跨模型验收过才翻。
+pub fn handover_gain_db() -> f32 {
+    std::env::var("UTAI_RANGE_HANDOVER_GAIN")
+        .ok()
+        .and_then(|x| x.trim().parse::<f32>().ok())
+        .filter(|t| t.is_finite() && (0.0..=30.0).contains(t))
+        .unwrap_or(0.0)
+}
+
+/// 收益驱动时的**粗筛**:落差连这个都够不到就不必算收益(纯省开销,不决定结果)。
+/// 取 3.0 dB —— 略高于可闻阈 2.7,再小的落差不可能产生 ≥2.7 dB 的收益。
+const HANDOVER_COARSE_DB: f32 = 3.0;
+
 /// ⚙ 出厂默认 = **false(关)** —— `UTAI_RANGE_HANDOVER_FADEWIN=1` 打开。
 ///
 /// ## ⭐⭐⭐ 交接点体检**看错了那一段**
@@ -5765,6 +5799,8 @@ fn defer_dead_handover(
     tied_xf: usize,
     xf: usize,
     fade_window: bool,
+    // ⭐⭐⭐ S165 —— 收益驱动的最小收益(dB);`0.0` = 关 = 走今天的纯门限逻辑。见 `handover_gain_db`。
+    gain_db: f32,
 ) -> std::collections::HashMap<usize, usize> {
     let mut out = std::collections::HashMap::new();
     if deficit <= 0.0 || order.len() < 2 {
@@ -5840,21 +5876,56 @@ fn defer_dead_handover(
             }
         }
         let Some((off, w, lv0, rv0)) = pick else { continue };
-        if lv0 - rv0 <= deficit {
+        // ⭐⭐⭐ S165 —— **收益驱动**(`gain_db > 0`)取代「落差 > 绝对门限」。
+        //    机理与为什么换掉门限,见 [`handover_gain_db`] 的 doc。
+        let coarse = if gain_db > 0.0 { HANDOVER_COARSE_DB } else { deficit };
+        if lv0 - rv0 <= coarse {
             continue;
         }
+        // 这条缝在候选点 `t` 上「混合之后比【两条里较好的那条】差多少」——越小越好。
+        // ⚠ 等增益淡化在 w∈[0,1] 上的平均功率 = (Pl+Pr)/3(不相干相加);
+        //   实测这两条 donor 的相干度只有 0.15-0.32,近似站得住。
+        let mix_deficit = |t: usize| -> f32 {
+            let (lv, rv) = (lvl(*llo, lseg, t, off, w), lvl(*rlo, rseg, t, off, w));
+            if !lv.is_finite() || !rv.is_finite() {
+                return f32::INFINITY;
+            }
+            let (pl, pr) = (10f32.powf(lv / 10.0), 10f32.powf(rv / 10.0));
+            let mix = 10.0 * ((pl + pr) / 3.0).max(1e-30).log10();
+            lv.max(rv) - mix
+        };
+        let base_md = mix_deficit(t0);
         // 往后找第一个「进来的那条追上来」的点
         let mut t = t0;
         let mut fixed = None;
-        while t + step <= t0 + max_defer {
-            t += step;
-            let (lv, rv) = (lvl(*llo, lseg, t, off, w), lvl(*rlo, rseg, t, off, w));
-            if !lv.is_finite() || !rv.is_finite() {
-                break;
+        if gain_db > 0.0 {
+            // 收益驱动:扫完整个允许区间,取**收益最大**的那个点;不够 `gain_db` 就不动手。
+            let mut best = (0.0f32, t0);
+            while t + step <= t0 + max_defer {
+                t += step;
+                let md = mix_deficit(t);
+                if !md.is_finite() {
+                    break;
+                }
+                let g = base_md - md;
+                if g > best.0 {
+                    best = (g, t);
+                }
             }
-            if rv >= lv - deficit * 0.5 {
-                fixed = Some(t);
-                break;
+            if best.0 >= gain_db {
+                fixed = Some(best.1);
+            }
+        } else {
+            while t + step <= t0 + max_defer {
+                t += step;
+                let (lv, rv) = (lvl(*llo, lseg, t, off, w), lvl(*rlo, rseg, t, off, w));
+                if !lv.is_finite() || !rv.is_finite() {
+                    break;
+                }
+                if rv >= lv - deficit * 0.5 {
+                    fixed = Some(t);
+                    break;
+                }
             }
         }
         match fixed {
@@ -5933,6 +6004,7 @@ fn splice_kept(
         tied_xf,
         xf,
         handover_fade_window(),
+        handover_gain_db(),
     ));
     // ⭐⭐ S163 —— **长音延续处的接缝改成长交叉淡化**(用户:「一个长音三个听感 / 长音割裂」)。
     // ⛔ 做法必须走 `join` 那一套:左窗**硬写到交接点**(不淡出)、右窗**从交接点往前**
@@ -8771,7 +8843,7 @@ mod tests {
         let notes = [NoteSpan { start: 20, frames: 60, sung: true, hz: 440.0, tied: true }];
 
         let run = |fade_window: bool| {
-            defer_dead_handover(SR, spf, &jobs, &kept, &order, 15.0, &notes, tied_xf, xf, fade_window)
+            defer_dead_handover(SR, spf, &jobs, &kept, &order, 15.0, &notes, tied_xf, xf, fade_window, 0.0)
         };
 
         // ⑴ 今天的窗(往后 40 ms):那里右 donor 已经恢复 ⇒ **看不见** ⇒ 不该触发。
@@ -8795,7 +8867,7 @@ mod tests {
         //    ⇒ `tied_here` 不成立 ⇒ 开关开着也必须退回今天的窗 ⇒ 不触发。
         let notes_off = [NoteSpan { start: 0, frames: 10, sung: true, hz: 440.0, tied: false }];
         assert!(
-            defer_dead_handover(SR, spf, &jobs, &kept, &order, 15.0, &notes_off, tied_xf, xf, true)
+            defer_dead_handover(SR, spf, &jobs, &kept, &order, 15.0, &notes_off, tied_xf, xf, true, 0.0)
                 .is_empty(),
             "不是 tied 缝时,这一刀必须退回今天的窗 —— 否则它会波及所有接缝"
         );
@@ -8815,9 +8887,9 @@ mod tests {
             .collect();
         let kept_after = vec![(0i64, 0usize, kept[0].2.clone()), (1i64, 0usize, rseg_after)];
         let hit_off =
-            defer_dead_handover(SR, spf, &jobs, &kept_after, &order, 15.0, &notes, tied_xf, xf, false);
+            defer_dead_handover(SR, spf, &jobs, &kept_after, &order, 15.0, &notes, tied_xf, xf, false, 0.0);
         let hit_on =
-            defer_dead_handover(SR, spf, &jobs, &kept_after, &order, 15.0, &notes, tied_xf, xf, true);
+            defer_dead_handover(SR, spf, &jobs, &kept_after, &order, 15.0, &notes, tied_xf, xf, true, 0.0);
         assert!(!hit_off.is_empty(), "往后那一段是静音 —— 今天的体检本来就拦得住它");
         assert!(
             !hit_on.is_empty(),
