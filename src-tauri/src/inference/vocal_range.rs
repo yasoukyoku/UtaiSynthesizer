@@ -2445,6 +2445,26 @@ pub fn note_spans_tied(
     transpose: i64,
     lyrics: &[String],
 ) -> Vec<NoteSpan> {
+    note_spans_tied_with(note_nums, frames, transpose, lyrics, vowel_tied())
+}
+
+/// ⚙ 出厂默认 = **false(关)** —— `UTAI_RANGE_VOWEL_TIED=1` 打开。
+/// 机理见 [`note_spans_tied_with`] 里 `vowel_onset` 的 doc。
+pub fn vowel_tied() -> bool {
+    matches!(
+        std::env::var("UTAI_RANGE_VOWEL_TIED").ok().as_deref().map(str::trim),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
+/// [`note_spans_tied`] 的纯函数版 —— ⛔ 判据不许读进程环境(S151 笔1)。
+pub fn note_spans_tied_with(
+    note_nums: &[i64],
+    frames: &[i64],
+    transpose: i64,
+    lyrics: &[String],
+    vowel_tied: bool,
+) -> Vec<NoteSpan> {
     const SUSTAIN: &[&str] = &["-", "+", "ー", "〜", "\u{301c}"];
     /// ⭐⭐⭐ S163 —— **同歌词还不够，音高也要连得上**。
     ///
@@ -2456,6 +2476,32 @@ pub fn note_spans_tied(
     /// ⚠ 2 个半音的余量：真正的延续音在谱面上可能带滑音/装饰而微调音高，但不会跳七度。
     /// ⭐ **延音记号不受这条约束** —— 那是谱面明写的「接着上一个音唱」。
     const TIED_MAX_ST: i64 = 2;
+
+    /// ⭐⭐⭐ S165 —— **下一个音是纯元音开头时,音节边界也算「接得上」**。
+    ///
+    /// # 病
+    /// 用户 2026-08-28 点名 yuyuko × 炉心 **4:29.249-4:29.300**:「接缝挺明显」「像哑了一下」,
+    /// 而同一批修好的 4:36 他说「基本上真好了」。两处的唯一结构差别是**淡入宽度**:
+    /// 4:36 是 `[793]あ → [794]あ`(歌词相同)⇒ 判 tied ⇒ **120 ms**;
+    /// 4:29 是 `[784]な → [785]あ`(歌词不同)⇒ 音节边界 ⇒ 只有 **10 ms** ⇒ 边界几乎是跳变。
+    ///
+    /// # 为什么放宽是安全的
+    /// [`tied_xfade_ms`] 不拉长音节边界的**理由**写得很清楚:
+    /// 「音节边界上有**辅音与起音**,拉长淡化会把它糊掉」。
+    /// 而 `あいうえお` 开头的音**没有辅音要保护** ⇒ 那条理由在这一族上不成立。
+    /// ⛔ 而真正危险的那一族(4:36 事故:`あ(90) → あ(85)` 差 7 个半音被混 120 ms)
+    ///    是被 `TIED_MAX_ST` 挡住的,**这里一个字节都不动它** ——
+    ///    放宽的只是「歌词必须相同」,音高必须连得上的约束原样保留。
+    ///    实测 4:29 的 `な(85) → あ(83)` 差 **2 个半音,正好在约束之内**。
+    ///
+    /// ⚠ 只认**平假名/片假名的五个纯元音**。拗音(ゃゅょ)、促音(っ)、拨音(ん)都不是元音开头。
+    fn vowel_onset(ly: &str) -> bool {
+        matches!(
+            ly.chars().next(),
+            Some('あ' | 'い' | 'う' | 'え' | 'お' | 'ア' | 'イ' | 'ウ' | 'エ' | 'オ')
+        )
+    }
+
     let mut acc = 0i64;
     let mut prev: Option<(&str, i64)> = None;
     note_nums
@@ -2471,7 +2517,13 @@ pub fn note_spans_tied(
             let tied = sung
                 && !ly.is_empty()
                 && (SUSTAIN.contains(&ly)
-                    || prev.is_some_and(|(p, pn)| p == ly && (n - pn).abs() <= TIED_MAX_ST));
+                    || prev.is_some_and(|(p, pn)| {
+                        // ⭐ S165 —— 歌词相同 **或** 这个音是纯元音开头(见 `vowel_onset`);
+                        //    ⛔ 音高必须连得上这一条(`TIED_MAX_ST`)对两者都成立,一个字节没动。
+                        let _ = p;
+                        (p == ly || (vowel_tied && vowel_onset(ly)))
+                            && (n - pn).abs() <= TIED_MAX_ST
+                    }));
             if sung {
                 prev = Some((ly, n));
             } else {
@@ -8924,6 +8976,63 @@ mod tests {
         assert!(
             !hit_on.is_empty(),
             "⛔ 开着之后反而放走了原本拦得住的缝 —— 这一刀是【额外看一段】,不是替换那一段"
+        );
+    }
+
+    /// ⭐⭐⭐ S165 —— 元音开头的音节边界算「接得上」,而**音高约束一个字节不许动**。
+    ///
+    /// 夹具全部照**真实坐标**造(yuyuko × 炉心融解 × +7):
+    /// * `[784]な(85) → [785]あ(83)` —— 用户 2026-08-28 报「4:29 接缝挺明显」的那一处:
+    ///   歌词不同、但下一个是纯元音、音高差 2 ⇒ **该判 tied**(拿 120 ms 淡入);
+    /// * `[792]あ(90) → [793]あ(85)` —— 用户 2026-08-27 报的 4:36 事故:
+    ///   歌词相同但**差 5 个半音** ⇒ **绝不许判 tied**(否则把两个音色混 120 ms,比不治更糟);
+    /// * `し → か` —— 下一个音有辅音 ⇒ **不许判 tied**(拉长会糊掉起音,这是那条规则的本意)。
+    #[test]
+    fn a_vowel_onset_bridges_a_syllable_boundary_but_never_a_pitch_jump() {
+        let ly = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_string()).collect() };
+        let fr = vec![9i64; 8];
+        let run = |nums: &[i64], lyr: &[&str], on: bool| -> Vec<bool> {
+            note_spans_tied_with(nums, &fr[..nums.len()], 0, &ly(lyr), on)
+                .iter()
+                .map(|s| s.tied)
+                .collect()
+        };
+
+        // ⑴ 4:29 那一处:な(85) → あ(83)。关着 = 今天(不 tied);开着必须 tied。
+        assert_eq!(run(&[85, 83], &["な", "あ"], false)[1], false, "关着必须与今天逐位相同");
+        assert_eq!(
+            run(&[85, 83], &["な", "あ"], true)[1],
+            true,
+            "な(85) → あ(83):下一个是纯元音、音高差 2 ⇒ 该判 tied"
+        );
+
+        // ⑵ ⛔ 4:36 那个事故:あ(90) → あ(85),差 5 个半音。开着也**绝不许** tied。
+        assert_eq!(
+            run(&[90, 85], &["あ", "あ"], true)[1],
+            false,
+            "⛔ 差 5 个半音是旋律不是延续音 —— 放宽歌词条件不许动 TIED_MAX_ST"
+        );
+        // 同一对歌词、音高连得上 ⇒ 本来就该 tied(两档都一样)。
+        assert_eq!(run(&[85, 83], &["あ", "あ"], false)[1], true, "歌词相同 + 音高连得上 = 今天就 tied");
+
+        // ⑶ ⛔ 下一个音有辅音 ⇒ 不许 tied(拉长会糊掉起音)。
+        for nxt in ["か", "し", "ぱ", "ん", "っ"] {
+            assert_eq!(
+                run(&[85, 83], &["な", nxt], true)[1],
+                false,
+                "「{nxt}」不是纯元音开头 ⇒ 不许判 tied(那条规则本来就是为了保护起音)"
+            );
+        }
+
+        // ⑷ 片假名同样算元音开头;延音记号不受音高约束(谱面明写「接着唱」)。
+        assert_eq!(run(&[85, 83], &["ナ", "ア"], true)[1], true, "片假名的纯元音也算");
+        assert_eq!(run(&[90, 60], &["あ", "ー"], true)[1], true, "延音记号不受 TIED_MAX_ST 约束");
+
+        // ⑸ ⛔ 阴性对照:隔着休止不算同一个长音。
+        assert_eq!(
+            run(&[85, 0, 83], &["な", "R", "あ"], true)[2],
+            false,
+            "隔着休止就不是同一个长音了 —— 这条不许被放宽绕过"
         );
     }
 
