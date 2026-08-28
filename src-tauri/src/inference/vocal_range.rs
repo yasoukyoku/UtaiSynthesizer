@@ -1190,6 +1190,9 @@ fn decide_group(
     usag_eps: f32,
     // ⭐⭐⭐ S163 —— 对手轴的闸(dB)。见 [`landing_usag_dim_cap`]。
     usag_dim_cap: f32,
+    // ⭐⭐⭐ S165 —— `2·f0` 电平当排序键的 eps(dB);`0` = 关 = 逐位回到今天。
+    //    见 [`landing_h2_eps`]。
+    h2_eps: f32,
 ) -> Vec<usize> {
     let mut mine: Vec<usize> = (0..cand.len()).filter(|&c| cand[c].0 == ji).collect();
     if mine.len() < 2 {
@@ -1282,6 +1285,31 @@ fn decide_group(
         // ⛔ 为什么要 eps:两个候选只差零点几 dB 时这根轴和噪声底分不开,而用户给的两个
         //    「听起来正常」的对照正好落在那个区间(候选间只差 2.0 dB),
         //    三个缺陷点则差 17.9 / 7.6 / 6.6 dB ⇒ eps ≈ 3 时缺陷全动、对照全不动。
+        // ⭐⭐⭐ S165 —— **`2·f0` 电平**:排在 `usag` 之前,但 eps 更大(只在差得很多时发言)。
+        //
+        // ⛔ 为什么排最前:用户 2026-08-28 听过 `−8 → −13` 的探针臂后说
+        //    「**f1『强』/『实』确实在听感上更好,即使它把 f4 炸了**」——
+        //    `2·f0` = 1975 Hz 落在耳朵最敏感的区间,而更高的谐波感知权重低得多。
+        // ⛔ 为什么 eps 要比 `usag_eps` 大:它排在前面,eps 小就会把已经过耳判的
+        //    `usag`/`gone` 决策整个盖掉。实测这根轴的候选间差距**要么很小、要么十几 dB**
+        //    (目标音 −8 是 −17.0 而 −13 是 −5.2)⇒ 大 eps 不会漏掉真正要救的。
+        if h2_eps > 0.0 {
+            let (hx, hy) = (cand[x].4.worst_h2(), cand[y].4.worst_h2());
+            if (hx - hy).abs() > h2_eps {
+                // ⛔⛔ 对手轴闸 —— **每一根参与排序的轴都要配**(S163 §32 的血训:
+                //    `gone` 那一支当初没配,直接造出全曲唯一一个变闷 >2.7 的音)。
+                let dim_ok = if usag_dim_cap > 0.0 {
+                    let (w, l) = if hx > hy { (x, y) } else { (y, x) };
+                    cand[w].4.worst_dim_vs(&cand[l].4) <= H2_DIM_CAP
+                } else {
+                    true
+                };
+                if dim_ok {
+                    // 越接近 0(`2·f0` 越实)越靠前
+                    return hy.partial_cmp(&hx).unwrap_or(std::cmp::Ordering::Equal);
+                }
+            }
+        }
         if usag_eps > 0.0 {
             let (ux, uy) = (cand[x].4.worst_usag(), cand[y].4.worst_usag());
             if (ux - uy).abs() > usag_eps {
@@ -4062,6 +4090,34 @@ const REPAIR_SPREAD_DB: f32 = 6.0;
 /// 只有 wall 涨（K → Q 上升 48%）。⛔ 再往上扩之前先量遍数。
 const REPAIR_RADIUS: i64 = 2;
 
+/// ⭐⭐⭐ S165 —— `2·f0` 掉到这个值以下 ⇒ 这一组走修补遍,并且用 [`H2_REPAIR_RADIUS`] 的宽半径。
+///
+/// ⛔ 为什么要**独立于排序 eps** 的一个绝对门限:排序只在「两个候选之间」比,
+/// 而 yachiyo 的候选产出率是 **0%**(两份计划给出相同落点)⇒ `decide_group` 开头就 return
+/// ⇒ **不先把它渲出来,排序永远没有输入**。这与 S163 §27 给 `usag` 开的通路是同一条。
+///
+/// ⚙ −12 dB 由实测的触发率定:门限 −8/−10/−12/−14 ⇒ yachiyo 触发 39/30/**24**/24%、
+/// yuyuko 48/24/**17**/14%(各 33 / 29 个可测窗)。−12 是「触发率掉到平台」的那一档。
+const H2_REPAIR_FLOOR: f32 = -12.0;
+
+/// ⭐⭐⭐ S165 —— `2·f0` 触发的组用这个半径,而不是 [`REPAIR_RADIUS`]。
+///
+/// ⛔ 为什么必须更宽:用户点名的那个音今天落在 **−8**(`2·f0` = −17.0 dB),
+/// 而好格是 **−13**(−5.2 dB,与用户说「好」的 yuyuko **完全一致**)——
+/// `REPAIR_RADIUS = 2` 从 −8 只够到 −10,**结构上够不着**。
+/// ⚠ 代价:只有触发的那 17-24% 的组付,其余一个字节不动。
+const H2_REPAIR_RADIUS: i64 = 6;
+
+/// ⭐⭐ S165 —— `2·f0` 这一支的对手轴闸(dB)。见 [`landing_h2_eps`]。
+///
+/// ⛔ 比 [`LANDING_USAG_DIM_CAP_DEFAULT`] 松,而且是**用户耳判定的**:
+/// 2026-08-28 听过 `−8 → −13` 的探针臂后说「**f1『强』/『实』确实在听感上更好,
+/// 即使它把 f4 炸了**」——因为 `2·f0` = 1975 Hz 落在耳朵最敏感的区间,
+/// 而 `5·f0` = 4939 Hz 感知权重低得多(A 计权差 ~7 dB)⇒ **同样的 dB 在听感上不等价**。
+/// ⚠ 但闸不能不设:那一句的前提是「**前一个音本身 f4 也不强,所以不会造出跳变或接缝**」,
+/// 换个上下文就不成立了。
+const H2_DIM_CAP: f32 = 10.0;
+
 
 /// ⚙ 出厂默认 = 3.0(**开**)。`UTAI_RANGE_USAG=0` 关掉 ——
 /// **上方谐波音内塌陷**当排序主键时,「算有差别」的最小 dB。
@@ -4131,6 +4187,42 @@ fn parse_usag_dim(v: Option<&str>) -> f32 {
             .ok()
             .filter(|x| x.is_finite() && *x >= 0.0 && *x <= 40.0)
             .unwrap_or(USAG_DIM_CAP_DEFAULT),
+    }
+}
+
+/// ⚙ 出厂默认 = 0.0(**关**)—— 等 A/B 整曲耳判后再翻。
+///
+/// ⭐⭐⭐ S165 —— **`2·f0` 电平**这根轴的排序 eps(dB);`0` = 整根轴关掉。
+///
+/// # 它在修什么
+/// 用户 2026-08-28 指着三张频谱图说 yachiyo 的谐波线「**非常小段的忽明忽暗、不是一条干净的
+/// 连续线**」,断得最明显的是「**基频上面那条**」= `2·f0`。实测(炉心 `[794]あ`,f0 987.8):
+/// yachiyo **−17.0 dB** / yuyuko −5.2 / SV +0.9,而 `3·f0` 三条臂**一致**(都是谷)
+/// ⇒ **只有这一根把它们分开**,落差 15 dB。
+///
+/// # ⛔ 本场先判负了**八把**尺子,全部错在同一件事上
+/// 归一包络 std/mean · 包络谱尖峰度 · STFT 条纹 · 短窗峰宽 · 谐波间填充 · 存在率 ·
+/// 40-60 Hz 调制占比 · log 域绝对快抖 —— **它们全在量「沿时间的变化」**,
+/// 而真正的差别是「**跨谐波的幅度分布**」。⭐ **「忽明忽暗」是低电平的后果,不是原因。**
+/// (旁证:一个独立的多 agent 搜索里,`jitter` 那把尺子的判负理由正是
+/// 「yachiyo 这个音的 `2·f0` 比 yuyuko 弱 10.6 dB ⇒ 读数被谐波弱这一件事解释掉了」;
+/// 而 `residual`(声源层规整度)判负说明忽明忽暗**不在激励层**。)
+///
+/// # ⚙ 翻它之前要看什么
+/// ⚠ 渲染噪声底已验:目标音 h2 在 **7 条独立渲染**上极差 **0.02 dB**,而效应 11.8 dB
+/// ⇒ gap/floor = **478×**(对比同批一把「调制深度」尺子有 1-3% 的窗摆动得比效应还大)。
+pub fn landing_h2_eps() -> f32 {
+    parse_h2_eps(std::env::var("UTAI_RANGE_H2").ok().as_deref())
+}
+
+/// ⚙ 出厂默认。见 [`landing_h2_eps`]。
+const LANDING_H2_EPS_DEFAULT: f32 = 0.0;
+
+fn parse_h2_eps(v: Option<&str>) -> f32 {
+    match v {
+        None | Some("") => LANDING_H2_EPS_DEFAULT,
+        Some(x) => x.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(LANDING_H2_EPS_DEFAULT),
     }
 }
 
@@ -4817,6 +4909,29 @@ struct CandScore {
     /// ```
     /// ⛔ 而今天唯一的排序键 `rel` 在同一批点上**方向是反的**。
     usag: Vec<(usize, f32)>,
+    /// ⭐⭐⭐ S165 —— (音下标, **第二谐波 `2·f0` 相对 `f0` 的电平** dB)。
+    ///
+    /// 见 [`utai_dsp::harmonicity::second_harmonic_level_db`]。用户 2026-08-28 指着三张频谱图说
+    /// yachiyo 的谐波线「**非常小段的忽明忽暗、不是一条干净的连续线**」,断得最明显的是
+    /// 「**基频上面那条**」= `2·f0`;而 yuyuko 与 SV 在**同一个音**上都正常:
+    ///
+    /// | 目标音(炉心 `[794]あ` f0 987.8) | `2·f0` 相对 `f0` |
+    /// |---|---|
+    /// | yachiyo(用户说油) | **−17.0 dB** |
+    /// | yuyuko(用户说好) | −5.2 |
+    /// | SV(用户说好) | +0.9 |
+    ///
+    /// ⇒ ⭐ **「忽明忽暗」是低电平的后果不是原因**:一根本来就暗 12-18 dB 的线叠上**正常**的
+    /// 抖动(yachiyo 的抖动是它自己全曲的 43 百分位),在频谱图上就是断续的。
+    /// 本场为此先造了**八把**量「沿时间变化」的尺子,**全部读反或分不开**。
+    ///
+    /// ⛔ 为什么 [`CandScore::uplev`] 看不见它:那一根量 `2..8·f0` 的**整体**,
+    /// **`2·f0` 那 12 dB 的缺口被 7 根谐波一平均只剩 ~1.7 dB**。
+    ///
+    /// ✅ 用户 2026-08-28 耳判确认(拿 `donor_post_-13` 整窗替换的探针臂):
+    /// 「**f1『强』/『实』确实在听感上更好,即使它把 f4 炸了**」——
+    /// 因为 `2·f0`=1975 Hz 落在耳朵最敏感的区间,而 `5·f0`=4939 Hz 感知权重低得多。
+    h2: Vec<(usize, f32)>,
     /// ⭐⭐⭐ S163 —— (音下标, **上方谐波的绝对强度** dB:`2..8·f0` 相对 `0.7..1.6·f0`)。
     ///
     /// ⛔ 它是 [`CandScore::usag`] 的**对手轴**:`usag` 量「稳不稳」,它量「强不强」。
@@ -4859,6 +4974,29 @@ impl CandScore {
     /// (S162 的 oracle 用的就是这个口径)。
     fn worst_usag(&self) -> f32 {
         self.usag.iter().map(|&(_, v)| v).fold(0.0f32, f32::min)
+    }
+
+    /// ⭐ S165 —— 组内**第二谐波最弱**的那个音(最负的)。没量到 ⇒ `0.0`(= 没有证据说它坏)。
+    ///
+    /// ⛔ 取最差而不是平均 —— 与 [`CandScore::worst_usag`] 同一个理由。
+    fn worst_h2(&self) -> f32 {
+        self.h2.iter().map(|&(_, v)| v).fold(0.0f32, f32::min)
+    }
+
+    /// ⭐ S165 —— 某个音上的第二谐波电平。
+    fn h2_of(&self, i: usize) -> Option<f32> {
+        self.h2.iter().find(|&&(j, _)| j == i).map(|&(_, v)| v)
+    }
+
+    /// ⭐⭐ S165 —— `self` 相对 `other` 在**任何一个音**上的最大 `2·f0` 增益(dB,正 = 更实)。
+    ///
+    /// ⛔ 逐音取**最好**(不是最差):这根轴是来救「某一个音被掏空」的,
+    /// 组里其它音本来就好 ⇒ 取最差会被它们摁死。
+    fn best_h2_vs(&self, other: &CandScore) -> f32 {
+        self.h2
+            .iter()
+            .filter_map(|&(i, mine)| other.h2_of(i).map(|theirs| mine - theirs))
+            .fold(0.0f32, f32::max)
     }
 
     /// ⭐ S163 —— 某个音上的上方谐波强度。
@@ -5217,7 +5355,9 @@ pub fn apply_dead_only_windows_with(
             || repair_ms > 0.0
             || comb_floor > 0.0
             // S163 -- usag alone must also enter scoring, or both fill points are skipped.
-            || landing_usag_eps() > 0.0)
+            || landing_usag_eps() > 0.0
+            // S165 -- same for the h2 axis: without this the two fill points never run.
+            || landing_h2_eps() > 0.0)
             && !notes.is_empty();
     let (note_lv, note_cov) = if scoring {
         note_levels_and_coverage(base, spf, jobs, notes)
@@ -5232,6 +5372,8 @@ pub fn apply_dead_only_windows_with(
     let usag_eps = if scoring { landing_usag_eps() } else { 0.0 };
     // S163 -- opponent-axis cap for the usag sort key.
     let usag_dim_cap = landing_usag_dim_cap();
+    // S165 second-harmonic sort eps (factory 0 = off = bit-identical).
+    let h2_eps = if scoring { landing_h2_eps() } else { 0.0 };
     // 每个窗**正身**里的音 = 被这个窗盖住 ≥80% 的唱音(它的好坏由这个窗的落点决定)。
     let job_notes: Vec<Vec<usize>> = if scoring {
         jobs.iter()
@@ -5349,6 +5491,15 @@ pub fn apply_dead_only_windows_with(
                             ) {
                                 sc.uplev.push((ni, l));
                             }
+                            // ⭐⭐⭐ S165 —— **第二谐波电平**。⛔ 与 `width` 同一个坑:
+                            //    **两处填充点(主评估 + 修补遍后重评估),漏一处这根轴就静默失效。**
+                            if let Some(h) = utai_dsp::harmonicity::second_harmonic_level_db(
+                                seg,
+                                sample_rate,
+                                nd.hz,
+                            ) {
+                                sc.h2.push((ni, h));
+                            }
                         }
                         let g = silence_run_ms(seg, sample_rate);
                         if g > 0.0 {
@@ -5411,6 +5562,7 @@ pub fn apply_dead_only_windows_with(
             width_eps,
             usag_eps,
             usag_dim_cap,
+            h2_eps,
         );
         log_pick(&cand, &mine, ji, jobs);
         chosen[ji] = mine.first().copied();
@@ -5468,6 +5620,11 @@ pub fn apply_dead_only_windows_with(
                         //    代价:触发率 akiko 11% / yuyuko 10% / 东雪莲 14%(每组多渲 ±2,
                         //    而 `REPAIR_RADIUS = 2` 实测 donor 遍数不涨)。
                         || (usag_eps > 0.0 && cand[c].4.worst_usag() < -usag_eps)
+                        // ⭐⭐⭐ S165 —— ⑦ **`2·f0` 被掏空**(用户 2026-08-28 点名的那一族)。
+                        //   ⛔ 这一条和 ⑥ 一样,是让新轴在【没有候选】的模型上生效的**唯一**通路:
+                        //   yachiyo 的落点候选产出率是 **0%** ⇒ 不先渲出来,排序永远没有输入。
+                        //   ⚙ 门限 −12 dB 由实测触发率定(yachiyo 24% / yuyuko 17%)。
+                        || (h2_eps > 0.0 && cand[c].4.worst_h2() < H2_REPAIR_FLOOR)
                 }) || spread(ji) > REPAIR_SPREAD_DB
             })
             .collect();
@@ -5490,6 +5647,17 @@ pub fn apply_dead_only_windows_with(
                 //    **−14** 是计划那个 −13 的 −1，永远够不着（日志：`[(-12,60),(-13,60),(-11,60)]`）。
                 let curs: Vec<i64> =
                     (0..cand.len()).filter(|&c| cand[c].0 == ji).map(|c| cand[c].1).collect();
+                // ⭐⭐⭐ S165 —— **`2·f0` 触发的组用宽半径**,其余组一个字节不动。
+                //   ⛔ 用户点名的那个音今天在 **−8**(`2·f0` −17.0 dB),好格是 **−13**(−5.2,
+                //   与用户说「好」的 yuyuko **完全一致**)⇒ `REPAIR_RADIUS = 2` 从 −8 只够到 −10,
+                //   **结构上够不着**。⚠ 代价只有触发的那 17-24% 的组付。
+                let radius = if h2_eps > 0.0
+                    && chosen[ji].is_some_and(|c| cand[c].4.worst_h2() < H2_REPAIR_FLOOR)
+                {
+                    H2_REPAIR_RADIUS
+                } else {
+                    REPAIR_RADIUS
+                };
                 // ⭐⭐⭐ S163 —— **搜索半径从 ±1 扩到 ±[`REPAIR_RADIUS`]**。
                 //    ⛔ 实测（R 臂，两个旋钮成对开）：修补遍触发 32/48 次、峰宽否决
                 //    真的在选（31/106 次），而人群面**几乎不变**（次怪段 p75 11.89 → 11.89）。
@@ -5499,7 +5667,7 @@ pub fn apply_dead_only_windows_with(
                 //    只有 wall 涨（K→Q 上升 48%）。
                 for (cur, d) in curs
                     .iter()
-                    .flat_map(|&c| (1..=REPAIR_RADIUS).flat_map(move |r| [(c, -r), (c, r)]))
+                    .flat_map(|&c| (1..=radius).flat_map(move |r| [(c, -r), (c, r)]))
                 {
                     let s2 = cur + d;
                     if s2 == 0 || s2.abs() > MAX_RANGE_SHIFT {
@@ -5582,6 +5750,18 @@ pub fn apply_dead_only_windows_with(
                                     {
                                         sc.uplev.push((ni, l));
                                     }
+                                    // ⭐⭐⭐ S165 —— **第二谐波电平**,第 2 处。
+                                    //    ⛔ 漏这一处 = 修补遍渲出来的新候选**没有 h2 分数**
+                                    //    ⇒ 排序拿不到它 ⇒ 整根轴静默失效(`width` 正是这样栽的)。
+                                    if let Some(h) =
+                                        utai_dsp::harmonicity::second_harmonic_level_db(
+                                            seg,
+                                            sample_rate,
+                                            nd.hz,
+                                        )
+                                    {
+                                        sc.h2.push((ni, h));
+                                    }
                                 }
                                 if nd.hz > 0.0 {
                                 if let Some(c) =
@@ -5606,6 +5786,7 @@ pub fn apply_dead_only_windows_with(
                     width_eps,
                     usag_eps,
                     usag_dim_cap,
+                    h2_eps,
                 );
                 if let Some(&c) = mine.first() {
                     tracing::info!(
@@ -8382,6 +8563,78 @@ mod tests {
     /// * 把比较写成 `ux.partial_cmp(&uy)`(方向反) ⇒ ⑵ 失守;
     /// * 把 `> usag_eps` 写成 `>= 0.0`(等于取消 eps) ⇒ ⑶ 失守,对照组被动;
     /// * 少填一处 `sc.usag.push` ⇒ `worst_usag()` 恒 0 ⇒ ⑵ 失守。
+    /// ⭐⭐⭐ S165 —— `2·f0` 电平这根轴:**出厂不变 · 真坐标能修好 · 对照不许动 · 对手轴闸拦得住**。
+    ///
+    /// 夹具全部照**实测坐标**造(yachiyo × 炉心融解 +7,`[794]あ`,f0 987.8 Hz):
+    /// 今天落在 `−8` ⇒ `2·f0` = **−17.0 dB**;好格 `−13` ⇒ **−5.2 dB**
+    /// (与用户说「好」的 yuyuko 在同一个音上**完全一致**)。
+    /// 用户 2026-08-28 听过这两档的探针臂后判:「**f1『强』/『实』确实在听感上更好**」。
+    #[test]
+    fn the_second_harmonic_axis_fixes_the_hollowed_note_without_touching_the_healthy_ones() {
+        let mk = |shift: i64, rel: f32, h2: f32, uplev: f32| {
+            let mut sc = CandScore::default();
+            sc.rel.push((0, rel));
+            sc.h2.push((0, h2));
+            sc.uplev.push((0, uplev));
+            (0usize, shift, 0usize, Vec::<f32>::new(), sc)
+        };
+        // 真实形状:rel 偏好今天的 −8,而 h2 说 −13 好 11.8 dB。
+        let cand = vec![mk(-8, 4.2, -17.0, 0.0), mk(-13, 5.9, -5.2, -3.0)];
+
+        // ⑴ ⛔ eps = 0 ⇒ **逐位回到今天**(这是「出厂关 = 不改音频」的保证)
+        let today = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(cand[today[0]].1, -8, "eps=0 必须逐位回到今天的 rel 排序");
+
+        // ⑵ 差 11.8 dB > eps 6.0 ⇒ 按 h2 选 −13,哪怕 rel 指向 −8
+        let fixed = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        assert_eq!(
+            cand[fixed[0]].1, -13,
+            "h2 差 11.8 dB 时必须压过 rel —— 用户耳判确认 −13 更好听"
+        );
+
+        // ⑶ ⛔ 对照:h2 只差 2.5 dB(< eps)⇒ 回落 rel ⇒ **一个都不许动**。
+        //    实测两个模型的 h2 中位是 −4.8 / −6.5,大量音就在这个区间里,
+        //    eps 若设小了会把它们全部翻一遍。
+        let ctrl = vec![mk(-8, 4.2, -5.0, 0.0), mk(-13, 5.9, -7.5, -3.0)];
+        let kept = decide_group(&ctrl, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        assert_eq!(ctrl[kept[0]].1, -8, "h2 只差 2.5 dB 时必须回落 rel");
+
+        // ⑷ ⛔⛔ **对手轴闸**:赢家把上方谐波压掉超过 `H2_DIM_CAP` ⇒ 不许换。
+        //    S163 §32 的血训:`gone` 那一支当初没配对手轴闸,直接造出全曲唯一一个变闷 >2.7 的音
+        //    ⇒ **每一根参与排序的轴都要配**。
+        let costly = vec![mk(-8, 4.2, -17.0, 6.0), mk(-13, 5.9, -5.2, -8.0)];
+        let held = decide_group(&costly, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        assert_eq!(
+            costly[held[0]].1, -8,
+            "赢家把上方谐波压了 14 dB(> H2_DIM_CAP {H2_DIM_CAP})⇒ 必须拦住"
+        );
+
+        // ⑸ ⭐ `h2` 排在 `usag` **之前**:两根轴指向相反时,h2 说了算。
+        //    (用户的理由:`2·f0` = 1975 Hz 在耳朵最敏感的区间,更高的谐波感知权重低得多。)
+        let mut a = mk(-8, 4.2, -17.0, 0.0);
+        let mut b = mk(-13, 5.9, -5.2, -3.0);
+        a.4.usag.push((0, 1.0)); // 今天这档 usag 更好
+        b.4.usag.push((0, -6.0)); // 好格 usag 更差,差 7 dB > usag_eps 3
+        let both = vec![a, b];
+        let win = decide_group(&both, 0, -8, 0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 6.0);
+        assert_eq!(
+            both[win[0]].1, -13,
+            "h2 与 usag 指向相反时 h2 必须赢 —— 它排在 usag 之前就是为了这个"
+        );
+
+        // ⑹ ⛔ 阴性对照:**量不到 h2 的候选**(峰位验证失败 ⇒ 空 Vec)不许被当成「很差」。
+        //    气声/清音段落正是这种情况(yuyuko 0:56-1:01 的 f1 大多读不出来)。
+        let blind = vec![
+            (0usize, -8i64, 0usize, Vec::<f32>::new(), CandScore::default()),
+            (0usize, -13i64, 0usize, Vec::<f32>::new(), CandScore::default()),
+        ];
+        let n = decide_group(&blind, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0);
+        assert_eq!(
+            blind[n[0]].1, -8,
+            "两边都量不到 h2 ⇒ 这根轴必须闭嘴(worst_h2 都是 0.0,差 0 < eps)"
+        );
+    }
+
     #[test]
     fn usag_becomes_the_primary_sort_key_only_when_the_gap_is_real() {
         let mk = |ji: usize, shift: i64, rel: f32, usag: f32| {
@@ -8394,14 +8647,14 @@ mod tests {
         let cand = vec![mk(0, -2, 4.48, -10.8), mk(0, -4, 5.96, -3.2)];
 
         // ⑴ eps = 0 ⇒ 逐位回到今天(rel 最小的 −2 在前)
-        let today = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let today = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[today[0]].1, -2,
             "eps=0 必须逐位回到今天的 rel 排序 —— 这是「出厂不变」的保证"
         );
 
         // ⑵ 差 7.6 dB > eps 3.0 ⇒ 按 usag 选 −4，哪怕 rel 指向 −2
-        let fixed = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0);
+        let fixed = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0);
         assert_eq!(
             cand[fixed[0]].1, -4,
             "usag 差 7.6 dB 时必须压过 rel —— 实测那一组 rel 的方向是反的"
@@ -8410,7 +8663,7 @@ mod tests {
         // ⑶ 对照组的形状:usag 只差 2.0 dB(< eps) ⇒ 回落 rel ⇒ **不动**
         //    (用户点名的 0:40.901 与 0:43.641 两个「听起来正常」的音就是这个形状)
         let ctrl = vec![mk(0, -2, 4.90, 1.3), mk(0, -4, 5.80, 3.3)];
-        let kept = decide_group(&ctrl, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0);
+        let kept = decide_group(&ctrl, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0);
         assert_eq!(
             ctrl[kept[0]].1, -2,
             "usag 只差 2.0 dB 时必须回落 rel ⇒ 听起来正常的那些音一个都不许动"
@@ -8429,7 +8682,7 @@ mod tests {
                 sc
             }),
         ];
-        let n = decide_group(&none, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0);
+        let n = decide_group(&none, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0);
         assert_eq!(
             none[n[0]].1, -2,
             "量不到 usag 的组必须原样走 rel —— 短音上这根轴是噪声,不许拿它决策"
@@ -10979,7 +11232,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}              usag={} usagdim={} gonesort={} dipfill={} restwin={}/{}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}              usag={} usagdim={} gonesort={} dipfill={} restwin={}/{} h2={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -11057,6 +11310,13 @@ mod tests {
             //    （与 SPLIT_MIN_COST 那次同款的洞、同款的修法）。
             REST_PRE_FRAMES,
             REST_POST_FRAMES,
+            // ⭐⭐⭐ S165 —— `2·f0` 电平当排序键的 eps。
+            //    ⚠ **出厂 0 = 关 = 逐位不变** ⇒ 加它**不该**触发版本 bump
+            //    (与 `usag=` / `width=` / `donorin=` 同例);
+            //    进指纹的意义是「下一个人想把它变成默认之前,必须先来这里改一行,
+            //    于是不得不读 `landing_h2_eps` 那段 doc 与它的三个常量
+            //    (`H2_REPAIR_FLOOR` / `H2_REPAIR_RADIUS` / `H2_DIM_CAP`)」。
+            parse_h2_eps(None),
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -11069,7 +11329,7 @@ mod tests {
             //    它**会改音频**（所以在指纹里、不在 `EXEMPT` 里），但**出厂没设 ⇒ off ⇒ 不改音频**
             //    ⇒ 按本判据自己的规矩（“若它出厂关 = 不改音频，就不要 bump 版本号”）**不跟着 bump**，
             //    与 `valhuman=` 当初同例。进指纹的意义是：下一个人想把它变成默认之前，必须先来这里改一行。
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true donorin=false valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 h2=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true donorin=false valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -11155,6 +11415,7 @@ mod tests {
             ("USAG_EPS_DEFAULT", "pub fn landing_usag_eps("),
             ("USAG_DIM_CAP_DEFAULT", "pub fn landing_usag_dim_cap("),
             ("DIPFILL_DEPTH_DEFAULT", "pub fn dipfill_depth_db("),
+            ("LANDING_H2_EPS_DEFAULT", "pub fn landing_h2_eps("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
@@ -11801,6 +12062,7 @@ mod tests {
                     comb: Vec::new(),
                     width: vec![(0, width)],
                     usag: Vec::new(),
+                    h2: Vec::new(),
                     uplev: Vec::new(),
                 },
             )
@@ -11809,7 +12071,7 @@ mod tests {
         // B = 候选 −4：电平差一点（2.0 dB）但谱峰很清晰（1%）
         let cand = vec![mk(-8, 0.2, 12.0), mk(-4, 2.0, 1.0)];
         // ① 开着（eps = 2.0）⇒ 12% > 1% × 2 ⇒ 剔掉 A ⇒ 选 B
-        let on = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0);
+        let on = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[on[0]].1,
             -4,
@@ -11817,7 +12079,7 @@ mod tests {
             cand[on[0]].1
         );
         // ② ⛔ 阴性对照：关掉 ⇒ 只剩电平轴 ⇒ 选 A（糊的）
-        let off = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let off = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[off[0]].1,
             -8,
