@@ -388,6 +388,113 @@ mod f0_probe {
         }
     }
 }
+/// S165 §106 -- fill stretches where RMVPE dropped a held note on the floor.
+///
+/// RMVPE does not merely mis-read pitch, it sometimes stops reporting one. On this record the
+/// worst case is 730 ms in the middle of a single sustained note (4:04.80-4:05.53): `pitchf`
+/// is 0 there, RVC synthesises those frames as unvoiced, and what comes out is broadband
+/// noise. It is the longest single defect left in the song -- 640 ms of the 15 remaining bad
+/// segments, more than the next four put together.
+///
+/// The two cases separate cleanly on waveform autocorrelation, which is why this is safe:
+///     inside that hole    peak 0.962, f0 709.6 Hz with a 2.3 Hz spread over 37 frames
+///     genuinely unvoiced  peak p50 0.230, p90 0.396, p99 0.673      (n = 122 frames)
+/// A 0.75 gate therefore sits above every unvoiced frame measured and far below the hole.
+/// The pitch written in is the autocorrelation reading itself rather than an interpolation
+/// across the gap: RMVPE's own first frame after the hole reads 714 Hz against the 712 that
+/// autocorrelation measures inside it, which is what says the hole is the same held note and
+/// not a gap between two.
+///
+/// ⚠ Runs BEFORE the octave repair on purpose, so anything filled here goes through the same
+/// Viterbi as the rest. Filling afterwards would hand the octave logic a run of frames it
+/// never had a chance to judge -- and a wrongly-octaved fill is worse than a hole.
+fn fill_voiced_holes_inplace(f0: &mut [f32], audio16k: &[f32], hop: usize) -> usize {
+    let min_run = min_hole_frames();
+    let mut filled = 0usize;
+    let mut i = 0usize;
+    while i < f0.len() {
+        if f0[i] > 20.0 {
+            i += 1;
+            continue;
+        }
+        // Measure the whole hole before deciding whether it is ours. Scattered 1-3 frame
+        // gaps already belong to `fill_isolated_uv_inplace`; measuring the first version of
+        // this pass showed why the division matters -- of 240 runs it filled, 231 (96 %) were
+        // 10-30 ms crumbs and exactly one was the 730 ms dropout it exists for. Sprinkling
+        // patches across the song is how an unvoiced consonant gap acquires a pitch.
+        let start = i;
+        while i < f0.len() && f0[i] <= 20.0 {
+            i += 1;
+        }
+        if i - start < min_run {
+            continue;
+        }
+        for j in start..i {
+            if fill_one(f0, audio16k, hop, j) {
+                filled += 1;
+            }
+        }
+    }
+    filled
+}
+
+/// 补一帧:量它的波形自相关,够周期才写回音高。返回是否真的写了。
+fn fill_one(f0: &mut [f32], audio16k: &[f32], hop: usize, i: usize) -> bool {
+    /// Above every unvoiced frame measured (p99 = 0.673), far below the hole (0.962).
+    const PEAK_GATE: f32 = 0.75;
+    /// Below 200 Hz a 40 ms window holds too few periods to trust; above 1100 Hz is past
+    /// what RVC's coarse table can carry anyway.
+    const F_MIN: f32 = 200.0;
+    const F_MAX: f32 = 1100.0;
+    /// 40 ms at 16 kHz -- the window the separation above was measured with.
+    const WIN: usize = 640;
+
+    let sr = 16_000.0f32;
+    let lag_lo = (sr / F_MAX) as usize;
+    let lag_hi = (sr / F_MIN) as usize;
+    if lag_hi + 2 >= WIN {
+        return false;
+    }
+    let c = i * hop;
+    if c + WIN > audio16k.len() {
+        return false;
+    }
+    let w = &audio16k[c..c + WIN];
+    let mean = w.iter().sum::<f32>() / WIN as f32;
+    let e0: f32 = w.iter().map(|v| (v - mean) * (v - mean)).sum();
+    if e0 <= 1e-9 {
+        return false;
+    }
+    let (mut best_lag, mut best) = (0usize, 0.0f32);
+    for lag in lag_lo..=lag_hi {
+        let mut acc = 0.0f32;
+        for k in 0..WIN - lag {
+            acc += (w[k] - mean) * (w[k + lag] - mean);
+        }
+        let v = acc / e0;
+        if v > best {
+            best = v;
+            best_lag = lag;
+        }
+    }
+    if best >= PEAK_GATE && best_lag > 0 {
+        f0[i] = sr / best_lag as f32;
+        return true;
+    }
+    false
+}
+
+/// S165 §106 —— 归这一刀管的最小洞长(帧,100 fps)。
+/// 出厂 5 帧 = 50 ms:比清辅音的下限(50-120 ms 是**有声辅音**的量级,而 1-3 帧的缝是
+/// 跟踪器抖动)高,又远低于那个 730 ms 的漏唱。`UTAI_COVER_MIN_HOLE_FRAMES` 可扫。
+fn min_hole_frames() -> usize {
+    std::env::var("UTAI_COVER_MIN_HOLE_FRAMES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1 && *n <= 200)
+        .unwrap_or(5)
+}
+
 
 /// ⭐⭐⭐⭐⭐ S165 —— **修 RMVPE 的八度错**(把真基频报成 1/2)。
 ///
@@ -872,6 +979,17 @@ pub fn run_pipeline(
     // ⛔ 也必须在 `f0` 上(而不是下面截断后的 `pitchf`)—— donor 那一遍会重跑这整段,
     //    自递归继承的是这里的结果。
     // ⚙ 出厂开;`UTAI_COVER_OCTAVE_FIX=0` 关掉 ⇒ 逐位回到今天。
+    // ⭐ S165 §106 —— **先补 RMVPE 漏掉的长音**(见 [`fill_voiced_holes_inplace`])。
+    // ⛔ 必须在八度修复**之前**:补回来的帧要和其余帧一起过 Viterbi。
+    // ⚙ 出厂开;`UTAI_COVER_FILL_HOLES=0` 关掉 ⇒ 逐位回到今天。
+    if !matches!(std::env::var("UTAI_COVER_FILL_HOLES").as_deref(), Ok("0")) {
+        let k = fill_voiced_holes_inplace(&mut f0, &audio_pad, WINDOW);
+        if k > 0 {
+            tracing::info!(
+                "RVC f0: filled {k} frame(s) RMVPE dropped mid-note (autocorr peak >= 0.75) (S165)"
+            );
+        }
+    }
     if !matches!(std::env::var("UTAI_COVER_OCTAVE_FIX").as_deref(), Ok("0")) {
         let k = fix_octave_inplace(&mut f0, &audio_pad, WINDOW);
         if k > 0 {
@@ -1496,6 +1614,121 @@ pub fn f0_to_coarse(f0: f32) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// S165 §106 —— **短洞不归这一刀管**,交给 `fill_isolated_uv_inplace`。
+    ///
+    /// 第一版没有这条界,实测在全曲补出 240 段:其中 **231 段(96 %)是 10-30 ms 的碎渣**,
+    /// 而它真正为之存在的那个漏唱只有 1 段(730 ms)。往全曲撒碎补丁,正是让一个清辅音
+    /// 间隙凭空得到音高的方式 —— 用户报的 0:57.540 在那一版里从 26 % 退到 30 %。
+    #[test]
+    fn short_gaps_are_left_to_the_isolated_hole_pass() {
+        const SR: f32 = 16_000.0;
+        const HOP: usize = 160;
+        let n = HOP * 80 + 1600;
+        let tone: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 700.0 * i as f32 / SR).sin() * 0.3)
+            .collect();
+        // 出厂门槛 5 帧:4 帧的洞不许碰,5 帧的要补 —— 两边都钉住,否则门槛可以随便滑。
+        let hole_of = |len: usize| {
+            let mut f0 = vec![440.0f32; 60];
+            for v in f0.iter_mut().skip(20).take(len) {
+                *v = 0.0;
+            }
+            f0
+        };
+        let mut short = hole_of(4);
+        assert_eq!(
+            super::fill_voiced_holes_inplace(&mut short, &tone, HOP),
+            0,
+            "4 帧的洞归 fill_isolated_uv_inplace 管,这一刀不许碰"
+        );
+        assert!(short[20..24].iter().all(|v| *v == 0.0), "短洞必须原样留着");
+        let mut long = hole_of(5);
+        assert!(
+            super::fill_voiced_holes_inplace(&mut long, &tone, HOP) > 0,
+            "刚好够门槛(5 帧 = 50 ms)的洞必须补"
+        );
+        // 门槛本身也钉住,免得默认值被悄悄挪走
+        assert_eq!(super::min_hole_frames(), 5, "出厂最小洞长应当是 5 帧 = 50 ms");
+    }
+
+    /// S165 §106 —— **RMVPE 把长音整段漏掉时,用自相关把它补回来**;而真清音一帧都不许碰。
+    ///
+    /// 这两件事必须同时成立才安全,所以判据把两边都钉上:补错了会在清辅音上凭空造出音高,
+    /// 比留着洞更糟。分离度是量出来的:洞里自相关峰 0.962,真清音帧 p90 才 0.396(n=122)。
+    #[test]
+    fn a_dropped_held_note_is_filled_and_real_silence_is_left_alone() {
+        const SR: f32 = 16_000.0;
+        const HOP: usize = 160; // 100 fps
+        let n = HOP * 60 + 1600;
+        // ⑴ 一段干净的 700 Hz 持续音,而 f0 全是 0(= RMVPE 整段漏掉)
+        let tone: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 700.0 * i as f32 / SR).sin() * 0.3)
+            .collect();
+        let mut f0 = vec![0.0f32; 50];
+        let k = super::fill_voiced_holes_inplace(&mut f0, &tone, HOP);
+        assert!(k >= 40, "整段周期音必须被补回来,只补了 {k} 帧");
+        let got: Vec<f32> = f0.iter().copied().filter(|v| *v > 20.0).collect();
+        let med = {
+            let mut v = got.clone();
+            v.sort_by(f32::total_cmp);
+            v[v.len() / 2]
+        };
+        assert!(
+            (med - 700.0).abs() < 25.0,
+            "补进去的音高要贴着真值(700 Hz),读到 {med:.1}"
+        );
+        // ⑵ ⭐⭐ 阴性对照:**贴着闸**的半周期信号,一帧都不许补。
+        //
+        // ⛔ 第一版用纯白噪,结果把闸从 0.75 一路放到 0.2 它都不被补 —— 那条对照
+        //    离闸太远,**测不出闸有没有用**。真实的清擦音自相关峰 p90 = 0.396、
+        //    p99 = 0.673(n=122 帧实测),所以对照必须落在那个量级上才有意义。
+        let mut rng = 0x1234_5678u32;
+        let mut white = || {
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (rng >> 16) as f32 / 32_768.0 - 1.0
+        };
+        // 正弦 : 噪声 ≈ 1.2 : 1 ⇒ 自相关峰落在 0.5-0.7,恰好在闸下面一点
+        let halfp: Vec<f32> = (0..n)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * 700.0 * i as f32 / SR).sin() * 0.30
+                    + white() * 0.25
+            })
+            .collect();
+        // 先自证夹具:它的峰确实贴着闸,否则这条对照又是空的
+        let peak = {
+            let w = &halfp[..640];
+            let mean = w.iter().sum::<f32>() / 640.0;
+            let e0: f32 = w.iter().map(|v| (v - mean) * (v - mean)).sum();
+            let mut best = 0.0f32;
+            for lag in 14..80 {
+                let acc: f32 =
+                    (0..640 - lag).map(|k| (w[k] - mean) * (w[k + lag] - mean)).sum();
+                best = best.max(acc / e0);
+            }
+            best
+        };
+        assert!(
+            (0.45..0.72).contains(&peak),
+            "夹具本身要贴着闸(实测清音 p90 0.396 / p99 0.673),现在是 {peak:.3} ——              离闸太远的对照测不出闸有没有用"
+        );
+        let mut f0n = vec![0.0f32; 50];
+        let kn = super::fill_voiced_holes_inplace(&mut f0n, &halfp, HOP);
+        assert_eq!(kn, 0, "周期性只到 {peak:.3} 的信号不许被补,却补了 {kn} 帧");
+        // ⑶ 已经有音高的帧不许被改写(它只补洞,不重估)
+        let mut f0k = vec![0.0f32; 50];
+        f0k[10] = 123.0;
+        super::fill_voiced_holes_inplace(&mut f0k, &tone, HOP);
+        assert!((f0k[10] - 123.0).abs() < f32::EPSILON, "已有音高的帧不许动");
+        // ⑷ 静音不许补(能量为零时自相关没有意义)
+        let mut f0s = vec![0.0f32; 50];
+        let silence = vec![0.0f32; n];
+        assert_eq!(
+            super::fill_voiced_holes_inplace(&mut f0s, &silence, HOP),
+            0,
+            "静音里不许凭空造音高"
+        );
+    }
+
     /// S165 §103 —— **session 还活着就复用它那一档 tier**,别再去问"内存够不够"。
     ///
     /// tier 决定 chunk 长度,chunk 长度决定输入 shape,而**新 shape 才要付 DirectML
