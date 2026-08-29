@@ -131,6 +131,55 @@ const CHUNK_TIERS: &[ChunkTier] = &[
 /// `need_mb` fits the CURRENT system available commit wins; if even the smallest doesn't
 /// fit, the smallest is used anyway — the engine's INFERENCE_LOW_MEMORY floor (and the
 /// Auto-device CPU fallback in load_voice) guard the truly hopeless cases.
+thread_local! {
+    /// S165 §100 —— 这一首歌选定的 chunk tier。见 [`tier_for_this_song`]。
+    static LOCKED_TIER: std::cell::Cell<Option<&'static ChunkTier>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// 释放 [`LOCKED_TIER`] 的 RAII 哨兵;只有加锁的那一层(最外层)真的清。
+struct TierLock(bool);
+impl Drop for TierLock {
+    fn drop(&mut self) {
+        if self.0 {
+            LOCKED_TIER.with(|c| c.set(None));
+        }
+    }
+}
+
+/// 整首歌用同一个 chunk tier —— **最外层选一次,donor 递归照用**。
+///
+/// ⛔ 为什么必须锁住(S165 §100,一整天的 A/B 全毁在这上面):
+/// tier 是按**当下可用 commit** 选的,而 WDDM 把显存算进 commit,一次渲染就占掉 7 GB 上下。
+/// donor 死区是自递归调用 `run_pipeline` 的,于是每渲一段就重选一次 tier(实测一条臂里 61 次)。
+/// 后面几十次都看见 commit 已经很紧 ⇒ 降 tier ⇒ **而降 tier 就是换一个新输入 shape,
+/// 要再付一张 DirectML first-shape ticket(单张 1.7-3.4 GB)** ⇒ commit 更紧 ⇒ 再降。
+/// **越紧越降,越降越紧**,一条臂里从 32 s 一路掉到 10 s。
+///
+/// 代价不是省内存而是质量:同一份素材、同一个二进制,
+/// **tier 32 s 的臂坏帧率 6.2-6.4 %,tier 19 s 的 13.0-13.6 %** —— 整整翻倍。
+/// 用户社区报的"内存问题"、以及跨臂 A/B 莫名其妙对不上,都是这一条。
+///
+/// 锁住之后三件事同时成立:降级螺旋断掉、shape 只有一种(只付一张 ticket)、
+/// 同一次渲染里各段可比。⚠ 锁的是**一首歌**,不是进程 —— 下一首重新按当时的内存选。
+fn tier_for_this_song(engine: &OnnxEngine, voice_session: &str) -> (&'static ChunkTier, TierLock) {
+    tier_for_this_song_with(|| pick_chunk_tier(engine, voice_session))
+}
+
+/// [`tier_for_this_song`] 的锁那一半,与引擎解耦以便判据能直接钉住嵌套行为。
+fn tier_for_this_song_with(
+    pick: impl FnOnce() -> &'static ChunkTier,
+) -> (&'static ChunkTier, TierLock) {
+    LOCKED_TIER.with(|c| {
+        if let Some(t) = c.get() {
+            return (t, TierLock(false)); // donor 递归:照用外层定好的
+        }
+        let t = pick();
+        c.set(Some(t));
+        (t, TierLock(true))
+    })
+}
+
 fn pick_chunk_tier(engine: &OnnxEngine, voice_session: &str) -> &'static ChunkTier {
     // A concurrently evicted session resolves to None (reload-on-miss rebuilds it inside
     // run_typed, AFTER this pick) — fall back to the global preference so an explicit
@@ -603,6 +652,8 @@ pub fn run_pipeline(
         // went UP. One-sided makes the omission worse, not better, so the floor is not
         // optional here.
         let floor_db = cover_flatten_knob("UTAI_COVER_FLATTEN_FLOOR_DB", -24.0, -60.0, 0.0);
+        // dB per second the gain may move; 0 = uncapped (the S165 §95 behaviour).
+        let slew_db_s = cover_flatten_knob("UTAI_COVER_FLATTEN_SLEW_DB_S", 0.0, 0.0, 2000.0);
         let two_sided = cover_flatten_two_sided();
 
         let n = ((win_ms / 1000.0) * SR as f32) as usize;
@@ -630,18 +681,44 @@ pub fn run_pipeline(
                 let hi = 10f32.powf(cap_db / 20.0);
                 let lo = if two_sided { 1.0 / hi } else { 1.0 };
                 let floor = refv * 10f32.powf(floor_db / 20.0);
-                let mut moved = 0usize;
-                let mut lifted_db_sum = 0.0f64;
-                for (i, v) in audio_f.iter_mut().enumerate() {
+                let mut gain = vec![1.0f32; audio_f.len()];
+                for (i, g) in gain.iter_mut().enumerate() {
                     let e = env[i];
-                    let mut g = (refv / e).clamp(lo, hi);
+                    let mut v = (refv / e).clamp(lo, hi);
                     // Fade the lift out below the floor instead of cutting it off, so the
                     // gain stays continuous across the boundary (a step here would be a
                     // new transient -- exactly the thing this filter exists to remove).
                     if e < floor {
                         let t = (e / floor.max(1e-9)).clamp(0.0, 1.0);
-                        g = 1.0 + (g - 1.0) * t;
+                        v = 1.0 + (v - 1.0) * t;
                     }
+                    *g = v;
+                }
+                // S165 §99 -- cap how fast the gain itself may move.
+                //
+                // Measured need: the first (unlimited) version cut spiky frames across the
+                // song by 60% but GREW 19 new spiky spots of its own, one of which the user
+                // picked out by ear (0:50.10 -- source crest 9.58, off 7.65, lifted 12.21).
+                // The cause is this filter's own doing: where the envelope turns sharply the
+                // gain turns sharply with it, and a fast gain move IS a transient -- the very
+                // thing the filter exists to remove.
+                //
+                // Two passes taking the min, so the cap holds in both directions and the
+                // curve picks up no delay (a one-way pass would smear every lift later in
+                // time, which would smear it onto the wrong syllable).
+                if slew_db_s > 0.0 {
+                    let step = 10f32.powf(slew_db_s / (SR as f32) / 20.0);
+                    for i in 1..gain.len() {
+                        gain[i] = gain[i].min(gain[i - 1] * step);
+                    }
+                    for i in (0..gain.len() - 1).rev() {
+                        gain[i] = gain[i].min(gain[i + 1] * step);
+                    }
+                }
+                let mut moved = 0usize;
+                let mut lifted_db_sum = 0.0f64;
+                for (i, v) in audio_f.iter_mut().enumerate() {
+                    let g = gain[i];
                     if (g - 1.0).abs() > 1e-3 {
                         moved += 1;
                         lifted_db_sum += f64::from(20.0 * g.log10());
@@ -651,7 +728,7 @@ pub fn run_pipeline(
                 let mean_db =
                     if moved > 0 { lifted_db_sum / moved as f64 } else { 0.0 };
                 tracing::info!(
-                    "RVC cover: input envelope {} ({win_ms} ms window, ref p{ref_pct:.0} {refv:.5}, cap {cap_db:.1} dB, floor {floor_db:.1} dB)                      -- {moved}/{} samples scaled, mean {mean_db:+.2} dB (S165)",
+                    "RVC cover: input envelope {} ({win_ms} ms window, ref p{ref_pct:.0} {refv:.5}, cap {cap_db:.1} dB, floor {floor_db:.1} dB, slew {slew_db_s} dB/s)                      -- {moved}/{} samples scaled, mean {mean_db:+.2} dB (S165)",
                     if two_sided { "flattened BOTH ways (rejected arm)" } else { "lifted (one-sided)" },
                     audio_f.len()
                 );
@@ -660,7 +737,7 @@ pub fn run_pipeline(
     }
     let audio_f = audio_f;
 
-    let tier = pick_chunk_tier(m.engine, m.voice_session);
+    let (tier, _tier_lock) = tier_for_this_song(m.engine, m.voice_session);
     let t_pad = SR * X_PAD;
     let t_pad_tgt = m.sample_rate as usize * X_PAD;
     let t_pad2 = t_pad * 2;
@@ -1355,6 +1432,55 @@ pub fn f0_to_coarse(f0: f32) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// S165 §100 —— **一首歌只选一次 chunk tier**。
+    ///
+    /// 这条判据挡的是一整天被毁掉的 A/B:donor 死区自递归调用 `run_pipeline`,
+    /// 从前每递归一次就重选一次 tier(实测一条臂里 61 次)。而 WDDM 把显存算进 commit、
+    /// 一次渲染占掉 7 GB,于是后面几十次全看见"内存紧"⇒ 降 tier ⇒ 换新输入 shape
+    /// ⇒ 再付一张 1.7-3.4 GB 的 DirectML first-shape ticket ⇒ 更紧 ⇒ 再降。
+    /// 实测后果:tier 32s 的臂坏帧率 6.2-6.4%,tier 19s 的 13.0-13.6% —— **翻倍**。
+    ///
+    /// ⚠ 第三段(锁必须还回去)不是形式主义:锁不释放的话,**下一首歌会沿用上一首的 tier**,
+    /// 那等于把这个 bug 换了个方向再犯一次。
+    #[test]
+    fn one_song_picks_its_chunk_tier_exactly_once() {
+        use std::cell::Cell;
+        let calls = Cell::new(0usize);
+        let pick_small = || {
+            calls.set(calls.get() + 1);
+            &super::CHUNK_TIERS[3] // 最小的那档,和默认档明显不同
+        };
+        {
+            // ⑴ 最外层:真的选一次
+            let (outer, _g0) = super::tier_for_this_song_with(pick_small);
+            assert_eq!(calls.get(), 1, "最外层应当选一次");
+            assert_eq!(outer.x_max, super::CHUNK_TIERS[3].x_max);
+            // ⑵ donor 递归(可以嵌很多层):一次都不许再选,而且拿到同一个 tier
+            for depth in 0..5 {
+                let (inner, _g) = super::tier_for_this_song_with(|| {
+                    panic!("donor 递归第 {depth} 层又去选 tier 了 —— 降级螺旋会回来");
+                });
+                assert_eq!(
+                    inner.x_max, outer.x_max,
+                    "donor 递归必须照用最外层定好的 tier"
+                );
+            }
+            assert_eq!(calls.get(), 1, "整首歌自始至终只许选一次");
+        }
+        // ⑶ 整首歌渲完 ⇒ 锁必须还回去,下一首重新按当时的内存选
+        let big = || {
+            calls.set(calls.get() + 1);
+            &super::CHUNK_TIERS[0]
+        };
+        let (next_song, _g) = super::tier_for_this_song_with(big);
+        assert_eq!(calls.get(), 2, "下一首必须重新选,而不是沿用上一首的");
+        assert_eq!(
+            next_song.x_max,
+            super::CHUNK_TIERS[0].x_max,
+            "下一首应当拿到它自己选的那一档"
+        );
+    }
+
 
     /// S165 —— 钉住输入包络提升的**出厂值**。
     ///
