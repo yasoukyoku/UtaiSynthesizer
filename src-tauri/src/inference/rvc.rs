@@ -64,6 +64,60 @@ struct ChunkTier {
     need_mb: u64,
 }
 
+/// S165 -- `UTAI_COVER_FLATTEN_MS=<ms>`: lift the quiet stretches of the input envelope
+/// with a running-RMS window before the model sees it. **On by default at 100 ms**;
+/// `UTAI_COVER_FLATTEN_MS=0` turns it off.
+///
+/// Flipped on after three rulers -- each of which had to pass its own negative controls --
+/// agreed on the direction (see the call site for why the shape is one-sided):
+///   spectral flatness (noise-ness):        2 better, 0 worse, 7 unchanged
+///   spectral-structure similarity to src:  8 better, 1 worse, 0 unchanged, p50 +0.099
+///   whole-song bad-window rate:            5.8% -> 3.0%
+/// and the source envelope is tracked BETTER afterwards, not worse (r 0.734 -> 0.861).
+/// ⚠ The one segment that all three call worse is 4:05.4, inside the region the user
+/// flagged as its own kind of damage -- tracked separately, not a reason to hold this back.
+fn cover_flatten_ms() -> Option<f32> {
+    parse_flatten_ms(std::env::var("UTAI_COVER_FLATTEN_MS").ok().as_deref())
+}
+
+/// The parsing half of [`cover_flatten_ms`], split out so it can be pinned by a test
+/// without touching process-wide env (which would race the rest of the suite).
+fn parse_flatten_ms(raw: Option<&str>) -> Option<f32> {
+    /// ⛔ Do not change without re-running the three-ruler acceptance in S165 §99.
+    const DEFAULT_MS: f32 = 100.0;
+    match raw {
+        Some(v) => {
+            let t = v.trim();
+            // An explicit 0 (or anything out of range) is a deliberate OFF, not a typo we
+            // should paper over with the default -- the arm has to stay reachable, or the
+            // knob stops being falsifiable.
+            if t == "0" {
+                return None;
+            }
+            t.parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 10.0 && *v <= 1000.0)
+        }
+        None => Some(DEFAULT_MS),
+    }
+}
+
+/// S165 -- read one `f32` knob with a default. Used by the flattener's three shape
+/// parameters so a single build can sweep them (they are exploratory, not shipped).
+fn cover_flatten_knob(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= lo && *v <= hi)
+        .unwrap_or(default)
+}
+
+/// S165 -- `UTAI_COVER_FLATTEN_BOTH=1` restores the two-sided normalisation that was
+/// measured and REJECTED (see the call site). Default is one-sided: lift only.
+fn cover_flatten_two_sided() -> bool {
+    std::env::var("UTAI_COVER_FLATTEN_BOTH").map(|v| v.trim() == "1").unwrap_or(false)
+}
+
 const CHUNK_TIERS: &[ChunkTier] = &[
     ChunkTier { x_query: 6, x_center: 38, x_max: 41, need_mb: 7800 }, // upstream fp32/5G (default); worst 52 s
     ChunkTier { x_query: 5, x_center: 30, x_max: 32, need_mb: 6500 }, // upstream ≤4GB tier; worst 42 s
@@ -502,7 +556,109 @@ pub fn run_pipeline(
         tracing::warn!("RVC input contained {} non-finite sample(s) (NaN/Inf) — zeroed before feature extraction", bad);
     }
     let wav16k = resample(&mono.samples, mono.sample_rate, SR as u32);
-    let audio_f = highpass_48hz_16k(&wav16k)?;
+    let mut audio_f = highpass_48hz_16k(&wav16k)?;
+
+    // S165 -- flatten the INPUT envelope before the model sees it (factory OFF).
+    //
+    // WHY. The cover break-ups were traced (S165 §88-§90) to one thing: RVC cannot synthesise a
+    // regular glottal pulse train while the energy is moving fast. Measured over the whole song
+    // (160 ms windows, fully-voiced only, n=3675), bad-window rate by in-window energy slope:
+    //     -12..-8 dB -> 10.3%   -8..-5 -> 4.7%   -2..+2 (flat) -> 0.2% (n=1093)   +2..+5 -> 0.4%
+    // i.e. moving-energy windows are 5-50x worse than flat ones, decay side worst.
+    //
+    // The score lane never hits this because its loudness is a CONSTANT placeholder
+    // (`VOCAL_FLAT_VOL`, real per-frame loudness deferred to §10.5): |slope|>5 dB in only 2.8% of
+    // its windows vs 29.6% for the cover source. It is not stronger -- it never gets that input.
+    // ⇒ The user's original architecture call ("do loudness as POST-processing") is what saves it.
+    //
+    // So do the same for cover: flatten going IN, and let the existing `change_rms` (which already
+    // runs AFTER decoding, rvc.rs ~:793) put the source envelope back. Offline measurement of this
+    // exact filter (100 ms RMS window, +/-12 dB cage):
+    //     windows with |slope|>5 dB : 29.6% -> 9.7%      windows below -8 dB : 9.9% -> 2.5%
+    //     (score lane reference: 2.8% / 1.8%)   cost to the source's own periodicity: -0.021
+    //
+    // ⚠ Factory OFF until an A/B render is heard: this changes what the model is fed everywhere,
+    // not just at the 25 defect segments.
+    if let Some(win_ms) = cover_flatten_ms() {
+        // Shape knobs. One-sided by default: LIFT the quiet stretches, never push the loud
+        // ones down. The two-sided version was rendered and rejected in S165 -- it fixed
+        // nothing at the 25 defect segments (p50 0.542 -> 0.544/0.560, inside the render
+        // noise floor), made the whole song WORSE (p50 0.804 -> 0.792, bad-window rate
+        // 2.2% -> 3.4%), and collapsed how well the output still tracks the source's own
+        // envelope (r 0.882 -> 0.61) -- because the restore on the way out (`change_rms`,
+        // rms_mix_rate = 0.25) only gives back a quarter of what was taken away.
+        //
+        // One-sided is the right shape because BOTH symptoms only ever need a lift:
+        //   * dropout: a quiet stretch that the model reads as "this is all there is"
+        //   * break-up: energy falling FAST -- lifting the bottom of the fall flattens the
+        //     slope just as well as pressing the top down would have
+        // and because the loud stretches keep their original gain, `change_rms` has an
+        // order of magnitude less to undo.
+        let ref_pct = cover_flatten_knob("UTAI_COVER_FLATTEN_REF_PCT", 40.0, 1.0, 99.0);
+        let cap_db = cover_flatten_knob("UTAI_COVER_FLATTEN_CAP_DB", 9.0, 0.0, 24.0);
+        // Below this (relative to the reference) a window is breath, sibilance or room
+        // tone, not an under-sung note. ⚠ The two-sided version had no such floor: its
+        // gain for a silent window ran straight into the cage (env -> 0 => g = 4.0), so it
+        // lifted the noise bed by 12 dB. That is a likely part of why its bad-window rate
+        // went UP. One-sided makes the omission worse, not better, so the floor is not
+        // optional here.
+        let floor_db = cover_flatten_knob("UTAI_COVER_FLATTEN_FLOOR_DB", -24.0, -60.0, 0.0);
+        let two_sided = cover_flatten_two_sided();
+
+        let n = ((win_ms / 1000.0) * SR as f32) as usize;
+        if n >= 2 && audio_f.len() > n {
+            // running RMS via prefix sums
+            let mut pre = vec![0.0f64; audio_f.len() + 1];
+            for (i, &v) in audio_f.iter().enumerate() {
+                pre[i + 1] = pre[i] + f64::from(v) * f64::from(v);
+            }
+            let half = n / 2;
+            let mut env = vec![0.0f32; audio_f.len()];
+            for i in 0..audio_f.len() {
+                let a = i.saturating_sub(half);
+                let b = (i + half).min(audio_f.len());
+                env[i] = (((pre[b] - pre[a]) / (b - a).max(1) as f64).sqrt() as f32).max(1e-6);
+            }
+            // Reference = a percentile of the VOICED-level envelope. The two-sided version
+            // used the median; one-sided wants it LOWER, because everything under the
+            // reference gets lifted and the median would lift half the song.
+            let mut lv: Vec<f32> = env.iter().copied().filter(|&v| v > 1e-4).collect();
+            if !lv.is_empty() {
+                lv.sort_by(f32::total_cmp);
+                let idx = (((ref_pct / 100.0) * lv.len() as f32) as usize).min(lv.len() - 1);
+                let refv = lv[idx];
+                let hi = 10f32.powf(cap_db / 20.0);
+                let lo = if two_sided { 1.0 / hi } else { 1.0 };
+                let floor = refv * 10f32.powf(floor_db / 20.0);
+                let mut moved = 0usize;
+                let mut lifted_db_sum = 0.0f64;
+                for (i, v) in audio_f.iter_mut().enumerate() {
+                    let e = env[i];
+                    let mut g = (refv / e).clamp(lo, hi);
+                    // Fade the lift out below the floor instead of cutting it off, so the
+                    // gain stays continuous across the boundary (a step here would be a
+                    // new transient -- exactly the thing this filter exists to remove).
+                    if e < floor {
+                        let t = (e / floor.max(1e-9)).clamp(0.0, 1.0);
+                        g = 1.0 + (g - 1.0) * t;
+                    }
+                    if (g - 1.0).abs() > 1e-3 {
+                        moved += 1;
+                        lifted_db_sum += f64::from(20.0 * g.log10());
+                    }
+                    *v *= g;
+                }
+                let mean_db =
+                    if moved > 0 { lifted_db_sum / moved as f64 } else { 0.0 };
+                tracing::info!(
+                    "RVC cover: input envelope {} ({win_ms} ms window, ref p{ref_pct:.0} {refv:.5}, cap {cap_db:.1} dB, floor {floor_db:.1} dB)                      -- {moved}/{} samples scaled, mean {mean_db:+.2} dB (S165)",
+                    if two_sided { "flattened BOTH ways (rejected arm)" } else { "lifted (one-sided)" },
+                    audio_f.len()
+                );
+            }
+        }
+    }
+    let audio_f = audio_f;
 
     let tier = pick_chunk_tier(m.engine, m.voice_session);
     let t_pad = SR * X_PAD;
@@ -1199,6 +1355,41 @@ pub fn f0_to_coarse(f0: f32) -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// S165 —— 钉住输入包络提升的**出厂值**。
+    ///
+    /// 这一刀是翻了默认的(不再是探针),所以它值多少必须有判据看着 —— 三把尺子各自过了
+    /// 自己的阴性对照之后才翻的:谱平坦度 2 好 0 坏、谱结构相似度 8 好 1 坏(p50 +0.099)、
+    /// 全曲坏窗率 5.8% → 3.0%,而且源包络反而**更**还原得住(r 0.734 → 0.861)。
+    ///
+    /// ⚠ 第二条断言(显式 `0` 必须真的关掉)不是形式主义:阴性臂要是被默认值悄悄吃掉,
+    /// 以后就再也没法证伪这把刀了 —— S129「一条从没被执行过的错误分支就是一条空判据」。
+    #[test]
+    fn the_input_envelope_lift_ships_on_at_100ms_and_stays_switchable() {
+        // ⑴ 没设环境变量 = 出厂 ⇒ 开着,100 ms
+        assert_eq!(
+            super::parse_flatten_ms(None),
+            Some(100.0),
+            "出厂应当是开着的 100 ms —— 改这个值前先重跑 S165 §99 的三尺子验收"
+        );
+        // ⑵ 显式 0 = 关(阴性臂必须可达)
+        assert_eq!(super::parse_flatten_ms(Some("0")), None, "显式 0 必须真的关掉");
+        assert_eq!(super::parse_flatten_ms(Some(" 0 ")), None, "带空白的 0 也是关");
+        // ⑶ 合法值原样生效
+        assert_eq!(super::parse_flatten_ms(Some("250")), Some(250.0));
+        assert_eq!(super::parse_flatten_ms(Some("10")), Some(10.0), "下界含在内");
+        assert_eq!(super::parse_flatten_ms(Some("1000")), Some(1000.0), "上界含在内");
+        // ⑷ 越界/垃圾 ⇒ 关,而**不是**悄悄回落到默认值
+        //    (回落会让一个手滑的越界值伪装成「我设了它」,正是我们最怕的那种静默)
+        for bad in ["5000", "9", "-1", "abc", "", "NaN", "inf"] {
+            assert_eq!(
+                super::parse_flatten_ms(Some(bad)),
+                None,
+                "越界或垃圾值 {bad:?} 必须落到关,不许回落成默认值"
+            );
+        }
+    }
+
     use super::*;
 
     /// ⭐⭐⭐⭐⭐ S165 —— **八度修复:两种情形必须分开**。
