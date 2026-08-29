@@ -2499,6 +2499,37 @@ const LANDING_DAMAGE_EPS: f32 = 0.05;
 /// ⇒ **−2 那一档几乎什么也没买到,却照样付两条边界的代价**(见 [`cover_dead_plan`] 的
 /// 「边界」那一段:每段两条边,而边界台阶正是用户听到的破音)。⇒ 门槛设在 3。
 /// ⚠ −3/−4 那两档买到的是 5-7 dB,不算大但是正的,而且变脏比例已经掉到个位数 ⇒ 留着。
+/// ⭐⭐⭐⭐⭐ S165 —— **RVC 的 `f0_to_coarse` 能表达的最高基频(Hz)**。
+///
+/// # ⛔ 它为什么是一条**独立于 `slot_singable` 的死因**
+/// `rvc::f0_to_coarse` 把 f0 压进 **256 档 mel 表**,而表的上界写死在
+/// `f0_mel_max = 1127·ln(1 + 1100/700)`(那边的判据钉着 `f0_to_coarse(1100.0) == 255`)。
+/// ⇒ **任何 > 1100 Hz 的 f0 都被 clamp 成同一个 255** —— 模型收到的音高信息是「顶格」,
+///   它**不知道该唱 1422 还是 1600**。
+///
+/// ⚠⚠ 这与 [`SpeakerRange::slot_singable`] **量的不是一件事**:
+/// 1422 Hz 在 `usable` 之内 ⇒ `slot_singable` 说「唱得动」⇒ 救援不触发 ⇒ 原样喂进模型 ⇒ **吐噪声**。
+///
+/// # ⭐ 频谱证据(用户 2026-08-29 点名的 4:04.740,全曲最长的一处破音,980 ms)
+/// * **源**:1400 / 2800 / 4200 / 5700 / 7100 五条**又细又亮的谐波线**笔直贯穿整整 1 秒;
+/// * **cover**:244.75 起**所有谐波线消失**,只剩两团又宽又糊的能量带 + 噪声。
+/// ⇒ **不是抬错八度**(八度修复开/关两条臂都糊),是**谐波结构整个没了**。
+///
+/// # ⭐⭐ 为什么谱面轨没有这一族(用户当场纠正过我:**两条轨都是 RVC**)
+/// 两边**共用** `f0_to_coarse`(`score2svc.rs` 与 `rvc.rs` 各一个调用点),
+/// 差别在**谱面轨的救援把高音整体降下去渲**:实测各 donor 遍喂进模型的 `note_hz`
+/// 超 1100 Hz 的帧 —— `shift −8` 及更深**全是 0.0 %**(最深 −23 时 max 只有 440 Hz),
+/// 而 **cover 修复前 2.7 %、八度修复之后 10.0 %**(⛔ 我那把刀**把更多帧推过了上限**)。
+///
+/// # ⚠ 为什么不直接抬这个上界
+/// 256 档是**训练时定死的**;抬上界 ⇒ 与训练分布对不上 ⇒ 整个模型的音高响应会漂。
+/// ⇒ 正确的做法是**走已有的救援通路**(降八度渲染 + PSOLA 移回),与谱面轨同构。
+///
+/// ⚙ 规模(实测这份素材):受影响 **10.0 % 的浊音帧、连成 58 段**,
+/// 长度 p50 0.14 s / p90 0.90 s / max 2.40 s;≥0.5 s 的 8 段。
+/// 降八度之后 max 正好落回 **1100**。
+pub(crate) const RVC_COARSE_MAX_HZ: f32 = 1100.0;
+
 const COVER_MIN_RESCUE_DEPTH: i64 = 3;
 
 /// S159k —— 把区段的边往外找清音帧时,**最多找这么远**(毫秒)。找不到就**不外扩**。
@@ -2862,7 +2893,14 @@ pub fn cover_dead_plan_with(
         }
     }
     let midi = median5(&midi); // 倍频闪烁卫生,与旧决策同款
-    let is_dead = |m: f32| !range.slot_singable(m.round() as i64);
+    // ⭐⭐⭐⭐ S165 —— **两条死因**:
+    //   ⑴ 模型**唱不动**(`slot_singable`,S85 起就有的那条);
+    //   ⑵ ⭐ f0 **超出 `f0_to_coarse` 能表达的上限**([`RVC_COARSE_MAX_HZ`])——
+    //      那时模型「唱得动」但**收到的音高是顶格的 255**,吐出来的是噪声。
+    //   ⛔ ⑵ 是 S165 新加的,而它**不能**用 ⑴ 表达:1422 Hz 在 `usable` 之内。
+    //   ⚠ 对谱面轨零影响:它的 donor 遍喂进模型的 f0 超 1100 的帧实测**全是 0.0 %**。
+    let coarse_max_midi = 69.0 + 12.0 * (RVC_COARSE_MAX_HZ / 440.0).log2();
+    let is_dead = |m: f32| !range.slot_singable(m.round() as i64) || m > coarse_max_midi;
     // 死帧原始帧号 → gap 桥接分组 → 时长门。★门量的是「浊死帧数」而非帧号跨度(审查 S85d:
     // 跨度门会让桥接隙+夹层活帧凑数——5 个 3 帧幻影爆点跨 250ms 就能成区;S62b 铁律
     // 「幻影岛绝不触发染色」要求死亡本身够长。桥接仍跨活帧/清音隙=真高潮里的短落坑不劈区,
@@ -3000,8 +3038,16 @@ pub fn cover_dead_plan_with(
             .filter(|(&i, _)| i >= a && i <= b)
             .map(|(_, &m)| m.round() as i64)
             .collect();
-        let dead: Vec<i64> =
-            pitches.iter().copied().filter(|&p| !range.slot_singable(p)).collect();
+        // ⛔⛔ S165 —— **这里必须与上面的 `is_dead` 用【同一条】判据**。
+        //    第一版只写了 `!slot_singable`,而新加的「超 `RVC_COARSE_MAX_HZ`」那一支没跟上
+        //    ⇒ 超界的组 `dead` 为空 ⇒ 算不出位移 ⇒ **整组被静默丢掉**,判据当场红。
+        //    这就是本项目反复栽的「两处填充点漏一处」——判据 `cover_treats_f0_above_the_
+        //    rvc_coarse_ceiling_as_dead` 现在钉住它。
+        let dead: Vec<i64> = pitches
+            .iter()
+            .copied()
+            .filter(|&p| !range.slot_singable(p) || (p as f32) > coarse_max_midi)
+            .collect();
         (pitches, dead)
     };
     // ⛔ 深度门与「无解」是**两件事**,报法必须分开(S129 铁律:一条红要能被归因)。
@@ -3045,9 +3091,37 @@ pub fn cover_dead_plan_with(
             .sum()
     };
 
+    // ⭐⭐⭐⭐ S165 —— **把位移再压深到 f0 落回 `RVC_COARSE_MAX_HZ` 以下**。
+    //
+    // ⛔ 为什么不能改 [`minimal_rescue_shift`]:那个函数**谱面轨共用**,它的语义是
+    //   「把唱不动的音搬进 `slot_singable`」。而 coarse 上界是 **RVC 编码器的表达上限**,
+    //   与「唱不动」是两件事(1422 Hz 在 `usable` 之内,`slot_singable` 说唱得动)。
+    //   ⇒ 在 **cover 这一侧**把它算完,不动共用函数。
+    // ⚠ 取 `max`:两条死因谁要得深就听谁的。
+    let deepen_for_coarse = |pitches: &[i64], s: i64| -> i64 {
+        let hi = pitches.iter().copied().max().unwrap_or(0) as f32;
+        if hi <= coarse_max_midi {
+            return s;
+        }
+        // 需要往下多少个半音才能让最高音落到上界以下(向上取整)
+        let need = (hi - coarse_max_midi).ceil() as i64;
+        s.min(-need)
+    };
     for (ea, eb, orig) in spans {
         let (pitches, dead) = collect(ea, eb);
-        match minimal_rescue_shift(&dead, &pitches, range, None) {
+        // ⭐ 超界的组按 coarse 上界把位移**压深**。
+        //
+        // ⛔⛔ **`None` 必须原样传下去,不许救活它。**第一版写成
+        //   `(None, true) => Some(deepen_for_coarse(&pitches, 0))`,当场被两条既有判据抓住
+        //   (`a_cover_merge_never_swallows_material_no_predicate_has_looked_at` 与
+        //    `cover_plan_counts_unfixable_regions_loudly`)。
+        //   它们的夹具是「死亡高潮里混着够不着的低音」(高音 midi 88 + 低音 midi 30 同区):
+        //   `None` 的含义**不是**「没查过」,而是「**降下去会把低音乘客拖到唱不出来的地方**」
+        //   —— midi 30 再降就是 18。⇒ 那时正确的行为是**报无解**,不是硬渲一段垃圾。
+        //   ⭐ 这两条判据是 S85d 那次「拖拽守卫」留下的,今天正好接住了我。
+        let shift_opt = minimal_rescue_shift(&dead, &pitches, range, None)
+            .map(|s| deepen_for_coarse(&pitches, s));
+        match shift_opt {
             Some(s) => {
                 let mut parts: Vec<(usize, usize, i64)> = Vec::new();
                 if grouping.split_gain > 0.0 {
@@ -9559,6 +9633,73 @@ mod tests {
         ];
         let nd = decide_group(&nodip, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2);
         assert_eq!(nodip[nd[0]].1, -8, "两边都量不到 dip 时不许拦 —— 那会让短音上整根轴失效");
+    }
+
+    /// ⭐⭐⭐⭐⭐ S165 —— **cover 的第二条死因:f0 超出 `f0_to_coarse` 的表达上限。**
+    ///
+    /// # ⛔ 它治什么
+    /// 用户 2026-08-29 点名翻唱轨破音,频谱图上是**谐波结构整个消失、变成宽带噪声**
+    /// (4:04.740 那 980 ms:源五条细亮谐波线,cover 只剩两团糊带)。
+    /// 根因:`rvc::f0_to_coarse` 的 256 档 mel 表上界是 **1100 Hz**,
+    /// 而那个音真 f0 **1422.6 Hz** ⇒ clamp 成 255 ⇒ 模型收到「顶格」⇒ 吐噪声。
+    /// ⚠⚠ 它**不能**用 `slot_singable` 表达 —— 1422 Hz 在 `usable` 之内,「唱得动」。
+    ///
+    /// 钉四件:
+    /// ⑴ **超上界的音被判死**(哪怕 `slot_singable` 说唱得动);
+    /// ⑵ ⛔ **阴性对照**:同样的音高、但把上界调高到它之上 ⇒ **不判死**
+    ///    (否则 ⑴ 可能只是因为 `slot_singable` 自己就判死了);
+    /// ⑶ ⛔ **阴性对照**:上界以下的正常高音**一格都不许被新判死**;
+    /// ⑷ ⭐ 判死之后**救援真的把它降到上界以下** —— 否则只是换了个地方吐噪声。
+    #[test]
+    fn cover_treats_f0_above_the_rvc_coarse_ceiling_as_dead() {
+        // 这条记录的 usable 顶到 midi 96(≈ 2093 Hz)⇒ 1422 Hz(midi ≈ 89.7)「唱得动」
+        let r = SpeakerRange::bounds((40.0, 96.0), (40.0, 96.0));
+        let hz = |m: f32| 440.0f32 * 2f32.powf((m - 69.0) / 12.0);
+        // ⑶ 先建对照:一段稳稳在上界【以下】的高音(midi 84 ≈ 1046 Hz)
+        let below: Vec<f32> = vec![hz(84.0); 200];
+        let (j_below, _) = cover_dead_plan_with(&below, 100.0, &r, CoverGrouping::today());
+        assert!(
+            j_below.is_empty(),
+            "上界以下的正常高音(1046 Hz)被判死了 {} 段 —— 这一刀在误伤",
+            j_below.len()
+        );
+        // ⑴ 同样长度、但在上界【以上】(midi 89.7 ≈ 1422 Hz)
+        let above: Vec<f32> = vec![hz(89.7); 200];
+        let (j_above, _) = cover_dead_plan_with(&above, 100.0, &r, CoverGrouping::today());
+        assert!(
+            !j_above.is_empty(),
+            "1422 Hz 超过 f0_to_coarse 的上界 {RVC_COARSE_MAX_HZ} Hz 却没被判死 —— 
+             模型会收到 clamp 成 255 的音高然后吐噪声(见本判据的 doc)"
+        );
+        // ⑵ 阴性对照:把 usable 顶降到 88(< 89.7)⇒ `slot_singable` 自己就会判死
+        //    ⇒ 用它证明 ⑴ 不是靠 `slot_singable` 达成的:这里反过来把上界【抬高】,
+        //    如果 ⑴ 真是新判据起的作用,那么在一个 coarse 上界更高的世界里它就不该判死。
+        //    (`RVC_COARSE_MAX_HZ` 是常量,不能在测试里改 ⇒ 改用一个**低于**上界的音高,
+        //     并确认它在同一条记录下**不**被判死 —— 那就是 ⑶,已经断言过。)
+        //    这里再补一条:上界【正上方一点点】也要被判死,证明边界位置就在 1100 Hz。
+        // ⚠⚠ 边界位置**不能**用「刚过上界 5%」来钉:那只需要降 1 个半音,
+        //    而 [`COVER_MIN_RESCUE_DEPTH`] = 3 会把它整组丢掉(既有设计,不是 bug)。
+        //    ⇒ 用**刚过 3 个半音**的那一档来钉边界:它是这条死因**实际能生效的最浅处**。
+        let just_deep: Vec<f32> = vec![RVC_COARSE_MAX_HZ * 2f32.powf(3.2 / 12.0); 200];
+        let (j_ja, _) = cover_dead_plan_with(&just_deep, 100.0, &r, CoverGrouping::today());
+        assert!(
+            !j_ja.is_empty(),
+            "超上界 3.2 个半音的音没被判死 —— 这条死因在它实际能生效的最浅处就失守了"
+        );
+        let just_below: Vec<f32> = vec![RVC_COARSE_MAX_HZ * 0.95; 200];
+        let (j_jb, _) = cover_dead_plan_with(&just_below, 100.0, &r, CoverGrouping::today());
+        assert!(j_jb.is_empty(), "刚不到上界 5% 的音被判死了 —— 边界位置不对");
+        // ⚠ 如实登记:**超界 0-3 个半音的音这条刀够不着**(被 COVER_MIN_RESCUE_DEPTH 挡下)。
+        //   实测这份素材里超界帧的分布是「要么不超、要么超很多」,所以这个盲区代价可接受;
+        //   但它是**真盲区**,别读成「全覆盖」。
+        // ⑷ 救援真的把它降到上界以下
+        let sh = j_above[0].shift;
+        assert!(sh < 0, "救援位移应当是往下的,实际 {sh:+}");
+        let after = hz(89.7) * 2f32.powf(sh as f32 / 12.0);
+        assert!(
+            after <= RVC_COARSE_MAX_HZ,
+            "救援之后 f0 还是 {after:.0} Hz(> {RVC_COARSE_MAX_HZ})—— 只是换了个地方吐噪声"
+        );
     }
 
     use super::*;
