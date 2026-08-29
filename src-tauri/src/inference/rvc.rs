@@ -251,9 +251,16 @@ mod f0_probe {
 /// 造出比八度错本身更难听的东西。⇒ 这里用 **Viterbi**(两状态:保持 / 翻倍),
 /// 转移代价 [`OCTAVE_SWITCH_PENALTY_DB`] 把翻转压到**成段**发生。
 ///
-/// # ⚠ 只往上修,不往下
-/// RMVPE 的已知失败模式是**报成 1/2**;没有观测到「报成 2 倍」。
-/// ⇒ 候选只有 `{fc, 2·fc}`,不含 `fc/2` —— 少一个状态就少一族误伤。
+/// # ⚠ 只往上修,不往下;候选 `{fc, 2·fc, 3·fc}`
+/// RMVPE 的已知失败模式是**把真基频报成它的 1/2 或 1/3**;没有观测到「报成 2 倍」。
+/// ⇒ 候选不含 `fc/2` —— 少一个状态就少一族误伤。
+///
+/// ⭐ **`3·fc` 是实测逼出来的**:用户点名的「ぴゃ」(244.29-245.76 s,全曲最高音)
+/// 源实测真 f0 **1422.6 Hz**,而 RMVPE 在那里报 **471/473**(= 1422.6 **/ 3**)、
+/// 少数帧报 **705**(= / 2)、**61 % 的帧直接报无声**。
+/// 只有 `{fc, 2fc}` 时那一段被抬到 942 ——**还是错的,只是换了个错法**,
+/// 实测该段八度错率从 88.6 % 只降到 73.8 %(其余九段降到 0-40 %)。
+/// ⛔ 那 61 % 的无声是**另一族**(RMVPE 在极高音上完全失效),这把刀够不着。
 fn fix_octave_inplace(pitchf: &mut [f32], audio16k: &[f32], hop: usize) -> usize {
     if pitchf.is_empty() || audio16k.len() < 4 * hop {
         return 0;
@@ -265,17 +272,17 @@ fn fix_octave_inplace(pitchf: &mut [f32], audio16k: &[f32], hop: usize) -> usize
     let w: Vec<f64> = (0..win)
         .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / win as f64).cos())
         .collect();
-    // 每帧两个状态的观测代价
-    let mut obs: Vec<[f64; 2]> = Vec::with_capacity(pitchf.len());
+    // 每帧三个状态(×1 / ×2 / ×3)的观测代价
+    let mut obs: Vec<[f64; 3]> = Vec::with_capacity(pitchf.len());
     for (i, &fc) in pitchf.iter().enumerate() {
         if fc <= 20.0 || 2.0 * f64::from(fc) >= SR / 2.0 * 0.9 {
-            obs.push([0.0, 1e9]); // 无声/太高 ⇒ 只能保持
+            obs.push([0.0, 1e9, 1e9]); // 无声/太高 ⇒ 只能保持
             continue;
         }
         let c = i * hop;
         let a = c.saturating_sub(win / 2);
         if a + win > audio16k.len() {
-            obs.push([0.0, 1e9]);
+            obs.push([0.0, 1e9, 1e9]);
             continue;
         }
         let mut re: Vec<f64> = (0..nfft)
@@ -305,29 +312,37 @@ fn fix_octave_inplace(pitchf: &mut [f32], audio16k: &[f32], hop: usize) -> usize
         let f = f64::from(fc);
         let p1 = 20.0 * (peak(f).max(1e-12) / bg(f).max(1e-12)).log10();
         let p2 = 20.0 * (peak(2.0 * f).max(1e-12) / bg(2.0 * f).max(1e-12)).log10();
+        // ⭐ 3 倍那一支:超出 Nyquist 就直接不可用(而不是读到一个折叠回来的假峰)。
+        let p3 = if 3.0 * f < SR / 2.0 * 0.9 {
+            20.0 * (peak(3.0 * f).max(1e-12) / bg(3.0 * f).max(1e-12)).log10()
+        } else {
+            -1e9
+        };
         // 代价 = 负的突出度(越突出越便宜)
-        obs.push([-p1, -p2]);
+        obs.push([-p1, -p2, -p3]);
     }
-    // Viterbi(两状态)
+    // Viterbi(三状态:×1 / ×2 / ×3)
     let n = obs.len();
-    let mut cost = [obs[0][0], obs[0][1]];
-    let mut back: Vec<[u8; 2]> = vec![[0, 0]; n];
+    let mut cost = obs[0];
+    let mut back: Vec<[u8; 3]> = vec![[0, 0, 0]; n];
+    let pen = f64::from(OCTAVE_SWITCH_PENALTY_DB);
     for i in 1..n {
-        let mut next = [0.0f64; 2];
-        for s in 0..2 {
-            let stay = cost[s];
-            let switch = cost[1 - s] + f64::from(OCTAVE_SWITCH_PENALTY_DB);
-            if stay <= switch {
-                next[s] = stay + obs[i][s];
-                back[i][s] = s as u8;
-            } else {
-                next[s] = switch + obs[i][s];
-                back[i][s] = (1 - s) as u8;
+        let mut next = [0.0f64; 3];
+        for s in 0..3 {
+            // 从哪个前一状态过来最便宜(保持不罚,换档罚 `pen`)
+            let mut best = (0usize, f64::INFINITY);
+            for pv in 0..3 {
+                let c = cost[pv] + if pv == s { 0.0 } else { pen };
+                if c < best.1 {
+                    best = (pv, c);
+                }
             }
+            next[s] = best.1 + obs[i][s];
+            back[i][s] = best.0 as u8;
         }
         cost = next;
     }
-    let mut st = if cost[1] < cost[0] { 1usize } else { 0usize };
+    let mut st = (0..3).min_by(|&a, &b| cost[a].total_cmp(&cost[b])).unwrap_or(0);
     let mut path = vec![0u8; n];
     for i in (0..n).rev() {
         path[i] = st as u8;
@@ -335,8 +350,8 @@ fn fix_octave_inplace(pitchf: &mut [f32], audio16k: &[f32], hop: usize) -> usize
     }
     let mut fixed = 0usize;
     for (i, &s) in path.iter().enumerate() {
-        if s == 1 && pitchf[i] > 20.0 {
-            pitchf[i] *= 2.0;
+        if s > 0 && pitchf[i] > 20.0 {
+            pitchf[i] *= (s + 1) as f32;
             fixed += 1;
         }
     }
@@ -1172,13 +1187,29 @@ mod tests {
             halved.iter().filter(|v| (**v - 400.0).abs() < 1.0).count() >= n_frames * 8 / 10,
             "抬完之后没落在 400 Hz 上"
         );
+        // ⑴b ⭐ **三倍那一支**(实测逼出来的):用户点名的「ぴゃ」上 RMVPE 报的是真 f0 的 **1/3**
+        //     (源实测 1422.6 Hz,轨报 471)。只有 `{fc,2fc}` 时那一段会被抬到 942 ——
+        //     **还是错的,只是换了个错法**。⇒ 真基频 600、轨报 200 ⇒ 必须抬到 600。
+        let audio600 = tone(600.0);
+        let mut third = vec![200.0f32; n_frames];
+        let lifted3 = fix_octave_inplace(&mut third, &audio600, HOP);
+        assert!(
+            lifted3 >= n_frames * 8 / 10,
+            "真基频 600 而轨报 200:只抬了 {lifted3}/{n_frames} 帧"
+        );
+        assert!(
+            third.iter().filter(|v| (**v - 600.0).abs() < 1.0).count() >= n_frames * 8 / 10,
+            "三倍那一支没落在 600 Hz 上(可能只抬到了 400)"
+        );
+
         // ⑵ ⛔ 阴性对照:音频真的就是 200
         let audio200 = tone(200.0);
         let mut genuine = vec![200.0f32; n_frames];
         let moved = fix_octave_inplace(&mut genuine, &audio200, HOP);
         assert_eq!(
             moved, 0,
-            "音频真基频就是 200 Hz,却被抬了 {moved} 帧 —— 这个修复会毁掉正常的低音"
+            "音频真基频就是 200 Hz,却被抬了 {moved} 帧 —— 这个修复会毁掉正常的低音
+             (三个候选 ×1/×2/×3 都不许被选中)"
         );
         // ⑶ 无声帧
         let mut with_rest = vec![200.0f32; n_frames];
