@@ -31,12 +31,35 @@ pub const MIN_COMFORT_SPAN: f32 = 5.0;
 /// Absurdity brake on any tier decision: no material legitimately needs more than ±2
 /// octaves of translation — past that a stale/garbage record is doing the deciding.
 pub const MAX_RANGE_SHIFT: i64 = 24;
-/// Frames a DEAD region must SUSTAIN to count as musical content (≈250 ms on the 100 fps
-/// grid). rmvpe reads breaths/sibilance an octave UP for a few frames at a time; those
-/// phantom islands must never trigger a recolour (S62b field case, lengv2.3 — a handful of
-/// octave-doubled spikes once dragged whole-song shifts; the dead-only world keeps the same
-/// hygiene: a real climax is seconds long and sails through, shorter runs are ignored).
-pub const MIN_VIOLATION_MS: f32 = 250.0;
+/// How long a DEAD region must SUSTAIN to count as musical content, in ms on the 100 fps
+/// grid (counted in VOICED DEAD FRAMES, not span — see the grouping code).
+///
+/// Was 250 ms. The reason was phantom islands: rmvpe reads breaths and sibilance an octave
+/// UP for a few frames at a time, and in S62b (lengv2.3) a handful of octave-doubled spikes
+/// once dragged whole-song shifts. That reason has since been undercut twice — S159k pinned
+/// region edges to unvoiced frames, and S165 put a Viterbi octave repair in front of the
+/// planner — so the door it was holding shut is now mostly bricked up anyway.
+///
+/// Meanwhile it was holding out real notes. Seven segments the user reported as ruined all
+/// sang at 724-1178 Hz against a model whose usable top is 698 Hz; five of them were never
+/// rescued at all, because at 65 % voiced a 400 ms passage only musters ~15 dead frames.
+/// They are not phantoms: their waveform autocorrelation peaks at 0.75-0.94, where genuinely
+/// unvoiced frames sit at p90 = 0.396 (n=122).
+///
+/// Same-tier A/B, three arms, whole song (bad-frame rate on frames the SOURCE sings cleanly):
+///     250 ms  5.85 %   68 regions      100 ms  4.64 %   105 regions
+///     150 ms  5.24 %   91 regions      noise floor between identical configs: 0.03 pp
+/// Both families fell together (spiky 1.57 → 1.36 %, periodicity-collapse 5.17 → 4.04 %),
+/// bad segments went 27 → 15, and the seven reported spots went e.g. 100 → 0 %, 100 → 21 %,
+/// 78 → 22 %. Coverage tracked the fix exactly: every spot that gained coverage improved,
+/// every spot whose coverage did not move did not move either — seven for seven.
+///
+/// Cost checked and found small: the extra 37 regions add ~13 s to a 292 s song (188 → 201 s),
+/// and the edges that land mid-note (the ones that can leave a timbre step) stayed at 18-20 %
+/// of all edges throughout — S159k's edge-snapping holds for the new regions too.
+///
+/// ⚠ 60 ms was measured as well and is not worth it: +2 regions, +0.2 pp coverage, 4 more edges.
+pub const MIN_VIOLATION_MS: f32 = 100.0;
 /// Largest ORIGINAL-index step a dead run may take and still count as ONE sustained region,
 /// in milliseconds. Bridges rmvpe's blips + the voiceless consonants inside a held climax;
 /// a real breath/phrase gap (100-300 ms) must break the region.
@@ -10068,6 +10091,53 @@ mod tests {
         assert_eq!(seen, vec![-9], "donor 闭包收到的必须是移调半音,绝不是帧号");
     }
 
+        /// S165 §105 —— 钉住 [`MIN_VIOLATION_MS`] 的出厂值,以及它两头各自还守着什么。
+    ///
+    /// 它从 250 ms 降到 100 ms,是因为 250 挡掉的不只是幻影:用户报的七处里有五处
+    /// 根本没被救援过,而它们唱在 724-1178 Hz、模型可用顶只有 698 Hz。同 tier 三臂实测
+    /// 全曲坏帧率 5.85 %(250)→ 5.24 %(150)→ 4.64 %(100),两族齐降,坏段 27 → 15。
+    ///
+    /// 这条判据钉三件,缺一不可:
+    /// ⑴ 出厂值就是 100 ms;
+    /// ⑵ **够长的真死区必须成区** —— 10 个浊死帧(= 门槛本身)要救,9 个不救;
+    /// ⑶ ⭐ **幻影岛仍然挡得住** —— 降门槛最该担心的就是这个。rmvpe 把气声读高八度是
+    ///    几帧几帧地读,桥接容差只有 30 ms,所以那些爆点各自独立、每个都远够不着 10 帧。
+    #[test]
+    fn the_dead_region_threshold_ships_at_100ms_and_still_blocks_phantoms() {
+        assert!(
+            (super::MIN_VIOLATION_MS - 100.0).abs() < f32::EPSILON,
+            "出厂门槛应当是 100 ms —— 改它之前先重跑 §105 那组同 tier 三臂 A/B"
+        );
+        let g = super::CoverGrouping::pinned(
+            super::GAP_TOL_MS,
+            super::MIN_VIOLATION_MS,
+            super::COVER_SPLIT_MIN_GAIN,
+            super::COVER_SPLIT_MIN_PART_MS,
+        );
+        // ⑵ 一段连续的高音:10 帧(= 100 ms)要救,9 帧不救。
+        let run_of = |n: usize| {
+            let mut f0 = vec![hz(60.0); 400];
+            f0.extend(vec![hz(95.0); n]);
+            f0.extend(vec![hz(60.0); 400]);
+            f0
+        };
+        let (j10, _) = cover_dead_plan_with(&run_of(10), 100.0, &range(), g);
+        assert!(!j10.is_empty(), "刚好够门槛的真死区必须成区(10 帧 = 100 ms)");
+        let (j9, _) = cover_dead_plan_with(&run_of(9), 100.0, &range(), g);
+        assert!(j9.is_empty(), "差一帧就不该成区,否则门槛形同虚设");
+        // ⑶ 幻影岛:5 组各 3 帧,组间隔 4 帧活帧 > 桥接容差 ⇒ 各自独立,谁也够不着门槛。
+        let mut ph = vec![hz(60.0); 400];
+        for _ in 0..5 {
+            ph.extend(vec![hz(95.0); 3]);
+            ph.extend(vec![hz(60.0); 4]);
+        }
+        ph.extend(vec![hz(60.0); 400]);
+        let (jp, up) = cover_dead_plan_with(&ph, 100.0, &range(), g);
+        assert!(
+            jp.is_empty() && up.is_empty(),
+            "把门槛降到 100 ms 之后,几帧几帧的幻影爆点仍然不许触发染色"
+        );
+    }
     #[test]
     fn cover_plan_min_run_counts_dead_frames_not_span() {
         // 审查 S85d:5 个 3 帧幻影爆点以 ≤40ms 间隙相连 = 跨度 ≥250ms 但浊死帧仅 150ms
