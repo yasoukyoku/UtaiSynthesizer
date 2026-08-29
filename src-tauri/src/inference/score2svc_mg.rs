@@ -1784,8 +1784,17 @@ fn mg_cover_rvc() {
         sample_rate: spec.sample_rate,
         channels: spec.channels,
     };
+    // ⭐ S165 —— `UTAI_COVER_NOISE=<f32>`:扫 `noise_scale`(不设 ⇒ 生产默认 0.66666)。
+    //    ⛔ 探针旋钮,**不动生产默认**。用来验「破音处的包络周期性塌掉」是不是这一路来的:
+    //    实测破音 18 段 源 0.83 → cover 0.49(Δ −0.27),而正常 113 段 Δ +0.00。
+    //    ⚠ RVC 的默认 **0.66666**,而 SoVITS 那条是 **0.4** —— 但「看起来高」不是证据,要扫。
+    let noise = std::env::var("UTAI_COVER_NOISE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 2.0);
     let opts = RvcOptions {
         seed: 0,
+        noise_scale: noise.unwrap_or(RvcOptions::default().noise_scale),
         speaker_id: Some(speaker),
         f0_shift,
         range_extend: want_range,
