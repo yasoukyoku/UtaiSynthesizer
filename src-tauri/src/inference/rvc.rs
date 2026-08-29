@@ -1058,6 +1058,37 @@ pub(crate) fn vc_decode(
         }
     }
 
+    // S165 -- `UTAI_COVER_DUMP_TENSORS=<dir>`: drop the decoder's INPUTS for this chunk.
+    //
+    // Why this exists: ten hypotheses about the cover break-ups were all killed by their own
+    // negative controls (S165 §86). The only fact left is that the envelope periodicity of the
+    // 18 break-up segments is 0.49 while the source is 0.83 and every normal cover segment is
+    // 0.82 -- same lane, same parameters. So the cause has to be in what those 18 positions
+    // feed the decoder, and the only way to see that is to dump it instead of guessing.
+    //
+    // Files (raw little-endian f32): `<dir>/c<chunk>_feats.f32` [T, dim],
+    // `<dir>/c<chunk>_pitchf.f32` [T], `<dir>/c<chunk>_meta.txt` (T, dim, offsets).
+    // Unset => not a single branch runs => byte-identical.
+    if let Ok(dir) = std::env::var("UTAI_COVER_DUMP_TENSORS") {
+        let d = std::path::PathBuf::from(&dir);
+        if std::fs::create_dir_all(&d).is_ok() {
+            let w = |name: &str, v: &[f32]| {
+                let mut b = Vec::with_capacity(v.len() * 4);
+                for x in v {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                let _ = std::fs::write(d.join(format!("c{chunk_idx}_{name}.f32")), &b);
+            };
+            w("feats", &feats.iter().copied().collect::<Vec<f32>>());
+            w("pitchf", pitchf);
+            let _ = std::fs::write(
+                d.join(format!("c{chunk_idx}_meta.txt")),
+                format!("T={} dim={} p_len={}
+", feats.nrows(), feats.ncols(), p_len),
+            );
+        }
+    }
+
     // rnd: N(0,1)·noise_scale, [1, inter_channels, T]. Seeded; the chunk index is mixed in
     // so chunks get independent (but reproducible) noise like the original's fresh randn.
     let rnd = chunk_noise(m.noise_channels, p_len, options.seed, chunk_idx, options.noise_scale);
