@@ -440,6 +440,18 @@ mod f0_probe {
 /// Viterbi as the rest. Filling afterwards would hand the octave logic a run of frames it
 /// never had a chance to judge -- and a wrongly-octaved fill is worse than a hole.
 fn fill_voiced_holes_inplace(f0: &mut [f32], audio16k: &[f32], hop: usize) -> usize {
+    let mut marks = vec![false; f0.len()];
+    fill_voiced_holes_marked(f0, audio16k, hop, &mut marks)
+}
+
+/// 同上,外加把**这一刀写过的帧**记在 `marks` 里
+/// —— [`drop_inconsistent_fills_inplace`] 要它。
+fn fill_voiced_holes_marked(
+    f0: &mut [f32],
+    audio16k: &[f32],
+    hop: usize,
+    marks: &mut [bool],
+) -> usize {
     let min_run = min_hole_frames();
     let mut filled = 0usize;
     let mut i = 0usize;
@@ -460,7 +472,17 @@ fn fill_voiced_holes_inplace(f0: &mut [f32], audio16k: &[f32], hop: usize) -> us
         if i - start < min_run {
             continue;
         }
+        // ⛔⛔ 标记的是**整个洞**,不是「写成功的那些帧」。
+        //    S165 实测:`fill_one` 可能只写洞里的一部分(4:28.650 那个洞它只写了末帧 552),
+        //    剩下的空档随后被 `fill_isolated_uv_inplace` **插值**填上
+        //    (835 = (1118 + 552) / 2,一个字都不差)。
+        //    若只标写成功的帧,那一帧的左右紧邻就都是「洞里没被填的无声帧」,
+        //    而 [`run_anchor`] 一碰到无声就停 ⇒ 取不到锚 ⇒ 整段被跳过。
+        //    ⇒ 标整个洞,「一段」才等于「一个洞」。
         for j in start..i {
+            if j < marks.len() {
+                marks[j] = true;
+            }
             if fill_one(f0, audio16k, hop, j) {
                 filled += 1;
             }
@@ -469,7 +491,165 @@ fn fill_voiced_holes_inplace(f0: &mut [f32], audio16k: &[f32], hop: usize) -> us
     filled
 }
 
-/// 补一帧:量它的波形自相关,够周期才写回音高。返回是否真的写了。
+/// 一段 `[start, end)` 的**锚**:两侧各最多 [`FILL_ANCHOR_FRAMES`] 个真浊音帧的中位。
+/// `skip` 为真的帧不算锚——**补洞自己写的那些不能给自己当参照**。
+/// 碰到真无声就停（再往外是另一个音）；取不到 ⇒ `0.0` = 没有锚。
+fn run_anchor(f0: &[f32], skip: &[bool], start: usize, end: usize) -> f32 {
+    let mut side = |mut k: usize, back: bool| -> Option<f32> {
+        let mut v: Vec<f32> = Vec::new();
+        loop {
+            if back {
+                if k == 0 {
+                    break;
+                }
+                k -= 1;
+            } else {
+                if k >= f0.len() {
+                    break;
+                }
+            }
+            if !skip.get(k).copied().unwrap_or(false) {
+                if f0[k] > 20.0 {
+                    v.push(f0[k]);
+                } else {
+                    break; // 洞外的真无声 ⇒ 再往外是另一个音了,停
+                }
+            }
+            if v.len() >= FILL_ANCHOR_FRAMES {
+                break;
+            }
+            if !back {
+                k += 1;
+            }
+        }
+        if v.is_empty() {
+            return None;
+        }
+        v.sort_by(f32::total_cmp);
+        Some(v[v.len() / 2])
+    };
+    // ⛔ 两侧各取中位再平均 —— 直接把两边的帧混在一起取中位,会被帧数多的那一侧拖过去
+    //    (实测 4:28.310 那个洞:混着取 v[5] 读到 1199,而两侧中位分别是 1058 / 1199)。
+    let l = side(start, true);
+    let r = side(end, false);
+    match (l, r) {
+        (Some(a), Some(b)) => 0.5 * (a + b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => 0.0,
+    }
+}
+
+/// 两侧各取几帧当锚。
+const FILL_ANCHOR_FRAMES: usize = 5;
+
+/// ⭐ 补进来的值相对锚的容许比（倍）。落在 `[anchor/RATIO, anchor*RATIO]`
+/// 之外 ⇒ 交给谱证据裁决。
+///
+/// ⚙ **1.4**：实测 163 段有锚的填充里,`填值/锚` 的 p10 = 0.818、中位 1.002、
+///    p90 = 1.196 ⇒ 1.4 把**正常那一坨整个放行**,同时把 0.5 与 2.0 两个八度各留
+///    **1.43 × 的余量**。
+const FILL_ANCHOR_RATIO: f32 = 1.4;
+
+/// ⭐⭐⭐ S165 —— 把**与自己两侧对不上**的补洞帧撤掉（或搬到对得上的那个八度）。
+///
+/// ⛔ 病因：[`fill_one`] 在 `[F_MIN, F_MAX]` 里**自己找自相关峰、完全不看洞的两侧**,
+///    而在衰减尾/音节间隙上,两倍周期的自相关常常比真周期还高 ⇒ 锁到次谐波。
+///    实测这首歌 163 段有锚的填充：`填值/锚` 有 **119 段（73 %）落在 0.95-1.05**（完全对）,
+///    却拖着一条低尾巴（0.41 / 0.49 / 0.52 / 0.54 / **0.55 = 4:28.310** / **0.60 = 4:28.650** …）,
+///    **它们的锚全在 985-1206 Hz**,即贴着或高于 `F_MAX` 能表示的 1143 Hz。
+///    用户 2026-08-26 报的 4:28.3 与 4:28.638 两条尾巴就是它：补洞把音的释放段写成浊音、
+///    而且写的是次谐波,PSOLA 照着合成 ⇒ f0 以下冒出一团（关掉补洞的对照臂上它们干净消失）。
+///
+/// ⛔⛔ **为什么必须跑在 [`fix_octave_inplace`] 之后**（承重；S165 第一版就栽在这）：
+///    补洞跑在八度修复**之前**,那时的 `f0` 本身就可能整段偏低一个八度
+///    ——「ぴゃ」那一带 RMVPE 读的是 ~710,是后面 Viterbi 整段抬成 1412 的。
+///    在那一层取锚 = 拿一个自己都不可靠的参照去做八度判断，
+///    实测**把 ぴゃ 打坏了 16 帧**（1391→0、1455→364）。
+///    放到修复之后,那一带的填充值（1412）与邻居（1417）自然吻合 ⇒ **一帧都不动**。
+///
+/// 逐段处理被 `marks` 标记的填充：落在锚的 ±[`FILL_ANCHOR_RATIO`] 内 ⇒ 留；
+/// 否则试它的整数倍/整数分之一,**哪个八度在音频里真的站得住就搬到哪个**
+/// （共用 [`OctaveSpec`] 与 [`OCTAVE_OUTLIER_MIN_DB`]）；一个都站不住 ⇒ **撤掉**。
+///
+/// 返回（撤掉的帧数, 搬了八度的帧数）。
+fn drop_inconsistent_fills_inplace(
+    f0: &mut [f32],
+    audio16k: &[f32],
+    hop: usize,
+    marks: &[bool],
+) -> (usize, usize) {
+    if !anchor_enabled() || f0.is_empty() {
+        return (0, 0);
+    }
+    let spec = OctaveSpec::new();
+    let ratio = fill_anchor_ratio();
+    let (mut dropped, mut moved) = (0usize, 0usize);
+    let n = f0.len().min(marks.len());
+    let mut i = 0usize;
+    while i < n {
+        if !marks[i] {
+            i += 1;
+            continue;
+        }
+        let a = i;
+        while i < n && marks[i] {
+            i += 1;
+        }
+        let anchor = run_anchor(f0, marks, a, i);
+        if anchor <= 20.0 {
+            continue; // 没有锚 ⇒ 无从判断,不动
+        }
+        let in_band = |f: f32| f > anchor / ratio && f < anchor * ratio;
+        // ⭐⭐ 判的是**这一段整体**,不是逐帧。
+        //    ⛔ 逐帧会让一条单调下滑的坡从带边溜过去:4:28.310 那个洞填的是
+        //    `856 667 619 571 593` —— 整条都是自相关在衰减尾上一路走低的产物,
+        //    而 856 恰好卡在带内 ⇒ 逐帧判会把它留下,坡还在。
+        let mut vals: Vec<f32> = (a..i).map(|k| f0[k]).filter(|v| *v > 20.0).collect();
+        if vals.is_empty() {
+            continue;
+        }
+        vals.sort_by(f32::total_cmp);
+        if in_band(vals[vals.len() / 2]) {
+            continue; // 整段与两侧对得上 ⇒ 一帧不动
+        }
+        for k in a..i {
+            let v = f0[k];
+            if v <= 20.0 {
+                continue;
+            }
+            let Some(mag) = spec.frame_mag(audio16k, k, hop) else {
+                continue;
+            };
+            let p_v = spec.prominence_db(&mag, f64::from(v));
+            let mut best: Option<(f32, f64)> = None;
+            for m in [2.0f32, 3.0, 0.5, 1.0 / 3.0] {
+                let f = v * m;
+                if !in_band(f) || f64::from(f) >= OCTAVE_SR / 2.0 * 0.9 {
+                    continue;
+                }
+                let d = spec.prominence_db(&mag, f64::from(f)) - p_v;
+                if d >= f64::from(OCTAVE_OUTLIER_MIN_DB) && best.is_none_or(|(_, bd)| d > bd) {
+                    best = Some((f, d));
+                }
+            }
+            match best {
+                Some((f, _)) => {
+                    f0[k] = f;
+                    moved += 1;
+                }
+                None => {
+                    f0[k] = 0.0;
+                    dropped += 1;
+                }
+            }
+        }
+    }
+    (dropped, moved)
+}
+
+/// ⛔ 它**不看洞的两侧** —— 那道一致性闸在 [`drop_inconsistent_fills_inplace`],
+/// 跑在**八度修复之后**。⛔⛔ 不许搬回这一层：S165 试过,把那个 730 ms 的
+/// 「ぴゃ」漏唱打坏了 16 帧 —— 因为此刻的 `f0` 本身就可能整段偏低一个八度。
 fn fill_one(f0: &mut [f32], audio16k: &[f32], hop: usize, i: usize) -> bool {
     /// Above every unvoiced frame measured (p99 = 0.673), far below the hole (0.962).
     const PEAK_GATE: f32 = 0.75;
@@ -528,6 +708,20 @@ fn fill_one(f0: &mut [f32], audio16k: &[f32], hop: usize, i: usize) -> bool {
         return true;
     }
     false
+}
+
+/// ⚙ 出厂开;`UTAI_COVER_FILL_ANCHOR=0` 关掉 ⇒ 逐位回到 S165 §106 那一版。
+fn anchor_enabled() -> bool {
+    !matches!(std::env::var("UTAI_COVER_FILL_ANCHOR").as_deref(), Ok("0"))
+}
+
+/// ⚙ `UTAI_COVER_FILL_ANCHOR_RATIO=<倍>` 可扫;见 [`FILL_ANCHOR_RATIO`]。
+fn fill_anchor_ratio() -> f32 {
+    std::env::var("UTAI_COVER_FILL_ANCHOR_RATIO")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| *v > 1.0 && *v < 4.0)
+        .unwrap_or(FILL_ANCHOR_RATIO)
 }
 
 /// S165 §106 —— 归这一刀管的最小洞长(帧,100 fps)。
@@ -1175,8 +1369,9 @@ pub fn run_pipeline(
     // ⭐ S165 §106 —— **先补 RMVPE 漏掉的长音**(见 [`fill_voiced_holes_inplace`])。
     // ⛔ 必须在八度修复**之前**:补回来的帧要和其余帧一起过 Viterbi。
     // ⚙ 出厂开;`UTAI_COVER_FILL_HOLES=0` 关掉 ⇒ 逐位回到今天。
+    let mut fill_marks = vec![false; f0.len()];
     if !matches!(std::env::var("UTAI_COVER_FILL_HOLES").as_deref(), Ok("0")) {
-        let k = fill_voiced_holes_inplace(&mut f0, &audio_pad, WINDOW);
+        let k = fill_voiced_holes_marked(&mut f0, &audio_pad, WINDOW, &mut fill_marks);
         if k > 0 {
             tracing::info!(
                 "RVC f0: filled {k} frame(s) RMVPE dropped mid-note (autocorr peak >= 0.75) (S165)"
@@ -1204,6 +1399,17 @@ pub fn run_pipeline(
                     "RVC f0: octave-outlier pass fixed {o} isolated frame(s) Viterbi cannot reach (S165)"
                 );
             }
+        }
+    }
+    // ⭐⭐⭐ S165 —— 把与自己两侧对不上的补洞帧撤掉/搬八度。
+    // ⛔⛔ 位置是承重的：必须在八度修复**之后** —— 机理与实测见
+    //    [`drop_inconsistent_fills_inplace`]（放在之前会把「ぴゃ」打坏 16 帧）。
+    if fill_marks.iter().any(|m| *m) {
+        let (d, mv) = drop_inconsistent_fills_inplace(&mut f0, &audio_pad, WINDOW, &fill_marks);
+        if d > 0 || mv > 0 {
+            tracing::info!(
+                "RVC f0: fill-anchor gate dropped {d} and re-octaved {mv} filled frame(s) (S165)"
+            );
         }
     }
     // f0 *= 2^(f0_up_key/12) — applied to the raw Hz track BEFORE coarse quantization
@@ -1877,8 +2083,12 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * 700.0 * i as f32 / SR).sin() * 0.3)
             .collect();
         // 出厂门槛 5 帧:4 帧的洞不许碰,5 帧的要补 —— 两边都钉住,否则门槛可以随便滑。
+        // ⛔ S165 —— 轨上的值必须与音频**一致**（都是 700 Hz）。
+        //    第一版写的是 440,而音频是 700 —— 差一个五度。那时无所谓（补洞不看邻居）,
+        //    加了锚闸（[`hole_anchor`]）之后它就是一个**洞里的音频与两侧对不上**的夹具
+        //    ⇒ 闸拒填是对的,错的是夹具。这条判据要钉的是**洞长门槛**,不是锚闸。
         let hole_of = |len: usize| {
-            let mut f0 = vec![440.0f32; 60];
+            let mut f0 = vec![700.0f32; 60];
             for v in f0.iter_mut().skip(20).take(len) {
                 *v = 0.0;
             }
@@ -1964,10 +2174,15 @@ mod tests {
         let kn = super::fill_voiced_holes_inplace(&mut f0n, &halfp, HOP);
         assert_eq!(kn, 0, "周期性只到 {peak:.3} 的信号不许被补,却补了 {kn} 帧");
         // ⑶ 已经有音高的帧不许被改写(它只补洞,不重估)
+        // ⛔ S165 —— 这一帧的值要与音频**自洽**（690 贴着 700）。
+        //    第一版写 123 Hz —— 与 700 Hz 的音频差 5.7 倍 ⇒ 锚闸会把两侧的洞**整段拒掉**,
+        //    于是这条判据退化成「什么都没填所以也没被改写」= **空判据**。
+        //    ⇒ 下面多钉一条：周围必须真的被填了。
         let mut f0k = vec![0.0f32; 50];
-        f0k[10] = 123.0;
-        super::fill_voiced_holes_inplace(&mut f0k, &tone, HOP);
-        assert!((f0k[10] - 123.0).abs() < f32::EPSILON, "已有音高的帧不许动");
+        f0k[10] = 690.0;
+        let kk = super::fill_voiced_holes_inplace(&mut f0k, &tone, HOP);
+        assert!((f0k[10] - 690.0).abs() < f32::EPSILON, "已有音高的帧不许动");
+        assert!(kk >= 30, "周围必须真的被填了（只填了 {kk} 帧）—— 否则上一条断言是空的");
         // ⑷ 静音不许补(能量为零时自相关没有意义)
         let mut f0s = vec![0.0f32; 50];
         let silence = vec![0.0f32; n];
@@ -2108,6 +2323,147 @@ mod tests {
 
     use super::*;
 
+
+    /// ⭐⭐⭐ S165 —— 补洞的【锚闸】([`drop_inconsistent_fills_inplace`])。
+    ///
+    /// ⛔ 病因:`fill_one` 在 `[F_MIN, F_MAX]` 里**自己找自相关峰、完全不看洞的两侧**,
+    ///    而在衰减尾/音节间隙上,两倍周期的自相关常常比真周期还高 ⇒ 它锁到次谐波。
+    ///    实测这首歌 163 段有锚的填充:`填值/锚` 有 **119 段(73 %)落在 0.95-1.05**,
+    ///    却拖着一条低尾巴(0.41 / 0.49 / 0.52 / 0.54 / **0.55 = 4:28.310** / **0.60 = 4:28.650** …),
+    ///    **它们的锚全在 985-1206 Hz**,即贴着或高于 `F_MAX` 能表示的 1143 Hz。
+    ///    用户 2026-08-26 报的那两条尾巴就是它。
+    ///
+    /// ⛔⛔ **承重的一半是「必须跑在八度修复之后」。** 第一版把闸写在 `fill_one` 里,
+    ///    结果**把「ぴゃ」那个 730 ms 漏唱打坏了 16 帧**(1391→0、1455→364)——
+    ///    因为补洞跑在八度修复之前,那时的 `f0` 本身就整段偏低一个八度
+    ///    (那一带 RMVPE 读 ~710,靠 Viterbi 整段抬成 1412)。
+    ///    ⇒ 这条判据必须**同时**钉住「修得对」和「ぴゃ 一帧不动」。
+    ///
+    /// 五条:
+    /// ⑴ **正常洞**(音频与两侧一致)—— 一帧都不许被撤。
+    /// ⑵ **「ぴゃ」形**(真基频高于搜索上限,整段被读低一个八度)—— 一帧都不许被撤。
+    /// ⑶ **次谐波填充**(两侧 1100,填 619)—— 必须撤掉或搬回对得上的八度。
+    /// ⑷ **锚不算自己**:`run_anchor` 不许把补洞自己写的帧当参照。
+    /// ⑸ 旋钮关掉 ⇒ 一帧不动。
+    #[test]
+    fn a_fill_that_disagrees_with_its_own_edges_is_dropped_but_pika_is_untouched() {
+        const SR: f32 = 16_000.0;
+        const HOP: usize = 160;
+        let n = HOP * 60 + 1600;
+        let tone = |f: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / SR;
+                    let mut v = 0.0f32;
+                    for k in 1..=5 {
+                        let kf = f * k as f32;
+                        if kf < SR / 2.0 * 0.9 {
+                            v += (2.0 * std::f32::consts::PI * kf * t).sin() / k as f32;
+                        }
+                    }
+                    v * 0.3
+                })
+                .collect()
+        };
+        // 帧 20..30 是被补出来的;两侧是真浊音。
+        let make = |edge: f32, fill: f32| -> (Vec<f32>, Vec<bool>) {
+            let mut f0 = vec![edge; 50];
+            let mut m = vec![false; 50];
+            for k in 20..30 {
+                f0[k] = fill;
+                m[k] = true;
+            }
+            (f0, m)
+        };
+
+        // ⑴ 正常:两侧 700,补的也是 700 ⇒ 一帧不动。
+        let a700 = tone(700.0);
+        let (mut f0, m) = make(700.0, 700.0);
+        let before = f0.clone();
+        let (d, mv) = drop_inconsistent_fills_inplace(&mut f0, &a700, HOP, &m);
+        assert_eq!((d, mv), (0, 0), "正常洞被动了({d} 撤 / {mv} 搬)");
+        assert_eq!(f0, before);
+
+        // ⑵ ⛔ 「ぴゃ」形:真基频 1454 高于搜索上限 ⇒ **整段**(补的和两侧)都是 727,
+        //    自洽 ⇒ 一帧都不许被撤。这一条不成立,这一整刀就是净损失。
+        let ahigh = tone(1454.0);
+        let (mut pika, mp) = make(727.0, 727.0);
+        let pb = pika.clone();
+        let (dp, mvp) = drop_inconsistent_fills_inplace(&mut pika, &ahigh, HOP, &mp);
+        assert_eq!(
+            (dp, mvp),
+            (0, 0),
+            "「ぴゃ」形被动了({dp} 撤 / {mvp} 搬)—— 整段一致偏低一个八度是**对的**,\
+             那是后面 Viterbi 的活;在这里动它就是 S165 第一版那个 16 帧的回归"
+        );
+        assert_eq!(pika, pb);
+
+        // ⑶ 次谐波填充:两侧是真的 1100,补进来的是 550(一半)⇒ 必须被处理掉。
+        let a1100 = tone(1100.0);
+        let (mut bad, mb) = make(1100.0, 550.0);
+        let (db, mvb) = drop_inconsistent_fills_inplace(&mut bad, &a1100, HOP, &mb);
+        assert_eq!(db + mvb, 10, "10 帧次谐波填充只处理了 {db}+{mvb} 帧");
+        for k in 20..30 {
+            assert!(
+                bad[k] <= 20.0 || (bad[k] > 1100.0 / 1.4 && bad[k] < 1100.0 * 1.4),
+                "第 {k} 帧留下了 {v:.0} Hz —— 既没撤掉也没搬到对得上的八度",
+                v = bad[k]
+            );
+        }
+        assert!(bad[..20].iter().all(|v| (*v - 1100.0).abs() < f32::EPSILON), "两侧不许被动");
+
+        // ⑷ ⛔ 锚不许把补洞自己写的帧算进去 —— 否则 550 会给 550 当参照,闸永远不开。
+        let (f0b, mb2) = make(1100.0, 550.0);
+        assert!(
+            (run_anchor(&f0b, &mb2, 20, 30) - 1100.0).abs() < 1.0,
+            "锚读到 {a:.0},说明它把补洞自己写的帧当成参照了",
+            a = run_anchor(&f0b, &mb2, 20, 30)
+        );
+
+        // ⑸ ⛔⛔ **锚要能跨过洞里【没被填】的那些无声帧**。
+        //    S165 实测:4:28.650 那个洞 `fill_one` 只写了末帧 552,左边紧邻是同一个洞里
+        //    没被填的空档 ⇒ 第一版的 `run_anchor` 一碰无声就停 ⇒ 取不到锚 ⇒ 整段被跳过,
+        //    那条尾巴原封不动留着。⇒ 标记的是**整个洞**,锚要跳过洞内的无声继续往外找。
+        let mut f0h = vec![1100.0f32; 50];
+        let mut mh = vec![false; 50];
+        for k in 20..30 {
+            mh[k] = true;
+            f0h[k] = 0.0; // 洞里大部分没被填
+        }
+        f0h[29] = 550.0; // 只有末帧写上了(而且是次谐波)
+        assert!(
+            (run_anchor(&f0h, &mh, 20, 30) - 1100.0).abs() < 1.0,
+            "洞里有没填的空档时锚读到 {a:.0} —— 它应当跳过洞内的无声,继续往外找真浊音",
+            a = run_anchor(&f0h, &mh, 20, 30)
+        );
+        let (dh, mvh) = drop_inconsistent_fills_inplace(&mut f0h, &a1100, HOP, &mh);
+        assert_eq!(dh + mvh, 1, "洞里那一帧次谐波没被处理({dh} 撤 / {mvh} 搬)");
+
+        // ⑹ ⛔ 判的是**这一段整体**:一条单调下滑的坡,不许让卡在带边的第一帧溜过去。
+        //    实测 4:28.310 那个洞填的是 856 667 619 571 593(锚 ≈ 1128)——
+        //    逐帧判会把 856 留下,坡还在。
+        let mut ramp = vec![1100.0f32; 50];
+        let mut mr = vec![false; 50];
+        for (j, v) in [856.0f32, 667.0, 619.0, 571.0, 593.0].iter().enumerate() {
+            ramp[20 + j] = *v;
+            mr[20 + j] = true;
+        }
+        let (dr, mvr) = drop_inconsistent_fills_inplace(&mut ramp, &a1100, HOP, &mr);
+        assert_eq!(dr + mvr, 5, "下滑坡只处理了 {dr}+{mvr}/5 帧 —— 856 大概率从带边溜过去了");
+        assert!(
+            ramp[20] <= 20.0 || (ramp[20] > 1100.0 / 1.4 && ramp[20] < 1100.0 * 1.4),
+            "坡的第一帧留下了 {v:.0} Hz",
+            v = ramp[20]
+        );
+
+        // ⑸ 门槛写字面量,不许拿常量自己跟自己比。
+        assert!(
+            FILL_ANCHOR_RATIO > 1.2 && FILL_ANCHOR_RATIO < 1.7,
+            "锚带 {FILL_ANCHOR_RATIO} 掉出了实测区间:p10=0.818 / p90=1.196 要放行,\
+             而 0.5 与 2.0 两个八度要拦住"
+        );
+        assert_eq!(FILL_ANCHOR_FRAMES, 5);
+    }
 
     /// ⭐⭐⭐ S165 —— 【孤立八度离群帧】的补刀([`fix_octave_outliers_inplace`])。
     ///
