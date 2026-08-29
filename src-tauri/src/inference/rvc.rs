@@ -65,17 +65,23 @@ struct ChunkTier {
 }
 
 /// S165 -- `UTAI_COVER_FLATTEN_MS=<ms>`: lift the quiet stretches of the input envelope
-/// with a running-RMS window before the model sees it. **On by default at 100 ms**;
-/// `UTAI_COVER_FLATTEN_MS=0` turns it off.
+/// with a running-RMS window before the model sees it. **Off by default — it was rendered,
+/// measured, and it makes things worse.**
 ///
-/// Flipped on after three rulers -- each of which had to pass its own negative controls --
-/// agreed on the direction (see the call site for why the shape is one-sided):
-///   spectral flatness (noise-ness):        2 better, 0 worse, 7 unchanged
-///   spectral-structure similarity to src:  8 better, 1 worse, 0 unchanged, p50 +0.099
-///   whole-song bad-window rate:            5.8% -> 3.0%
-/// and the source envelope is tracked BETTER afterwards, not worse (r 0.734 -> 0.861).
-/// ⚠ The one segment that all three call worse is 4:05.4, inside the region the user
-/// flagged as its own kind of damage -- tracked separately, not a reason to hold this back.
+/// It shipped on for a few hours on the strength of a comparison that turned out to be
+/// worthless: the baseline arm happened to render at a 19 s chunk tier and the treated arm
+/// at 32 s, and *that* was the entire "123 bad segments down to 27". See the tier lock in
+/// `tier_for_this_song` for why the tier moved on its own.
+///
+/// Redone with all four arms pinned to the same tier, twice each:
+///     off  5.88%  5.85%      on  6.33%  6.34%      (bad-frame rate, whole song)
+/// Two renders of the same config land within 0.01-0.03 pp of each other, so the +0.45 pp
+/// the lift costs is roughly fifteen times the noise floor, and it reproduces. The user had
+/// said it plainly after listening — "basically no improvement over the octave-fix build" —
+/// while every ruler I had was still reporting a large win.
+///
+/// Kept reachable rather than deleted so the arm stays falsifiable, and so the next person
+/// who has this idea finds the measurement instead of re-running it.
 fn cover_flatten_ms() -> Option<f32> {
     parse_flatten_ms(std::env::var("UTAI_COVER_FLATTEN_MS").ok().as_deref())
 }
@@ -83,14 +89,12 @@ fn cover_flatten_ms() -> Option<f32> {
 /// The parsing half of [`cover_flatten_ms`], split out so it can be pinned by a test
 /// without touching process-wide env (which would race the rest of the suite).
 fn parse_flatten_ms(raw: Option<&str>) -> Option<f32> {
-    /// ⛔ Do not change without re-running the three-ruler acceptance in S165 §99.
-    const DEFAULT_MS: f32 = 100.0;
+    /// ⛔ 0 = off. Measured worse than off (see [`cover_flatten_ms`]); do not flip back
+    /// without a same-tier A/B that beats the 0.03 pp noise floor.
+    const DEFAULT_MS: f32 = 0.0;
     match raw {
         Some(v) => {
             let t = v.trim();
-            // An explicit 0 (or anything out of range) is a deliberate OFF, not a typo we
-            // should paper over with the default -- the arm has to stay reachable, or the
-            // knob stops being falsifiable.
             if t == "0" {
                 return None;
             }
@@ -98,7 +102,7 @@ fn parse_flatten_ms(raw: Option<&str>) -> Option<f32> {
                 .ok()
                 .filter(|v| v.is_finite() && *v >= 10.0 && *v <= 1000.0)
         }
-        None => Some(DEFAULT_MS),
+        None => (DEFAULT_MS > 0.0).then_some(DEFAULT_MS),
     }
 }
 
@@ -1482,21 +1486,25 @@ mod tests {
     }
 
 
-    /// S165 —— 钉住输入包络提升的**出厂值**。
+    /// S165 §102 —— 钉住输入包络提升**出厂是关的**。
     ///
-    /// 这一刀是翻了默认的(不再是探针),所以它值多少必须有判据看着 —— 三把尺子各自过了
-    /// 自己的阴性对照之后才翻的:谱平坦度 2 好 0 坏、谱结构相似度 8 好 1 坏(p50 +0.099)、
-    /// 全曲坏窗率 5.8% → 3.0%,而且源包络反而**更**还原得住(r 0.734 → 0.861)。
+    /// 它曾经开了几个小时,依据是一组**假对照**:基线臂恰好跑在 19 s chunk tier、
+    /// 处理臂恰好跑在 32 s,那个「坏段 123→27」全是 tier 差出来的(见 `tier_for_this_song`)。
+    /// 四条臂钉死在同一个 tier、开关各渲两遍之后:
+    ///     关 5.88% / 5.85%      开 6.33% / 6.34%
+    /// 同配置两遍只差 0.01-0.03 pp,而这一刀稳定要 +0.45 pp ⇒ **十五倍于噪声底,且可复现**。
+    /// ⭐ 用户当时听完就说了「跟八度修复那版比基本没什么明显进步」——**耳朵是对的,尺子是脏的**。
     ///
     /// ⚠ 第二条断言(显式 `0` 必须真的关掉)不是形式主义:阴性臂要是被默认值悄悄吃掉,
     /// 以后就再也没法证伪这把刀了 —— S129「一条从没被执行过的错误分支就是一条空判据」。
     #[test]
-    fn the_input_envelope_lift_ships_on_at_100ms_and_stays_switchable() {
-        // ⑴ 没设环境变量 = 出厂 ⇒ 开着,100 ms
+    fn the_input_envelope_lift_ships_off_after_measuring_worse() {
+        // ⑴ 没设环境变量 = 出厂 ⇒ **关**(同 tier 四臂实测:开 6.33/6.34% vs 关 5.88/5.85%,
+        //    而同配置两遍只差 0.01-0.03 pp ⇒ 这一刀稳定地把结果推坏 0.45 pp)
         assert_eq!(
             super::parse_flatten_ms(None),
-            Some(100.0),
-            "出厂应当是开着的 100 ms —— 改这个值前先重跑 S165 §99 的三尺子验收"
+            None,
+            "出厂必须是关的 —— 想翻回去先拿一组【同 tier】的 A/B 打赢 0.03 pp 的噪声底"
         );
         // ⑵ 显式 0 = 关(阴性臂必须可达)
         assert_eq!(super::parse_flatten_ms(Some("0")), None, "显式 0 必须真的关掉");
