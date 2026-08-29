@@ -213,12 +213,43 @@ fn tier_for_this_song_with(
     })
 }
 
+/// ⭐⭐ S165 —— `UTAI_RVC_CHUNK_MAX_S=<秒>` 把 chunk tier **钉死**在不大于它的第一档。
+///
+/// ⛔⛔ 为什么必须有它:tier 是按【渲染那一刻的可用 commit】选的,**不是配置的一部分**
+///    ⇒ 同一份代码、同一条命令,两条臂可以跑出不同的 tier;而实测 19 s 臂的坏率
+///    **13.0-13.6 %**、32 s 臂 **6.2-6.4 %**(整整翻倍)⇒ **任何 A/B 都可能是这个在说话**,
+///    而不是被测的那把刀。S165 这一天里它坏掉过三次对照。
+///    ⚠ 光靠「渲染前等 commit 回到 7900 MB」拦不住:等到的那一刻与 tier 真正被选的那一刻
+///    之间隔着模型加载,中间还会被别的进程吃掉。
+/// ⚙ 不设 = 今天的自动选择(**逐位不变**);设了就绕过自动选择与 session memo。
+/// ⛔ 它**不保证**这一档跑得起来 —— 钉高了就该 OOM,那是使用者的选择,不是这里的判断。
+fn chunk_max_s() -> Option<f32> {
+    chunk_max_s_from(std::env::var("UTAI_RVC_CHUNK_MAX_S").ok().as_deref())
+}
+
+/// env 解析写成纯函数 —— 判据不许去碰进程状态（同 `parse_infrasonic_ms`）。
+fn chunk_max_s_from(v: Option<&str>) -> Option<f32> {
+    let v: f32 = v?.trim().parse().ok()?;
+    (v > 0.0).then_some(v)
+}
 fn pick_chunk_tier(engine: &OnnxEngine, voice_session: &str) -> &'static ChunkTier {
     // A concurrently evicted session resolves to None (reload-on-miss rebuilds it inside
     // run_typed, AFTER this pick) — fall back to the global preference so an explicit
     // DirectML choice never silently loses the tiering (review round 2). Auto stays
     // conservative-false: the window is one eviction race wide, and guessing DML on a
     // CUDA box would needlessly shorten its chunks.
+    // ⭐ 钉死的 tier 绕过自动选择与 session memo。见 [`chunk_max_s`]。
+    if let Some(pin) = chunk_max_s() {
+        let t = CHUNK_TIERS
+            .iter()
+            .find(|t| (t.x_max as f32) <= pin)
+            .unwrap_or(CHUNK_TIERS.last().expect("tiers non-empty"));
+        tracing::info!(
+            "RVC chunk tier lowered to x_max={} s (pinned by UTAI_RVC_CHUNK_MAX_S={pin}) (S165)",
+            t.x_max
+        );
+        return t;
+    }
     let resolved = engine.resolved_device(voice_session);
     let is_dml = resolved
         .as_deref()
@@ -511,6 +542,185 @@ fn min_hole_frames() -> usize {
 }
 
 
+/// 八度判据用的分析采样率。⛔ 与 RVC 的 16 kHz f0 链一致,不是渲染采样率。
+const OCTAVE_SR: f64 = 16_000.0;
+
+/// ⭐ S165 —— 八度判据的**唯一一份**谱算子(40 ms 汉宁窗 + 谐波突出度)。
+///
+/// ⛔ 为什么要有它:[`fix_octave_inplace`] 与 [`fix_octave_outliers_inplace`] 必须用
+///    **同一把尺子**。两遍各写一份 = 两把会各自漂移的尺子,而第二遍的门槛
+///    ([`OCTAVE_OUTLIER_MIN_DB`])是**照着第一遍量出来的读数**定的 —— 尺子一漂,
+///    那个门槛就悄悄失去含义。
+struct OctaveSpec {
+    win: usize,
+    nfft: usize,
+    w: Vec<f64>,
+}
+
+impl OctaveSpec {
+    fn new() -> Self {
+        let win = (0.040 * OCTAVE_SR) as usize; // 40 ms
+        let nfft = win.next_power_of_two();
+        // 汉宁窗(一次算好)
+        let w: Vec<f64> = (0..win)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / win as f64).cos())
+            .collect();
+        Self { win, nfft, w }
+    }
+
+    /// 第 `i` 帧(`hop` 栅,窗以帧心为中心)的幅度谱;窗越界 ⇒ `None`。
+    fn frame_mag(&self, audio16k: &[f32], i: usize, hop: usize) -> Option<Vec<f64>> {
+        let c = i * hop;
+        let a = c.saturating_sub(self.win / 2);
+        if a + self.win > audio16k.len() {
+            return None;
+        }
+        let mut re: Vec<f64> = (0..self.nfft)
+            .map(|k| if k < self.win { f64::from(audio16k[a + k]) * self.w[k] } else { 0.0 })
+            .collect();
+        let mut im = vec![0.0f64; self.nfft];
+        octave_fft(&mut re, &mut im);
+        Some((0..=self.nfft / 2).map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt()).collect())
+    }
+
+    /// `f` 处的谐波突出度(dB)= `f` 附近的峰 / `0.5f` 与 `1.5f` 两处的背景。
+    fn prominence_db(&self, mag: &[f64], f: f64) -> f64 {
+        let nfft = self.nfft;
+        let bin = |x: f64| -> f64 { x * nfft as f64 / OCTAVE_SR };
+        let peak = {
+            let (lo, hi) = (bin(f * 0.88).floor().max(0.0) as usize, bin(f * 1.12).ceil() as usize);
+            mag[lo.min(nfft / 2)..=hi.min(nfft / 2)].iter().copied().fold(0.0f64, f64::max)
+        };
+        let bg = {
+            let mut v = Vec::new();
+            for k in [0.5f64, 1.5] {
+                let (lo, hi) =
+                    (bin(f * k * 0.92).floor().max(0.0) as usize, bin(f * k * 1.08).ceil() as usize);
+                let sl = &mag[lo.min(nfft / 2)..=hi.min(nfft / 2)];
+                if !sl.is_empty() {
+                    v.push(sl.iter().sum::<f64>() / sl.len() as f64);
+                }
+            }
+            if v.is_empty() { 1e-12 } else { v.iter().sum::<f64>() / v.len() as f64 }
+        };
+        20.0 * (peak.max(1e-12) / bg.max(1e-12)).log10()
+    }
+}
+
+/// ⭐ 孤立八度离群帧的**谱证据**门槛(dB)。见 [`fix_octave_outliers_inplace`]。
+///
+/// ⚙ **8 dB**:实测这首歌全部四个候选,`prom(2f) − prom(f)` 分成泾渭分明的两族 ——
+///    真的错:`4:25.960` **+21.8** · `4:28.640` **+15.4**
+///    真的低音起音:`4:26.910` **+0.7** · `4:34.180` **−6.0**
+///    ⇒ 空档是 `0.65 … 15.41`,取中点 **8.03** ⇒ 两边各留 ≥7 dB 余量。
+///    ⛔ 别调成「差不多就行」的小数:这道门是这一遍**唯一**的防误伤手段。
+const OCTAVE_OUTLIER_MIN_DB: f32 = 8.0;
+
+/// 孤立游程的最大长度(帧)。⛔ 超过它的就是**成段**的错,归 [`fix_octave_inplace`] 的
+/// Viterbi 管 —— 那里有时间连续性,这里没有。
+const OCTAVE_OUTLIER_MAX_RUN: usize = 2;
+
+/// 修完之后的 f0 至少要有这么高(Hz),否则这一帧不动。
+const OCTAVE_OUTLIER_MIN_HZ: f64 = 50.0;
+
+/// ⭐⭐⭐ S165 —— 【孤立八度离群帧】的补刀。
+///
+/// ⛔⛔ **为什么 [`fix_octave_inplace`] 结构上修不动这一类**(这才是这个函数存在的理由):
+///    那一遍是 Viterbi,换档罚 [`OCTAVE_SWITCH_PENALTY_DB`] = 12 dB **每次**。
+///    一个**单帧**的八度错要「换上去、再换回来」⇒ 付 **两次 = 24 dB**,
+///    而实测证据只有 15.4 dB(`4:28.640` 那一帧:`prom(559 Hz) = 10.17`,
+///    `prom(1118 Hz) = 25.58`)⇒ **它永远赢不了**,和罚值定得对不对无关。
+///    ⚠ 岛**末**帧更糟:下一帧无声,`obs = [0, 1e9, 1e9]` 把状态硬拽回 `×1`,
+///    连「换上去就不用换回来」这条退路都没有。
+///
+/// ⭐ 症状:喂给 PSOLA 的 f0 在那一帧只有真值的一半 ⇒ 颗粒按**两倍周期**摆
+///    ⇒ 输出多出一条 `f0/2` 的次谐波。用户 2026-08-26 点名的 `4:28.630` 就是它:
+///    1150/2350/3550 那一摞谐波突然断掉,同时 ~575 Hz 冒出一团,源与纯 base 都没有。
+///    全曲统计:岛**末**帧掉半 0.8 %、岛**首**帧 0.8 %,而岛**内**只有 0.01 %
+///    ⇒ 边界处富集 **142 ×**。
+///
+/// ⛔ 它**不是**「把 [`OCTAVE_SWITCH_PENALTY_DB`] 调小」的替代品:调小罚值会放松**全曲**的
+///    成段判据(S160 已判负逐帧独立版),而这一遍只在**孤立短游程**上开口 ——
+///    成段的错它一帧都碰不到(见 [`OCTAVE_OUTLIER_MAX_RUN`])。
+///
+/// 返回改动的帧数。
+fn fix_octave_outliers_inplace(pitchf: &mut [f32], audio16k: &[f32], hop: usize) -> usize {
+    if pitchf.is_empty() || audio16k.len() < 4 * hop {
+        return 0;
+    }
+    let spec = OctaveSpec::new();
+    let n = pitchf.len();
+    let voiced = |v: f32| v > 20.0;
+    let mut fixed = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        if !voiced(pitchf[i]) {
+            i += 1;
+            continue;
+        }
+        // 这个浊音岛 `[a, b)`。⛔ 邻居只在**岛内**取:隔着无声的两个音本来就可以差一个八度。
+        let a = i;
+        let mut b = i;
+        while b < n && voiced(pitchf[b]) {
+            b += 1;
+        }
+        i = b;
+        let mut s = a;
+        while s < b {
+            let mut hit = 0usize;
+            'run: for l in 1..=OCTAVE_OUTLIER_MAX_RUN {
+                if s + l > b {
+                    break;
+                }
+                let left = (s > a).then(|| f64::from(pitchf[s - 1]));
+                let right = (s + l < b).then(|| f64::from(pitchf[s + l]));
+                if left.is_none() && right.is_none() {
+                    // 整个岛都在游程里 ⇒ 没有参照,不动(那是成段的错,归 Viterbi)。
+                    break;
+                }
+                // `up = true` ⇒ 这一段被读成了**一半**,要 ×2;`false` ⇒ 被读成两倍,要 ×0.5。
+                for up in [true, false] {
+                    let (lo_r, hi_r) = if up { (0.42, 0.62) } else { (1.65, 2.40) };
+                    let shaped = (s..s + l).all(|k| {
+                        let v = f64::from(pitchf[k]);
+                        [left, right].iter().flatten().all(|&nb| {
+                            let r = v / nb;
+                            r > lo_r && r < hi_r
+                        })
+                    });
+                    if !shaped {
+                        continue;
+                    }
+                    // 谱证据:游程里**每一帧**都要过门,不许拿一帧的证据去改两帧。
+                    let proven = (s..s + l).all(|k| {
+                        let f = f64::from(pitchf[k]);
+                        let tgt = if up { 2.0 * f } else { 0.5 * f };
+                        if tgt < OCTAVE_OUTLIER_MIN_HZ || tgt >= OCTAVE_SR / 2.0 * 0.9 {
+                            return false;
+                        }
+                        let Some(mag) = spec.frame_mag(audio16k, k, hop) else {
+                            return false;
+                        };
+                        spec.prominence_db(&mag, tgt) - spec.prominence_db(&mag, f)
+                            >= f64::from(OCTAVE_OUTLIER_MIN_DB)
+                    });
+                    if !proven {
+                        continue;
+                    }
+                    for k in s..s + l {
+                        pitchf[k] *= if up { 2.0 } else { 0.5 };
+                        fixed += 1;
+                    }
+                    hit = l;
+                    break 'run;
+                }
+            }
+            s += hit.max(1);
+        }
+    }
+    fixed
+}
+
 /// ⭐⭐⭐⭐⭐ S165 —— **修 RMVPE 的八度错**(把真基频报成 1/2)。
 ///
 /// # ⛔ 它为什么必须存在
@@ -554,56 +764,24 @@ fn fix_octave_inplace(pitchf: &mut [f32], audio16k: &[f32], hop: usize) -> usize
     if pitchf.is_empty() || audio16k.len() < 4 * hop {
         return 0;
     }
-    const SR: f64 = 16_000.0;
-    let win = (0.040 * SR) as usize; // 40 ms
-    let nfft = win.next_power_of_two();
-    // 汉宁窗(一次算好)
-    let w: Vec<f64> = (0..win)
-        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / win as f64).cos())
-        .collect();
+    let spec = OctaveSpec::new();
     // 每帧三个状态(×1 / ×2 / ×3)的观测代价
     let mut obs: Vec<[f64; 3]> = Vec::with_capacity(pitchf.len());
     for (i, &fc) in pitchf.iter().enumerate() {
-        if fc <= 20.0 || 2.0 * f64::from(fc) >= SR / 2.0 * 0.9 {
+        if fc <= 20.0 || 2.0 * f64::from(fc) >= OCTAVE_SR / 2.0 * 0.9 {
             obs.push([0.0, 1e9, 1e9]); // 无声/太高 ⇒ 只能保持
             continue;
         }
-        let c = i * hop;
-        let a = c.saturating_sub(win / 2);
-        if a + win > audio16k.len() {
+        let Some(mag) = spec.frame_mag(audio16k, i, hop) else {
             obs.push([0.0, 1e9, 1e9]);
             continue;
-        }
-        let mut re: Vec<f64> = (0..nfft)
-            .map(|k| if k < win { f64::from(audio16k[a + k]) * w[k] } else { 0.0 })
-            .collect();
-        let mut im = vec![0.0f64; nfft];
-        octave_fft(&mut re, &mut im);
-        let mag: Vec<f64> =
-            (0..=nfft / 2).map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt()).collect();
-        let bin = |f: f64| -> f64 { f * nfft as f64 / SR };
-        let peak = |f: f64| -> f64 {
-            let (lo, hi) = (bin(f * 0.88).floor().max(0.0) as usize, bin(f * 1.12).ceil() as usize);
-            mag[lo.min(nfft / 2)..=hi.min(nfft / 2)].iter().copied().fold(0.0f64, f64::max)
-        };
-        let bg = |f: f64| -> f64 {
-            let mut v = Vec::new();
-            for k in [0.5f64, 1.5] {
-                let (lo, hi) =
-                    (bin(f * k * 0.92).floor().max(0.0) as usize, bin(f * k * 1.08).ceil() as usize);
-                let sl = &mag[lo.min(nfft / 2)..=hi.min(nfft / 2)];
-                if !sl.is_empty() {
-                    v.push(sl.iter().sum::<f64>() / sl.len() as f64);
-                }
-            }
-            if v.is_empty() { 1e-12 } else { v.iter().sum::<f64>() / v.len() as f64 }
         };
         let f = f64::from(fc);
-        let p1 = 20.0 * (peak(f).max(1e-12) / bg(f).max(1e-12)).log10();
-        let p2 = 20.0 * (peak(2.0 * f).max(1e-12) / bg(2.0 * f).max(1e-12)).log10();
+        let p1 = spec.prominence_db(&mag, f);
+        let p2 = spec.prominence_db(&mag, 2.0 * f);
         // ⭐ 3 倍那一支:超出 Nyquist 就直接不可用(而不是读到一个折叠回来的假峰)。
-        let p3 = if 3.0 * f < SR / 2.0 * 0.9 {
-            20.0 * (peak(3.0 * f).max(1e-12) / bg(3.0 * f).max(1e-12)).log10()
+        let p3 = if 3.0 * f < OCTAVE_SR / 2.0 * 0.9 {
+            spec.prominence_db(&mag, 3.0 * f)
         } else {
             -1e9
         };
@@ -1015,6 +1193,17 @@ pub fn run_pipeline(
             );
         } else {
             tracing::info!("RVC f0: octave-repair found nothing to lift (S165)");
+        }
+        // ⭐⭐ S165 —— Viterbi 结构上够不着的【孤立单帧】那一类
+        // （机理与为什么必须单独一遍，见 [`fix_octave_outliers_inplace`]）。
+        // ⚙ 出厂开；`UTAI_COVER_OCTAVE_OUTLIER=0` 关掉 ⇒ 逐位回到只有 Viterbi 那一遍。
+        if !matches!(std::env::var("UTAI_COVER_OCTAVE_OUTLIER").as_deref(), Ok("0")) {
+            let o = fix_octave_outliers_inplace(&mut f0, &audio_pad, WINDOW);
+            if o > 0 {
+                tracing::info!(
+                    "RVC f0: octave-outlier pass fixed {o} isolated frame(s) Viterbi cannot reach (S165)"
+                );
+            }
         }
     }
     // f0 *= 2^(f0_up_key/12) — applied to the raw Hz track BEFORE coarse quantization
@@ -1919,6 +2108,170 @@ mod tests {
 
     use super::*;
 
+
+    /// ⭐⭐⭐ S165 —— 【孤立八度离群帧】的补刀([`fix_octave_outliers_inplace`])。
+    ///
+    /// ⛔⛔ 这条判据的**承重点是「Viterbi 修不动」那一半** —— 没有它,这一整遍看起来
+    ///    只是 [`fix_octave_inplace`] 的重复,下一个人会顺手把它删掉。
+    ///    机理:换档罚 12 dB 要付**两次**(换上去、再换回来),而单帧的证据够不到 24 dB;
+    ///    岛**末**帧还更糟——下一帧无声,`obs = [0, 1e9, 1e9]` 把状态硬拽回 `×1`。
+    ///
+    /// ⛔⛔ **夹具必须先复现真实条件**(第一版就栽在这):纯合成音上证据差 **73.7 dB**,
+    ///    Viterbi 一下就修了 ⇒ 那个夹具证明不了任何事,只证明「合成音太干净」。
+    ///    真实的 `4:28.640` 是 `prom(559) = 10.17` / `prom(1118) = 25.58` / 差 **15.41**。
+    ///    ⇒ 这里掺 `NOISE_AMP` 的确定性噪声底把差压到 **≈15 dB**,并**在判据里当场量一遍**
+    ///    确认它落在 `(12, 24)` —— 12 = 一次换档罚,24 = 单帧要付的两次。
+    ///
+    /// 五条:
+    /// ⑴ **夹具自检**:证据差真的落在 `(12, 24)`。
+    /// ⑵ **阳性(岛末)**:真基频 400、只有**最后一帧**报成 200 ⇒ 补刀遍抬回 400。
+    /// ⑶ ⛔ **同一份输入上,只跑 Viterbi 抬不动它**。
+    /// ⑷ **阴性(真的低音)**:那一帧的音频**本来就是** 200 Hz ⇒ 一帧都不许动。
+    /// ⑸ **成段的错不归它管**:5 帧连着报成一半 ⇒ 超过 `OCTAVE_OUTLIER_MAX_RUN` ⇒ 不碰。
+    #[test]
+    fn an_isolated_halved_frame_is_lifted_where_viterbi_structurally_cannot() {
+        const SR: f32 = 16_000.0;
+        const HOP: usize = 160; // 100 fps
+        // 把证据差压进真实区间的噪声幅度(标定见 doc)。
+        const NOISE_AMP: f32 = 0.35;
+        let n_frames = 60usize;
+        let n = n_frames * HOP + 4 * HOP;
+        // 确定性噪声底(LCG;⛔ 不许用真随机 —— 判据要能逐位复现)
+        let noise: Vec<f32> = {
+            let mut st: u32 = 12345;
+            (0..n)
+                .map(|_| {
+                    st = st.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (st as f32 / 4_294_967_296.0) * 2.0 - 1.0
+                })
+                .collect()
+        };
+        // 真基频 `f` 的多谐波音 + 噪声底;`swap` 指定的样本区间换成另一个基频。
+        let tone = |f: f32, swap: Option<(usize, usize, f32)>| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / SR;
+                    let f = match swap {
+                        Some((a, b, g)) if i >= a && i < b => g,
+                        _ => f,
+                    };
+                    let mut v = 0.0f32;
+                    for k in 1..=6 {
+                        let kf = f * k as f32;
+                        if kf < SR / 2.0 * 0.9 {
+                            v += (2.0 * std::f32::consts::PI * kf * t).sin() / k as f32;
+                        }
+                    }
+                    v * 0.3 + NOISE_AMP * noise[i]
+                })
+                .collect()
+        };
+        let audio400 = tone(400.0, None);
+        let last = n_frames - 1;
+
+        // ⑴ 夹具自检 —— 拿引擎**自己那把尺子**量,不许另写一份。
+        let spec = OctaveSpec::new();
+        let mag = spec.frame_mag(&audio400, last, HOP).expect("末帧的窗越界了");
+        let gap = spec.prominence_db(&mag, 400.0) - spec.prominence_db(&mag, 200.0);
+        assert!(
+            (12.0..24.0).contains(&gap),
+            "夹具没复现真实条件:证据差 {gap:.2} dB 不在 (12, 24) 里 —— \
+             低于 12 连补刀遍都不该修,高于 24 则 Viterbi 自己就修了,\
+             两种情况下这条判据都证明不了 `fix_octave_outliers_inplace` 存在的必要"
+        );
+
+        // ⑵ 岛末单帧:后面必须真的接无声 —— 「岛末」正是它比岛内更难修的原因。
+        let mut edge = vec![400.0f32; n_frames];
+        edge[last] = 200.0;
+        edge.extend(std::iter::repeat_n(0.0f32, 20));
+        let mut both = edge.clone();
+        let moved = fix_octave_outliers_inplace(&mut both, &audio400, HOP);
+        assert_eq!(moved, 1, "岛末那一帧没被补刀遍抬起来(改动 {moved} 帧)");
+        assert!((both[last] - 400.0).abs() < 1.0, "抬完没落在 400 Hz 上:{}", both[last]);
+        assert!(
+            both[..last].iter().all(|v| (*v - 400.0).abs() < 1.0),
+            "补刀遍动了它不该动的帧"
+        );
+        assert!(both[n_frames..].iter().all(|v| *v == 0.0), "补刀遍动了无声帧");
+
+        // ⑶ ⛔ 承重:同一份输入,**只跑 Viterbi 那一遍**抬不动它。
+        let mut viterbi_only = edge.clone();
+        fix_octave_inplace(&mut viterbi_only, &audio400, HOP);
+        assert!(
+            (viterbi_only[last] - 200.0).abs() < 1.0,
+            "Viterbi 居然抬动了岛末单帧({} Hz)—— 那这一整遍补刀就是多余的,\
+             说明换档罚或观测代价被改过,这条判据与 `fix_octave_outliers_inplace` 的\
+             存在理由都要重新算",
+            viterbi_only[last]
+        );
+
+        // ⑷ 阴性:那一帧的音频**真的是** 200 Hz ⇒ 谱证据反向 ⇒ 一帧都不许动。
+        //    窗是 40 ms(±320 样本),真低音那一段要足够宽才不会被邻帧的 400 盖住。
+        let c = last * HOP;
+        let genuine_audio = tone(400.0, Some((c - 400, c + 400, 200.0)));
+        let mut genuine = edge.clone();
+        let moved_g = fix_octave_outliers_inplace(&mut genuine, &genuine_audio, HOP);
+        assert_eq!(
+            moved_g, 0,
+            "音频那一帧本来就是 200 Hz,补刀遍却动了 {moved_g} 帧 —— 谱证据的门失效了"
+        );
+
+        // ⑸ 成段的错(5 帧)不归它管 —— 那是 Viterbi 的活,这里一帧都不许碰。
+        let mut run5 = vec![400.0f32; n_frames];
+        for v in run5.iter_mut().take(30).skip(25) {
+            *v = 200.0;
+        }
+        let before = run5.clone();
+        let moved_r = fix_octave_outliers_inplace(&mut run5, &audio400, HOP);
+        assert_eq!(
+            moved_r, 0,
+            "5 帧的成段错超过 OCTAVE_OUTLIER_MAX_RUN,补刀遍却动了 {moved_r} 帧"
+        );
+        assert_eq!(run5, before);
+    }
+    /// ⛔⛔ S165 —— chunk tier 钉死旋钮([`chunk_max_s`])。
+    ///
+    /// 它存在的唯一理由是**让 A/B 成立**:tier 按渲染那一刻的可用 commit 选,
+    /// 实测 19 s 臂坏率 13.0-13.6 % vs 32 s 臂 6.2-6.4 % ⇒ tier 不同的两条臂没有可比性。
+    /// ⇒ ⑴ 不设 = `None`(逐位回到自动选择);⑵ 设了要落在**不大于它**的第一档;
+    ///    ⑶ 比最小档还小 ⇒ 落到最小档(而不是 panic 或回到默认)。
+    #[test]
+    fn the_chunk_tier_can_be_pinned_so_two_arms_are_comparable() {
+        // ⑴ 解析:只认正数
+        assert_eq!(super::chunk_max_s_from(None), None);
+        assert_eq!(super::chunk_max_s_from(Some("")), None);
+        assert_eq!(super::chunk_max_s_from(Some("0")), None);
+        assert_eq!(super::chunk_max_s_from(Some("-5")), None);
+        assert_eq!(super::chunk_max_s_from(Some(" 32 ")), Some(32.0));
+        // ⑵/⑶ 选档:`find(x_max <= pin)`,兜底最小档
+        let pick = |pin: f32| -> usize {
+            super::CHUNK_TIERS
+                .iter()
+                .find(|t| (t.x_max as f32) <= pin)
+                .unwrap_or(super::CHUNK_TIERS.last().expect("tiers non-empty"))
+                .x_max
+        };
+        assert_eq!(pick(41.0), 41, "钉在最大档应当就是最大档");
+        assert_eq!(pick(32.0), 32);
+        assert_eq!(pick(40.0), 32, "钉 40 拿不到 41,应当降到 32");
+        assert_eq!(pick(1.0), super::CHUNK_TIERS.last().unwrap().x_max, "钉得比最小档还小 ⇒ 最小档");
+        // ⛔ 承重:至少要有两档,否则「钉死」这件事本身没有意义
+        assert!(super::CHUNK_TIERS.len() >= 2);
+    }
+    /// ⛔ S165 —— 补刀遍的门槛是**照实测的空档**定的,不许被悄悄调松。
+    ///
+    /// 实测四个候选的 `prom(2f) − prom(f)`:真的错 +21.8 / +15.4,真的低音起音 +0.7 / −6.0。
+    /// ⇒ 门槛必须落在 `(0.65, 15.41)` 里面,否则要么放过真错、要么误伤真低音。
+    /// ⚠ 断言写**字面量**,不许拿常量自己跟自己比(那样改常量判据照绿)。
+    #[test]
+    fn the_outlier_threshold_stays_inside_the_measured_gap() {
+        assert!(
+            OCTAVE_OUTLIER_MIN_DB > 0.65 && OCTAVE_OUTLIER_MIN_DB < 15.41,
+            "门槛 {OCTAVE_OUTLIER_MIN_DB} dB 掉出了实测空档 (0.65, 15.41) —— \
+             要么放过 4:28.640 那一族,要么误伤 4:26.910 那一族的低音起音"
+        );
+        assert_eq!(OCTAVE_OUTLIER_MAX_RUN, 2, "孤立游程上限改了就不再是「孤立」");
+    }
     /// ⭐⭐⭐⭐⭐ S165 —— **八度修复:两种情形必须分开**。
     ///
     /// 这条判据的全部价值在于它的**两个对照**:
