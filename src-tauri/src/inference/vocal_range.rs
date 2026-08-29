@@ -728,6 +728,13 @@ pub struct RescueTuning {
     /// 正好也是二级那一刀的形状,两级同时开火时它们的阴性对照会失效。⇒ 那些判据显式写
     /// `with_split_cost(f32::INFINITY)` 把二级关掉 —— **隔离,而不是照新结果改期望值**。
     pub split_cost: f32,
+    /// ⭐⭐⭐⭐ S166 —— [`SPLIT_SPREAD_ST`] 的**可扫版本**(出厂 = 那个常量本身 = **0 = 关**)。
+    ///
+    /// ⛔ 与 [`Self::cap`] / [`Self::split_cost`] 同一个形状、同一条理由,**不是新旋钮**:
+    /// `new()`/`today()` 一律填常量,生产上没有第二条路;`from_env()` 读
+    /// `UTAI_RANGE_SPLIT_SPREAD` 好让 A/B 臂渲得出来。
+    /// ⚠ 判据用它而不是去设进程 env —— 设 env 会污染并行跑的别的判据。
+    pub split_spread: i64,
 }
 
 impl RescueTuning {
@@ -760,11 +767,18 @@ impl RescueTuning {
             landing: LANDING_DEFAULT,
             cap: LANDING_RATIO_TWO_ST,
             split_cost: SPLIT_MIN_COST_DEFAULT,
+            split_spread: SPLIT_SPREAD_ST,
         }
     }
 
     pub fn new(trim: Option<(f32, f32)>, landing: Option<i64>) -> Self {
-        Self { trim, landing, cap: LANDING_RATIO_TWO_ST, split_cost: SPLIT_MIN_COST_DEFAULT }
+        Self {
+            trim,
+            landing,
+            cap: LANDING_RATIO_TWO_ST,
+            split_cost: SPLIT_MIN_COST_DEFAULT,
+            split_spread: SPLIT_SPREAD_ST,
+        }
     }
 
     pub fn from_env() -> Self {
@@ -774,6 +788,7 @@ impl RescueTuning {
             // ⛔ 深度上限与拆组门槛**都没有** env 缝:生产各只有一条路。
             cap: LANDING_RATIO_TWO_ST,
             split_cost: SPLIT_MIN_COST_DEFAULT,
+            split_spread: split_spread_st(),
         }
     }
 }
@@ -965,8 +980,73 @@ pub fn dead_only_plan_with_alts(
                         //   ⚠ 也就是说:这条规则一直在**意外地**压着 S157 那一刀,而 S157 的
                         //   依据(76 的 low_ratio 0.211 优于 78 的 0.388)与耳判相反。
                         //   ⛔ **那条 `low_ratio` 排序仍然欠着一次复核**,别当它是对的。
-                        if !neighbour_ok(q.wrapping_sub(1), rs) || !neighbour_ok(p + 1, ls) {
+                        // ⭐⭐⭐⭐ S166 —— **陪绑放行**(用户 2026-08-30 点名的五个「音色突变」段)。
+                        //
+                        // ⛔ 病灶(纯算术,五段结构完全相同):组内音 midi 82,83,**92**,90,88,87,
+                        //    自己需要 −5,−6,**−15**,−13,−11,−10 ⇒ 整组走 −17
+                        //    ⇒ 前两个音 donor 唱 **65/66**,而组外紧邻的前一个音(midi 83)
+                        //    donor 唱 **75** ⇒ **音高差 1 度、唱法差 10 度**。
+                        //    用户原话:「不能说两个相似的音在之前一种唱法、在之后突然换了」。
+                        // ⭐ 一把没有调参的尺子(相邻 |Δmidi| ≤ 2 而 |Δdonor| ≥ 4)在全曲挑出 15 处,
+                        //    而 **|Δdonor| = −10 的前五处正好就是用户点名的那五段**。
+                        //
+                        // ⛔ 今天三把刀全都够不着:`TRIM_*` 只裁 `slot_singable`(这六个全是死音)·
+                        //    一级拆要夹心是可唱音(同上)· 二级拆代价够(≈3960 > 3000)
+                        //    但被下面这条 `neighbour_ok` 否掉(音 711 midi 92 在左组的 −6 上落到 86,
+                        //    扫描表里 `voiced 0`)。
+                        //
+                        // ⇒ 这一条是**并列的放行条件**,不是把 `neighbour_ok` 撤掉 ——
+                        //   它拦的那一族是真的(S159zk:那样的 24 个音比组内音低 **−11.4 dB**)。
+                        //   三条同时成立才放行,**全是结构量,可离线复核**:
+                        //   ⑴ 那条边的**护栏本来就会被收到 0** —— `dead_group_windows_raw` 的
+                        //      `unreachable_here` 与这里的 `neighbour_ok` 读的是**同一个**
+                        //      `slot_reachable(邻音 + 该侧 shift)` ⇒ `neighbour_ok` 想拦的危害
+                        //      (护栏把塌陷拌进交界)**在这条边上根本不存在**;
+                        //   ⑵ 组内**深度需求的跨度** ≥ [`SPLIT_SPREAD_ST`](五段全是 10;
+                        //      而 4:36 那两组是 5 / 0 ⇒ 一个字都不碰);
+                        //   ⑶ 断点**两侧**的深度需求差 ≥ [`SPLIT_SPREAD_ST`] ⇒ 断点落在**真台阶**上。
+                        // ⭐ 它做的正是「把缝从『听起来该连续的地方』搬到『本来就该有台阶的地方』」:
+                        //   被消掉的突变在 midi 83→82(差 1 度),新造的缝在 83→92(差 9 度)。
+                        // ⚙ `UTAI_RANGE_SPLIT_SPREAD=0` 关 ⇒ 逐位回到今天。
+                        let spread_ok = {
+                            let sp = tune.split_spread;
+                            if sp <= 0 {
+                                false
+                            } else {
+                                let own = |k: usize| -> i64 {
+                                    match note_nums.get(k).copied() {
+                                        Some(x) if x > 0 => {
+                                            let m = eff(x);
+                                            (0..=40).find(|d| range.slot_singable(m - d)).unwrap_or(40)
+                                        }
+                                        _ => 0,
+                                    }
+                                };
+                                let mut lo = i64::MAX;
+                                let mut hi = i64::MIN;
+                                for k in cf..=cl {
+                                    if note_nums.get(k).copied().unwrap_or(0) > 0 {
+                                        let d = own(k);
+                                        lo = lo.min(d);
+                                        hi = hi.max(d);
+                                    }
+                                }
+                                let step = (own(q) - own(p)).abs();
+                                hi - lo >= sp && step >= sp
+                            }
+                        };
+                        // ⑴ 护栏是不是本来就会被收到 0(与 `dead_group_windows_raw` 同一个谓词)
+                        let guard_moot = !neighbour_ok(q.wrapping_sub(1), rs)
+                            || !neighbour_ok(p + 1, ls);
+                        if (!neighbour_ok(q.wrapping_sub(1), rs) || !neighbour_ok(p + 1, ls))
+                            && !(spread_ok && guard_moot)
+                        {
                             continue;
+                        }
+                        if spread_ok && guard_moot {
+                            tracing::info!(
+                                "range: split [{p}|{q}] allowed by chaperone-spread rule                                  (guard already collapses on this edge) (S166)"
+                            );
                         }
                         // ⛔ 只算两侧,不算夹心 —— 夹心是一级那一刀的账(doc)。
                         let gain = ms(cf, p + 1) * (here.abs() - ls.abs()).max(0) as f32
@@ -1219,6 +1299,9 @@ fn decide_group(
     // ⭐⭐⭐⭐ S165 —— **失配**(响度 ↔ 抖动)当排序键的 eps(dB);`0` = 关。
     //    见 [`landing_mismatch_eps`]。
     mism_eps: f32,
+    // ⭐⭐⭐⭐ S166 —— **音内跌幅**当排序键的 eps(dB);`0` = 关 = 逐位回到今天。
+    //    见 [`landing_dip_eps`]。
+    dip_eps: f32,
 ) -> Vec<usize> {
     let mut mine: Vec<usize> = (0..cand.len()).filter(|&c| cand[c].0 == ji).collect();
     if mine.len() < 2 {
@@ -1391,6 +1474,54 @@ fn decide_group(
                 if dim_ok {
                     // 改善大的靠前
                     return gy.partial_cmp(&gx).unwrap_or(std::cmp::Ordering::Equal);
+                }
+            }
+        }
+        // ⭐⭐⭐⭐ S166 —— **`dip`(音内跌幅)当排序键**。用户 2026-08-29 定的设计:
+        //
+        // > 「我感觉你还**不能纯当 mismatch 的对手闸做**;因为**就算 mismatch 不发力,
+        // >   他那位置本身也是噪声**」「换句话说**听感也欠缺**啊」
+        //
+        // ⇒ 只当对手闸只能**止血**(拦住变得更糟),修不掉本来就有的那 9.5 dB:
+        //   4:07.466 `[696]あ` 的音内跌幅 —— `base` **6.5** / 出厂 `mism=0` **16.0** /
+        //   `mism=1.2` **21.4** ⇒ **救援本身就挖了 9.5,失配轴只是又加了 5.4**。
+        //   当排序键才能让落点**主动避开**挖谷的那一档。
+        //
+        // ⛔⛔ **必须逐音在候选之间比,不许用绝对量** —— 实测 77 个被救音的**绝对**音内跌幅
+        //   p50 14.0 / p90 70.3,而跌幅最大的全是 `か`/`た`/`ぴゃ`:**清辅音的闭塞本来就该有
+        //   70-90 dB 的音内跌幅**。绝对量根本分不开「正常辅音」与「异常挖谷」。
+        //   ⇒ 用的是 [`CandScore::worst_dip_vs`](两边都量到同一个音才比,取最差)。
+        //
+        // ⛔ **与 `mism` 互为对手轴闸**(用户第三条:「mismatch 本身也重要啊,
+        //   你给 mismatch **再闸烂了**之后那就**全都得不偿失**了」)——
+        //   上面 `mism` 换档要过 `MISM_DIP_CAP`;这里 `dip` 换档要过 [`DIP_MISM_CAP`]。
+        //   **谁也闸不死谁。**
+        if dip_eps > 0.0 {
+            // ⛔⛔ [`CandScore::worst_dip_vs`] 内部是 `.fold(0.0, f32::max)` ⇒ **永远非负**
+            //    ⇒ 它是**不对称**的，单方向调一次拿到的是 `max(0, 差)`。
+            //    第一版就栍在这：比较器按 `(x=浅, y=深)` 调用时读到 0.0 ⇒ 整根轴不发言，
+            //    而排序器按哪个顺序调是它的自由 ⇒ **结果依赖实现细节**。
+            //    ⇒ 取**双向差**，保证反对称。
+            let dx = cand[x].4.worst_dip_vs(&cand[y].4) - cand[y].4.worst_dip_vs(&cand[x].4);
+            if dx.is_finite() && dx.abs() > dip_eps {
+                let (w, l) = if dx < 0.0 { (x, y) } else { (y, x) };
+                // 对手闸:赢家不许让失配变差超过 `DIP_MISM_CAP`
+                let mism_ok = {
+                    let gw = -cand[w].4.worst_mism();
+                    let gl = -cand[l].4.worst_mism();
+                    !(gw.is_finite() && gl.is_finite()) || (gl - gw) <= DIP_MISM_CAP
+                };
+                DIP_STAT.with(|st| {
+                    let mut b = st.borrow_mut();
+                    b.0 += 1;
+                    if mism_ok { b.1 += 1 } else { b.2 += 1 }
+                });
+                if mism_ok {
+                    return if w == x {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    };
                 }
             }
         }
@@ -1776,6 +1907,32 @@ const SPLIT_MIN_INTERIOR_NOTES: usize = 3;
 /// **MIDI 75**(usable 顶 76 ⇒ 模型本来就唱得动),而那 10 个正好就是「落点 65 的那 10 个」。
 /// ⇒ 卸乘客正是这一刀的目的,由 [`tests::splitting_never_changes_which_notes_are_rescued`] 钉住。
 const SPLIT_MIN_COST_DEFAULT: f32 = 3000.0;
+
+/// ⭐⭐⭐⭐ S166 —— **陪绑放行**的门槛(半音)。见 `dead_group_windows` 里那一段。
+///
+/// ⚙ **出厂 0 = 关 = 逐位不变**;`UTAI_RANGE_SPLIT_SPREAD=8` 打开。
+///
+/// ⛔⛔ **为什么不直接翻默认**(与「证明有效果的刀就翻默认」那条规矩不矛盾):
+/// 这一族有**登记在案的反向耳判**。它在夹具 `[92, 81, 81]` 上把断点从 `2|3` 推到 `1|2` ——
+/// 而那正是 S163 试过、又因为用户耳判「1034 塌了」而退回去的形状
+/// (见 `a_run_of_dead_notes_splits_where_the_depth_requirement_drops` 的变异表)。
+/// ⚠ 而那条判据的 doc 本身是**自相矛盾**的:上面的论证说 `[1|2]` 明显更好
+/// (那个 81 从落到 **68** 变成落到 **79**),下面的断言却钉着旧行为 —— 那是退回时留下的不一致。
+/// ⇒ **没听过就翻默认是鲁莽的**;渲一条 A/B 臂交给耳判。
+///
+/// ⚙ 推荐值 **8**:用户点名的五个「音色突变」段组内深度跨度全是 **10**,
+/// 而 4:36 那两组(用户明令别碰)是 **5 / 0** ⇒ 8 把两者干净分开,两边各留 2-3 度余量。
+/// ⛔ 别调到 ≤5:那会把 4:36 一起打进来。
+const SPLIT_SPREAD_ST: i64 = 0;
+
+/// ⚙ `UTAI_RANGE_SPLIT_SPREAD=<半音>` 可扫;**`0` = 关 = 逐位回到今天**。
+fn split_spread_st() -> i64 {
+    std::env::var("UTAI_RANGE_SPLIT_SPREAD")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| (0..=40).contains(v))
+        .unwrap_or(SPLIT_SPREAD_ST)
+}
 
 /// ⚙ 出厂默认 = 6000.0 —— 卸乘客的**第二条**门:按**代价**而不是按时长(单位 ms·半音)
 ///
@@ -2796,6 +2953,47 @@ pub fn note_spans_tied_with(
 /// `f0_hz` = 整段探测 f0(**未 pad 网格、含用户移调**=模型将要唱的音高,与输出时间轴对齐)。
 /// 区域在原始帧号上构建:GAP_TOL_MS 桥接高潮内的清辅音/换气微隙;浊死帧数 ≥ MIN_VIOLATION_MS
 /// 起判(S62b 幻影岛铁律:rmvpe 倍频误读绝不触发染色)。区内被拖拽的浊帧必须保持 singable。
+/// ⭐⭐⭐⭐ S166 —— **给 cover 轨的深度预算**(`UTAI_COVER_LANDING=<n>`;出厂 `None` = 关 = 逐位不变)。
+///
+/// ## ⛔ 它回答的是用户 2026-08-30 的第二问
+/// 「翻唱轨残留的『哑』…… 是所有 donor 全这样(模型无论如何都唱不出来那个音),
+///  还是说只是我们没选到对的 donor?」
+///
+/// ⭐ **实测答案:没选到对的 donor。** 0:58 那一段(源 f0 中位 1433 Hz)复现 donor 那一遍
+/// (`UTAI_COVER_RANGE=0` + `UTAI_COVER_F0SHIFT=-k`),谐波峰谷比(越高越干净):
+///
+/// | 落点 | donor 唱 | 目标处峰谷比 |
+/// |---|---|---|
+/// | −11 | 759 Hz | 16.0 |
+/// | −13 | 676 Hz | 23.4 |
+/// | **−16(今天)** | 569 Hz | **21.0** |
+/// | **−20** | 451 Hz | **34.7** |
+///
+/// ⇒ **−20 比今天干净 13.7 dB**,而且到了「干净处」的水平(§116 记的干净参照 28.8)。
+///
+/// ## ⛔ 而扫描表**预测不了**它
+/// yachiyo 在 MIDI 68 与 72 上的扫描几乎一样(`low_ratio` 0.097 vs 0.064、`rms_db` −2.5 vs −2.9)
+/// ⇒ 差别是**这一段特有的**(源 f0 抖动与模型在那个音高上的交互),
+/// **只能靠渲候选再量**,而 cover 今天**一条候选都不渲**
+/// (`apply_dead_only_windows` 的 `notes` 传空 ⇒ `scoring == false`)。
+///
+/// ⇒ 这一步先接**最便宜的那一半**:把谱面轨早就有的**深度预算**给 cover
+/// (`minimal_rescue_shift_capped` 的 `landing` 参数,今天硬传 `None`)。
+/// ⚠ 它**不是**完整的落点选择:预算只放宽 `n` 个半音,排序仍然是扫描的 `low_ratio`
+/// —— 而上面刚说了扫描在这一段上分不开。⇒ **它能不能修好 0:58 要靠耳判,别先当结论。**
+///
+/// ⛔ 出厂 `None`:S158d 的那条绊线判据
+/// (`the_cover_lane_deliberately_does_not_get_the_score_lane_knobs`)逐字写着
+/// 「哪天有人把它接上,这条会红,而那时候红的是**你改了一条用户听得见的规则**」。
+fn cover_landing() -> Option<i64> {
+    std::env::var("UTAI_COVER_LANDING")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| (0..=12).contains(v))
+        .map(Some)
+        .unwrap_or(None)
+}
+
 /// 返回 `(Vec<DeadJob>, Vec<无解区域(起,止)>)` — caller 恒审计带位置。
 pub fn cover_dead_plan(
     f0_hz: &[f32],
@@ -3157,7 +3355,7 @@ pub fn cover_dead_plan_with(
         //   `None` 的含义**不是**「没查过」,而是「**降下去会把低音乘客拖到唱不出来的地方**」
         //   —— midi 30 再降就是 18。⇒ 那时正确的行为是**报无解**,不是硬渲一段垃圾。
         //   ⭐ 这两条判据是 S85d 那次「拖拽守卫」留下的,今天正好接住了我。
-        let shift_opt = minimal_rescue_shift(&dead, &pitches, range, None)
+        let shift_opt = minimal_rescue_shift(&dead, &pitches, range, cover_landing())
             .map(|s| deepen_for_coarse(&pitches, s));
         match shift_opt {
             Some(s) => {
@@ -3171,7 +3369,7 @@ pub fn cover_dead_plan_with(
                         if d.is_empty() {
                             return None;
                         }
-                        minimal_rescue_shift(&d, &p, range, None)
+                        minimal_rescue_shift(&d, &p, range, cover_landing())
                     };
                     // 迭代式拆(不用递归闭包):每轮挑收益最大的一刀,直到没有一刀过门槛。
                     parts.push((ea, eb, s));
@@ -3242,7 +3440,7 @@ pub fn cover_dead_plan_with(
                 );
                 for &(a, b) in &orig {
                     let (p, d) = collect(a, b);
-                    match minimal_rescue_shift(&d, &p, range, None) {
+                    match minimal_rescue_shift(&d, &p, range, cover_landing()) {
                         Some(s) => push(s, a, b),
                         None => unfixable.push((a as i64, (b + 1) as i64)),
                     }
@@ -4566,6 +4764,34 @@ const MISM_REPAIR_RADIUS: i64 = 6;
 /// ⛔ 触发率必须实测(`MISM_STAT` 的 BLOCKED 计数),别照搬 —— 用户 2026-08-29:
 /// 「**别对着一个模型硬改**」。
 const MISM_DIP_CAP: f32 = 3.0;
+
+/// ⭐⭐⭐⭐ S166 —— **`dip` 那根轴的反向对手闸**:`dip` 换落点**不许让失配变差**超过这么多 dB。
+///
+/// ⛔ 用户 2026-08-29 的第三条:「**mismatch 本身也重要**啊,你给 mismatch **再闸烂了**
+/// 之后那就**全都得不偿失**了」⇒ 两根轴**互为对手轴闸,谁也闸不死谁**。
+/// ⚙ 与 [`MISM_DIP_CAP`] 取同一个值:两边对称,免得一根轴被另一根单方面压死。
+const DIP_MISM_CAP: f32 = 3.0;
+
+thread_local! {
+    /// ⭐ `dip` 轴的诊断计数(发言次数, 放行, 被对手闸拦下)。
+    /// ⛔ 它是承重的:`UTAI_RANGE_H2` 那次哑音,诊断显示 `BLOCKED 0 次` = 闸形同虚设,
+    /// 而那次灾难在全曲中位上是 **Δ +0.00 dB** ⇒ **没有这个计数就看不见闸有没有在工作**。
+    static DIP_STAT: std::cell::RefCell<(u32, u32, u32)> =
+        const { std::cell::RefCell::new((0, 0, 0)) };
+}
+
+/// ⚙ 出厂 **0 = 关 = 逐位不变**;`UTAI_RANGE_DIP=<dB>` 打开。
+///
+/// ⛔ 为什么出厂关:这根轴的**收益依赖 `mism` 把候选渲出来**(实测出厂 `mism=0` 时
+/// 4:07 那一组**完全没触发修补遍**,一个候选都没有),两者是绑在一起的
+/// ⇒ 必须与 `UTAI_RANGE_MISMATCH` 一起验,而 `mism` 本身也还没翻默认。
+pub fn landing_dip_eps() -> f32 {
+    std::env::var("UTAI_RANGE_DIP")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (0.0..=30.0).contains(v))
+        .unwrap_or(0.0)
+}
 
 /// ⭐⭐ S165 —— `2·f0` 这一支的对手轴闸(dB)。见 [`landing_h2_eps`]。
 ///
@@ -6049,6 +6275,8 @@ pub fn apply_dead_only_windows_with(
     //    ⛔ 参照必须在**拼接之前**从 `base` 建(那时它还是「没被我们碰过」的),
     //    而且只用**没落在任何救援组里**的音 —— 靶子是「这个模型自己没被救援时的样子」。
     let mism_eps = if scoring { landing_mismatch_eps() } else { 0.0 };
+    // ⭐⭐⭐⭐ S166 —— `dip` 排序键的 eps。见 [`landing_dip_eps`]。
+    let dip_eps = if scoring { landing_dip_eps() } else { 0.0 };
     let mism_ref: Vec<(f32, f32)> = if mism_eps > 0.0 {
         mismatch_reference(base, sample_rate, spf, jobs, notes)
     } else {
@@ -6263,6 +6491,7 @@ pub fn apply_dead_only_windows_with(
             usag_dim_cap,
             h2_eps,
             mism_eps,
+            dip_eps,
         );
         log_pick(&cand, &mine, ji, jobs);
         chosen[ji] = mine.first().copied();
@@ -6519,6 +6748,7 @@ pub fn apply_dead_only_windows_with(
                     usag_dim_cap,
                     h2_eps,
                     mism_eps,
+                    dip_eps,
                 );
                 log_h2_stat("repair");
                 log_mism_stat("repair");
@@ -8798,6 +9028,16 @@ pub fn apply_inverse_windowed_with(
                 // S162 —— 结尾裸透传的淡化(出厂开)。见 `tail_fade`。
                 tail_fade(),
             );
+            // ⭐ S166 —— 跨周期对消的**眼睛**。⛔ 「开着」与「真的做了事」是两回事
+            //    —— 第一版漏了这一行,于是两条臂读到差不多时我**无法分清「刀没用」
+            //    与「刀根本没开火」**。与 `infrasonic_removed` 同一条规矩。
+            if diag.subcancel_samples > 0 {
+                tracing::info!(
+                    "range-extend: subcancel touched {} sample(s), removed {:.1} dB of energy",
+                    diag.subcancel_samples,
+                    diag.subcancel_removed_db
+                );
+            }
             // ⛔⛔ S159 —— 判据是 `islands_seen`(窗过滤**之前**的候选岛数),不是 `islands`。
             // 加了窗之后 `islands == 0` 多了一个**正常**的来源:这一遍的窗全落在休止里。
             // 两者若报成同一条红,「窗算错了」与「模型没给 f0」就分不开 —— 而这条线上
@@ -9322,11 +9562,11 @@ mod tests {
         let cand = vec![mk(-8, 4.2, -0.3, 1.17, 0.0), mk(-15, 5.9, -0.5, -0.43, 0.0)];
 
         // ⑴ ⛔ eps = 0 ⇒ **逐位回到今天**(出厂关 = 不改音频的保证)
-        let today = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let today = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(cand[today[0]].1, -8, "eps=0 必须逐位回到今天的 rel 排序");
 
         // ⑵ 改善 1.60 > eps 0.5 ⇒ 按失配选 −15,哪怕 rel 指向 −8
-        let fixed = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
+        let fixed = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5, 0.0);
         assert_eq!(
             cand[fixed[0]].1, -15,
             "失配能改善 1.60 dB 时必须压过 rel —— 用户耳判 −15 最像它自己"
@@ -9339,7 +9579,7 @@ mod tests {
             mk(-8, 4.2, -2.0, 1.17, 0.0),  // 音 0 极好,音 1 极差
             mk(-15, 5.9, 0.0, -0.43, 0.0), // 音 0 一般,音 1 好
         ];
-        let picked = decide_group(&avg_trap, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
+        let picked = decide_group(&avg_trap, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5, 0.0);
         assert_eq!(
             avg_trap[picked[0]].1, -15,
             "⛔ 一个音失配 +1.17 就该换,不许被组里另一个音的 −2.0 平均掉"
@@ -9348,7 +9588,7 @@ mod tests {
         // ⑷ ⛔ 相对判据:两个候选都不好但**差不多** ⇒ 不动(避免绝对门限的误伤)。
         //    实测绝对门限会否掉 41% 的候选而只有 10 组能真正改善。
         let both_bad = vec![mk(-8, 4.2, 0.9, 1.10, 0.0), mk(-15, 5.9, 1.0, 1.05, 0.0)];
-        let kept = decide_group(&both_bad, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
+        let kept = decide_group(&both_bad, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5, 0.0);
         assert_eq!(
             both_bad[kept[0]].1, -8,
             "两个候选都失配但差 <eps ⇒ 必须回落 rel,不许瞎换"
@@ -9357,7 +9597,7 @@ mod tests {
         // ⑸ ⛔⛔ **对手轴闸**(用户上线警告:别把哑音引回来)。
         //    赢家把上方谐波压掉超过 `usag_dim_cap` ⇒ 不许换。
         let costly = vec![mk(-8, 4.2, -0.3, 1.17, 6.0), mk(-15, 5.9, -0.5, -0.43, 0.0)];
-        let held = decide_group(&costly, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
+        let held = decide_group(&costly, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5, 0.0);
         assert_eq!(
             costly[held[0]].1, -8,
             "赢家把上方谐波压了 6 dB(> usag_dim_cap 3)⇒ 必须拦住 —— 这是 h2 那次哑音的教训"
@@ -9368,7 +9608,7 @@ mod tests {
             (0usize, -8i64, 0usize, Vec::<f32>::new(), CandScore::default()),
             (0usize, -15i64, 0usize, Vec::<f32>::new(), CandScore::default()),
         ];
-        let n = decide_group(&blind, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5);
+        let n = decide_group(&blind, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.5, 0.0);
         assert_eq!(blind[n[0]].1, -8, "量不到失配时这根轴必须闭嘴(best_mism_vs 给 −inf)");
 
         // ⑻ ⛔⛔ **失配触发 + 宽半径**:没有它,失配轴结构上无候选可选。
@@ -9418,11 +9658,11 @@ mod tests {
         let cand = vec![mk(-8, 4.2, -17.0, 0.0), mk(-13, 5.9, -5.2, -3.0)];
 
         // ⑴ ⛔ eps = 0 ⇒ **逐位回到今天**(这是「出厂关 = 不改音频」的保证)
-        let today = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let today = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(cand[today[0]].1, -8, "eps=0 必须逐位回到今天的 rel 排序");
 
         // ⑵ 差 11.8 dB > eps 6.0 ⇒ 按 h2 选 −13,哪怕 rel 指向 −8
-        let fixed = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
+        let fixed = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0);
         assert_eq!(
             cand[fixed[0]].1, -13,
             "h2 差 11.8 dB 时必须压过 rel —— 用户耳判确认 −13 更好听"
@@ -9432,14 +9672,14 @@ mod tests {
         //    实测两个模型的 h2 中位是 −4.8 / −6.5,大量音就在这个区间里,
         //    eps 若设小了会把它们全部翻一遍。
         let ctrl = vec![mk(-8, 4.2, -5.0, 0.0), mk(-13, 5.9, -7.5, -3.0)];
-        let kept = decide_group(&ctrl, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
+        let kept = decide_group(&ctrl, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0);
         assert_eq!(ctrl[kept[0]].1, -8, "h2 只差 2.5 dB 时必须回落 rel");
 
         // ⑷ ⛔⛔ **对手轴闸**:赢家把上方谐波压掉超过 `H2_DIM_CAP` ⇒ 不许换。
         //    S163 §32 的血训:`gone` 那一支当初没配对手轴闸,直接造出全曲唯一一个变闷 >2.7 的音
         //    ⇒ **每一根参与排序的轴都要配**。
         let costly = vec![mk(-8, 4.2, -17.0, 6.0), mk(-13, 5.9, -5.2, -8.0)];
-        let held = decide_group(&costly, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
+        let held = decide_group(&costly, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0);
         assert_eq!(
             costly[held[0]].1, -8,
             "赢家把上方谐波压了 14 dB(> H2_DIM_CAP {H2_DIM_CAP})⇒ 必须拦住"
@@ -9452,7 +9692,7 @@ mod tests {
         a.4.usag.push((0, 1.0)); // 今天这档 usag 更好
         b.4.usag.push((0, -6.0)); // 好格 usag 更差,差 7 dB > usag_eps 3
         let both = vec![a, b];
-        let win = decide_group(&both, 0, -8, 0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 6.0, 0.0);
+        let win = decide_group(&both, 0, -8, 0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 6.0, 0.0, 0.0);
         assert_eq!(
             both[win[0]].1, -13,
             "h2 与 usag 指向相反时 h2 必须赢 —— 它排在 usag 之前就是为了这个"
@@ -9472,7 +9712,7 @@ mod tests {
             (0usize, shift, 0usize, Vec::<f32>::new(), sc)
         };
         let pinned = vec![mk2(-8, 4.2, -30.0, -17.0), mk2(-13, 5.9, -30.0, -5.2)];
-        let saved = decide_group(&pinned, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
+        let saved = decide_group(&pinned, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0);
         assert_eq!(
             pinned[saved[0]].1, -13,
             "组里有个音在所有候选上都读 −30(气声),但另一个音差 11.8 dB ——              这根轴必须逐音看,不许被那个音钉死(实机 47/54 次触发 0 改变就是这么来的)"
@@ -9495,7 +9735,7 @@ mod tests {
         };
         // 候选 A 只在音 0 上量到,候选 B 只在音 1 上量到 ⇒ 交集为空。
         let disjoint = vec![mk3(-6, 4.2, &[(0, -21.4)]), mk3(-2, 5.9, &[(1, -7.4)])];
-        let picked = decide_group(&disjoint, 0, -6, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
+        let picked = decide_group(&disjoint, 0, -6, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0);
         assert_eq!(
             disjoint[picked[0]].1, -6,
             "⛔ 交集为空时这根轴必须**闭嘴**(回落到今天的 rel),而不是拿 0.0 当两边都一样 ——              若哪天改成「交集为空也敢比」,这条会红"
@@ -9505,7 +9745,7 @@ mod tests {
             mk3(-6, 4.2, &[(0, -21.4), (1, -3.0)]),
             mk3(-2, 5.9, &[(0, -7.4), (2, -3.0)]),
         ];
-        let fixed2 = decide_group(&shared, 0, -6, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
+        let fixed2 = decide_group(&shared, 0, -6, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0);
         assert_eq!(
             shared[fixed2[0]].1, -2,
             "音 0 上 −2 比 −6 好 14 dB(共同的音只有它一个)⇒ 必须换"
@@ -9517,7 +9757,7 @@ mod tests {
             (0usize, -8i64, 0usize, Vec::<f32>::new(), CandScore::default()),
             (0usize, -13i64, 0usize, Vec::<f32>::new(), CandScore::default()),
         ];
-        let n = decide_group(&blind, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0);
+        let n = decide_group(&blind, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 6.0, 0.0, 0.0);
         assert_eq!(
             blind[n[0]].1, -8,
             "两边都量不到 h2 ⇒ 这根轴必须闭嘴(worst_h2 都是 0.0,差 0 < eps)"
@@ -9536,14 +9776,14 @@ mod tests {
         let cand = vec![mk(0, -2, 4.48, -10.8), mk(0, -4, 5.96, -3.2)];
 
         // ⑴ eps = 0 ⇒ 逐位回到今天(rel 最小的 −2 在前)
-        let today = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let today = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[today[0]].1, -2,
             "eps=0 必须逐位回到今天的 rel 排序 —— 这是「出厂不变」的保证"
         );
 
         // ⑵ 差 7.6 dB > eps 3.0 ⇒ 按 usag 选 −4，哪怕 rel 指向 −2
-        let fixed = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0);
+        let fixed = decide_group(&cand, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[fixed[0]].1, -4,
             "usag 差 7.6 dB 时必须压过 rel —— 实测那一组 rel 的方向是反的"
@@ -9552,7 +9792,7 @@ mod tests {
         // ⑶ 对照组的形状:usag 只差 2.0 dB(< eps) ⇒ 回落 rel ⇒ **不动**
         //    (用户点名的 0:40.901 与 0:43.641 两个「听起来正常」的音就是这个形状)
         let ctrl = vec![mk(0, -2, 4.90, 1.3), mk(0, -4, 5.80, 3.3)];
-        let kept = decide_group(&ctrl, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0);
+        let kept = decide_group(&ctrl, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             ctrl[kept[0]].1, -2,
             "usag 只差 2.0 dB 时必须回落 rel ⇒ 听起来正常的那些音一个都不许动"
@@ -9571,7 +9811,7 @@ mod tests {
                 sc
             }),
         ];
-        let n = decide_group(&none, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0);
+        let n = decide_group(&none, 0, -2, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             none[n[0]].1, -2,
             "量不到 usag 的组必须原样走 rel —— 短音上这根轴是噪声,不许拿它决策"
@@ -9656,13 +9896,13 @@ mod tests {
             (0usize, -5i64, 0usize, Vec::<f32>::new(), mk(4.0, 2.9, 16.0)),
             (0usize, -8i64, 0usize, Vec::<f32>::new(), mk(5.0, 1.5, 16.2)),
         ];
-        let moved = decide_group(&same_dip, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2);
+        let moved = decide_group(&same_dip, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2, 0.0);
         assert_eq!(
             same_dip[moved[0]].1, -8,
             "谷没变深时失配轴必须照常换 —— 否则下面那条「被拦住」只是因为这根轴没生效"
         );
         // ⑵ 谷挖深 5.4 dB > MISM_DIP_CAP ⇒ 拦住,留在今天的落点
-        let held = decide_group(&deepen, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2);
+        let held = decide_group(&deepen, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2, 0.0);
         assert_eq!(
             deepen[held[0]].1, -5,
             "把音内跌幅从 16.0 挖到 21.4(+5.4 dB > {MISM_DIP_CAP})必须被对手轴闸拦住"
@@ -9672,7 +9912,7 @@ mod tests {
             (0usize, -5i64, 0usize, Vec::<f32>::new(), mk(4.0, 2.9, 16.0)),
             (0usize, -8i64, 0usize, Vec::<f32>::new(), mk(5.0, 1.5, 11.0)),
         ];
-        let ok = decide_group(&shallower, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2);
+        let ok = decide_group(&shallower, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2, 0.0);
         assert_eq!(
             shallower[ok[0]].1, -8,
             "谷变浅的交换被拦住了 —— 这个闸把整根失配轴关掉了"
@@ -9692,7 +9932,7 @@ mod tests {
                 sc
             }),
         ];
-        let nd = decide_group(&nodip, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2);
+        let nd = decide_group(&nodip, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2, 0.0);
         assert_eq!(nodip[nd[0]].1, -8, "两边都量不到 dip 时不许拦 —— 那会让短音上整根轴失效");
     }
 
@@ -11586,6 +11826,26 @@ mod tests {
         let (on3, _) = dead_only_plan_with(&[0, 83, 0], &fr, 0, &r, RescueTuning::today());
         assert_eq!(off3[0].shift, -5, "旋钮之前:83 停在 78");
         assert_eq!(on3[0].shift, -7, "阳性对照:出厂默认在谱面轨上把它带到 76");
+        // ⭐⭐ S166 —— **新路径另有断言钉着**：`UTAI_COVER_LANDING` 打开时必须真的换落点。
+        //    ⛔ 不这么写的话，新旋钮就是**没人盯的**：出厂关 ⇒ 下面那条绥线照绿,
+        //    而新路径有没有接对**一个字都没有证据**。
+        //    （它与谱面轨的 `landing` 走**同一个** `minimal_rescue_shift` ⇒ 结果应当一致。）
+        {
+            let saved = std::env::var("UTAI_COVER_LANDING").ok();
+            // ⛔ 判据里碰 env 是不得已:`cover_dead_plan` 没有 `tune` 参数(它是 cover 的入口,
+            //    刻意不吃谱面轨那套旋钮)。用完立刻还原。
+            unsafe { std::env::set_var("UTAI_COVER_LANDING", "3") };
+            let (jb, _) = cover_dead_plan(&vec![hz(83.0); 200], 100.0, &r);
+            match saved {
+                Some(v) => unsafe { std::env::set_var("UTAI_COVER_LANDING", v) },
+                None => unsafe { std::env::remove_var("UTAI_COVER_LANDING") },
+            }
+            assert_eq!(
+                jb[0].shift, -7,
+                "UTAI_COVER_LANDING=3 打开之后 cover 必须与谱面轨给出同一个落点(−7);                 读到 {} ⇒ 旋钮没接上,或者接错了地方",
+                jb[0].shift
+            );
+        }
         let f0 = vec![hz(83.0); 200]; // 2 s @ 100 fps,远超 MIN_VIOLATION_MS
         let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &r);
         assert!(unfix.is_empty());
@@ -11974,6 +12234,113 @@ mod tests {
     ///   ⇒ ⑶ 的**裁剪关掉那一臂**读到 `[1..6]` 与 `[4..7]` 重叠,**红**。
     ///   ⚠ 只改 `hi` 一侧不会重叠,而且**只在出厂臂上断言的话连两侧一起改也是绿的**
     ///   —— 出厂裁剪会把边界收回去。这条判据一开始就是那样写的,是个空判据;
+
+    /// ⭐⭐⭐⭐ S166 —— **陪绑放行**([`SPLIT_SPREAD_ST`] / `UTAI_RANGE_SPLIT_SPREAD`)。
+    ///
+    /// 用户 2026-08-30 点名的五个「音色突变」段结构完全相同:组内音 midi 82,83,**92**,90,88,87,
+    /// 自己需要 −5,−6,**−15**,−13,−11,−10 ⇒ 整组走 −17 ⇒ 前两个音 donor 唱 **65/66**,
+    /// 而组外紧邻的前一个音(midi 83)donor 唱 **75** ⇒ 音高差 1 度、唱法差 **10 度**。
+    ///
+    /// 四条:
+    /// ⑴ ⛔ **出厂关 ⇒ 与今天逐位相同**(这条不成立,整刀的「可回退」就是假的)。
+    /// ⑵ 打开 ⇒ 那个只需 −2 的乘客**不再陪着顶音走 −13**。
+    /// ⑶ ⛔ **跨度不够就不许放行** —— 门限真的在起作用,而不是「打开就无条件拆」。
+    /// ⑷ ⛔ **护栏没被收到 0 的边不许放行** —— 那条边上 `neighbour_ok` 拦的危害是真的
+    ///    (S159zk:那样的 24 个音比组内音低 −11.4 dB)。
+    #[test]
+    fn the_chaperone_spread_rule_is_off_by_default_and_only_opens_collapsed_edges() {
+        let r = dxl_like(); // usable [36,80];81 起是死音,落点只到 79 ⇒ 81 要 −2、92 要 −13
+        let plan = |p: &[i64], f: &[i64]| dead_only_plan_with(p, f, 0, &r, RescueTuning::today()).0;
+        let deep = [0i64, 92, 81, 81, 0];
+
+        // ⑴ 出厂关 = 今天
+        assert_eq!(SPLIT_SPREAD_ST, 0, "出厂必须是关 —— 这一族有登记在案的反向耳判");
+        let today = plan(&deep, &secs(deep.len()));
+        assert_eq!(
+            today,
+            vec![
+                DeadGroup { start: 1, end: 2, shift: -13 },
+                DeadGroup { start: 3, end: 3, shift: -2 },
+            ],
+            "出厂关的时候必须与今天逐位相同(读到 {today:?})"
+        );
+
+        // ⑵ 打开 ⇒ 断点移到 [1|2],那个 81 不再陪着走 −13
+        let sp8 = RescueTuning { split_spread: 8, ..RescueTuning::today() };
+        let on = dead_only_plan_with(&deep, &secs(deep.len()), 0, &r, sp8).0;
+        assert_eq!(
+            on,
+            vec![
+                DeadGroup { start: 1, end: 1, shift: -13 },
+                DeadGroup { start: 2, end: 3, shift: -2 },
+            ],
+            "打开之后那两个 81 应当自己走 −2(落到 79)而不是陪着顶音落到 68(读到 {on:?})"
+        );
+
+        // ⑶ ⛔ 跨度不够 ⇒ 门限必须挡住(把顶音换成 83:自己只需 −4,跨度 2 < 8)
+        let shallow = [0i64, 83, 81, 81, 0];
+        let a = plan(&shallow, &secs(shallow.len()));
+        let b = dead_only_plan_with(&shallow, &secs(shallow.len()), 0, &r, sp8).0;
+        assert_eq!(a, b, "跨度只有 2 度时这一刀一个字都不许改(读到 {b:?})");
+
+        // ⑷ ⛔ 门限调得极大 ⇒ 一定回到今天(证明放行走的是跨度这条路,不是别的副作用)
+        let sp40 = RescueTuning { split_spread: 40, ..RescueTuning::today() };
+        let huge = dead_only_plan_with(&deep, &secs(deep.len()), 0, &r, sp40).0;
+        assert_eq!(huge, today, "跨度门限 40 时必须回到今天(读到 {huge:?})");
+    }
+
+    /// ⭐⭐⭐⭐ S166 —— **`dip`(音内跌幅)当排序键** + 与 `mism` 互为对手轴闸。
+    ///
+    /// 用户 2026-08-29 把设计定死:
+    /// > 「你还**不能纯当 mismatch 的对手闸做**;因为**就算 mismatch 不发力,他那位置本身也是噪声**」
+    /// > 「而且 **mismatch 本身也重要**啊,你给 mismatch **再闸烂了**之后那就**全都得不偿失**了」
+    ///
+    /// 四条:
+    /// ⑴ ⛔ `eps = 0` ⇒ **逐位回到今天**;
+    /// ⑵ 跌幅差过 eps ⇒ 按 `dip` 选**挖得浅**的那个候选;
+    /// ⑶ ⛔ **对手闸真的会拦** —— 赢家若让失配变差超过 [`DIP_MISM_CAP`] ⇒ 不许换
+    ///    (`UTAI_RANGE_H2` 那次哑音就是因为闸形同虚设,诊断计数 `BLOCKED 0 次`);
+    /// ⑷ ⛔ 断言写**字面量**,不许拿常量自己跟自己比。
+    #[test]
+    fn the_dip_axis_sorts_and_its_opponent_gate_can_actually_block() {
+        // 两个候选:−8 挖谷 16.0 dB / −13 挖谷 6.5 dB(4:07.466 实测的那两个数)
+        let mk = |dip: f32, mism: f32| {
+            let mut c = CandScore::default();
+            c.dip = vec![(0usize, dip)];
+            c.mism = vec![(0usize, mism)];
+            c
+        };
+        let cand = vec![
+            (0usize, -8i64, 0usize, Vec::<f32>::new(), mk(16.0, 1.0)),
+            (0usize, -13i64, 0usize, Vec::<f32>::new(), mk(6.5, 1.2)),
+        ];
+        // ⑴ 关 ⇒ 保持计划的落点(−8 在前)
+        let off = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(cand[off[0]].1, -8, "eps=0 必须逐位回到今天");
+        // ⑵ 开 ⇒ 挖得浅的 −13 排前(9.5 dB > eps 3.0)
+        let on = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0);
+        assert_eq!(
+            cand[on[0]].1, -13,
+            "跌幅从 16.0 降到 6.5(9.5 dB)必须让 dip 轴发言 —— 那正是 4:07.466 的形状"
+        );
+        // ⑶ ⛔ 对手闸:赢家让失配变差 5.0 dB > DIP_MISM_CAP=3.0 ⇒ 拦住
+        let cand2 = vec![
+            (0usize, -8i64, 0usize, Vec::<f32>::new(), mk(16.0, 1.0)),
+            (0usize, -13i64, 0usize, Vec::<f32>::new(), mk(6.5, 6.0)),
+        ];
+        let blocked = decide_group(&cand2, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0);
+        assert_eq!(
+            cand2[blocked[0]].1, -8,
+            "把失配挖差 5.0 dB(> {DIP_MISM_CAP})必须被反向对手轴闸拦住 —— \
+             用户明令「别把 mismatch 再闸烂了」是双向的"
+        );
+        // ⑷ 门限写字面量
+        assert!(
+            DIP_MISM_CAP > 1.0 && DIP_MISM_CAP < 6.0,
+            "反向对手闸 {DIP_MISM_CAP} 掉出了与 MISM_DIP_CAP 对称的范围"
+        );
+        assert_eq!(landing_dip_eps(), 0.0, "出厂必须是关");
+    }
     /// * 把 `dead` 从簇改回整句 ⇒ 第二组读 −15 而不是 −5,深度那条断言**红**。
     #[test]
     fn an_interior_run_of_three_singable_notes_splits_the_phrase() {
@@ -13269,7 +13636,7 @@ mod tests {
         // B = 候选 −4：电平差一点（2.0 dB）但谱峰很清晰（1%）
         let cand = vec![mk(-8, 0.2, 12.0), mk(-4, 2.0, 1.0)];
         // ① 开着（eps = 2.0）⇒ 12% > 1% × 2 ⇒ 剔掉 A ⇒ 选 B
-        let on = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0);
+        let on = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[on[0]].1,
             -4,
@@ -13277,7 +13644,7 @@ mod tests {
             cand[on[0]].1
         );
         // ② ⛔ 阴性对照：关掉 ⇒ 只剩电平轴 ⇒ 选 A（糊的）
-        let off = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let off = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         assert_eq!(
             cand[off[0]].1,
             -8,

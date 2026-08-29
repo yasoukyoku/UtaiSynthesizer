@@ -202,6 +202,10 @@ pub struct PsolaDiagnostics {
     /// symmetric. Every ruler in this repo had missed it, because they are all RMS-domain and
     /// **RMS does not see a DC offset as a defect — it just counts it as signal.**
     pub infrasonic_frac: f32,
+    /// ⭐ S165 —— 跨周期对消动过的样本数与真的减掉的能量占比（dB）。
+    /// ⛔ 「开着」与「真的做了事」是两回事 —— 与 `infrasonic_removed` 同一条规矩。
+    pub subcancel_samples: usize,
+    pub subcancel_removed_db: f32,
     /// S152 — how much of that the removal arm actually took out (`before − after`), 0.0 when off.
     /// ⛔ Same reason as `wsola_moved` / `marks_locked`: "the arm is on" and "the arm did
     /// something" are different facts and only the second one is visible in the audio.
@@ -1003,6 +1007,294 @@ static GRAIN_TRACE: std::sync::Mutex<Vec<[f64; 8]>> = std::sync::Mutex::new(Vec:
 /// * 读点随 `fr` 连续变化 ⇒ 相邻若干颗不再读**同一段波形** ⇒ 成对被打散。
 /// ⚠ 代价：读点不再对齐到脉冲上（`snap_to_pulse` 想避开的东西）⇒ 重叠相加时
 /// 相位不一致。那正是打破相干性所需的，但它同时会不会伤到谐波主体，**只能实测**。
+/// ⚙ 出厂默认 = 0.0 = 关 = **逐位不变**。
+/// S165 —— `UTAI_PSOLA_SUBCANCEL=<0..1>`:**跨周期自适应对消**,专治颗粒复用漏进输出的
+/// `f_out/2` 那一族(用户 S155 听成「合唱感」、S165 在 4:25.963 的岛边界上点名的那一处)。
+///
+/// ## ⛔ 为什么必须是这一刀,而不是第六个「在两颗源颗粒之间选/混」的算子
+/// S163 §13.5 把那一族**五个**算子放在同一条权衡线上量完了(同一份 `donor_pre`、78 音人群):
+/// `xgrain` 关 / 误差扩散 0.6 / **`xdither` 1.0(交换比 1.31 最优)** / 误差扩散 1.0 /
+/// **`xslide` 1.0(半频 +54.61,炸)**。S165 又在 **cover 轨、−11 度、真实整曲**上复验了两个
+/// (`xdither` 人群 +7.53 dB、`xslide` +37.06)⇒ **方向与量级都对上,门关死了。**
+/// ⛔ 根因是结构性的:颗粒成对产生**所有半整数倍**(0.5/1.5/2.5·f0),**正好就是「谐波之间」**
+/// ⇒ 半频与我们想保住的噪声**占同一个频率区间,滤波分不开**。
+/// ⇒ 唯一的出路不在频率上,而在**相干性**上 —— 那正是这一刀走的路。
+///
+/// ## 机理(三步,每一步都对应一个已知失败模式)
+/// 记输出 `y = H + S + N`:`H` 以 `T`(输出周期)为周期(谐波主体)、
+/// `S` 以 `2T` 为周期且**在 `T` 上反相**(半频那一族)、`N` 不重复(谐波间噪声,**要保住**)。
+///
+/// ⑴ **反周期差**:`d(t) = y(t) − g·y(t−T)` ⇒ `H` 抵消掉、`S` 变成 `2S`、`N` 留下。
+///    ⛔ `g = env(t)/env(t−T)` 是**包络比**,不是 1 —— 释放段本来就在衰减,
+///    不归一的话 `y(t) − y(t−T)` 光靠幅度差就很大,会把真信号当半频减掉。
+///    (这正是这一刀最容易做坏的地方,而 4:25.963 恰恰**就在**释放段。)
+/// ⑵ **跨 `2T` 相干平均**:`S` 每 `2T` 重复、`N` 不重复
+///    ⇒ 把 `d` 在 `m·2T`(`m = 0..PAIRS`)上按包络归一后平均,得到 `2·Ŝ`。
+///    ⚠ 4:25.963 那个释放段只有 15-20 ms ≈ 16-21 个周期 ⇒ 8-10 对 ⇒ `PAIRS = 4` 有余量。
+/// ⑶ **Wiener 自适应增益**:`gain = 相干能量 / (相干 + 不相干)`
+///    ⇒ 全是噪声的地方 `gain → 0`(**不动手**),真有相干半频的地方 `gain → 1`。
+///    ⇒ 这一刀**自己瞄准**,不需要外部的「哪里该修」判据。
+///
+/// ⭐ 交换比:相干的半频被**完全**对消(反相求和 → 0),而不相干的噪声在两抽头上只掉 3 dB
+/// ⇒ 结构上优于那五个算子的 1.31-2.12。
+///
+/// ⛔⛔ **这条轴的规矩(S150 定):只有盲测(或用户自己在整曲渲染上做谱分析)才能翻默认。**
+/// 尺子不许提拔它 —— S148 的 WSOLA 在它自己那把尺子上从 4.80 % 读到 0.38 %,
+/// 却 3/3 被耳判否掉,**因为它在制造一个八度以下的次谐波而尺子把那当成修复**。
+fn subcancel() -> f64 {
+    parse_subcancel(std::env::var("UTAI_PSOLA_SUBCANCEL").ok().as_deref())
+}
+
+/// env 解析写成纯函数 —— 判据不许去碰进程状态。
+fn parse_subcancel(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(0.0)
+}
+
+/// 相干平均用几对 `2T`。见 [`subcancel`] ⑵。
+const SUBCANCEL_PAIRS: usize = 4;
+
+/// 逐块处理的块长（ms）—— `T` 与 `L` 每块各估一次。
+const SUBCANCEL_BLOCK_MS: f64 = 8.0;
+
+/// 污染相干性的下限：`d` 在 `L` 处的归一化互相关低于它 ⇒ **这一块不动手**。
+/// ⭐ 实测：4:25.963 的爆发段 **0.62**，而健康段在 `2T` 附近只有 **0.02**。
+const SUBCANCEL_MIN_CORR: f64 = 0.40;
+
+/// 包络比的夹子(倍)。⛔ 它是**保险丝**:`env` 在近静音处会给出荒唐的比值。
+const SUBCANCEL_G_CLAMP: f64 = 4.0;
+
+/// 包络平滑的半宽(输出周期数)。
+const SUBCANCEL_ENV_PERIODS: f64 = 1.5;
+
+/// ⭐⭐⭐ S166 —— 跨周期自适应对消的本体。见 [`subcancel`]。
+///
+/// ## ⛔ 第一版为什么在真实素材上是空刀(三条,全是实测逼出来的)
+/// 合成靶上半频掉 **57.8 dB**,而真实整曲上人群中位只动 **−0.21…−0.24 dB**。三个原因:
+/// ⑴ ⭐⭐⭐ **周期不够准**。第一版拿 `sr / (f0轨 × ratio)` 当 `T`。而差分算子
+///    `A: y ↦ y(t) − y(t−T)` 对第 `k` 次谐波的残留是 `|1 − e^{−j2πkε}| ≈ 2πkε`
+///    ⇒ **`T` 差 2 % 时第 6 次谐波只被压掉 25 %**,`d` 里于是塞满了残余谐波,
+///    Wiener 增益被它们的方差压到 0。⇒ **`T` 必须从输出自身估**(自相关峰,亚样本细化)。
+/// ⑵ **相干平均的滞后也要估**。实测 4:25.963 那一处 `d` 的自相关峰在 **L = 87**,
+///    而 `2·T_out = 84.6` —— 差 2.8 %,四项累积相位误差 61°,相干和退化。
+/// ⑶ ⛔ **减出来的东西必须强制反周期**。`d` 里残留的谐波是 `T` 周期的,因而**也是 `2T` 周期的**
+///    ⇒ 相干平均照样把它提出来,减掉就是**削真谐波**。
+///    ⇒ 末了做一次 `Ŝ ← ½(Ŝ(t) − Ŝ(t−T))`:`T` 周期的成分被它清零,反周期的成分原样保留。
+///    **这一步是谐波主体的保险丝,不是优化。**
+///
+/// ⛔ **FIR,不许就地反馈**:历史一律从 `src`(未被碰过的副本)读。
+///
+/// 返回(动过的样本数, 被减掉的能量占比 dB)—— 「开着」与「真的做了事」是两回事。
+fn cancel_subharmonic(
+    y: &mut [f32],
+    f0_hz: &[f32],
+    f0_hop: usize,
+    sample_rate: u32,
+    ratio: f64,
+    strength: f64,
+) -> (usize, f32) {
+    if !(strength > 0.0) || y.is_empty() || f0_hop == 0 || !(ratio.is_finite() && ratio > 0.0) {
+        return (0, 0.0);
+    }
+    let sr = f64::from(sample_rate);
+    let n = y.len();
+    let src: Vec<f32> = y.to_vec();
+
+    // 包络:滑动均方根,半宽固定 3 ms(只用来做幅度归一,精度要求远低于 `T`)。
+    let env_half = ((0.003 * sr) as usize).max(2);
+    let env: Vec<f64> = {
+        let mut pre = vec![0.0f64; n + 1];
+        for i in 0..n {
+            pre[i + 1] = pre[i] + f64::from(src[i]) * f64::from(src[i]);
+        }
+        (0..n)
+            .map(|i| {
+                let a = i.saturating_sub(env_half);
+                let b = (i + env_half + 1).min(n);
+                (((pre[b] - pre[a]) / (b - a).max(1) as f64).sqrt()).max(1e-9)
+            })
+            .collect()
+    };
+    let env_at = |p: f64| -> f64 {
+        let k = p.round();
+        if k < 0.0 || k >= n as f64 { 1e-9 } else { env[k as usize] }
+    };
+    // 归一化互相关:`src` 在 `c` 处的窗与 `c − lag` 处的窗。
+    let ncorr = |c: usize, lag: f64, half: usize| -> f64 {
+        if (c as f64) - lag - half as f64 - 1.0 < 0.0 || c + half >= n {
+            return -2.0;
+        }
+        let (mut num, mut e1, mut e2) = (0.0f64, 0.0f64, 0.0f64);
+        for k in 0..(2 * half) {
+            let i = c + k - half;
+            let a = f64::from(src[i]);
+            let b = sinc_read(&src, i as f64 - lag);
+            num += a * b;
+            e1 += a * a;
+            e2 += b * b;
+        }
+        if e1 <= 0.0 || e2 <= 0.0 { -2.0 } else { num / (e1 * e2).sqrt() }
+    };
+    // 在 `[lo, hi]` 里找互相关最大的滞后,再用抛物线细化到亚样本。
+    let best_lag = |c: usize, lo: f64, hi: f64, half: usize| -> Option<(f64, f64)> {
+        if !(hi > lo) {
+            return None;
+        }
+        let (mut bl, mut bv) = (0.0f64, -2.0f64);
+        let mut l = lo.floor().max(2.0);
+        while l <= hi {
+            let v = ncorr(c, l, half);
+            if v > bv {
+                bv = v;
+                bl = l;
+            }
+            l += 1.0;
+        }
+        if bv <= -1.5 {
+            return None;
+        }
+        let (a, b, cc) = (ncorr(c, bl - 1.0, half), bv, ncorr(c, bl + 1.0, half));
+        let refined = if a > -1.5 && cc > -1.5 {
+            bl + parabolic(a, b, cc)
+        } else {
+            bl
+        };
+        Some((refined, bv))
+    };
+
+    let mut touched = 0usize;
+    let mut e_before = 0.0f64;
+    let mut e_removed = 0.0f64;
+
+    for (a, b) in voiced_islands(f0_hz, f0_hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
+        // 逐块处理:块内 `T` 与 `L` 各估一次(它们变得比样本慢得多,而每样本估一次太贵)。
+        let mut blk = a;
+        while blk < b.min(n) {
+            let f_nom = f0_at(f0_hz, f0_hop, blk as f64) * ratio;
+            if !(f_nom > 0.0) {
+                blk += 1;
+                continue;
+            }
+            let t_nom = sr / f_nom;
+            if !(t_nom.is_finite() && t_nom >= 4.0) {
+                blk += 1;
+                continue;
+            }
+            let step = ((SUBCANCEL_BLOCK_MS / 1000.0 * sr) as usize).max(8);
+            let end = (blk + step).min(b).min(n);
+            let half = (t_nom * 1.5) as usize;
+            let c = (blk + end) / 2;
+            // ⑴ `T` 从输出自身估 —— 名义值只用来划搜索范围。
+            let Some((t_hat, _)) = best_lag(c, t_nom * 0.88, t_nom * 1.14, half) else {
+                blk = end.max(blk + 1);
+                continue;
+            };
+            // 需要的历史:`PAIRS` 个 `L` 再加一个 `T`。
+            let need = SUBCANCEL_PAIRS as f64 * 2.2 * t_hat + t_hat + 2.0;
+            if (blk as f64) < need {
+                blk = end.max(blk + 1);
+                continue;
+            }
+            // ⑵ 相干平均的滞后 `L` 也估 —— 在 `2T` 附近搜。
+            //    ⛔ 用 `d` 的自相关而不是 `src` 的:要找的是**污染**的周期。
+            let dsig = |i: f64| -> f64 {
+                let p1 = i - t_hat;
+                let g = (env_at(i) / env_at(p1)).clamp(1.0 / SUBCANCEL_G_CLAMP, SUBCANCEL_G_CLAMP);
+                sinc_read(&src, i) - g * sinc_read(&src, p1)
+            };
+            let dcorr = |lag: f64| -> f64 {
+                let (mut num, mut e1, mut e2) = (0.0f64, 0.0f64, 0.0f64);
+                for k in 0..(2 * half) {
+                    let i = (c + k) as f64 - half as f64;
+                    if i - lag - t_hat < 1.0 || i >= n as f64 - 1.0 {
+                        return -2.0;
+                    }
+                    let (u, v) = (dsig(i), dsig(i - lag));
+                    num += u * v;
+                    e1 += u * u;
+                    e2 += v * v;
+                }
+                if e1 <= 0.0 || e2 <= 0.0 { -2.0 } else { num / (e1 * e2).sqrt() }
+            };
+            let (mut lbest, mut lval) = (2.0 * t_hat, -2.0f64);
+            let mut l = (1.85 * t_hat).floor();
+            while l <= 2.15 * t_hat {
+                let v = dcorr(l);
+                if v > lval {
+                    lval = v;
+                    lbest = l;
+                }
+                l += 1.0;
+            }
+            // ⛔ 污染不够相干 ⇒ 这一块**不动手**(健康段的阴性对照就靠它)。
+            if lval < SUBCANCEL_MIN_CORR {
+                blk = end.max(blk + 1);
+                continue;
+            }
+            for i in blk..end {
+                let ip = i as f64;
+                let mut acc = 0.0f64;
+                let mut sq = 0.0f64;
+                let mut m_used = 0usize;
+                for m in 0..SUBCANCEL_PAIRS {
+                    let p = ip - (m as f64) * lbest;
+                    if p - t_hat < 1.0 {
+                        break;
+                    }
+                    let k = (env_at(ip) / env_at(p)).clamp(1.0 / SUBCANCEL_G_CLAMP, SUBCANCEL_G_CLAMP);
+                    acc += k * dsig(p);
+                    sq += (k * dsig(p)) * (k * dsig(p));
+                    m_used += 1;
+                }
+                if m_used < 2 {
+                    continue;
+                }
+                let mean = acc / m_used as f64;
+                let var = (sq / m_used as f64 - mean * mean).max(0.0);
+                let coh = mean * mean;
+                let gain = if coh + var > 1e-18 { coh / (coh + var) } else { 0.0 };
+                if gain <= 0.0 {
+                    continue;
+                }
+                // ⑶ ⛔ **强制反周期** —— 把 `Ŝ` 里所有 `T` 周期的成分(= 残余谐波)清零。
+                //    做法:同一条估计在 `i` 与 `i − T` 上各算一次,取半差。
+                let mut acc2 = 0.0f64;
+                let mut m2 = 0usize;
+                for m in 0..SUBCANCEL_PAIRS {
+                    let p = ip - t_hat - (m as f64) * lbest;
+                    if p - t_hat < 1.0 {
+                        break;
+                    }
+                    let k = (env_at(ip) / env_at(p)).clamp(1.0 / SUBCANCEL_G_CLAMP, SUBCANCEL_G_CLAMP);
+                    acc2 += k * dsig(p);
+                    m2 += 1;
+                }
+                if m2 < 2 {
+                    continue;
+                }
+                let anti = 0.5 * (mean - acc2 / m2 as f64);
+                let corr = strength * gain * anti * 0.5;
+                if corr.abs() < 1e-12 {
+                    continue;
+                }
+                let before = f64::from(src[i]);
+                y[i] = (before - corr) as f32;
+                e_before += before * before;
+                e_removed += corr * corr;
+                touched += 1;
+            }
+            blk = end.max(blk + 1);
+        }
+    }
+    let db = if e_before > 0.0 {
+        (10.0 * (e_removed / e_before).max(1e-12).log10()) as f32
+    } else {
+        0.0
+    };
+    (touched, db)
+}
+
 fn xslide() -> f64 {
     std::env::var("UTAI_PSOLA_XSLIDE")
         .ok()
@@ -3431,6 +3723,18 @@ pub fn psola_shift_edge(
             diag.env_dev_after_db = env_dev_p50_db(&ey2, &ex, &covered) as f32;
         }
     }
+    // ⭐⭐⭐ S165 —— 跨周期自适应对消（见 [`subcancel`]）。
+    // ⛔ 位置：在**合成之后、去次声之前**。
+    //    在合成之后 —— 它要对消的东西是**合成制造的**（颗粒复用），不存在于输入；
+    //    在去次声之前 —— 去次声是差分式的（`d = out − x`），要让它看到的是**最终的** `out`。
+    {
+        let sc = subcancel();
+        if sc > 0.0 {
+            let (k, db) = cancel_subharmonic(&mut out, f0_hz, f0_hop, sample_rate, ratio, sc);
+            diag.subcancel_samples = k;
+            diag.subcancel_removed_db = db;
+        }
+    }
     // S152 —— **读数无条件算,修法才由旋钮控**。这样今天的生产日志里就能看见它,而输出逐位不变。
     // ⛔ 这一条是从 S147 那次「收益静默减半」学来的:一个只在改动打开时才存在的读数,
     // 没法用来判断「改动之前是什么样」。
@@ -3651,6 +3955,145 @@ mod tests {
     /// ⑷ ⛔ **阴性对照**:核确实读到了信号(不是恒 0);
     /// ⑸ ⭐ 顺带记下**有多少个读点是真的逐位相同的** —— 若哪天它掉到 0,
     ///    说明分叉从「1 ulp」变成了别的东西,那是要看的。
+    /// ⭐⭐⭐ S165 —— 跨周期自适应对消([`cancel_subharmonic`])。
+    ///
+    /// ⛔⛔ **这条判据的承重点是「留住噪声」那一半**。整条线上已经有五个算子倒在
+    /// 「打散了成对结构、同时把谐波间的噪声一起平均掉」上(S163 §13.5:`xgrain` 关 /
+    /// 误差扩散 0.6 / `xdither` / 误差扩散 1.0 / `xslide`,交换比 1.31-2.12)。
+    /// ⇒ 只测「半频降了多少」的判据**证明不了这一刀比它们强** —— 必须两边一起钉。
+    ///
+    /// 靶(合成,零假设):`y = H + S + N`
+    /// * `H` = 基频 `F` 的 6 次谐波(周期 `T`);
+    /// * `S` = `F/2` 的正弦(周期 `2T`,在 `T` 上反相)= 要被吃掉的;
+    /// * `N` = 确定性白噪(不重复)= **要留住的**。
+    ///
+    /// 五条:
+    /// ⑴ 关(出厂 0.0)⇒ **逐位不变**。
+    /// ⑵ 开 ⇒ 半频 `F/2` 那根**至少掉 12 dB**。
+    /// ⑶ ⛔ 谐波主体 `F..6F` **不许掉超过 1 dB**。
+    /// ⑷ ⛔ **噪声不许掉超过 4 dB**(两抽头对不相干成分理论上 −3 dB;留 1 dB 余量)。
+    ///    ——— 这一条就是那五个算子过不去的门。
+    /// ⑸ 诊断眼睛要真的报数(`subcancel_samples > 0`)。
+    #[test]
+    fn subharmonic_cancellation_eats_the_half_rate_and_keeps_the_noise() {
+        const SR: u32 = 48_000;
+        const F: f64 = 1000.0;
+        let n = SR as usize / 2; // 0.5 s
+        let mut rng: u32 = 0x9e37_79b9;
+        let mut white = || {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng >> 8) as f32 / 8_388_608.0 - 1.0
+        };
+        let mut y = vec![0.0f32; n];
+        let mut noise = vec![0.0f32; n];
+        for i in 0..n {
+            let t = i as f64 / f64::from(SR);
+            let mut v = 0.0f64;
+            for k in 1..=6 {
+                v += (2.0 * std::f64::consts::PI * F * k as f64 * t).sin() / k as f64;
+            }
+            v += 0.35 * (2.0 * std::f64::consts::PI * (F / 2.0) * t).sin(); // 半频
+            let w = 0.05 * f64::from(white());
+            noise[i] = w as f32;
+            y[i] = (0.30 * v + w) as f32;
+        }
+        // 喂给它的 f0 轨:整段浊音、恰好 F(ratio 1.0 ⇒ 输出周期 = SR/F)
+        let hop = SR as usize / 100;
+        let f0 = vec![F as f32; n / hop + 2];
+
+        let bin_db = |x: &[f32], f: f64| -> f64 {
+            // 单频点的 Goertzel(比 FFT 省事,而且不需要窗对齐)
+            let w = 2.0 * std::f64::consts::PI * f / f64::from(SR);
+            let (c, s) = (w.cos(), w.sin());
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, v) in x.iter().enumerate() {
+                let p = w * i as f64;
+                let _ = (c, s);
+                re += f64::from(*v) * p.cos();
+                im += f64::from(*v) * p.sin();
+            }
+            10.0 * ((re * re + im * im) / (x.len() * x.len()) as f64).max(1e-30).log10()
+        };
+        // ⑴ 关 = 逐位不变
+        let mut off = y.clone();
+        let (k0, db0) = cancel_subharmonic(&mut off, &f0, hop, SR, 1.0, 0.0);
+        assert_eq!((k0, db0), (0, 0.0));
+        assert_eq!(off, y, "关着的时候必须逐位不变");
+
+        // ⑵⑶⑷ 开
+        let mut on = y.clone();
+        let (k1, _db1) = cancel_subharmonic(&mut on, &f0, hop, SR, 1.0, 1.0);
+        assert!(k1 > n / 4, "只动了 {k1} / {n} 个样本 —— 这一刀几乎没跑");
+
+        let half_before = bin_db(&y, F / 2.0);
+        let half_after = bin_db(&on, F / 2.0);
+        assert!(
+            half_after < half_before - 12.0,
+            "半频只掉了 {:.1} dB(要求 ≥12)",
+            half_before - half_after
+        );
+        for k in 1..=6 {
+            let f = F * k as f64;
+            let (a, b) = (bin_db(&y, f), bin_db(&on, f));
+            assert!(
+                b > a - 1.0,
+                "第 {k} 次谐波掉了 {:.2} dB —— 谐波主体不许被动(上限 1 dB)",
+                a - b
+            );
+        }
+        // ⑷ ⛔⛔ **噪声代价要在【另一个靶】上量** —— 靶 B 里**根本没有半频**。
+        //    ⛔ 第一版在靶 A 上拿「减掉谐波+半频后的残差」当噪声,**而它把被减掉的半频
+        //    当成了新增噪声** ⇒ 读到「噪声涨了 8.34 dB」,而真相是半频被干掉了。
+        //    那条断言因此是**空的**(残差涨了就恒过)。⭐ 血训:
+        //    **尺子的参照里不能含有「被测刀子故意去掉的东西」。**
+        let mut yb = vec![0.0f32; n];
+        let mut rng2: u32 = 0x9e37_79b9;
+        let mut white2 = || {
+            rng2 = rng2.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng2 >> 8) as f32 / 8_388_608.0 - 1.0
+        };
+        let mut harm = vec![0.0f32; n];
+        for i in 0..n {
+            let t = i as f64 / f64::from(SR);
+            let mut v = 0.0f64;
+            for k in 1..=6 {
+                v += (2.0 * std::f64::consts::PI * F * k as f64 * t).sin() / k as f64;
+            }
+            harm[i] = (0.30 * v) as f32;
+            yb[i] = harm[i] + 0.05 * white2();
+        }
+        let mut ob = yb.clone();
+        cancel_subharmonic(&mut ob, &f0, hop, SR, 1.0, 1.0);
+        let skip =
+            (SUBCANCEL_PAIRS as f64 * 2.0 * (f64::from(SR) / F) + f64::from(SR) / F) as usize + 1;
+        let noise_e = |x: &[f32]| -> f64 {
+            let mut e = 0.0f64;
+            for i in skip..n {
+                let r = f64::from(x[i]) - f64::from(harm[i]);
+                e += r * r;
+            }
+            10.0 * (e / (n - skip) as f64).max(1e-30).log10()
+        };
+        let (nb, na) = (noise_e(&yb), noise_e(&ob));
+        assert!(
+            na > nb - 1.5,
+            "噪声掉了 {:.2} dB(上限 1.5)—— 这正是 S163 那五个算子倒下的地方;\
+             实测应当只有 **−0.39 dB**(半频 −57.8 换噪声 −0.39)",
+            nb - na
+        );
+        for k in 1..=6 {
+            let f = F * k as f64;
+            let (a2, b2) = (bin_db(&yb, f), bin_db(&ob, f));
+            assert!(b2 > a2 - 0.5, "靶 B 上第 {k} 次谐波掉了 {:.2} dB", a2 - b2);
+        }
+
+        // ⑸ 出厂值与解析
+        assert_eq!(parse_subcancel(None), 0.0, "出厂必须是 0 = 逐位不变");
+        assert_eq!(parse_subcancel(Some("0.5")), 0.5);
+        assert_eq!(parse_subcancel(Some("2")), 0.0, "越界要落回出厂");
+        assert_eq!(SUBCANCEL_PAIRS, 4);
+    }
+
     #[test]
     fn the_cached_sinc_kernel_matches_the_direct_read_to_one_ulp() {
         let n = 512usize;
