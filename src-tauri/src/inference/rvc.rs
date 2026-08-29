@@ -442,9 +442,24 @@ fn fill_voiced_holes_inplace(f0: &mut [f32], audio16k: &[f32], hop: usize) -> us
 fn fill_one(f0: &mut [f32], audio16k: &[f32], hop: usize, i: usize) -> bool {
     /// Above every unvoiced frame measured (p99 = 0.673), far below the hole (0.962).
     const PEAK_GATE: f32 = 0.75;
-    /// Below 200 Hz a 40 ms window holds too few periods to trust; above 1100 Hz is past
-    /// what RVC's coarse table can carry anyway.
+    /// Below 200 Hz a 40 ms window holds too few periods to trust.
     const F_MIN: f32 = 200.0;
+    /// Capped at what `f0_to_coarse` can carry. Raising it was tried and MEASURED WORSE.
+    ///
+    /// The argument for raising it sounded solid: at the 730 ms dropout the true fundamental
+    /// is ~1420 Hz, and with the cap at 1100 autocorrelation locks onto a sub-multiple and
+    /// writes 470 Hz — a twelfth low. Reading the truth should also let the frame trip the
+    /// `RVC_COARSE_MAX_HZ` death test and get rescued down properly. So: cap to 1600, render,
+    /// measure.
+    ///
+    /// What that missed is that the filled value is a CONDITION handed to the model, not the
+    /// output pitch. Measured at the dropout (spectral peaks, source median 1392 Hz):
+    ///     cap 1100   output 1384 Hz   -10 cents      whole-song bad frames 4.32 %
+    ///     cap 1600   output 1426 Hz   +42 cents                            4.56 %
+    /// Writing 470 Hz does not make the model sing a twelfth low — those frames simply skip
+    /// the death test and the model tracks the source anyway. Writing 1454 Hz does trip it,
+    /// and the -15 semitone rescue that follows costs both pitch accuracy and cleanliness.
+    /// Both arms of the comparison lose, so the cap stays where it was.
     const F_MAX: f32 = 1100.0;
     /// 40 ms at 16 kHz -- the window the separation above was measured with.
     const WIN: usize = 640;
@@ -1614,6 +1629,51 @@ pub fn f0_to_coarse(f0: f32) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// S165 §107/§109 —— 补洞的搜索上限**保持在 `f0_to_coarse` 装得下的范围内**。
+    ///
+    /// ⛔ 抬高它试过,**实测更差,两条都输**。当时的推理听着很硬:那处漏唱的真基频约
+    /// 1420 Hz,上限 1100 时自相关锁到次谐波、写进 470 Hz(低了十二度);读出真值还能让
+    /// 这一帧撞 `RVC_COARSE_MAX_HZ` 那条死因、被正经救援下来。于是抬到 1600、渲、量——
+    ///
+    /// 漏掉的是:**补进去的值是喂给模型的【条件】,不是输出音高本身**。在那处实测
+    /// (谱峰法,源中位 1392 Hz):
+    ///     上限 1100   输出 1384 Hz  −10 音分     全曲坏帧 4.32 %
+    ///     上限 1600   输出 1426 Hz  +42 音分              4.56 %
+    /// 写 470 Hz 并不会让模型唱低十二度——那些帧只是跳过死因判定,模型照样跟着源唱;
+    /// 写 1454 Hz 反而触发 −15 度深救援,音准和干净度**一起变差**。
+    ///
+    /// ⚠ 这条判据钉的是**上限本身**,以及「读出来的东西装得进 coarse 表」这个约束。
+    #[test]
+    fn the_fill_search_stays_inside_what_coarse_can_carry() {
+        const SR: f32 = 16_000.0;
+        const HOP: usize = 160;
+        let n = HOP * 60 + 1600;
+        // 700 Hz:装得下,必须读准
+        let tone: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 700.0 * i as f32 / SR).sin() * 0.3)
+            .collect();
+        let mut f0 = vec![0.0f32; 50];
+        assert!(super::fill_voiced_holes_inplace(&mut f0, &tone, HOP) >= 40);
+        let mut got: Vec<f32> = f0.iter().copied().filter(|v| *v > 20.0).collect();
+        got.sort_by(f32::total_cmp);
+        let med = got[got.len() / 2];
+        assert!((med - 700.0).abs() < 25.0, "装得下的音必须读准,读到 {med:.1}");
+        // ⭐ 承重:凡是写进 f0 的值,都必须落在 coarse 表装得下的范围内 —— 否则这一帧会被
+        //    判死并拖去深救援,而实测那样音准和干净度一起变差。
+        let ceiling = super::super::vocal_range::RVC_COARSE_MAX_HZ;
+        let high: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 1454.0 * i as f32 / SR).sin() * 0.3)
+            .collect();
+        let mut f0h = vec![0.0f32; 50];
+        super::fill_voiced_holes_inplace(&mut f0h, &high, HOP);
+        for v in f0h.iter().copied().filter(|v| *v > 20.0) {
+            assert!(
+                v <= ceiling,
+                "补进去的 {v:.1} Hz 超过了 coarse 上限 {ceiling:.0} ——                  那会把这一帧推进深救援,实测音准与干净度一起变差(§109)"
+            );
+        }
+    }
+
     /// S165 §106 —— **短洞不归这一刀管**,交给 `fill_isolated_uv_inplace`。
     ///
     /// 第一版没有这条界,实测在全曲补出 240 段:其中 **231 段(96 %)是 10-30 ms 的碎渣**,
