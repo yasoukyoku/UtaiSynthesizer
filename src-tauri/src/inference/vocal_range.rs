@@ -2597,6 +2597,21 @@ const COVER_EDGE_SEEK_MS: f32 = 300.0;
 /// ⇒ 0.8 s 之后曲线就平了(再远的同位移邻段本来就不存在)⇒ 停在 0.8。
 const COVER_MERGE_SAME_SHIFT_MS: f32 = 800.0;
 
+/// S165 §113 —— 相邻救援段位移相差不超过这么多度时也合并(深的赢)。见合并处的推导。
+/// ⛔ 调它之前先重跑那条代价曲线:2 度每条缝 0.63 度·秒,4 度 1.57,6 度 3.27。
+const COVER_MERGE_NEAR_SHIFT_ST: i64 = 2;
+
+/// 出厂 = [`COVER_MERGE_NEAR_SHIFT_ST`];`UTAI_COVER_MERGE_NEAR=<度>` 可扫,`0` = 关
+/// (退回只合并同位移 = S159n 的行为)。
+/// ⛔ 判据不许走这条(判据要钉常量本身,走 env 会随机器上导出了什么静默改答案)。
+fn cover_merge_near_st() -> i64 {
+    std::env::var("UTAI_COVER_MERGE_NEAR")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| (0..=24).contains(n))
+        .unwrap_or(COVER_MERGE_NEAR_SHIFT_ST)
+}
+
 /// S159n —— `UTAI_COVER_PHRASE_GAP_MS=<ms>`:**按乐句整段救**(0 = 关 = 出厂默认)。
 ///
 /// ## ⛔ 为什么它今天是旋钮而不是默认
@@ -3269,14 +3284,36 @@ pub fn cover_dead_plan_with(
             .filter(|(&i, _)| (i as i64) >= p_end && (i as i64) < j_start)
             .all(|(_, &m)| range.slot_reachable(m.round() as i64 + shift))
     };
+    // S165 §113 —— 位移**相近**的相邻段也合并,深的那个赢。
+    //
+    // 为什么:每条缝本身就值约 3.7 dB 的音色跳变(缝上逐带形状跳变 p50 9.91 dB,
+    // 段内同样间隔只有 6.21),而**落差与跳变的相关只有 r=0.256** —— 咔哒主要来自
+    // 「有一条缝」,不是「两侧差得多」。用户点名的 4:28.627 落差才 4 度,照样听得见。
+    // ⇒ 少一条缝比压小落差更管用,而合并正是少一条缝。
+    //
+    // 为什么恰好是 2 度:离线扫过代价曲线(消掉的缝数 / 代价「度·秒」= 被拖深的时长 ×
+    // 多降的半音)——
+    //     ≤2 st  消 21 条  代价 13.3   每条 0.63
+    //     ≤4 st  消 32 条  代价 50.2   每条 1.57
+    //     ≤6 st  消 43 条  代价 140.6  每条 3.27
+    // 2 度那一档每条缝便宜一倍半以上:多降一两个半音几乎不额外染色,而 6 度的合并等于
+    // 把一段浅救援推进深救援区,那正是 0:58 听到的那种代价。⚠ 同一个数字也是
+    // `TIED_MAX_ST` 的取值,理由同源:一两度是同一个音的余量,更大就是另一个音了。
+    //
+    // ⛔ 两道护栏原样继承(S159p 血训):`bridge_ok` 必须用**合并后的目标位移**去验,
+    //    否则中间那截材料会按一个从没被验过的位移被吞进 donor。
+    let near_st = cover_merge_near_st();
     let mut merged: Vec<DeadJob> = Vec::with_capacity(out.len());
     for j in out {
         match merged.last_mut() {
             Some(p)
-                if p.shift == j.shift
+                if (p.shift - j.shift).abs() <= near_st
                     && j.start - p.end <= merge_gap
-                    && bridge_ok(p.end, j.start, j.shift) =>
+                    && bridge_ok(p.end, j.start, p.shift.min(j.shift)) =>
             {
+                // 深的赢:浅的那段被拖深至多 COVER_MERGE_NEAR_SHIFT_ST 度,而更深的一侧
+                // 一个字节不动 —— 合并绝不许把任何材料救得更浅。
+                p.shift = p.shift.min(j.shift);
                 p.end = p.end.max(j.end);
             }
             _ => merged.push(j),
@@ -8911,6 +8948,7 @@ pub fn apply_inverse_windowed_with(
 #[cfg(test)]
 mod tests {
 
+
     /// ⛔⛔ S163 v2 —— 钉住**谐波收益闸**：坑找到了，但填进去的 `base` 在上方谐波上
     /// 不比 donor 好时，**必须不填**。
     ///
@@ -10136,6 +10174,75 @@ mod tests {
         assert!(
             jp.is_empty() && up.is_empty(),
             "把门槛降到 100 ms 之后,几帧几帧的幻影爆点仍然不许触发染色"
+        );
+    }
+        /// S165 §113 —— **位移相近的相邻段也合并,而且深的那个赢**。
+    ///
+    /// 为什么要合并:每条缝本身就值约 3.7 dB 的音色跳变(缝上逐带形状跳变 p50 9.91 dB,
+    /// 段内同样间隔 6.21),而**落差与跳变只有 r=0.256** —— 咔哒来自「有一条缝」,
+    /// 不是「两侧差得多」(用户点名的 4:28.627 落差才 4 度照样听得见)。
+    ///
+    /// 这条判据钉四件:
+    /// ⑴ 位移差 ≤2 度的相邻段要合并;
+    /// ⑵ ⭐ **深的赢** —— 合并绝不许把任何材料救得更浅(那会让它重新唱不动);
+    /// ⑶ 位移差 >2 度不许合并(否则等于把浅救援推进深救援区,代价曲线上每条缝贵 3 倍);
+    /// ⑷ ⛔ **S159p 的两道护栏仍然生效**:中间盖住无解区间、或中间浊帧移位后够不着,
+    ///    都不许合并 —— 而且必须用**合并后的目标位移**去验。
+    #[test]
+    fn adjacent_regions_within_two_semitones_merge_and_the_deeper_wins() {
+        let fps = 100.0f32;
+        let g = CoverGrouping::pinned(
+            GAP_TOL_MS,
+            MIN_VIOLATION_MS,
+            COVER_SPLIT_MIN_GAIN,
+            COVER_SPLIT_MIN_PART_MS,
+        );
+        // 两段唱不动的高音,中间隔一小段【模型唱得动】的材料(合并时会被吞进 donor)。
+        // 两段高度略有差别 ⇒ 落点会算出相差一两度的位移。
+        let build = |hi_a: f32, hi_b: f32, gap_frames: usize| {
+            let mut f0 = vec![hz(60.0); 200];
+            f0.extend(vec![hz(hi_a); 30]);
+            f0.extend(vec![hz(62.0); gap_frames]); // 中间这截唱得动
+            f0.extend(vec![hz(hi_b); 30]);
+            f0.extend(vec![hz(60.0); 200]);
+            f0
+        };
+        // ⑴⑵ 两段高度差 1 个半音 ⇒ 位移差 ≤2 ⇒ 合并,且取更深的那个
+        let (j, _) = cover_dead_plan_with(&build(88.0, 89.0, 8), fps, &range(), g);
+        assert_eq!(j.len(), 1, "位移相差 ≤2 度的相邻段应当合并成一段,得到 {j:?}");
+        let (solo_a, _) = cover_dead_plan_with(&build(88.0, 88.0, 400), fps, &range(), g);
+        let (solo_b, _) = cover_dead_plan_with(&build(89.0, 89.0, 400), fps, &range(), g);
+        let deepest = solo_a[0].shift.min(solo_b[0].shift);
+        assert_eq!(
+            j[0].shift, deepest,
+            "合并后必须取更深的那个位移 —— 救得更浅会让材料重新唱不动"
+        );
+        // ⑶ ⭐ 边界两侧都要夹住,而且反例必须【贴着】阈值 ——
+        //    音高与位移在这份夹具上是 1:1(midi 88→-9、90→-11、91→-12),
+        //    所以 88+90 = 差 2 度(要合并)、88+91 = 差 3 度(不许合并)。
+        //    ⛔ 第一版用了 88+96(差 8 度),离阈值太远:把阈值放宽到 9 度它照样不合并,
+        //       断言照样过 ⇒ 那一条守不住上界,是空的(与白噪阴性对照同型的错)。
+        let (edge_in, _) = cover_dead_plan_with(&build(88.0, 90.0, 8), fps, &range(), g);
+        assert_eq!(
+            edge_in.len(),
+            1,
+            "差 2 度(= 阈值本身)必须合并,得到 {edge_in:?}"
+        );
+        let (edge_out, _) = cover_dead_plan_with(&build(88.0, 91.0, 8), fps, &range(), g);
+        assert!(
+            edge_out.len() >= 2,
+            "差 3 度(= 阈值 +1)不许合并 —— 那等于把浅救援推进深救援区,得到 {edge_out:?}"
+        );
+        // ⑷ 护栏:中间那截若移位后够不着,不许合并
+        let mut low_mid = vec![hz(60.0); 200];
+        low_mid.extend(vec![hz(88.0); 30]);
+        low_mid.extend(vec![hz(50.0); 8]); // 低到一移位就掉出可达范围
+        low_mid.extend(vec![hz(89.0); 30]);
+        low_mid.extend(vec![hz(60.0); 200]);
+        let (guarded, _) = cover_dead_plan_with(&low_mid, fps, &range(), g);
+        assert!(
+            guarded.len() >= 2,
+            "中间那截移位后够不着时不许合并(S159p 护栏),得到 {guarded:?}"
         );
     }
     #[test]
