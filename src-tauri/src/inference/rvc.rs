@@ -135,6 +135,35 @@ const CHUNK_TIERS: &[ChunkTier] = &[
 /// `need_mb` fits the CURRENT system available commit wins; if even the smallest doesn't
 /// fit, the smallest is used anyway — the engine's INFERENCE_LOW_MEMORY floor (and the
 /// Auto-device CPU fallback in load_voice) guard the truly hopeless cases.
+/// S165 §103 —— 每个 session 记住它选定的 chunk tier。见 [`pick_chunk_tier`] 里的理由。
+/// ⚠ 跨 session 的状态,所以是进程级的;`UTAI_RVC_TIER_MEMO=0` 可关(安全阀)。
+static TIER_MEMO: std::sync::Mutex<Option<(String, &'static ChunkTier)>> =
+    std::sync::Mutex::new(None);
+
+fn tier_memo_enabled() -> bool {
+    !std::env::var("UTAI_RVC_TIER_MEMO").map(|v| v.trim() == "0").unwrap_or(false)
+}
+
+fn tier_memo_get(session_id: &str) -> Option<&'static ChunkTier> {
+    TIER_MEMO
+        .lock()
+        .ok()?
+        .as_ref()
+        .and_then(|(id, t)| (id == session_id).then_some(*t))
+}
+
+fn tier_memo_set(session_id: &str, tier: &'static ChunkTier) {
+    if let Ok(mut g) = TIER_MEMO.lock() {
+        *g = Some((session_id.to_string(), tier));
+    }
+}
+
+fn tier_memo_clear() {
+    if let Ok(mut g) = TIER_MEMO.lock() {
+        *g = None;
+    }
+}
+
 thread_local! {
     /// S165 §100 —— 这一首歌选定的 chunk tier。见 [`tier_for_this_song`]。
     static LOCKED_TIER: std::cell::Cell<Option<&'static ChunkTier>> =
@@ -190,14 +219,42 @@ fn pick_chunk_tier(engine: &OnnxEngine, voice_session: &str) -> &'static ChunkTi
     // DirectML choice never silently loses the tiering (review round 2). Auto stays
     // conservative-false: the window is one eviction race wide, and guessing DML on a
     // CUDA box would needlessly shorten its chunks.
-    let is_dml = engine
-        .resolved_device(voice_session)
+    let resolved = engine.resolved_device(voice_session);
+    let is_dml = resolved
+        .as_deref()
         .map(|d| d.contains("DirectML"))
         .unwrap_or_else(|| {
             matches!(engine.device(), super::engine::DeviceConfig::DirectMl { .. })
         });
     if !is_dml {
         return &CHUNK_TIERS[0];
+    }
+    // S165 §103 -- a loaded session has ALREADY paid for its shape.
+    //
+    // The tier decides the chunk length, the chunk length decides the input shape, and a new
+    // input shape is what costs a DirectML first-shape ticket (1.7-3.4 GB). So the question
+    // this function is really asking is "can I afford a ticket", and once the session is up
+    // holding one, the answer for THAT shape is yes -- the memory is already committed. Asking
+    // again per song and seeing a low number gets it exactly backwards: it switches to a
+    // shorter chunk, which is a NEW shape, which buys a SECOND ticket. That is the loop that
+    // walked this machine from 32 s down to 10 s, at twice the defect rate.
+    //
+    // So: remember the tier per session, and reuse it for as long as that session is alive.
+    // Nothing is being relaxed here -- reuse allocates nothing, it declines to allocate again.
+    // When the session is gone (evicted, device switched) the ticket went with it and the
+    // next pick starts fresh from whatever memory actually exists.
+    if tier_memo_enabled() {
+        if resolved.is_some() {
+            if let Some(t) = tier_memo_get(voice_session) {
+                tracing::info!(
+                    "RVC chunk tier reused (x_max={} s) — this session already holds its                      first-shape ticket; re-asking would only buy a second one (S165)",
+                    t.x_max
+                );
+                return t;
+            }
+        } else {
+            tier_memo_clear();
+        }
     }
     let (_, avail) = super::engine::system_memory_mb();
     if avail == 0 {
@@ -207,6 +264,9 @@ fn pick_chunk_tier(engine: &OnnxEngine, voice_session: &str) -> &'static ChunkTi
         .iter()
         .find(|t| avail >= t.need_mb)
         .unwrap_or(CHUNK_TIERS.last().expect("tiers non-empty"));
+    if tier_memo_enabled() {
+        tier_memo_set(voice_session, tier);
+    }
     if tier.x_max != CHUNK_TIERS[0].x_max {
         tracing::info!(
             "RVC chunk tier lowered to x_max={} s (system available commit {} MB; DirectML \
@@ -1436,6 +1496,46 @@ pub fn f0_to_coarse(f0: f32) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// S165 §103 —— **session 还活着就复用它那一档 tier**,别再去问"内存够不够"。
+    ///
+    /// tier 决定 chunk 长度,chunk 长度决定输入 shape,而**新 shape 才要付 DirectML
+    /// first-shape ticket(1.7-3.4 GB)**。session 已经举着一张了 ⇒ 那个 shape 不用再买。
+    /// 每首歌重问一次、看见内存紧就换更短的 chunk,恰恰是**再买一张** —— 这就是把这台机器
+    /// 从 32 s 一路推到 10 s、缺陷率翻倍的那个循环。
+    ///
+    /// ⚠ 复用**不分配任何东西**,它只是拒绝再分配一次,所以这里没有放宽任何门槛。
+    /// session 没了(被驱逐 / 换设备)⇒ ticket 也没了 ⇒ 必须重新按当时真实的内存选。
+    #[test]
+    fn a_live_session_keeps_the_tier_it_already_paid_for() {
+        let sid = "test-session-A";
+        super::tier_memo_clear();
+        assert!(super::tier_memo_get(sid).is_none(), "清空后不该记得任何东西");
+
+        // ⑴ 第一次:选定并记住
+        super::tier_memo_set(sid, &super::CHUNK_TIERS[1]);
+        assert_eq!(
+            super::tier_memo_get(sid).map(|t| t.x_max),
+            Some(super::CHUNK_TIERS[1].x_max),
+            "同一个 session 必须拿回同一档"
+        );
+
+        // ⑵ 换了 session ⇒ 不许串用(不同模型/不同设备是不同的 ticket)
+        assert!(
+            super::tier_memo_get("test-session-B").is_none(),
+            "别的 session 不许命中这条记忆"
+        );
+
+        // ⑶ session 没了 ⇒ 记忆必须跟着没
+        super::tier_memo_clear();
+        assert!(
+            super::tier_memo_get(sid).is_none(),
+            "session 被驱逐之后还记着旧 tier,就会拿一张早就退掉的票去下结论"
+        );
+
+        // ⑷ 安全阀存在(出厂开;=0 关)
+        assert!(super::tier_memo_enabled(), "出厂应当是开的");
+    }
+
     /// S165 §100 —— **一首歌只选一次 chunk tier**。
     ///
     /// 这条判据挡的是一整天被毁掉的 A/B:donor 死区自递归调用 `run_pipeline`,
