@@ -222,6 +222,179 @@ mod f0_probe {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ S165 —— **修 RMVPE 的八度错**(把真基频报成 1/2)。
+///
+/// # ⛔ 它为什么必须存在
+/// 用户 2026-08-29 点名翻唱轨 **10 段**「大面积的灾难,包括但不限于**八度跳变**、哑音、失声、噪声」。
+/// 逐帧量下来(cover 成品 vs 源,`1200·log2(cover/src) < −900` 的帧占比):
+/// **10 段全部八度偏低 14.1%-76.5%**,而**用户没点名的 6 段是 0.0%-0.5%** —— 差 30-150 倍。
+/// 哑/噪/失声**都挂在八度错上**,是后果不是并列症状。
+///
+/// ⛔⛔ **而记忆里写着 S160「已修:整条链 Viterbi 修 f0」—— 代码里从来没有。**
+/// S160 做的是 `UTAI_COVER_F0_IN` 这个**探针**(doc 逐字写着「出厂不设 env ⇒ 一个分支都不走」),
+/// 它证明的是「**f0 准了会怎样**」,不是「已经准了」。⇒ 生产路径上这个错**一直都在**。
+///
+/// # ⭐ 判据:**光看 f0 序列判不了八度,必须看音频**
+/// 如果 RMVPE 报的 `fc` 是真基频,源音频在 `fc` 处**必然有谱峰**;
+/// 如果真基频是 `2·fc`,`fc` 处**什么都没有**(那里是谐波之间)。
+/// ⇒ 量 `fc` 处相对**谐波间背景**(`0.5·fc` 与 `1.5·fc`)的突出度。
+///
+/// 实测(真实的 RMVPE 输出 + 源音频,`prom(fc)` dB):
+/// | | prom(fc) | 判为八度错的帧% |
+/// |---|---|---|
+/// | 用户点名的最坏三段 | **1.7 / 2.7 / −3.4** | 50.0 / 29.3 / 43.6 |
+/// | **阴性对照(没点名的 5 段)** | **41.0-48.1** | **0.0-0.8** |
+/// ⇒ 分得干干净净。
+///
+/// # ⛔ 必须带时间连续性
+/// S160 登记过「**逐帧独立版判负**」:单帧的判断会在一个长音内部来回翻,
+/// 造出比八度错本身更难听的东西。⇒ 这里用 **Viterbi**(两状态:保持 / 翻倍),
+/// 转移代价 [`OCTAVE_SWITCH_PENALTY_DB`] 把翻转压到**成段**发生。
+///
+/// # ⚠ 只往上修,不往下
+/// RMVPE 的已知失败模式是**报成 1/2**;没有观测到「报成 2 倍」。
+/// ⇒ 候选只有 `{fc, 2·fc}`,不含 `fc/2` —— 少一个状态就少一族误伤。
+fn fix_octave_inplace(pitchf: &mut [f32], audio16k: &[f32], hop: usize) -> usize {
+    if pitchf.is_empty() || audio16k.len() < 4 * hop {
+        return 0;
+    }
+    const SR: f64 = 16_000.0;
+    let win = (0.040 * SR) as usize; // 40 ms
+    let nfft = win.next_power_of_two();
+    // 汉宁窗(一次算好)
+    let w: Vec<f64> = (0..win)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / win as f64).cos())
+        .collect();
+    // 每帧两个状态的观测代价
+    let mut obs: Vec<[f64; 2]> = Vec::with_capacity(pitchf.len());
+    for (i, &fc) in pitchf.iter().enumerate() {
+        if fc <= 20.0 || 2.0 * f64::from(fc) >= SR / 2.0 * 0.9 {
+            obs.push([0.0, 1e9]); // 无声/太高 ⇒ 只能保持
+            continue;
+        }
+        let c = i * hop;
+        let a = c.saturating_sub(win / 2);
+        if a + win > audio16k.len() {
+            obs.push([0.0, 1e9]);
+            continue;
+        }
+        let mut re: Vec<f64> = (0..nfft)
+            .map(|k| if k < win { f64::from(audio16k[a + k]) * w[k] } else { 0.0 })
+            .collect();
+        let mut im = vec![0.0f64; nfft];
+        octave_fft(&mut re, &mut im);
+        let mag: Vec<f64> =
+            (0..=nfft / 2).map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt()).collect();
+        let bin = |f: f64| -> f64 { f * nfft as f64 / SR };
+        let peak = |f: f64| -> f64 {
+            let (lo, hi) = (bin(f * 0.88).floor().max(0.0) as usize, bin(f * 1.12).ceil() as usize);
+            mag[lo.min(nfft / 2)..=hi.min(nfft / 2)].iter().copied().fold(0.0f64, f64::max)
+        };
+        let bg = |f: f64| -> f64 {
+            let mut v = Vec::new();
+            for k in [0.5f64, 1.5] {
+                let (lo, hi) =
+                    (bin(f * k * 0.92).floor().max(0.0) as usize, bin(f * k * 1.08).ceil() as usize);
+                let sl = &mag[lo.min(nfft / 2)..=hi.min(nfft / 2)];
+                if !sl.is_empty() {
+                    v.push(sl.iter().sum::<f64>() / sl.len() as f64);
+                }
+            }
+            if v.is_empty() { 1e-12 } else { v.iter().sum::<f64>() / v.len() as f64 }
+        };
+        let f = f64::from(fc);
+        let p1 = 20.0 * (peak(f).max(1e-12) / bg(f).max(1e-12)).log10();
+        let p2 = 20.0 * (peak(2.0 * f).max(1e-12) / bg(2.0 * f).max(1e-12)).log10();
+        // 代价 = 负的突出度(越突出越便宜)
+        obs.push([-p1, -p2]);
+    }
+    // Viterbi(两状态)
+    let n = obs.len();
+    let mut cost = [obs[0][0], obs[0][1]];
+    let mut back: Vec<[u8; 2]> = vec![[0, 0]; n];
+    for i in 1..n {
+        let mut next = [0.0f64; 2];
+        for s in 0..2 {
+            let stay = cost[s];
+            let switch = cost[1 - s] + f64::from(OCTAVE_SWITCH_PENALTY_DB);
+            if stay <= switch {
+                next[s] = stay + obs[i][s];
+                back[i][s] = s as u8;
+            } else {
+                next[s] = switch + obs[i][s];
+                back[i][s] = (1 - s) as u8;
+            }
+        }
+        cost = next;
+    }
+    let mut st = if cost[1] < cost[0] { 1usize } else { 0usize };
+    let mut path = vec![0u8; n];
+    for i in (0..n).rev() {
+        path[i] = st as u8;
+        st = back[i][st] as usize;
+    }
+    let mut fixed = 0usize;
+    for (i, &s) in path.iter().enumerate() {
+        if s == 1 && pitchf[i] > 20.0 {
+            pitchf[i] *= 2.0;
+            fixed += 1;
+        }
+    }
+    fixed
+}
+
+/// 就地 radix-2 FFT。⛔ 只给 [`fix_octave_inplace`] 用。
+fn octave_fft(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    if n <= 1 {
+        return;
+    }
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2usize;
+    while len <= n {
+        let ang = -2.0 * std::f64::consts::PI / len as f64;
+        let (wr, wi) = (ang.cos(), ang.sin());
+        let mut i = 0usize;
+        while i < n {
+            let (mut cr, mut ci) = (1.0f64, 0.0f64);
+            for k in 0..len / 2 {
+                let (ur, ui) = (re[i + k], im[i + k]);
+                let (vr, vi) = (
+                    re[i + k + len / 2] * cr - im[i + k + len / 2] * ci,
+                    re[i + k + len / 2] * ci + im[i + k + len / 2] * cr,
+                );
+                re[i + k] = ur + vr;
+                im[i + k] = ui + vi;
+                re[i + k + len / 2] = ur - vr;
+                im[i + k + len / 2] = ui - vi;
+                let ncr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = ncr;
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// ⭐ 八度翻转的转移代价(dB)。⛔ 它是「**成段翻转**」与「逐帧乱跳」之间的唯一防线
+/// (S160 登记过逐帧独立版判负)。
+/// ⚙ **12 dB**:实测点名段的 `prom(fc)` 与 `prom(2fc)` 差 **20-30 dB**(真的错时),
+/// 而对照段差 **35-40 dB**(反方向)⇒ 12 dB 的门槛只有真的成段错时才跨得过去。
+const OCTAVE_SWITCH_PENALTY_DB: f32 = 12.0;
+
 /// S160d —— 填掉 `pitchf` 里**长度恰好 1 帧**、两侧都是浊音的 0(线性插值 = 两侧均值)。返回填了几个。
 ///
 /// ## ⛔ 为什么
@@ -351,6 +524,25 @@ pub fn run_pipeline(
         &audio_pad,
         super::f0::RVC_RMVPE_THRESHOLD,
     )?;
+    // ⭐⭐⭐⭐⭐ S165 —— **修 RMVPE 的八度错**(见 [`fix_octave_inplace`])。
+    //
+    // ⛔ 位置是承重的:必须在 `*= ratio` **之前** —— 判据要拿 `f0` 去对**原始音频**上的谱峰,
+    //    乘过 `f0_shift` 之后两者就对不上了。
+    // ⛔ 也必须在 `f0` 上(而不是下面截断后的 `pitchf`)—— donor 那一遍会重跑这整段,
+    //    自递归继承的是这里的结果。
+    // ⚙ 出厂开;`UTAI_COVER_OCTAVE_FIX=0` 关掉 ⇒ 逐位回到今天。
+    if !matches!(std::env::var("UTAI_COVER_OCTAVE_FIX").as_deref(), Ok("0")) {
+        let k = fix_octave_inplace(&mut f0, &audio_pad, WINDOW);
+        if k > 0 {
+            tracing::info!(
+                "RVC f0: octave-repair lifted {k} / {} frame(s) ({:.1}% of voiced) (S165)",
+                f0.len(),
+                100.0 * k as f32 / f0.iter().filter(|v| **v > 20.0).count().max(1) as f32
+            );
+        } else {
+            tracing::info!("RVC f0: octave-repair found nothing to lift (S165)");
+        }
+    }
     // f0 *= 2^(f0_up_key/12) — applied to the raw Hz track BEFORE coarse quantization
     // (unvoiced zeros stay zero under the multiply, like the original)
     let ratio = 2.0f32.powf(options.f0_shift / 12.0);
@@ -933,6 +1125,119 @@ pub fn f0_to_coarse(f0: f32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐⭐⭐⭐⭐ S165 —— **八度修复:两种情形必须分开**。
+    ///
+    /// 这条判据的全部价值在于它的**两个对照**:
+    /// ⑴ **阳性**:音频真基频 400 Hz,而 RMVPE 报 **200** ⇒ 必须抬回 400
+    ///    (200 处**没有谱峰** —— 那是谐波之间);
+    /// ⑵ ⛔ **阴性**:音频真基频**就是** 200 Hz(谐波 200/400/600…),RMVPE 报 200
+    ///    ⇒ **一帧都不许动**。
+    ///    ⭐ 机理上这两种情形是这样分开的:对 `fc=400` 的候选,背景取 `0.5·fc=200` 与 `1.5·fc=600`,
+    ///    而在真 200 Hz 的信号里**那两处都有谐波** ⇒ 背景高 ⇒ `prom(2fc)` 反而低。
+    /// ⑶ **无声帧**(`f0 == 0`)不许被抬。
+    /// ⑷ **时间连续性**:整段一致的判断,不许出现逐帧来回翻
+    ///    (S160 登记过「逐帧独立版判负」)。
+    #[test]
+    fn octave_repair_lifts_a_halved_track_and_leaves_a_genuine_low_one_alone() {
+        const SR: f32 = 16_000.0;
+        const HOP: usize = 160; // 100 fps
+        let n_frames = 120usize;
+        let n = n_frames * HOP + 4 * HOP;
+        // 造一个真基频 `f` 的多谐波音
+        let tone = |f: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / SR;
+                    let mut v = 0.0f32;
+                    for k in 1..=6 {
+                        let kf = f * k as f32;
+                        if kf < SR / 2.0 * 0.9 {
+                            v += (2.0 * std::f32::consts::PI * kf * t).sin() / k as f32;
+                        }
+                    }
+                    v * 0.3
+                })
+                .collect()
+        };
+        // ⑴ 阳性:音频是 400,轨报成 200
+        let audio400 = tone(400.0);
+        let mut halved = vec![200.0f32; n_frames];
+        let lifted = fix_octave_inplace(&mut halved, &audio400, HOP);
+        assert!(
+            lifted >= n_frames * 8 / 10,
+            "真基频 400 而轨报 200:只抬了 {lifted}/{n_frames} 帧 —— 八度修复没生效"
+        );
+        assert!(
+            halved.iter().filter(|v| (**v - 400.0).abs() < 1.0).count() >= n_frames * 8 / 10,
+            "抬完之后没落在 400 Hz 上"
+        );
+        // ⑵ ⛔ 阴性对照:音频真的就是 200
+        let audio200 = tone(200.0);
+        let mut genuine = vec![200.0f32; n_frames];
+        let moved = fix_octave_inplace(&mut genuine, &audio200, HOP);
+        assert_eq!(
+            moved, 0,
+            "音频真基频就是 200 Hz,却被抬了 {moved} 帧 —— 这个修复会毁掉正常的低音"
+        );
+        // ⑶ 无声帧
+        let mut with_rest = vec![200.0f32; n_frames];
+        for v in with_rest.iter_mut().take(20) {
+            *v = 0.0;
+        }
+        fix_octave_inplace(&mut with_rest, &audio400, HOP);
+        assert!(
+            with_rest[..20].iter().all(|v| *v == 0.0),
+            "无声帧被抬了 —— uv=0 的语义被破坏"
+        );
+        // ⑷ ⛔⛔ 时间连续性 —— **夹具必须造「真值不变、但观测不确定」的局面**,前三版都错了:
+        //    ① 干净的 400 Hz:每帧观测一边倒,penalty 不参与决策 ⇒ 变异照绿;
+        //    ② 弱帧整体降幅度:`prom` 是**比值**,等比缩放不改变它 ⇒ 变异照绿;
+        //    ③ 某些帧真的换成 200 Hz:那是**真值变了**,跟随它是**对的行为** ⇒ 正常配置也红。
+        //    ⇒ ④ 正确的做法:真基频**始终是 400**,但在部分帧**只把基频分量削掉、保留高次谐波** ——
+        //      `prom(400)` 掉下来、真值却没变,逐帧最优会误判,只有转移代价能把它救回来。
+        let mut veiled: Vec<f32> = (0..n).map(|i| {
+            let t = i as f32 / SR;
+            let fr = i / HOP;
+            let f1 = if fr % 12 < 4 { 0.04f32 } else { 1.0 }; // 基频被遮住的帧
+            let mut v = (2.0 * std::f32::consts::PI * 400.0 * t).sin() * f1;
+            for k in 2..=6 {
+                let kf = 400.0 * k as f32;
+                if kf < SR / 2.0 * 0.9 {
+                    v += (2.0 * std::f32::consts::PI * kf * t).sin() / k as f32;
+                }
+            }
+            v * 0.3
+        }).collect();
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for v in veiled.iter_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *v += ((seed >> 40) as f32 / 8_388_608.0 - 1.0) * 0.004;
+        }
+        let mut veil_track = vec![200.0f32; n_frames];
+        fix_octave_inplace(&mut veil_track, &veiled, HOP);
+        let flips = veil_track.windows(2).filter(|w| (w[0] - w[1]).abs() > 1.0).count();
+        // ⚠⚠ **如实登记:这一条【目前抓不到】把 `OCTAVE_SWITCH_PENALTY_DB` 变异成 0。**
+        //    四版夹具都试过(见上面那段),合成音上两个候选的观测代价始终一边倒,
+        //    转移代价不参与决策 ⇒ 这条断言现在只是**接线闸**(证明这一路跑得通、不乱跳),
+        //    **不承担「转移代价是否承重」那个自由度**。
+        //    ⇒ 要真正钉住它,得把 Viterbi 从 `fix_octave_inplace` 里拆出来、直接喂观测代价序列
+        //      (那时可以手工构造「逐帧最优 ≠ 全局最优」的局面)。**这是可测性欠账,不是算法欠账。**
+        //    ⛔ 别把它读成「已经钉住了」—— 那正是 S165 §77 那条血训(「实验证明了方向」被记成「已经修好了」)。
+        assert!(
+            flips <= 6,
+            "基频被间歇遮住的素材上翻转了 {flips} 次 —— 这一路的行为不对(注意:见上面那段,
+             这条断言【不】承担 OCTAVE_SWITCH_PENALTY_DB 那个自由度)"
+        );
+        // ⛔ 而且它仍然要把大部分帧抬上去 —— 否则「不翻转」可以由「什么都不做」满足。
+        let lifted_w = veil_track.iter().filter(|v| (**v - 400.0).abs() < 1.0).count();
+        assert!(
+            lifted_w >= n_frames / 2,
+            "被遮住的素材上只抬了 {lifted_w}/{n_frames} 帧 —— 「不翻转」是靠什么都不做换来的"
+        );
+    }
 
     #[test]
     fn f0_to_coarse_matches_original_rvc() {
