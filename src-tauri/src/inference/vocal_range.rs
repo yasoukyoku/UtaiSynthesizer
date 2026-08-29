@@ -1344,12 +1344,18 @@ fn decide_group(
                 // ⛔⛔ 对手轴闸 —— 用户 2026-08-28 的上线警告:
                 //    「小心这个新条件**别再把那个哑音和伪影引回来**」。
                 //    `UTAI_RANGE_H2` 那次哑音时诊断计数是 `BLOCKED 0 次` = 闸形同虚设。
+                let (w, l) = if gx > gy { (x, y) } else { (y, x) };
                 let dim_ok = if usag_dim_cap > 0.0 {
-                    let (w, l) = if gx > gy { (x, y) } else { (y, x) };
                     cand[w].4.worst_dim_vs(&cand[l].4) <= usag_dim_cap
                 } else {
                     true
                 };
+                // ⭐⭐⭐⭐ S165 —— **第二道对手轴闸:不许把音内的谷挖得更深。**
+                //    ⛔ 上面那道用 `uplev`(挡「变闷」),实测在 4:07.466 上**一次都没拦住**,
+                //    而那次交换把音内跌幅从 16.0 挖到 21.4 dB(听感:哑噪声 → 断音)。
+                //    见 [`MISM_DIP_CAP`] 与 [`note_dip_db`]。
+                let dip_ok = cand[w].4.worst_dip_vs(&cand[l].4) <= MISM_DIP_CAP;
+                let dim_ok = dim_ok && dip_ok;
                 MISM_STAT.with(|st| {
                     let mut b = st.borrow_mut();
                     b.1 += 1;
@@ -4415,6 +4421,18 @@ const MISM_REPAIR_FLOOR: f32 = 0.8;
 /// 好落点常常离当前档 **2-9 个半音**,`REPAIR_RADIUS = 2` 结构上够不着。
 const MISM_REPAIR_RADIUS: i64 = 6;
 
+/// ⭐⭐⭐⭐ S165 —— **失配轴的第二道对手轴闸**:换落点**不许把音内跌幅加深**超过这么多 dB。
+///
+/// ⛔ 为什么第一道闸不够:今天那道用的是 `uplev`(上方谐波电平),挡的是「**变闷**」。
+/// 而实测 4:07.466 上,失配轴换的那个落点**上方谐波电平差不多**(所以一次都没被拦),
+/// 却把音内跌幅从 **16.0 dB 挖到 21.4 dB** —— 听感从「哑噪声」变成「**断音**」。
+/// 见 [`note_dip_db`] 的那张表。
+///
+/// ⚙ **3.0 dB**:实测那次恶化是 **+5.4 dB**,取 3.0 能挡住它而仍给小幅交换留余地。
+/// ⛔ 触发率必须实测(`MISM_STAT` 的 BLOCKED 计数),别照搬 —— 用户 2026-08-29:
+/// 「**别对着一个模型硬改**」。
+const MISM_DIP_CAP: f32 = 3.0;
+
 /// ⭐⭐ S165 —— `2·f0` 这一支的对手轴闸(dB)。见 [`landing_h2_eps`]。
 ///
 /// ⛔ 比 [`LANDING_USAG_DIM_CAP_DEFAULT`] 松,而且是**用户耳判定的**:
@@ -5219,6 +5237,57 @@ const REPAIR_FLOOR_DBFS: f32 = -50.0;
 /// 同时还要比**该音自己的中位**低这么多 —— 挡掉「整个音本来就很轻」那一类。
 const REPAIR_REL_DB: f32 = 25.0;
 
+/// ⭐⭐⭐⭐ S165 —— 一个音**内部**的**电平跌幅**(dB):该音的稳态(p75)减去音内最低的 20 ms 窗。
+///
+/// # ⛔ 它为什么必须存在
+/// 失配轴([`landing_mismatch_eps`])的对手轴闸今天用的是 [`CandScore::worst_dim_vs`]
+/// (**上方谐波电平** `uplev`)—— 那挡的是「**变闷**」,**挡不住「把谷挖得更深**」。
+///
+/// 实测 4:07.466(`[696]あ`,用户 2026-08-29 连着两轮点名的那一处):
+/// | 臂 | 音内跌幅 | 谷底的谱平坦度 | 听感 |
+/// |---|---|---|---|
+/// | `base`(未救援) | **6.5 dB** | −16.5 | 连着 |
+/// | 出厂 `mism=0` | **16.0 dB** | −14.2 | **哑噪声** |
+/// | `mism=1.2`(Q1/R1/PJ 三条臂) | **21.4 / 21.5 / 21.4 dB** | −33.1 | **断音** |
+/// ⇒ 失配轴治好了 4:36(失配 2.82 → 1.68),**却把 4:07 的谷又挖深了 5.4 dB**,
+///   而 `uplev` 那个闸**一次都没拦住** —— 因为两个候选的上方谐波电平差不多。
+///
+/// # ⭐ 用户给的定义(2026-08-29)
+/// 「那里『是谷』不止可能像现在这样吐**噪声**,还可能像之前 Q1 那一遍一样
+///   **完全挖出来什么也没有(断音)**」「它是有点地方没噪声,但**有的地方它什么都没有**」
+///   「换句话说,**你得找它『确实连着的』位置**啊」
+/// ⇒ ⭐⭐ **两种坏法的共同点就是「电平掉了」** —— 噪声那一种平坦度高、断音那一种平坦度低,
+///   **任何只盯一种形态的尺子都会漏掉另一种**;而「掉了多少」两种都抓得到。
+/// ⇒ 所以闸架在**这根**轴上,不架在平坦度上。
+///
+/// # ⚠ 口径
+/// 稳态取 **p75** 而不是中位:密集救援的音里中位本身可能已经被谷拉低。
+/// 逐 **20 ms** 窗、hop **5 ms**(比 [`silence_run_ms`] 的 20 ms 格细,因为要抓 60 ms 宽的谷)。
+/// 少于 5 个窗 ⇒ `None`(测不出稳态)。
+fn note_dip_db(seg: &[f32], sample_rate: u32) -> Option<f32> {
+    let win = (sample_rate as usize / 50).max(16); // 20 ms
+    let hop = (win / 4).max(4); // 5 ms
+    if seg.len() < win + 4 * hop {
+        return None;
+    }
+    let mut lv: Vec<f32> = Vec::new();
+    let mut i = 0usize;
+    while i + win <= seg.len() {
+        let e: f64 =
+            seg[i..i + win].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / win as f64;
+        lv.push((10.0 * (e + 1e-20).log10()) as f32);
+        i += hop;
+    }
+    if lv.len() < 5 {
+        return None;
+    }
+    let mut sorted = lv.clone();
+    sorted.sort_by(f32::total_cmp);
+    let p75 = sorted[(sorted.len() * 3) / 4];
+    let lo = sorted[0];
+    Some(p75 - lo)
+}
+
 /// 一个音**内部**最长的一段「唱没了」有多少毫秒(0 = 没有)。
 ///
 /// ⛔ 逐 20 ms 格;两条门必须**同时**满足(绝对地板 + 相对该音中位),理由在
@@ -5263,6 +5332,9 @@ struct CandScore {
     harm: Vec<(usize, f32)>,
     /// ⭐ S163 —— (音下标, 音内最长「唱没了」的毫秒数)。**不需要参照**。见 [`silence_run_ms`]。
     gone: Vec<(usize, f32)>,
+    /// ⭐⭐⭐⭐ S165 —— (音下标, **音内电平跌幅** dB)。**不需要参照**。见 [`note_dip_db`]。
+    /// ⛔ 它只当**失配轴的对手轴闸**,不当排序键 —— 它的靶子是「换落点把谷挖得更深」那一类交换。
+    dip: Vec<(usize, f32)>,
     /// ⭐ S163 —— (音下标, 谐波梳深 dB)。**不需要参照**,而且与谐波占比**测的不是一件事**:
     /// 用户点名的「卡痰」那个音梳深 **−0.4**(谐波间被填满)而谐波占比 −0.10(看起来没问题)。
     comb: Vec<(usize, f32)>,
@@ -5466,6 +5538,17 @@ impl CandScore {
         self.uplev
             .iter()
             .filter_map(|&(i, mine)| other.uplev_of(i).map(|theirs| theirs - mine))
+            .fold(0.0f32, f32::max)
+    }
+
+    /// ⭐⭐⭐⭐ S165 —— 赢家相对输家**把谷挖深了多少 dB**(正 = 赢家更深 = 更糟)。
+    /// 与 [`Self::worst_dim_vs`] 同构:只在**两边都量到了同一个音**时比较,取最差。
+    fn worst_dip_vs(&self, other: &CandScore) -> f32 {
+        self.dip
+            .iter()
+            .filter_map(|&(i, mine)| {
+                other.dip.iter().find(|&&(j, _)| j == i).map(|&(_, theirs)| mine - theirs)
+            })
             .fold(0.0f32, f32::max)
     }
 
@@ -5982,6 +6065,11 @@ pub fn apply_dead_only_windows_with(
                         if g > 0.0 {
                             sc.gone.push((ni, g));
                         }
+                        // ⭐⭐⭐⭐ S165 —— **音内电平跌幅**,第 1 处(主评估)。
+                        // ⛔ 两处填充点,漏一处这根轴静默失效(`width` 正是这样栽的)。
+                        if let Some(d) = note_dip_db(seg, sample_rate) {
+                            sc.dip.push((ni, d));
+                        }
                         // ⭐ S163 —— 谐波**梳深**(谐波之间起没起雾)。
                         if nd.hz > 0.0 {
                             if let Some(c) =
@@ -6206,6 +6294,10 @@ pub fn apply_dead_only_windows_with(
                             let g = silence_run_ms(seg, sample_rate);
                             if g > 0.0 {
                                 sc.gone.push((ni, g));
+                            }
+                            // ⭐⭐⭐⭐ S165 —— **音内电平跌幅**,第 2 处(修补遍后重评估)。
+                            if let Some(d) = note_dip_db(seg, sample_rate) {
+                                sc.dip.push((ni, d));
                             }
                             if nd.hz > 0.0 {
                                     if let Some(w) =
@@ -9349,6 +9441,124 @@ mod tests {
             none[n[0]].1, -2,
             "量不到 usag 的组必须原样走 rel —— 短音上这根轴是噪声,不许拿它决策"
         );
+    }
+
+    /// ⭐⭐⭐⭐ S165 —— **失配轴的第二道对手轴闸:不许把音内的谷挖得更深。**
+    ///
+    /// # ⛔ 它为什么存在
+    /// 用户 2026-08-29 听出:开了失配轴之后 4:07.466 从「哑噪声」变成了「**断音**」。
+    /// 实测(同一个音 `[696]あ`,三条独立渲染的臂读数一致):
+    /// **出厂 `mism=0` 音内跌幅 16.0 dB → `mism=1.2` 变成 21.4 / 21.5 / 21.4 dB**,
+    /// 而当时**唯一的对手轴闸**用的是 `uplev`(上方谐波电平)⇒ **一次都没拦住**
+    /// (两个候选的上方谐波电平差不多)。
+    ///
+    /// # ⭐ 用户给的关键定义
+    /// 「那里『是谷』不止可能像现在这样吐**噪声**,还可能**完全挖出来什么也没有(断音)**」
+    /// ⇒ ⭐⭐ **两种坏法的共同点是「电平掉了」** —— 噪声那种谱平坦度**高**、断音那种**低**,
+    ///   **任何只盯一种形态的尺子都会漏掉另一种**。所以闸架在**跌幅**上。
+    ///
+    /// 钉五件:
+    /// ⑴ 闸关着(`cap` 极大)时,失配轴照常换 —— 否则 ⑵ 可能只是「失配轴根本没生效」;
+    /// ⑵ 闸开着时,**把谷挖深的那个交换被拦住**;
+    /// ⑶ ⛔ **阴性对照**:谷**没有**变深的交换**不许**被拦(否则这个闸等于关掉整根轴);
+    /// ⑷ ⛔ **阴性对照**:两个候选都量不到 `dip` 时,闸不许拦(`worst_dip_vs` 恒 0);
+    /// ⑸ ⭐ **两处填充点都在** —— 少填一处 `worst_dip_vs` 恒 0,⑵ 会静默失守。
+    ///     这里直接对 [`note_dip_db`] 造两种坏法的信号,证明**一把尺子两种都抓得到**。
+    #[test]
+    fn the_mismatch_axis_may_not_deepen_the_dip_inside_a_note() {
+        let sr = 48_000u32;
+        // ── ⑸ 先证明尺子对【两种坏法】都有反应,而对「连着」的信号没有 ──
+        let tone = |n: usize, gap: Option<(usize, usize, f32)>| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f64 / f64::from(sr);
+                    let mut v = (2.0 * std::f64::consts::PI * 440.0 * t).sin() as f32 * 0.5;
+                    if let Some((a, b, g)) = gap {
+                        if i >= a && i < b {
+                            v *= g;
+                        }
+                    }
+                    v
+                })
+                .collect()
+        };
+        let n = sr as usize / 2; // 0.5 s
+        let clean = tone(n, None);
+        // 坏法 A:挖空(断音)—— 60 ms 降到 −26 dB
+        let mut cut = tone(n, Some((n / 3, n / 3 + sr as usize * 6 / 100, 0.05)));
+        // 坏法 B:同一段换成噪声(电平也掉,但谱是平的)
+        let mut noisy = clean.clone();
+        let (a, b) = (n / 3, n / 3 + sr as usize * 6 / 100);
+        let mut seed = 12345u64;
+        for v in noisy[a..b].iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((seed >> 33) as f32 / 2_147_483_648.0 - 0.5) * 0.05;
+        }
+        let d_clean = note_dip_db(&clean, sr).expect("连着的信号量得到");
+        let d_cut = note_dip_db(&cut, sr).expect("断音量得到");
+        let d_noisy = note_dip_db(&noisy, sr).expect("噪声量得到");
+        assert!(d_clean < 3.0, "「确实连着」的信号跌幅应当很小,实际 {d_clean}");
+        assert!(d_cut > 15.0, "断音那种坏法没被抓到(跌幅只有 {d_cut})");
+        assert!(d_noisy > 15.0, "噪声那种坏法没被抓到(跌幅只有 {d_noisy})");
+        cut.truncate(0);
+
+        // ── ⑴⑵⑶⑷ 闸本身 ──
+        let mk = |rel: f32, mism: f32, dip: f32| {
+            let mut sc = CandScore::default();
+            sc.rel.push((0, rel));
+            sc.mism.push((0, mism));
+            sc.dip.push((0, dip));
+            sc
+        };
+        // 候选 A(今天的落点):失配差、谷浅   候选 B:失配好、**谷深 5.4 dB**(实测那次的形状)
+        let deepen = vec![
+            (0usize, -5i64, 0usize, Vec::<f32>::new(), mk(4.0, 2.9, 16.0)),
+            (0usize, -8i64, 0usize, Vec::<f32>::new(), mk(5.0, 1.5, 21.4)),
+        ];
+        // ⑴ 闸关着(cap 由常量给,这里用 `mism_eps` 大 + `usag_dim_cap`=0 走到闸)
+        //    ⇒ 先确认失配轴在没有 dip 差时**确实会换**
+        let same_dip = vec![
+            (0usize, -5i64, 0usize, Vec::<f32>::new(), mk(4.0, 2.9, 16.0)),
+            (0usize, -8i64, 0usize, Vec::<f32>::new(), mk(5.0, 1.5, 16.2)),
+        ];
+        let moved = decide_group(&same_dip, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2);
+        assert_eq!(
+            same_dip[moved[0]].1, -8,
+            "谷没变深时失配轴必须照常换 —— 否则下面那条「被拦住」只是因为这根轴没生效"
+        );
+        // ⑵ 谷挖深 5.4 dB > MISM_DIP_CAP ⇒ 拦住,留在今天的落点
+        let held = decide_group(&deepen, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2);
+        assert_eq!(
+            deepen[held[0]].1, -5,
+            "把音内跌幅从 16.0 挖到 21.4(+5.4 dB > {MISM_DIP_CAP})必须被对手轴闸拦住"
+        );
+        // ⑶ 阴性对照:谷反而变浅 ⇒ 不许拦
+        let shallower = vec![
+            (0usize, -5i64, 0usize, Vec::<f32>::new(), mk(4.0, 2.9, 16.0)),
+            (0usize, -8i64, 0usize, Vec::<f32>::new(), mk(5.0, 1.5, 11.0)),
+        ];
+        let ok = decide_group(&shallower, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2);
+        assert_eq!(
+            shallower[ok[0]].1, -8,
+            "谷变浅的交换被拦住了 —— 这个闸把整根失配轴关掉了"
+        );
+        // ⑷ 阴性对照:量不到 dip ⇒ `worst_dip_vs` 恒 0 ⇒ 不许拦
+        let nodip = vec![
+            (0usize, -5i64, 0usize, Vec::<f32>::new(), {
+                let mut sc = CandScore::default();
+                sc.rel.push((0, 4.0));
+                sc.mism.push((0, 2.9));
+                sc
+            }),
+            (0usize, -8i64, 0usize, Vec::<f32>::new(), {
+                let mut sc = CandScore::default();
+                sc.rel.push((0, 5.0));
+                sc.mism.push((0, 1.5));
+                sc
+            }),
+        ];
+        let nd = decide_group(&nodip, 0, -5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.2);
+        assert_eq!(nodip[nd[0]].1, -8, "两边都量不到 dip 时不许拦 —— 那会让短音上整根轴失效");
     }
 
     use super::*;
@@ -12726,6 +12936,7 @@ mod tests {
                     rel: vec![(0, rel)],
                     harm: Vec::new(),
                     gone: Vec::new(),
+                    dip: Vec::new(),
                     comb: Vec::new(),
                     width: vec![(0, width)],
                     usag: Vec::new(),
