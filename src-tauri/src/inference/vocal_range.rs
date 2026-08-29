@@ -4497,7 +4497,7 @@ fn parse_usag_dim(v: Option<&str>) -> f32 {
     }
 }
 
-/// ⚙ 出厂默认 = 0.0(**关**)—— **失配**这根轴的 eps(dB);`0` = 整根轴关掉。
+/// ⚙ 出厂默认 = 1.2 —— **失配**这根轴的 eps(dB);`0` = 整根轴关掉。
 ///
 /// # 它在修什么
 /// 用户 2026-08-28 定案:「油」= **响度与抖动失配**(「不是说『响就是好』或者『抖就是不好』……
@@ -4516,21 +4516,67 @@ fn parse_usag_dim(v: Option<&str>) -> f32 {
 /// −13 确实更好但**可能太干净了**…… **遵从原音色特征**可能是对的」。
 /// ⇒ 目标是**像它自己**,不是把音色改好看。
 ///
-/// # ⚙ 出厂 0(关),等 A/B 整曲耳判
-/// ⚠ 上线前必须带用户 2026-08-28 的两条警告:**保留对手轴闸**
-/// (`UTAI_RANGE_H2` 那次哑音时诊断计数是 `BLOCKED 0 次` = 闸形同虚设)、
+/// # ⭐⭐⭐ S165 收工翻成 1.2(`s165i` → `s165j`)
+/// 用户 2026-08-29 听出**出厂臂上 4:36 又回到原来那样了**,并当场指出根因:
+/// 「我不知道你是因为**没给上一刀抖动/落点选择那一刀翻默认/没带着**」——**是没翻默认**。
+/// ⛔ 顺带一条:4:36 是**这根轴**(失配),**不是**谷/断点(那条在 4:07.466);
+///    我第一次去查时拿谷深尺子量 4:36,量的是不相干的东西,被用户当场纠正。
+///
+/// | 配置 | `[793]あ` midi 78 | `[794]あ` midi 76 |
+/// |---|---|---|
+/// | **出厂 `0.0`**(渲两次) | **2.87 / 2.87** | 2.60 / 2.59 |
+/// | `0.05` | 2.37 | 2.62 |
+/// | `0.3` | 2.60 | 2.61 |
+/// | **`1.2`**(渲两次) | **1.88 / 1.90** | 1.07 / 2.95 |
+/// ⇒ **只有 1.2 真的动了它**;两组各自的两次渲染读数一致到 0.01-0.02
+///   ⇒ 这把尺子在这个音上噪声底几乎为零,差别是配置带来的。
+/// ⇒ ⛔ **别用 `0.05`/`0.3` 求稳:实测是空刀。**
+/// ⭐ 耳判背书:用户听过 `Q1`(= 这个值)后说「**这回至少一没明显炸,二在 4:36 那真有变化**」。
+///
+/// ## ⚠ 代价,如实登记
+/// 修补遍触发 **8 → 61 次** ⇒ donor 遍数 **20 → 37** ⇒ 渲染 249 s → 933 s(旧代码;
+/// S165 的 sinc 那一刀把 `inverse` 压掉约 38 %)。**这是这一场最贵的一个默认。**
+/// ⛔ 想省钱只能动 [`MISM_REPAIR_FLOOR`] / [`MISM_REPAIR_RADIUS`],而**那两个必须用生产的
+///    `MISM_STAT` 定,不许拿离线复刻的尺子定** —— 实测离线 python 版在 `FLOOR=0.8` 上读到
+///    98.4 % 触发,而生产实测约 48 %,**两个口径根本不是一回事**。
+///
+/// ## ⛔ 上线时仍然带着的两条(用户 2026-08-28)
+/// **保留对手轴闸**(`UTAI_RANGE_H2` 那次哑音时诊断计数是 `BLOCKED 0 次` = 闸形同虚设)、
 /// **验收看局部不看中位**(那次灾难在全曲中位上是 Δ +0.00 dB)。
 pub fn landing_mismatch_eps() -> f32 {
     parse_mismatch_eps(std::env::var("UTAI_RANGE_MISMATCH").ok().as_deref())
 }
 
-/// ⚙ 出厂默认。见 [`landing_mismatch_eps`]。
-const LANDING_MISMATCH_EPS_DEFAULT: f32 = 0.0;
-
-/// ⭐⭐ S165 —— 建议的换档门限(**出厂关**时用不到,写在这里是给调参与文档看的)。
-/// 实测 gap 分布 **0.34-2.48**(两首谱同量级),p75 ≈ **1.10** ⇒ **1.2** 只让上四分位过门。
-/// ⛔ 第一版用 **0.3** ⇒ 几乎全部过门 ⇒ 大幅换档 ⇒ 把「ぴゃ」炸了。
-const MISMATCH_EPS_SUGGESTED: f32 = 1.2;
+/// ⚙ 出厂默认 = 1.2。见 [`landing_mismatch_eps`]。
+///
+/// ## ⭐⭐⭐ S165 收工翻的(`s165i` → `s165j`)
+/// 用户 2026-08-29 听出**出厂臂上 4:36 又回到原来那样了**,并当场指出根因:
+/// 「我不知道你是因为**没给上一刀抖动/落点选择那一刀翻默认/没带着**」——**是没翻默认**。
+///
+/// ⛔ 4:36 是**失配**(响度 ↔ 抖动)那条轴,**不是**谷/断点(那条在 4:07.466)。
+///    我第一次去查时拿谷深尺子量它,量的是不相干的东西 —— 用户当场纠正。
+///
+/// ### 实测(同一批臂,逐谐波「电平 → 抖动」相对同臂未救援音的参照曲线,取最差谐波)
+/// | 配置 | `[793]あ` midi 78 | `[794]あ` midi 76 |
+/// |---|---|---|
+/// | **出厂 `0.0`**(渲两次) | **2.87 / 2.87** | 2.60 / 2.59 |
+/// | `0.05` | 2.37 | 2.62 |
+/// | `0.3` | 2.60 | 2.61 |
+/// | **`1.2`**(渲两次) | **1.88 / 1.90** | 1.07 / 2.95 |
+/// ⇒ ⭐ **只有 1.2 真的动了它**,而且**两次渲染读数一致**(出厂那两次也一致到 0.01)
+///   ⇒ 这把尺子在这个音上的噪声底几乎为零,差别是配置带来的。
+/// ⇒ `0.05` / `0.3` 基本没动 ⇒ **别用小 eps「稳一点」,那是空刀**。
+///
+/// ### ⭐ 耳判背书
+/// 用户听过 `Q1`(= 这个值)后说:「**这回至少一没明显炸,二在 4:36 那真有变化**」。
+///
+/// ### ⚠ 代价,如实登记
+/// 修补遍触发 **8 → 61 次** ⇒ donor 遍数 **20 → 37** ⇒ 渲染 249 s → 933 s(旧代码)。
+/// S165 的 sinc 那一刀把 `inverse` 压掉约 38 %,但**这仍然是这一场最贵的一个默认**。
+/// ⛔ 想省钱只能动 [`MISM_REPAIR_FLOOR`] / [`MISM_REPAIR_RADIUS`],而**那两个必须用生产的
+///    `MISM_STAT` 定,不许拿离线复刻的尺子定** —— 实测离线 python 版在 `FLOOR=0.8` 上读到
+///    98.4 % 触发,而生产实测约 48 %,**两个口径根本不是一回事**。
+const LANDING_MISMATCH_EPS_DEFAULT: f32 = 1.2;
 
 fn parse_mismatch_eps(v: Option<&str>) -> f32 {
     match v {
@@ -11949,7 +11995,7 @@ mod tests {
             //    它**会改音频**（所以在指纹里、不在 `EXEMPT` 里），但**出厂没设 ⇒ off ⇒ 不改音频**
             //    ⇒ 按本判据自己的规矩（“若它出厂关 = 不改音频，就不要 bump 版本号”）**不跟着 bump**，
             //    与 `valhuman=` 当初同例。进指纹的意义是：下一个人想把它变成默认之前，必须先来这里改一行。
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 h2=0 mism=0 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true donorin=false valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 h2=0 mism=1.2 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true donorin=false valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -11966,7 +12012,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s165i";
+        const TAG: &str = "s165j";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
