@@ -5448,7 +5448,23 @@ pub fn rest_gain_cell_ms() -> f32 {
 /// ⭐ S163 v10 —— 休止增益只补**一半**的 dB 差。⛔ 别调大:v14 把它推到「压进 base+6 dB」
 /// 时 p10 掉了 9.91 dB(单点 −15.2)= 砍电平,用户耳判否决。S166c 把增益改成逐格时
 /// **这个系数一个字节没动** —— 一把刀一次只许改一个变量。
-const REST_GAIN_FRACTION: f32 = 0.5;
+const REST_GAIN_FRACTION_DEFAULT: f32 = 0.5;
+
+/// ⚙ 出厂默认 = 0.5。见 [`REST_GAIN_FRACTION_DEFAULT`];`UTAI_RANGE_REST_FRAC=<0..1>` 可扫。
+///
+/// ⛔ **它为什么可能该调大**:0.5 是**整段一个增益**时代定的 —— 那时补满会把
+/// `consonant_preroll` 一起压死。改成**逐格**之后,含 preroll 的那一格 `base` 里也有 preroll
+/// ⇒ 比值 ≈ 1 ⇒ 补满也不动它。而「救援不许碰空拍」这条目标,在休止里本来就是
+/// **对齐 `base`**(= 补满 = 1.0)。
+/// ⛔ 与 v14 判负**不是一件事**:v14 是「压进 `base + 6 dB` 的**硬夹**」⇒ 砍电平(p10 −9.91);
+/// 这里仍然是同一条**逐格比值**公式,只是补的比例。
+pub fn rest_gain_fraction() -> f32 {
+    std::env::var("UTAI_RANGE_REST_FRAC")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .unwrap_or(REST_GAIN_FRACTION_DEFAULT)
+}
 
 /// S163 v8 -- rest head guard (ms): the previous note's natural release lives here.
 /// The previous note IS rescued, so its tail must stay donor.
@@ -8128,7 +8144,7 @@ fn splice_kept(
                     return 1.0;
                 }
                 // ⛔ 只压不抬:抬会把 donor 的伪影一起放大。
-                let g_db = (10.0 * (bs / dn).log10()) as f32 * REST_GAIN_FRACTION;
+                let g_db = (10.0 * (bs / dn).log10()) as f32 * rest_gain_fraction();
                 10f32.powf(g_db.clamp(REST_GAIN_MIN_DB, 0.0) / 20.0)
             };
             // ⭐⭐⭐⭐⭐ S166c —— **逐格**增益(见 [`REST_GAIN_CELL_MS_DEFAULT`])。
@@ -13685,6 +13701,7 @@ mod tests {
             ("LANDING_DIP_EPS_DEFAULT", "pub fn landing_dip_eps("),
             ("REST_GAIN_CELL_MS_DEFAULT", "pub fn rest_gain_cell_ms("),
             ("REST_TAIL_GUARD_CELL_MS_DEFAULT", "pub fn rest_tail_guard_cell_ms("),
+            ("REST_GAIN_FRACTION_DEFAULT", "pub fn rest_gain_fraction("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
