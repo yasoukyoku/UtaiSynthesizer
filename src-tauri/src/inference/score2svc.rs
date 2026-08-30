@@ -40,8 +40,8 @@ use super::features::{repeat_expand_2d, torch_interp_nearest};
 use super::g2p::{self, Lang, ScoreEvt};
 use super::rvc::{f0_to_coarse, vc_decode, RvcModel};
 use super::score2cv::{
-    build_arrays_daw, chunk_at_sp, classify_lyric, is_voiceless_phone, run_score2cv,
-    run_score2cv_vowel_clarity, Chunk, LyricClass, ScoreArrays,
+    build_arrays_daw, chunk_at_sp, is_voiceless_phone, run_score2cv,
+    run_score2cv_vowel_clarity, Chunk, ScoreArrays,
 };
 use super::score2cv_tables as tbl;
 use super::sovits::{apply_cluster_blend, decode_features, SovitsModel};
@@ -1621,7 +1621,7 @@ pub fn render_score_sovits(
     let secs = audio.len() as f64 / f64::from(m.sample_rate);
     tracing::info!(
         "[perf] score/sovits {secs:.1}s audio in {wall:.2}s (RTF {:.3}) · {} chunks ·          s2cv {t_s2cv:.2}s ({:.0}%) · decode(net_g+voc) {t_decode:.2}s ({:.0}%) ·          inverse {t_inverse:.2}s ({:.0}%) · other {:.2}s · range_shift {range_shift:+} \
-         · skipped {skipped}/{}",
+         · skipped {skipped}/{} · predamp {preroll_damped}",
         if secs > 0.0 { wall / secs } else { 0.0 },
         chunks.len(),
         100.0 * t_s2cv / wall.max(1e-9),

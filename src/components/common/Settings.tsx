@@ -1376,7 +1376,9 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
       rtRecommend: { zh: "本机推荐变体", en: "Recommended variant", ja: "推奨バリアント" },
       rtPackLabel_cpu: { zh: "CPU 运行时（模型转换基座 + CPU 训练）", en: "CPU runtime (model conversion base + CPU training)", ja: "CPU ランタイム（モデル変換基盤 + CPU トレーニング）" },
       rtPackLabel_nv_cu130: { zh: "NVIDIA 运行时（cu130；RTX 20-50 训练 + 模型转换）", en: "NVIDIA runtime (cu130; RTX 20-50 training + conversion)", ja: "NVIDIA ランタイム（cu130；RTX 20-50 トレーニング + 変換）" },
-      rtPackLabel_amd: { zh: "AMD 运行时（ROCm；RDNA3/4 训练 + 模型转换）", en: "AMD runtime (ROCm; RDNA3/4 training + conversion)", ja: "AMD ランタイム（ROCm；RDNA3/4 トレーニング + 変換）" },
+      // S167 (§F6): v2 wording — RDNA3 exactly (RX 7000 dGPUs + 780M-class iGPUs); the old
+      // "RDNA3/4" over-promised (RDNA4 has zero kernels in this pack line).
+      rtPackLabel_amd: { zh: "AMD 运行时（ROCm；RX 7000 系 + 780M 族核显训练 + 模型转换）", en: "AMD runtime (ROCm; RX 7000 series + 780M-class iGPU training + conversion)", ja: "AMD ランタイム（ROCm；RX 7000 シリーズ + 780M 系 iGPU トレーニング + 変換）" },
       rtPackLabel_xpu: { zh: "Intel 运行时（XPU；Arc 训练 + 模型转换）", en: "Intel runtime (XPU; Arc training + conversion)", ja: "Intel ランタイム（XPU；Arc トレーニング + 変換）" },
       // pyenv-progress channel (code+params → text; zh reproduces the pre-i18n wording)
       pgFetchManifest: { zh: "获取包清单...", en: "Fetching pack manifest...", ja: "パックマニフェストを取得中..." },

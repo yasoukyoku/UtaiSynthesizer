@@ -16770,6 +16770,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn the_landing_rule_never_changes_WHICH_notes_get_rescued() {
         // The safety property: ranking happens INSIDE the qualifying set, so the dead set and the
         // set of rescued groups are untouched. Asserted against the same plan the decision layer

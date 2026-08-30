@@ -495,7 +495,7 @@ fn fill_voiced_holes_marked(
 /// `skip` 为真的帧不算锚——**补洞自己写的那些不能给自己当参照**。
 /// 碰到真无声就停（再往外是另一个音）；取不到 ⇒ `0.0` = 没有锚。
 fn run_anchor(f0: &[f32], skip: &[bool], start: usize, end: usize) -> f32 {
-    let mut side = |mut k: usize, back: bool| -> Option<f32> {
+    let side = |mut k: usize, back: bool| -> Option<f32> {
         let mut v: Vec<f32> = Vec::new();
         loop {
             if back {

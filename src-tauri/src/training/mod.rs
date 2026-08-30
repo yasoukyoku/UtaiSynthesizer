@@ -4502,7 +4502,7 @@ mod tests {
             "total_epoch": 1, "batch_size": 1,
         }));
         let ds = tproject::dataset_dir(&data, id);
-        let plan = dataset_plan(&req, &assign_speaker_slugs(&req.speakers));
+        let _plan = dataset_plan(&req, &assign_speaker_slugs(&req.speakers));
         let assigned = assign_speaker_slugs(&req.speakers);
 
         // ---- import, byte for byte as run_worker does ----

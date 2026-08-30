@@ -488,22 +488,28 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
         "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-nv-cu130-v1.manifest.json",
     ],
 }, CatalogEntry {
-    id: "runtime-amd-v1",
+    // S167 (§F6): v2 REPLACES v1 in the catalog — same variant, superset kernels (the RDNA3 dGPU
+    // device wheels gfx1100/1101/1102 join v1's gfx1103, all on the same pinned nightly tag).
+    // v1 stays published on HF for existing installs, and an installed v1 keeps working (the
+    // scan-based resolver picks the highest installed version per variant); offering BOTH here
+    // would hand RX 7000 users the one pack that cannot run on their card.
+    id: "runtime-amd-v2",
     variant: "amd",
-    label: "AMD runtime (TheRock ROCm; RDNA3/4 training + model conversion, experimental)",
-    // Real numbers from the S44 build: 1.172 GB download / 4.50 GB on disk (single
-    // part, under the 1.9 GiB split cap). Validated end-to-end on the dev machine's
-    // Radeon 780M (gfx1103): flat-PBS-layout torch-rocm import + full envtest 20/20
-    // PASS (tiny_gan conv/convT converges identically to NVIDIA; fp16+GradScaler OK).
-    download_bytes: 1_171_991_360,
-    disk_bytes: 4_504_503_445,
+    label: "AMD runtime (TheRock ROCm; RX 7000 series + 780M/760M/740M iGPUs, training + model conversion, experimental)",
+    // Real numbers from the S167 build: 1.769 GB download / 5.92 GB on disk (single
+    // part, under the 1.9 GiB split cap). v1's 780M (gfx1103) validation carries over
+    // (same wheels, same tag); the dGPU targets are inventory-verified but have never
+    // been run on real RDNA3 dGPU silicon — the reason the tier stays experimental and
+    // the envtest stays the on-device authority.
+    download_bytes: 1_769_345_825,
+    disk_bytes: 5_916_078_212,
     // EXPERIMENTAL tier (design §4.3): TheRock ROCm is a pinned nightly; MIOpen ships
     // no precompiled conv DB for gfx1103 (#6335) → first-encounter conv configs pay a
     // one-time kernel-compile cost, then cache. envtest is the release gate.
     experimental: true,
     manifest_urls: &[
-        "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v1.manifest.json",
-        "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v1.manifest.json",
+        "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v2.manifest.json",
+        "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v2.manifest.json",
     ],
 }, CatalogEntry {
     id: "runtime-xpu-v1",
