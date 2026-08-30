@@ -581,6 +581,8 @@ Seven languages are supported; the language decides how lyrics turn into phoneme
 
 > Caution: switching languages can make existing lyrics "unpronounceable" — see OOV in the next section.
 
+**Spanish dialect** (v0.12): when the track language is Spanish (or a selected note is), the language section gains a "Spanish dialect" dropdown. It decides both dialect axes: ⟨z⟩ / ⟨c⟩+e,i as [θ] (distinción, peninsular) vs. merged into [s] (seseo, Latin America), and ⟨ll⟩ as [ʎ] vs. merged into [ʝ] (yeísmo). The default keeps the dictionary's rows exactly as shipped (a mixture, mostly distinción); picking a dialect normalizes every Spanish word toward that one variety — the dictionary's own variant rows first, orthography-driven derivation second, and a word neither can answer is left alone rather than guessed. Spanish notes only; bracket hints and per-note phoneme overrides always win.
+
 ### 5.6 OOV: the red "can't pronounce this" marks
 
 When a note's lyric cannot be found in its effective language's dictionary (Out-Of-Vocabulary), the app flags it in red at **three levels** at once:
@@ -673,9 +675,17 @@ Next to the editor's title are the "Loudness", "Formant" and "Phonemes" buttons;
 
 - **"Loudness"**: a ±12 dB per-frame volume curve that becomes the vocal's volume envelope at render time.
 - **"Formant"**: a ±12 semitone resonance-shift curve — positive is brighter/younger, negative is darker/fuller, pitch unchanged.
-- **"Phonemes"** (read-only): every phone this track will actually sing, drawn as a coloured block whose width is the duration it really got. Each note's start carries a reference line, so **a consonant block sitting left of that line was moved ahead of the beat** (see "Automatic phoneme timing" in 5.10). It runs the very allocator the render uses, so what you see here is what will be sung.
+- **"Phonemes"**: every phone this track will actually sing, drawn as a coloured block whose width is the duration it really got. Each note's start carries a reference line, so **a consonant block sitting left of that line was moved ahead of the beat** (see "Automatic phoneme timing" in 5.10). It runs the very allocator the render uses, so what you see here is what will be sung.
 
-Editing works exactly like audio-track envelopes: press empty space to insert a point and drag, drag existing points, right-click to delete; values quantize to 0.1; each gesture is one undo step. The dashed center line is 0 (no change). The curves are render parameters — changing them makes the clip "dirty", and the next Play re-renders automatically.
+**Phoneme duration and strength are hand-editable** (v0.12) — when the algorithm gets one wrong, you have the last word:
+
+- **Drag the boundary between two phones of the same note** to change their split. The note's total length never moves (one side grows at the other's expense, and every phone keeps at least one frame), so an edit can never push other notes around.
+- **Alt + drag a phone block vertically** to adjust that phone's strength (±12 dB in 0.5 dB steps; the hover readout shows `+N dB`).
+- **Right-click a phone block** to clear all manual edits on that note and return to automatic.
+- Edited blocks carry a highlighted underline. Changing the note's lyric / language / phoneme override invalidates the old edit (a dashed outline = a stale edit the render is ignoring) and drops it.
+- **A thin red marker = a dropped phone**: on a note too short to fund every consonant, the allocator drops the least load-bearing one — that used to happen silently; now it is drawn in the lane (to rescue it: lengthen the note, or drag a boundary to give it time).
+
+Curve editing (loudness/formant) works exactly like audio-track envelopes: press empty space to insert a point and drag, drag existing points, right-click to delete; values quantize to 0.1; each gesture is one undo step. The dashed center line is 0 (no change). The curves and phoneme edits are render parameters — changing them makes the clip "dirty", and the next Play re-renders automatically.
 
 > Tip: while the parameter band is open it takes a slice of the note area's height (the scroll position adjusts automatically). No points drawn = a pass-through that does not affect the sound at all. Deleting the last point clears the curve.
 
@@ -1166,6 +1176,7 @@ When a run completes (or stops), the run page shows a summary card and **this ru
 - **The automatic range-test result**: every RVC/SoVITS checkpoint automatically runs the C2–C7 scale test (about 1–2 s each), and the row directly shows the comfort zone in note names (e.g. F#2–A#4) — incidentally a direct read on how far each checkpoint has converged.
 - **"Audition"**: renders the built-in 10-second dry clip through the real inference chain (first click passes through "Converting…" and "Rendering…"). Multi-singer runs get an "Audition speaker" dropdown; vocoder runs get an extra "Built-in default vocoder (reference)" row for A/B comparison.
 - **"Import to library"**: single-row import with a rename box (pre-filled suggestions: the final checkpoint uses the model name, the best gets a `_best` suffix, periodic ones an epoch/step suffix); retrieval indexes/cluster assets pack up and travel automatically. Or check several rows and click "Import selected (N)" for a batch (a confirmation previews the naming; existing same-named models are replaced — use the per-row button for custom names). Imported models are immediately available in the resource manager / vocal tracks / workflows.
+- **"Community export"** (v0.12, RVC/SoVITS archive rows): export this snapshot in the community-standard file set — RVC gives `.pth` + a faiss retrieval `.index` (`added_IVF…` naming, directly usable by other RVC-ecosystem tools), SoVITS gives `.pth` + `config.json`. You pick a file name, then an output folder. Unlike "Export model package (.zip)" — the .zip is **our own** lossless round-trip format, the community set is for **other tools**.
 - **Shallow-diffusion rows "attach" instead**: pick the host SoVITS model in the "Attach to model" dropdown (only installed models with matching feature dimensions are listed; the same-named one is pre-selected; auditioning a diffusion checkpoint also needs the attach target first), audition until satisfied, then click "Attach" — it becomes the host model's diffusion attachment (success: "Diffusion model attached to "××"").
 - Rows pruned off disk by the retention policy grey out as "Pruned by the archive policy" and can no longer be auditioned/imported.
 
@@ -1241,7 +1252,7 @@ Manages the embedded Python packs used for training and model conversion. Instal
 
 - "CPU runtime (model conversion base + CPU training)": ~236 MB download / 1.2 GB on disk — **the minimum needed to import .pth models**.
 - "NVIDIA runtime (cu130; RTX 20-50 training + conversion)": ~1.8 GB / 3.6 GB. Below RTX 20 series (e.g. GTX 10 series) is unsupported and the entry does not appear.
-- "AMD runtime (ROCm; RDNA3/4 training + conversion)" and "Intel runtime (XPU; Arc training + conversion)": both "Experimental".
+- "AMD runtime (ROCm; RX 7000 series + 780M-class iGPU training + conversion)" and "Intel runtime (XPU; Arc training + conversion)": both "Experimental". Since v0.12 the AMD pack covers **all of RDNA3** — RX 7000-series discrete cards (7900/7800/7700/7600 and their mobile/workstation siblings) plus the Radeon 780M/760M/740M iGPUs; RX 6000 (RDNA2), RX 9000 (RDNA4) and other iGPU generations (680M/880M/890M) are **not** covered, and the download entry only appears on supported hardware.
 
 Downloads auto-resume, switch automatically between HuggingFace and its mirror, verify chunk by chunk, and run a **self-test** on completion (a real load of the environment to prove it works; success shows "Self-test passed"). "Install from local file…" supports offline installs of .tar.zst packs (exempt from the hardware gate). A footnote shows the "Recommended variant" for this machine.
 
