@@ -8208,7 +8208,7 @@ fn splice_kept(
             let rcell = ((f64::from(sample_rate) * f64::from(rest_cell_ms) / 1000.0) as usize).max(1);
             let rest_g: Vec<Vec<f32>> = rest_spans
                 .iter()
-                .map(|&(x, y, r0, r1)| {
+                .map(|&(x, y, _, _)| {
                     if rest_cell_ms <= 0.0 {
                         return vec![rest_gain_of(x, y)];
                     }

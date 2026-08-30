@@ -1066,6 +1066,11 @@ const SUBCANCEL_MIN_CORR: f64 = 0.40;
 const SUBCANCEL_G_CLAMP: f64 = 4.0;
 
 /// 包络平滑的半宽(输出周期数)。
+/// ⛔ S166c —— **v2 那一版不再用它**(改成逐块估 T + Wiener 增益之后,
+/// 包络平滑这一步被块内平均取代了)。留着是因为整把刀已判负、
+/// 下次要再动得先读 [`subcancel`] 那段 doc;加 `allow` 而不是删掉,
+/// 是为了不把那一版的参数取值一并丢掉。
+#[allow(dead_code)]
 const SUBCANCEL_ENV_PERIODS: f64 = 1.5;
 
 /// ⭐⭐⭐ S166 —— 跨周期自适应对消的本体。见 [`subcancel`]。
