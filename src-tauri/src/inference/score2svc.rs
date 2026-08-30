@@ -913,6 +913,117 @@ fn parse_uvgate_guard_ms(v: Option<&str>) -> f32 {
 /// (鹅妈妈 +7 × yachiyo,141 个 ≥100 ms 的清音段,中位)⇒ **真起音就在最后那 20 ms 里**。
 /// ⛔ 再宽就开始吃掉门本身:护栏 40 上 0:47.229 那个 3 帧的 run 只剩 1 帧,治愈从 −13.0 变成 **+0.5 dB**。
 const UVGATE_GUARD_MS_DEFAULT: f32 = 20.0;
+
+/// ⚙ **出厂默认 = 关**（S166d 新加，待实测）。**自适应起音护栏**。
+///
+/// 现行护栏（[`parse_uvgate_guard_ms`]）是**纯位置**的：只要后面有浊音，
+/// 就无条件留最后 `guard` 毫秒。它保住了真起音，**也放过了落在同一段里的漏网成分**。
+/// ⭐ 开着它时，护栏只在 [`uvgate_tail_is_rising`] 判为**上坡**时才留。
+///
+/// ⛔ 出厂先关：这一族的每一把刀都要先有**治愈 + 代价两张账**（S160k 血训）。
+fn parse_uvgate_adapt(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "true" | "on" | "yes"))
+}
+
+/// ⚙ 自适应护栏的**分析窗**（ms，从 run 末端往回量）。
+const UVGATE_TAIL_MS: f32 = 60.0;
+/// ⚙ 分析窗内的包络帧长 / 跳距（ms）。
+const UVGATE_TAIL_WIN_MS: f32 = 20.0;
+const UVGATE_TAIL_HOP_MS: f32 = 5.0;
+/// ⚙ **出厂默认 = 8.0**。鼓包的**落差门限**（dB）：
+/// 末端比峰低过这么多 ⇒ 判为「已回落的鼓包」⇒ 撤掉护栏。
+/// `UTAI_MG_UVGATE_RISE_DB=<dB>` 可扫。
+///
+/// # ⛔ 8 是**量出来的**，不是拍的（东雪莲 × 鹅妈妈 +7，donor 基频带）
+/// ```text
+/// 1:36.450 も→す /s/   落差 **11.0 dB**   ← 该撤（漏网）
+/// 2:44.029 て→こ /k/   落差 **43.8 dB**   ← 该撤
+/// 0:00.280 [2]し        落差 ** 5.5 dB**   ← **不该撤**
+/// ```
+/// ⭐ 第一版取 3.0，于是把 `0:00.280` 的 5.5 也当成鼓包 ⇒ **把曲子开头第三个音的 /ʃ/
+/// 吃掉了 12 dB**（而不救援臂同处也有那个能量 ⇒ 它是正当内容）。
+/// ⚠ 阈值是从**三个点**分开的，不是人群 ⇒ 所以它是**旋钮**，而不是写死的常数。
+const UVGATE_RISE_DB_DEFAULT: f32 = 8.0;
+
+fn parse_uvgate_rise_db(v: Option<&str>) -> f32 {
+    v.and_then(|x| x.trim().parse::<f32>().ok())
+        .filter(|g| g.is_finite() && (0.0..=60.0).contains(g))
+        .unwrap_or(UVGATE_RISE_DB_DEFAULT)
+}
+
+/// 单频 Goertzel 功率（dB）。⭐ 只需要**一个**频点，没必要上 FFT。
+fn goertzel_db(x: &[f32], sample_rate: u32, f: f32) -> f32 {
+    if x.len() < 8 || f <= 0.0 {
+        return -200.0;
+    }
+    let w = 2.0 * std::f32::consts::PI * f / sample_rate as f32;
+    let c = 2.0 * w.cos();
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for &v in x {
+        let s = v + c * s1 - s2;
+        s2 = s1;
+        s1 = s;
+    }
+    let p = s1 * s1 + s2 * s2 - c * s1 * s2;
+    10.0 * (p.max(1e-20) / x.len() as f32).log10()
+}
+
+/// ⭐⭐⭐ S166d —— **护栏该不该留**：run 尾部的参照基频带内包络，
+/// 是【单调上坡】还是【已回落的鼓包】。
+///
+/// # 实测依据（东雪莲 × 鹅妈妈 +7，成品域，donor 基频 ±0.5 半音带）
+/// ```text
+/// 1:36.450 も→す /s/   峰 +16 dB 之后回落到 −20   ⇒ **鼓包**（该被吃掉）
+/// 2:44.029 て→こ /k/   峰 +25 dB 之后回落到 −18   ⇒ **鼓包**
+/// 1:19.950 し          −50 → +15 单调上坡到边界    ⇒ **真起音**（护栏保的就是它）
+/// ```
+/// 两族的末 40 ms 斜率：鼓包 **−2.03 / −1.74** vs 真起音 **+5.63** dB/10ms。
+///
+/// ⛔ **量不了就保守地留护栏**（run 太短 / 帧不够）—— 这一族的默认必须偏向
+/// 「少吃一点」而不是「多吃一点」：吃错了是 **−23 dB 的音头塌陷**，放过了只是保持现状。
+fn uvgate_tail_is_rising(
+    audio: &[f32],
+    sample_rate: u32,
+    a: usize,
+    b: usize,
+    f_ref: f32,
+    rise_db: f32,
+) -> bool {
+    let sr = sample_rate as f32;
+    let win = ((UVGATE_TAIL_WIN_MS / 1000.0) * sr) as usize;
+    let hop = ((UVGATE_TAIL_HOP_MS / 1000.0) * sr) as usize;
+    let span = ((UVGATE_TAIL_MS / 1000.0) * sr) as usize;
+    if win < 8 || hop == 0 || b <= a || b > audio.len() {
+        return true;
+    }
+    let t0 = b.saturating_sub(span).max(a);
+    if b < t0 + win + 2 * hop {
+        return true;
+    }
+    let mut e: Vec<f32> = Vec::new();
+    let mut t = t0;
+    while t + win <= b {
+        e.push(goertzel_db(&audio[t..t + win], sample_rate, f_ref));
+        t += hop;
+    }
+    if e.len() < 3 {
+        return true;
+    }
+    let last = e[e.len() - 1];
+    let peak = e[..e.len() - 1].iter().copied().fold(f32::MIN, f32::max);
+    // S166d —— 诊断出口：**把门自己在 donor 域算的落差打出来**。
+    // ⛔ 起因：我第一版的阈值是在**成品域**量的（鼓包落差 11.0 / 5.5 / 43.8 dB），
+    //    而门跑在 **donor 域**（逆变换之前）—— 两者不是一回事，
+    //    于是阈值 8 把治愈也一起丢了。**阈值必须从它自己那一层的分布里选。**
+    if std::env::var_os("UTAI_MG_UVGATE_TRACE").is_some() {
+        tracing::info!(
+            "uv-trace: f_ref={f_ref:.1}Hz run={:.0}ms fall={:.1}dB",
+            (b - a) as f32 * 1000.0 / sr,
+            peak - last
+        );
+    }
+    last >= peak - rise_db
+}
 fn parse_valley_adaptive(v: Option<&str>) -> bool {
     matches!(v.map(str::trim), Some("1" | "true" | "on" | "yes"))
 }
@@ -1057,7 +1168,7 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
-        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{},{},{},{},{} restbucket={} donorin={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
+        "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} uvadapt={} uvrise={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{},{},{},{},{} restbucket={} donorin={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
         parse_score_f0_lerp(None),
         parse_fill1(None),
         FILL_ISOLATED_UV_DEFAULT,
@@ -1065,6 +1176,10 @@ pub(crate) fn production_defaults_fingerprint() -> String {
         parse_uvgate(None),
         parse_uvgate_k(None),
         parse_uvgate_guard_ms(None),
+        // S166d —— 自适应护栏。**出厂关 ⇒ 不改音频 ⇒ 不触发版本 bump**;
+        //    进指纹的意义与 valley_human 那条相同:下一个人翻它之前必须来这里改一行。
+        parse_uvgate_adapt(None),
+        parse_uvgate_rise_db(None),
         parse_valley_adaptive(None),
         parse_valley_after(None),
         // S161 —— ⚠ 与 `parse_windowed_inverse` 同款:它进指纹但**出厂关 ⇒ 不改音频**,
@@ -2827,12 +2942,18 @@ fn gate_unvoiced_tone(
     k: f32,
     fade_ms: f32,
     guard_ms: f32,
-) -> usize {
+    // S166d —— 护栏改成**自适应**（见 [`uvgate_tail_is_rising`]）。
+    adapt: bool,
+    rise_db: f32,
+) -> (usize, usize) {
     let hop = (sample_rate as usize / 50).max(1);
     let n = audio.len();
     let fade = ((fade_ms / 1000.0) * sample_rate as f32) as usize;
     let guard = ((guard_ms / 1000.0) * sample_rate as f32) as usize;
     let mut hit = 0usize;
+    // ⛔ 「臂开着」与「臂做了事」必须分开可查（S129 铁律）：
+    //    自适应护栏开着、但一次也没撤掉过护栏 ⇒ 它实际上是空的。
+    let mut dropped = 0usize;
     let mut i = 0usize;
     while i < note_hz.len() {
         if note_hz[i] != 0.0 {
@@ -2856,7 +2977,12 @@ fn gate_unvoiced_tone(
         // S162 —— 起音护栏:后继浊音那一侧留 `guard` 个样本不碰(见 `parse_uvgate_guard_ms`)。
         // ⛔ 只在**真有后继浊音**时收:run 落在曲尾(没有 `next`)时没有起音可保,收了纯亏。
         if next.is_some() {
-            b = b.saturating_sub(guard).max(a);
+            // S166d —— `adapt` 开着时，护栏只在尾部**仍在上坡**时才留。
+            if !adapt || uvgate_tail_is_rising(audio, sample_rate, a, b, f_ref, rise_db) {
+                b = b.saturating_sub(guard).max(a);
+            } else {
+                dropped += 1;
+            }
         }
         if b > a + 2 * fade + 8 {
             highpass_span(audio, sample_rate, a, b, cut, fade);
@@ -2864,7 +2990,7 @@ fn gate_unvoiced_tone(
         }
         i = j + 1;
     }
-    hit
+    (hit, dropped)
 }
 
 /// 零相位高通(RBJ 双二阶,前向 + 反向),只作用在 `[a, b)`,两端各 `fade` 个样本交叉淡化。
@@ -2947,12 +3073,16 @@ fn apply_range_inverse(
         //    `parse::<f32>() + 范围过滤`,范围与 `parse_uvgate_k` 并不相同。
         let k = parse_uvgate_k(std::env::var("UTAI_MG_UVGATE_K").ok().as_deref());
         let guard_ms = parse_uvgate_guard_ms(std::env::var("UTAI_MG_UVGATE_GUARD_MS").ok().as_deref());
-        let hit = gate_unvoiced_tone(&mut audio, sample_rate, note_hz, k, 4.0, guard_ms);
+        let adapt = parse_uvgate_adapt(std::env::var("UTAI_MG_UVGATE_ADAPT").ok().as_deref());
+        let rise_db = parse_uvgate_rise_db(std::env::var("UTAI_MG_UVGATE_RISE_DB").ok().as_deref());
+        let (hit, dropped) =
+            gate_unvoiced_tone(&mut audio, sample_rate, note_hz, k, 4.0, guard_ms, adapt, rise_db);
         // 「臂开着」与「臂做了事」必须分开可查(S129 铁律);⭐ 并且把**实际生效值**打出来
         // (钩子区:凡加一个旋钮,同时加一行打印实际生效值 —— S160e/f 两个静默失效的旋钮
         //  都是被这一行抓住的)。
         tracing::info!(
-            "range-extend(donor {range_shift:+}): uv-gate k={k} guard={guard_ms}ms — {hit} unvoiced span(s) high-passed"
+            "range-extend(donor {range_shift:+}): uv-gate k={k} guard={guard_ms}ms adapt={adapt} rise={rise_db} — \
+             {hit} unvoiced span(s) high-passed, {dropped} guard(s) dropped (tail had already decayed)"
         );
     }
     // ⚠ stem 只在转储开着时算(它会往一个进程内的表里插一条)。
@@ -5136,7 +5266,7 @@ mod tests {
 
 #[cfg(test)]
 mod s160k_uvgate_tests {
-    use super::{gate_unvoiced_tone, highpass_span};
+    use super::{gate_unvoiced_tone, highpass_span, parse_uvgate_adapt};
 
     fn tone(n: usize, sr: f32, f: f32) -> Vec<f32> {
         (0..n).map(|i| (2.0 * std::f32::consts::PI * f * i as f32 / sr).sin()).collect()
@@ -5179,6 +5309,78 @@ mod s160k_uvgate_tests {
         assert!(att > -1.5, "4 kHz 该基本过得去,实际 {att:.1} dB");
     }
 
+    /// ⭐⭐⭐ S166d —— **自适应护栏必须分得开【已回落的鼓包】与【单调上坡】。**
+    ///
+    /// 这两族在真实渲染里长这样（东雪莲 × 鹅妈妈 +7，donor 基频带）：
+    /// 鼓包 = `1:36.450 も→す /s/`（峰 +16 dB 后回落到 −20）—— 门**该**吃掉它；
+    /// 上坡 = `1:19.950 し`（−50 → +15 单调到边界）—— 护栏**保的就是它**（吃掉它 = −23 dB 的音头塌陷）。
+    #[test]
+    fn the_adaptive_guard_drops_a_decayed_hump_but_keeps_a_rising_onset() {
+        let sr = 44100u32;
+        let hop = sr as usize / 50;
+        let f = 494.0f32;
+        // 24 帧：0-7 浊音 · 8-17 清音（0）· 18-23 浊音
+        let mut hz = vec![f; 24];
+        for t in 8..18 {
+            hz[t] = 0.0;
+        }
+        let (a, b) = (8 * hop, 18 * hop);
+
+        // 包络制作器：run 内按 `shape(u)` 缩放（u = run 内的归一化位置）
+        let build = |shape: &dyn Fn(f32) -> f32| -> Vec<f32> {
+            let mut x = tone(24 * hop, sr as f32, f);
+            for t in a..b {
+                let u = (t - a) as f32 / (b - a) as f32;
+                x[t] *= shape(u);
+            }
+            x
+        };
+        // 鼓包：峰在 run 的 70%，之后回落到 1/100（−40 dB）
+        let mut hump = build(&|u| {
+            let d = (u - 0.70) / 0.10;
+            0.01 + 0.99 * (-0.5 * d * d).exp()
+        });
+        // 上坡：单调升到边界
+        let mut ramp = build(&|u| 0.01 + 0.99 * u * u);
+
+        let (hit_h, drop_h) = gate_unvoiced_tone(&mut hump, sr, &hz, 1.5, 4.0, 20.0, true, 8.0);
+        let (hit_r, drop_r) = gate_unvoiced_tone(&mut ramp, sr, &hz, 1.5, 4.0, 20.0, true, 8.0);
+        assert_eq!((hit_h, hit_r), (1, 1), "两条都只应命中一段");
+        assert_eq!(drop_h, 1, "已回落的鼓包 ⇒ 护栏应当被撤掉");
+        assert_eq!(drop_r, 0, "单调上坡 ⇒ 护栏必须保住（吃掉它就是音头塌陷）");
+
+        // ⛔ 阴性对照：`adapt = false` 时两条都不得撤护栏（否则新路径在偺坐旧行为）
+        let mut h2 = build(&|u| {
+            let d = (u - 0.70) / 0.10;
+            0.01 + 0.99 * (-0.5 * d * d).exp()
+        });
+        assert_eq!(
+            gate_unvoiced_tone(&mut h2, sr, &hz, 1.5, 4.0, 20.0, false, 8.0).1,
+            0,
+            "adapt 关着时一次都不该撤护栏"
+        );
+
+        // ⭐ 而且「撤护栏」必须真的改变了音频 —— 否则上面那个计数器只是个数字。
+        let g = ((20.0 / 1000.0) * sr as f32) as usize;
+        let att = 20.0
+            * (rms(&hump[b - g..b]) / rms(&h2[b - g..b])).log10();
+        assert!(
+            att < -6.0,
+            "撤掉护栏之后，run 最后 20 ms 里的 {f} Hz 该被压下去，实际 {att:.1} dB"
+        );
+    }
+
+    /// ⛔ S166d —— 自适应护栏 **出厂必须关**（治愈与代价两张账齐了才能翻），
+    /// 而且旋钮必须真的能把它打开 —— 否则上面那条判据可以靠「永远返回 false」造假。
+    #[test]
+    fn the_adaptive_guard_is_off_by_default_and_the_knob_really_turns_it_on() {
+        assert!(!parse_uvgate_adapt(None), "出厂必须关");
+        assert!(!parse_uvgate_adapt(Some("0")), "0 关");
+        assert!(!parse_uvgate_adapt(Some("垃圾")), "垃圾值一律落回出厂");
+        for v in ["1", "true", "on", "yes"] {
+            assert!(parse_uvgate_adapt(Some(v)), "{v} 应当能打开它");
+        }
+    }
     /// S160k —— 门只碰 `note_hz == 0` 的连续帧,而且**必须有一个浊音参照**才动手。
     #[test]
     fn the_gate_only_fires_on_unvoiced_runs_that_have_a_voiced_neighbour() {
@@ -5191,7 +5393,7 @@ mod s160k_uvgate_tests {
         }
         let mut x = tone(20 * hop, sr as f32, 494.0);
         let before = x.clone();
-        let hit = gate_unvoiced_tone(&mut x, sr, &hz, 1.5, 4.0, 0.0);
+        let hit = gate_unvoiced_tone(&mut x, sr, &hz, 1.5, 4.0, 0.0, false, 8.0).0;
         assert_eq!(hit, 1, "只该命中一段");
         // 清音段正中被压掉(494 Hz 在 1.5×494 = 741 Hz 截止之下)
         let (a, b) = (8 * hop, 12 * hop);
@@ -5208,13 +5410,13 @@ mod s160k_uvgate_tests {
         // ⛔ 全清音(没有任何浊音参照)⇒ 一个字不动
         let hz0 = vec![0.0f32; 20];
         let mut y = before.clone();
-        assert_eq!(gate_unvoiced_tone(&mut y, sr, &hz0, 1.5, 4.0, 0.0), 0);
+        assert_eq!(gate_unvoiced_tone(&mut y, sr, &hz0, 1.5, 4.0, 0.0, false, 8.0).0, 0);
         assert_eq!(y, before);
 
         // ⛔ 全浊音 ⇒ 一个字不动
         let hz1 = vec![494.0f32; 20];
         let mut z = before.clone();
-        assert_eq!(gate_unvoiced_tone(&mut z, sr, &hz1, 1.5, 4.0, 0.0), 0);
+        assert_eq!(gate_unvoiced_tone(&mut z, sr, &hz1, 1.5, 4.0, 0.0, false, 8.0).0, 0);
         assert_eq!(z, before);
     }
 
@@ -5238,11 +5440,11 @@ mod s160k_uvgate_tests {
 
         // 护栏 0 = 老行为:整段被压
         let mut none = x0.clone();
-        assert_eq!(gate_unvoiced_tone(&mut none, sr, &hz, 1.5, 4.0, 0.0), 1);
+        assert_eq!(gate_unvoiced_tone(&mut none, sr, &hz, 1.5, 4.0, 0.0, false, 8.0).0, 1);
 
         // 护栏 40 ms = 1764 样本:后 40 ms 必须**逐位不变**
         let mut g40 = x0.clone();
-        assert_eq!(gate_unvoiced_tone(&mut g40, sr, &hz, 1.5, 4.0, 40.0), 1, "护栏不该让它不开火");
+        assert_eq!(gate_unvoiced_tone(&mut g40, sr, &hz, 1.5, 4.0, 40.0, false, 8.0).0, 1, "护栏不该让它不开火");
         let guard = (0.040 * sr as f32) as usize;
         for t in (b - guard)..b {
             assert_eq!(g40[t], x0[t], "护栏内第 {t} 个样本被门碰了");
@@ -5262,7 +5464,7 @@ mod s160k_uvgate_tests {
             hz_end[t] = 0.0;
         }
         let mut tail = x0.clone();
-        assert_eq!(gate_unvoiced_tone(&mut tail, sr, &hz_end, 1.5, 4.0, 40.0), 1);
+        assert_eq!(gate_unvoiced_tone(&mut tail, sr, &hz_end, 1.5, 4.0, 40.0, false, 8.0).0, 1);
         let e = 20 * hop;
         let att_eof = 20.0 * (rms(&tail[e - guard..e - 400]) / rms(&x0[e - guard..e - 400])).log10();
         assert!(att_eof < -10.0, "曲尾那段没有后继浊音,护栏不该收,实际 {att_eof:.1} dB");
@@ -5311,7 +5513,7 @@ mod s160q_f0_lerp_tests {
         // ⛔⛔ 这条判据存在的理由:S160q 之前,本文件的生产默认【完全不在任何指纹里】,
         //     而 `FILL_ISOLATED_UV_DEFAULT` 出厂就是开着的。
         let fp = production_defaults_fingerprint();
-        for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "uvgateguard=", "valadapt=", "valafter=", "valhuman=", "valdb=", "valenv="] {
+        for key in ["f0lerp=", "fill1=", "filluv=", "fillmax=", "uvgate=", "uvgatek=", "uvgateguard=", "uvadapt=", "uvrise=", "valadapt=", "valafter=", "valhuman=", "valdb=", "valenv="] {
             assert!(fp.contains(key), "指纹串缺 {key} —— 少一个默认就少一道成对 bump 的闸:{fp}");
         }
     }
@@ -5418,6 +5620,8 @@ mod s160q_f0_lerp_tests {
             ("UTAI_MG_UVGATE", "uvgate="),
             ("UTAI_MG_UVGATE_K", "uvgatek="),
             ("UTAI_MG_UVGATE_GUARD_MS", "uvgateguard="),
+            ("UTAI_MG_UVGATE_ADAPT", "uvadapt="),
+            ("UTAI_MG_UVGATE_RISE_DB", "uvrise="),
             ("UTAI_MG_VALLEY_ADAPT", "valadapt="),
             ("UTAI_MG_VALLEY_AFTER", "valafter="),
             ("UTAI_VALLEY_HUMAN", "valhuman="),
@@ -5425,7 +5629,8 @@ mod s160q_f0_lerp_tests {
             ("UTAI_PREROLL_DAMP", "predamp="),
         ];
         // 只写文件、不改音频的诊断路径(见 `dump_donor_buffer` 的 doc)。
-        const EXEMPT: &[&str] = &["UTAI_RANGE_DUMP_DONOR"];
+        // `UTAI_MG_UVGATE_TRACE` 同理：只打日志，一个样本都不改。
+        const EXEMPT: &[&str] = &["UTAI_RANGE_DUMP_DONOR", "UTAI_MG_UVGATE_TRACE"];
         // 指纹里**不由 env 驱动**的格:纯常量默认,没有对应的环境变量。
         // ⚠ `restbucket=` 由 `UTAI_REST_BUCKET_TARGET` 驱动，但那个 env 读在 **score2cv.rs**，
         //    而这条判据只扫本文件 ⇒ 它扫不到，只能登记在这里。
