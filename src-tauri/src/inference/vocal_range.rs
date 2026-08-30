@@ -728,7 +728,7 @@ pub struct RescueTuning {
     /// 正好也是二级那一刀的形状,两级同时开火时它们的阴性对照会失效。⇒ 那些判据显式写
     /// `with_split_cost(f32::INFINITY)` 把二级关掉 —— **隔离,而不是照新结果改期望值**。
     pub split_cost: f32,
-    /// ⭐⭐⭐⭐ S166 —— [`SPLIT_SPREAD_ST`] 的**可扫版本**(出厂 = 那个常量本身 = **0 = 关**)。
+    /// ⭐⭐⭐⭐ S166 —— [`SPLIT_SPREAD_DEFAULT`] 的**可扫版本**(出厂 = 那个常量本身 = **0 = 关**)。
     ///
     /// ⛔ 与 [`Self::cap`] / [`Self::split_cost`] 同一个形状、同一条理由,**不是新旋钮**:
     /// `new()`/`today()` 一律填常量,生产上没有第二条路;`from_env()` 读
@@ -767,7 +767,7 @@ impl RescueTuning {
             landing: LANDING_DEFAULT,
             cap: LANDING_RATIO_TWO_ST,
             split_cost: SPLIT_MIN_COST_DEFAULT,
-            split_spread: SPLIT_SPREAD_ST,
+            split_spread: SPLIT_SPREAD_DEFAULT,
         }
     }
 
@@ -777,7 +777,7 @@ impl RescueTuning {
             landing,
             cap: LANDING_RATIO_TWO_ST,
             split_cost: SPLIT_MIN_COST_DEFAULT,
-            split_spread: SPLIT_SPREAD_ST,
+            split_spread: SPLIT_SPREAD_DEFAULT,
         }
     }
 
@@ -1002,9 +1002,9 @@ pub fn dead_only_plan_with_alts(
                         //      `unreachable_here` 与这里的 `neighbour_ok` 读的是**同一个**
                         //      `slot_reachable(邻音 + 该侧 shift)` ⇒ `neighbour_ok` 想拦的危害
                         //      (护栏把塌陷拌进交界)**在这条边上根本不存在**;
-                        //   ⑵ 组内**深度需求的跨度** ≥ [`SPLIT_SPREAD_ST`](五段全是 10;
+                        //   ⑵ 组内**深度需求的跨度** ≥ [`SPLIT_SPREAD_DEFAULT`](五段全是 10;
                         //      而 4:36 那两组是 5 / 0 ⇒ 一个字都不碰);
-                        //   ⑶ 断点**两侧**的深度需求差 ≥ [`SPLIT_SPREAD_ST`] ⇒ 断点落在**真台阶**上。
+                        //   ⑶ 断点**两侧**的深度需求差 ≥ [`SPLIT_SPREAD_DEFAULT`] ⇒ 断点落在**真台阶**上。
                         // ⭐ 它做的正是「把缝从『听起来该连续的地方』搬到『本来就该有台阶的地方』」:
                         //   被消掉的突变在 midi 83→82(差 1 度),新造的缝在 83→92(差 9 度)。
                         // ⚙ `UTAI_RANGE_SPLIT_SPREAD=0` 关 ⇒ 逐位回到今天。
@@ -1963,28 +1963,56 @@ const SPLIT_MIN_COST_DEFAULT: f32 = 3000.0;
 
 /// ⭐⭐⭐⭐ S166 —— **陪绑放行**的门槛(半音)。见 `dead_group_windows` 里那一段。
 ///
-/// ⚙ **出厂 0 = 关 = 逐位不变**;`UTAI_RANGE_SPLIT_SPREAD=8` 打开。
+/// ⚙ **出厂 8 = 开**(S166b 翻的);`UTAI_RANGE_SPLIT_SPREAD=0` 关掉 ⇒ 逐位回到 S166 之前。
 ///
-/// ⛔⛔ **为什么不直接翻默认**(与「证明有效果的刀就翻默认」那条规矩不矛盾):
-/// 这一族有**登记在案的反向耳判**。它在夹具 `[92, 81, 81]` 上把断点从 `2|3` 推到 `1|2` ——
-/// 而那正是 S163 试过、又因为用户耳判「1034 塌了」而退回去的形状
-/// (见 `a_run_of_dead_notes_splits_where_the_depth_requirement_drops` 的变异表)。
-/// ⚠ 而那条判据的 doc 本身是**自相矛盾**的:上面的论证说 `[1|2]` 明显更好
-/// (那个 81 从落到 **68** 变成落到 **79**),下面的断言却钉着旧行为 —— 那是退回时留下的不一致。
-/// ⇒ **没听过就翻默认是鲁莽的**;渲一条 A/B 臂交给耳判。
+/// ## ⭐⭐ 翻默认的证据(四层,缺一层都不够)
+/// ⑴ **用户耳判**(2026-08-30,炉心融解 +7 × yachiyo **整曲**):「③把乘客卸了确实更自然了」。
+/// ⑵ **计划层**:用户点名的五个「音色突变」段,陪绑合计 **+60 ⇒ +15 度**、
+///    donor 从唱 65/66 回到 **74/75**(与组外紧邻那个音对齐),而 **ぴゃ 与 4:36 逐格未动**。
+/// ⑶ **音频层**:逐音配对、按谐波序号对齐、各自按 f1-f4 归一后,
+///    `pass − base` 在 **f8-f16 读 −9.70 dB** ⇒ 那条「像上了很奇怪的 EQ」的倒斜被拉回了。
+/// ⑷ ⛔ **唯一的反向证据当面对质了 —— 它不复现**。
+///
+/// ## ⛔⛔ 那条反向证据的出处,以及它为什么必须单独渲一枪
+/// 我一直把它写成「S163」—— **错的**。出处是 **S159zk**,用户 **2026-08-22** 耳判
+/// 「和『う』(1033)连接的 1034『た』在 zk 也塌了」,素材是
+/// **不为人所知的鹅妈妈童谣 +7 × 东雪莲(SoVITS)** —— **不是**炉心融解 × yachiyo。
+/// ⇒ 用户在炉心融解上给的好评,**结构上洗不清它**。
+///
+/// ⭐ 而且机理正是 S166b 刚修的那一族,只是在**另一层**:
+/// 句内拆组会让**浅组那一遍去唱旁边那个掉出音域的深音** ⇒ 模型在那里塌,
+/// 顺着 `GUARD_FRAMES` 渗进交界。当时的解药是计划层的 `neighbour_ok`,
+/// 而 **这一刀恰恰是放开那道护栏的**;S166b 的天花板闸在拼接/修补层,**够不着它**。
+///
+/// ## ✅ S166b 实测(鹅妈妈 +7 × 东雪莲,base vs 这一刀,同一个二进制)
+/// 这一刀在那首歌上放行 **84 次**(炉心融解是 36),而且 `[1034]` 的组
+/// **确实被改回了当年判坏的那个构型**(base `[1033,1034] −14` ⇒ 这一刀 `[1034,1035] −2`)。
+/// ```text
+/// 全曲归一台阶(中位) −1.20 dB —— 先扣掉它(峰值归一造的,连没被碰的音都一样)
+/// [1034] Δ −1.93 dB   ← 当年登记的是 **−17 dB 量级**(起音 −9.6 ⇒ −26.5 dBFS)
+/// [1033] Δ −0.19 · [1035] Δ +0.04
+/// ```
+/// ⛔⛔ **而且噪声底当场量了**:扣台阶后最差的四个音(`[53]` −8.40 · `[696]` −5.34 ·
+/// `[700]` −5.29 · `[1152]` −4.37)的组在两条臂里**逐字相同** ⇒ 它们是**渲染噪声**,
+/// 不是这一刀 ⇒ **这把尺子在这首歌上的噪声底 ≈ 8 dB** ⇒ `[1034]` 的 1.93 在噪声里。
+/// ✅ 阴性对照干净:**组外 555 个音** p10 −0.27 / p90 +0.25 ⇒ 它不碰没被救援的音。
+///
+/// ⚙ 值 **8**:用户点名的五段组内深度跨度全是 **10**,
+/// 而 4:36 那两组(用户明令别碰)是 **5 / 0** ⇒ 8 把两者干净分开,两边各留 2-3 度余量。
+/// ⛔ **别调到 ≤5**:那会把 4:36 一起打进来。
 ///
 /// ⚙ 推荐值 **8**:用户点名的五个「音色突变」段组内深度跨度全是 **10**,
 /// 而 4:36 那两组(用户明令别碰)是 **5 / 0** ⇒ 8 把两者干净分开,两边各留 2-3 度余量。
 /// ⛔ 别调到 ≤5:那会把 4:36 一起打进来。
-const SPLIT_SPREAD_ST: i64 = 0;
+const SPLIT_SPREAD_DEFAULT: i64 = 8;
 
-/// ⚙ `UTAI_RANGE_SPLIT_SPREAD=<半音>` 可扫;**`0` = 关 = 逐位回到今天**。
+/// ⚙ 出厂默认 = 8 —— `UTAI_RANGE_SPLIT_SPREAD=<半音>` 可扫;**`0` = 关 = 逐位回到 S166 之前**。见 [`SPLIT_SPREAD_DEFAULT`] 的四层证据。
 fn split_spread_st() -> i64 {
     std::env::var("UTAI_RANGE_SPLIT_SPREAD")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|v| (0..=40).contains(v))
-        .unwrap_or(SPLIT_SPREAD_ST)
+        .unwrap_or(SPLIT_SPREAD_DEFAULT)
 }
 
 /// ⚙ 出厂默认 = 6000.0 —— 卸乘客的**第二条**门:按**代价**而不是按时长(单位 ms·半音)
@@ -12206,10 +12234,22 @@ mod tests {
     ///   ⛔⛔ 血训:⑻ 一开始只断言「拆成两组」+「位移是 −5」,而那条变异**照绿** ——
     ///   换谓词之后它把断点从 `[1|2]` 推到 `[2|3]`,**组数与位移一个字没变**。
     ///   **「拆了」和「断在该断的地方」是两件事**;凡是钉「断点」的判据,断言里必须出现下标。
+
     #[test]
     fn a_run_of_dead_notes_splits_where_the_depth_requirement_drops() {
         let r = dxl_like(); // usable [36,80];81 起是死音,落点只到 79 ⇒ 81 要 −2、92 要 −13
-        let plan = |p: &[i64], f: &[i64]| dead_only_plan_with(p, f, 0, &r, RescueTuning::today()).0;
+        // ⛔⛔⭐⭐⭐ S166b —— **这条判据必须显式关掉陪绑放行来跑**。
+        //
+        // 它盯的是 `neighbour_ok`(⑹ 的右门 / ⑺ 的左门 / ⑻ 的谓词),而 S166b 翻默认之后
+        // [`SPLIT_SPREAD_DEFAULT`] = 8 的陪绑放行**正是故意要盖过那道门**的
+        // ⇒ 拿出厂值跑,⑷/⑹ 会直接读到「放行后的形状」,
+        //    于是变异表里那条「去掉 `neighbour_ok` 右门 ⇒ 读回 `[1..1]−13,[2..3]−2`」
+        //    会**照绿** —— 那道门就此没人盯了。
+        // ⇒ 这里钉「关掉时 `neighbour_ok` 仍在工作」;**出厂开着时的行为**由
+        //    [`tests::the_chaperone_spread_rule_ships_on_and_only_opens_collapsed_edges`] 钉,
+        //    两条判据各管一个 regime。⛔ 少了任何一条都会留下一个洞。
+        let nospread = RescueTuning { split_spread: 0, ..RescueTuning::today() };
+        let plan = |p: &[i64], f: &[i64]| dead_only_plan_with(p, f, 0, &r, nospread).0;
 
         // ⑷ ⭐ 主臂 —— 3:16 的形状:顶音要 −13,后面两个只高出 usable 顶 1 度、只要 −2。
         // ⚠⚠ S159zk 时断点被推到 `[2|3]`,理由是「`[1|2]` 会让浅组的窗倒着伸进顶音 92,
@@ -12239,6 +12279,12 @@ mod tests {
         assert_eq!(g[0].shift.abs() - g[1].shift.abs(), 11, "省下来的正是这 11 个半音");
 
         // ⑹ ⭐⭐⭐ **断点的可行性** —— 用户 2026-08-22 耳判报的那条(「1034 在 zk 也塌了」)。
+        //
+        // ⭐⭐ S166b —— 那条自相矛盾**已经解掉了**(doc 说 `[1|2]` 明显更好、断言却钉旧形状):
+        // 「更好」这一半现在由**出厂的陪绑放行**兑现(见 [`SPLIT_SPREAD_DEFAULT`] 的四层证据,
+        // 含在鹅妈妈 +7 × 东雪莲上把 `[1034]` 改回当年判坏的构型后**实测 Δ 只有 −1.93 dB**、
+        // 而同一把尺子在**计划未变**的音上噪声底 ≈ 8 dB);
+        // 而这里钉的是**关掉之后 `neighbour_ok` 仍然在工作** —— 两件事,两条判据。
         //
         // `dead_group_windows` 的 `GUARD_FRAMES` 让每个窗倒着伸进旁边那个音 2 帧,而 donor
         // **按那一遍的位移唱整条谱** ⇒ 旁边那个音在这一遍掉出音域时模型直接塌掉。
@@ -12276,7 +12322,54 @@ mod tests {
         // * 而 `49 − 14 = 35` **唱不出** ⇒ 这个断点不可行 ⇒ **不许拆**。
         let pr = pya_like();
         let sandwich = [0i64, 90, 49, 81, 0];
-        let gw = dead_only_plan_with(&sandwich, &secs(sandwich.len()), 0, &pr, RescueTuning::today()).0;
+        let gw = dead_only_plan_with(&sandwich, &secs(sandwich.len()), 0, &pr, nospread).0;
+        // ⭐⭐⭐ S166b —— **出厂的陪绑放行确实会把这一处拆开,而那是对的**。
+        //
+        // ⛔ 写这一段时我先把它当成了回归(「深组走 −14 ⇒ 夹心 49 掉到 35」),
+        //    **探针当场否掉了它** —— 危害的载体是**窗**,不是断点:
+        //    ```text
+        //    关   计划 [1..3] −13            窗 [46..204)
+        //    开   计划 [1..1] −14 + [3..3] −5
+        //         深组窗 [46..100)   ← 夹心 49(帧 100-150)**不在里面**(那条边的护栏被收到 0)
+        //         浅组窗 [148..204) ← 伸进夹心 2 帧,而 49−5 = 44 唱得出 ✅
+        //    ```
+        //    ⇒ 拆开是**净收益**(那个 81 从落到 **68** 变成落到 **76**),
+        //      而且**没有任何一个窗伸进它那一遍唱不出的音**。
+        // ⛔⛔ 所以这里钉的不再是「拆不拆」,而是 **S159zk 那个真危害本身**:
+        //    每个窗盖到的每个唱音,在**那个窗自己的位移**上都必须 `slot_reachable`。
+        //    (旧的计划层断言是 S163 迁到窗层时留下的尾巴 —— 它自己的 doc 写着
+        //    「断点照拆,而深组的窗不许伸进夹心 49」,断言却钉着「不许拆」。)
+        let no_window_reaches_a_note_it_cannot_sing =
+            |notes: &[i64], fr: &[i64], t: RescueTuning, rg: &SpeakerRange| -> Option<(i64, usize, i64)> {
+                let plan = dead_only_plan_with(notes, fr, 0, rg, t).0;
+                let jobs = dead_group_windows(notes, fr, &plan, rg, 0);
+                let mut cum = vec![0i64];
+                for f in fr {
+                    cum.push(cum.last().unwrap() + (*f).max(0));
+                }
+                for j in &jobs {
+                    for (i, &n) in notes.iter().enumerate() {
+                        if n <= 0 || cum[i + 1] <= j.start || cum[i] >= j.end {
+                            continue;
+                        }
+                        if !rg.slot_reachable(n + j.shift) {
+                            return Some((j.shift, i, n + j.shift));
+                        }
+                    }
+                }
+                None
+            };
+        // ⛔ **变异（真跑过）**：把 `unreachable_here` 改成恒 `false`（护栏永不收缩）
+        //    ⇒ 读到 `Some((-14, 2, 35))` —— 夹心 49 在深组那一遍掉到 **35**（reach 下界 36），**红**。
+        //    ⇒ 这一条是承重的，而且它钉的正是「护栏收缩」那套机制 ——
+        //      而那套机制正是陪绑放行能安全拆开的**唯一理由**。
+        for (tag, t) in [("关", nospread), ("出厂", RescueTuning::today())] {
+            assert_eq!(
+                no_window_reaches_a_note_it_cannot_sing(&sandwich, &secs(sandwich.len()), t, &pr),
+                None,
+                "[{tag}] 有一个窗伸进了它那一遍唱不出的音 —— 那正是 S159zk 报的那一族"
+            );
+        }
         assert!(
             pr.slot_reachable(49) && !pr.slot_reachable(49 - 14),
             "夹具有效性:夹心 49 本来唱得出、被 −14 一拖必须掉出下边界,否则 ⑺ 是恒真的"
@@ -12303,7 +12396,13 @@ mod tests {
         // ⇒ 用 `slot_singable` 的话这一处就白白不拆了,而且**用户每把上限调低一格,
         //    就多一处不拆 ⇒ 陪绑更深** —— 那正是 S146f 用户耳判报的那条退化的形状。
         let bar = [0i64, 85, 81, 81, 0];
-        let gb = dead_only_plan_with(&bar, &secs(bar.len()), 0, &pr, RescueTuning::today()).0;
+        let gb = dead_only_plan_with(&bar, &secs(bar.len()), 0, &pr, nospread).0;
+        // ⛔ 同上:出厂的陪绑放行允许改变断点,但**真危害一样不许出现**。
+        assert_eq!(
+            no_window_reaches_a_note_it_cannot_sing(&bar, &secs(bar.len()), RescueTuning::today(), &pr),
+            None,
+            "⑻ 在出厂值下有窗伸进了唱不出的音"
+        );
         assert!(
             pr.slot_reachable(80) && !pr.slot_singable(80),
             "夹具有效性:80 必须是「唱得出但在用户线之外」那一格,否则 ⑻ 两个谓词读一样"
@@ -12420,39 +12519,44 @@ mod tests {
     ///   ⚠ 只改 `hi` 一侧不会重叠,而且**只在出厂臂上断言的话连两侧一起改也是绿的**
     ///   —— 出厂裁剪会把边界收回去。这条判据一开始就是那样写的,是个空判据;
 
-    /// ⭐⭐⭐⭐ S166 —— **陪绑放行**([`SPLIT_SPREAD_ST`] / `UTAI_RANGE_SPLIT_SPREAD`)。
+    /// ⭐⭐⭐⭐ S166 —— **陪绑放行**([`SPLIT_SPREAD_DEFAULT`] / `UTAI_RANGE_SPLIT_SPREAD`)。
     ///
     /// 用户 2026-08-30 点名的五个「音色突变」段结构完全相同:组内音 midi 82,83,**92**,90,88,87,
     /// 自己需要 −5,−6,**−15**,−13,−11,−10 ⇒ 整组走 −17 ⇒ 前两个音 donor 唱 **65/66**,
     /// 而组外紧邻的前一个音(midi 83)donor 唱 **75** ⇒ 音高差 1 度、唱法差 **10 度**。
     ///
     /// 四条:
-    /// ⑴ ⛔ **出厂关 ⇒ 与今天逐位相同**(这条不成立,整刀的「可回退」就是假的)。
+    /// ⑴ ⛔ **关掉 ⇒ 与 S166 之前逐位相同**(这条不成立,整刀的「可回退」就是假的)。
     /// ⑵ 打开 ⇒ 那个只需 −2 的乘客**不再陪着顶音走 −13**。
     /// ⑶ ⛔ **跨度不够就不许放行** —— 门限真的在起作用,而不是「打开就无条件拆」。
     /// ⑷ ⛔ **护栏没被收到 0 的边不许放行** —— 那条边上 `neighbour_ok` 拦的危害是真的
     ///    (S159zk:那样的 24 个音比组内音低 −11.4 dB)。
     #[test]
-    fn the_chaperone_spread_rule_is_off_by_default_and_only_opens_collapsed_edges() {
+    fn the_chaperone_spread_rule_ships_on_and_only_opens_collapsed_edges() {
         let r = dxl_like(); // usable [36,80];81 起是死音,落点只到 79 ⇒ 81 要 −2、92 要 −13
         let plan = |p: &[i64], f: &[i64]| dead_only_plan_with(p, f, 0, &r, RescueTuning::today()).0;
         let deep = [0i64, 92, 81, 81, 0];
 
-        // ⑴ 出厂关 = 今天
-        assert_eq!(SPLIT_SPREAD_ST, 0, "出厂必须是关 —— 这一族有登记在案的反向耳判");
-        let today = plan(&deep, &secs(deep.len()));
+        // ⑴ ⛔ **阴性对照**:显式关掉 ⇒ 逐位回到 S166 之前。
+        //    这一条不成立,整刀的「可回退」就是假的。
+        let off = RescueTuning { split_spread: 0, ..RescueTuning::today() };
+        let today = dead_only_plan_with(&deep, &secs(deep.len()), 0, &r, off).0;
         assert_eq!(
             today,
             vec![
                 DeadGroup { start: 1, end: 2, shift: -13 },
                 DeadGroup { start: 3, end: 3, shift: -2 },
             ],
-            "出厂关的时候必须与今天逐位相同(读到 {today:?})"
+            "关掉的时候必须与 S166 之前逐位相同(读到 {today:?})"
         );
 
-        // ⑵ 打开 ⇒ 断点移到 [1|2],那个 81 不再陪着走 −13
+        // ⑵ ⭐ **出厂就是开的**(S166b 翻的;四层证据见 [`SPLIT_SPREAD_DEFAULT`] 的 doc)
+        //    ⇒ 不传任何旋钮的 `today()` 就应当把断点放在 [1|2]。
+        assert_eq!(SPLIT_SPREAD_DEFAULT, 8, "出厂值改了就得重新过一遍那四层证据");
+        let shipped = plan(&deep, &secs(deep.len()));
         let sp8 = RescueTuning { split_spread: 8, ..RescueTuning::today() };
         let on = dead_only_plan_with(&deep, &secs(deep.len()), 0, &r, sp8).0;
+        assert_eq!(shipped, on, "出厂默认必须与显式传 8 一模一样(读到 {shipped:?})");
         assert_eq!(
             on,
             vec![
@@ -12464,7 +12568,7 @@ mod tests {
 
         // ⑶ ⛔ 跨度不够 ⇒ 门限必须挡住(把顶音换成 83:自己只需 −4,跨度 2 < 8)
         let shallow = [0i64, 83, 81, 81, 0];
-        let a = plan(&shallow, &secs(shallow.len()));
+        let a = dead_only_plan_with(&shallow, &secs(shallow.len()), 0, &r, off).0;
         let b = dead_only_plan_with(&shallow, &secs(shallow.len()), 0, &r, sp8).0;
         assert_eq!(a, b, "跨度只有 2 度时这一刀一个字都不许改(读到 {b:?})");
 
@@ -13169,6 +13273,8 @@ mod tests {
             ("TRIM_DEFAULT", "fn parse_trim("),
             ("TRIM_MIN_COST_DEFAULT", "const TRIM_MIN_COST_DEFAULT"),
             ("SPLIT_MIN_COST_DEFAULT", "const SPLIT_MIN_COST_DEFAULT"),
+            // ⛔ S166b 翻默认时加进来 —— `SPLIT_MIN_INTERIOR_NOTES` 当年就是漏进了这个洞。
+            ("SPLIT_SPREAD_DEFAULT", "fn split_spread_st("),
             ("JOIN_RESTS_DEFAULT", "pub fn join_rests_enabled("),
             ("FRAC_TRANSPORT_DEFAULT", "pub fn frac_transport("),
             ("PHASE_LOCK_DEFAULT", "pub fn phase_lock("),
