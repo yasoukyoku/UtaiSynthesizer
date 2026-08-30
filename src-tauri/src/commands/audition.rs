@@ -376,8 +376,17 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
             // never rescued anything re-render to a byte-identical result once; that is the known
             // and accepted cost of a version term (unlike the recurring mis-scoping the header
             // above was written to stop, this fires exactly once per engine change).
+            // s166c: **拼接层的音频改了五处**,而 cover 试听正走这条管线 ⇒ 必须成对 bump。
+            //   ① 休止增益改成**逐格**(`REST_GAIN_CELL_MS_DEFAULT = 10`,居中两格宽 + 格心插值)
+            //   ② 头尾护栏锚到**休止**而不是窗切出来的那一段
+            //   ③ 休止增益的参照改成**拼接前的原始 `base`**
+            //   ④ 逐格打开时尾护栏 40 → 10 ms
+            //   ⑤ 补偿比例 `REST_GAIN_FRACTION` 0.5 → 1.0
+            // 另外 **`UTAI_COVER_SCORE` 出厂开**(cover 落点打分)直接改的就是 cover 的落点。
+            // ⛔ 不 bump 的后果正是这条 doc 头上写的那一条:**缓存会继续供旧音频**,
+            //    而用户听到的是「我改了他什么都没听见」。
             format!(
-                "_s165j_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_s166c_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }

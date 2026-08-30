@@ -13581,7 +13581,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}              usag={} usagdim={} gonesort={} dipfill={} restwin={}/{} h2={} mism={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} sliver={} tiethin={} tilt={} pick={} harm={} repair={} comb={} handover={} tiedxf={} split={} interior={} xdith={} xslide={} tiedst={} width={} wfloor={} tiltfade={}/{}              usag={} usagdim={} gonesort={} dipfill={} restwin={}/{} h2={} mism={} dip={} spread={} restcell={} resttail={} restfrac={} coverscore={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -13670,6 +13670,17 @@ mod tests {
             //    进指纹的意义是「下一个人想把它变成默认之前,必须先来这里改一行,
             //    于是不得不读 `landing_mismatch_eps` 那段 doc —— 特别是**相对判据 + 最差口径**那两条」。
             parse_mismatch_eps(None),
+            // ⛔ S166b/S166c —— 下面六个**全都改音频**,而它们此前**不在指纹里**
+            //    ⇒ 翻它们不会让这条判据红 = 这条判据对它们是空的。补进来。
+            // S166b —— ③ 卸乘客(0 → 8)与 ④ `dip` 轴(0 → 3.0),都已翻默认。
+            landing_dip_eps(),
+            SPLIT_SPREAD_DEFAULT,
+            // S166c —— 休止增益的三个:逐格格宽 · 逐格时的尾护栏 · 补偿比例。
+            REST_GAIN_CELL_MS_DEFAULT,
+            REST_TAIL_GUARD_CELL_MS_DEFAULT,
+            REST_GAIN_FRACTION_DEFAULT,
+            // S166c —— ② 翻唱轨落点打分(出厂开)⇒ 直接改 cover 的落点。
+            cover_scoring_enabled(),
         );
         // ⛔⛔ S160q —— 这条闸此前**只看得见本文件**,而 `score2svc.rs` 里有七个会改音频的
         //    旋钮(含出厂就开着的 `FILL_ISOLATED_UV_DEFAULT`)一个都不在指纹里,
@@ -13682,7 +13693,7 @@ mod tests {
             //    它**会改音频**（所以在指纹里、不在 `EXEMPT` 里），但**出厂没设 ⇒ off ⇒ 不改音频**
             //    ⇒ 按本判据自己的规矩（“若它出厂关 = 不改音频，就不要 bump 版本号”）**不跟着 bump**，
             //    与 `valhuman=` 当初同例。进指纹的意义是：下一个人想把它变成默认之前，必须先来这里改一行。
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 h2=0 mism=1.2 | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true donorin=false valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 h2=0 mism=1.2 dip=3 spread=8 restcell=10 resttail=10 restfrac=1 coverscore=true | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true donorin=false valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -13699,7 +13710,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s165j";
+        const TAG: &str = "s166c";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
