@@ -5399,7 +5399,29 @@ const ONSET_FIT_MS: f32 = 60.0;
 /// ⭐ S163 v17 —— 形状整形的增益限幅(dB)。
 /// ⛔ 不能太大:`base` 在那些音上本来就是「唱不上去的破音」,
 /// 完全照抄它的形状会把破音的抖动也搬过来。
-const ONSET_FIT_MAX_DB: f32 = 9.0;
+const ONSET_FIT_MAX_DB_DEFAULT: f32 = 9.0;
+
+/// ⚙ 出厂默认 = 9.0。`UTAI_RANGE_ONSET_FIT_DB=<dB>` 可扫。见 [`ONSET_FIT_MAX_DB_DEFAULT`]。
+///
+/// # ⛔ 那条「不能太大」的理由**只对死音成立**
+/// 原话是「`base` 在那些音上本来就是**唱不上去的破音**」。
+/// ⚠ 但救援窗里**大半是陪绑音**(它们 `base` 唱得好好的)——
+/// 用户 2026-08-30 报的 `1:36.450` 就是:`[480]す` 是 **midi 80**,
+/// 而东雪莲 `usable` 顶正好 **80** ⇒ **它根本不是死音,是被拖着走的乘客**。
+/// ⇒ 对这一类,`base` 的起音形状是**可信的靶子**,9 dB 的夹持是无谓的自缚。
+///
+/// # ⭐⭐ 而它正好是残留咔哒的那一族(实测)
+/// 全曲 **344 个清音起头**的音,音头 6-16 kHz 的最大跳幅(dB/5 ms):
+/// `出厂 − 不救援` 中位 +0.19、p90 +4.35、**>6 dB 的 20 个**、最大 **+22.3**。
+/// 看图确认:救援臂的元音起音是**硬台阶**(`[480]す` 在 −5 ms 一跳到底),
+/// 不救援臂是**斜坡** —— 正是 v17 造出来治的形状,只是被夹持挡住了。
+pub fn onset_fit_max_db() -> f32 {
+    std::env::var("UTAI_RANGE_ONSET_FIT_DB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (0.0..=48.0).contains(v))
+        .unwrap_or(ONSET_FIT_MAX_DB_DEFAULT)
+}
 
 /// ⭐ S163 v17 —— 稳态电平的取样窗(ms，从音头起算)。归一化用它，所以它决定
 /// 「形状差」和「电平差」怎么分开。⛔ 太靠前会把起音本身算进稳态。
@@ -8218,6 +8240,8 @@ fn splice_kept(
             //    把 donor 的形状拉回 `base` 的 ⇒ **稳态电平一个字节不动**。
             //    ⛔ 这正是 v14(砍电平)/v16(整体延后)做错的地方。
             let ofit_cell = ((f64::from(sample_rate) * 0.002) as usize).max(1);
+            // ⭐ S166c —— 夹持只取一次,不进逐样本循环。见 [`onset_fit_max_db`]。
+            let ofit_db = onset_fit_max_db();
             let ofit: Vec<f32> = if onset_fit {
                 let span = (f64::from(sample_rate) * f64::from(ONSET_FIT_MS) / 1000.0) as usize;
                 let s_lo = (f64::from(sample_rate) * f64::from(ONSET_FIT_STEADY_LO_MS) / 1000.0) as usize;
@@ -8268,7 +8292,7 @@ fn splice_kept(
                                 //    **39193 个样本 |x|≥0.999**，后续归一化为容纳它
                                 //    把整条压了 **7 dB**，16-24 kHz 因削波失真 **+21.5 dB**。
                                 //    ⇒ 这正是 v14 已经写过的教训，我又丢了一次。
-                                g[idx] = 10f32.powf(db.clamp(-ONSET_FIT_MAX_DB, 0.0) / 20.0);
+                                g[idx] = 10f32.powf(db.clamp(-ofit_db, 0.0) / 20.0);
                             }
                         }
                         p = q;
@@ -13710,6 +13734,7 @@ mod tests {
             ("REST_GAIN_CELL_MS_DEFAULT", "pub fn rest_gain_cell_ms("),
             ("REST_TAIL_GUARD_CELL_MS_DEFAULT", "pub fn rest_tail_guard_cell_ms("),
             ("REST_GAIN_FRACTION_DEFAULT", "pub fn rest_gain_fraction("),
+            ("ONSET_FIT_MAX_DB_DEFAULT", "pub fn onset_fit_max_db("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
