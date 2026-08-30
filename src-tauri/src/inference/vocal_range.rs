@@ -1505,18 +1505,37 @@ fn decide_group(
             let dx = cand[x].4.worst_dip_vs(&cand[y].4) - cand[y].4.worst_dip_vs(&cand[x].4);
             if dx.is_finite() && dx.abs() > dip_eps {
                 let (w, l) = if dx < 0.0 { (x, y) } else { (y, x) };
-                // 对手闸:赢家不许让失配变差超过 `DIP_MISM_CAP`
+                // 对手闸①:赢家不许让失配变差超过 `DIP_MISM_CAP`
                 let mism_ok = {
                     let gw = -cand[w].4.worst_mism();
                     let gl = -cand[l].4.worst_mism();
                     !(gw.is_finite() && gl.is_finite()) || (gl - gw) <= DIP_MISM_CAP
                 };
+                // ⛔⛔⭐⭐⭐ 对手闸②:**赢家不许更闷/更塌**(`uplev`,与 `mism` 那根轴同一道闸)。
+                //
+                // ⛔ 用户 2026-08-30 耳判抓到的回归就是缺了这一道:`dip` 在
+                //    4:21.38-4:23.14(`す ば ら し`)把落点从计划的 **−8 换成了 −3**,
+                //    而组内音是 midi **82/83** ⇒ −3 之后 donor 要唱 **79/80**,
+                //    而 `usable` 顶是 **77** ⇒ **模型唱不动 ⇒ 整段塌**
+                //    (实测 `755 ば` 电平掉 **6.4 dB**、`756 ら` 掉 3.6)。
+                //
+                // ⭐⭐ **为什么偏偏是它赢**:一个塌掉的音是**均匀地轻**,
+                //    音内跌幅反而**最小** ⇒ **`dip` 轴天然奖励塌陷**。
+                //    ⇒ 这根轴**必须**有一道挡「变闷」的闸,否则它的最优解就是把音唱没。
+                // ⚠ `PITCH_GATE_CENTS` 拦不住这一族:PSOLA 会把音高抬回去,
+                //    **音准没错,错的是电平与音色**。
+                let dim_ok = if usag_dim_cap > 0.0 {
+                    cand[w].4.worst_dim_vs(&cand[l].4) <= usag_dim_cap
+                } else {
+                    true
+                };
+                let ok = mism_ok && dim_ok;
                 DIP_STAT.with(|st| {
                     let mut b = st.borrow_mut();
                     b.0 += 1;
-                    if mism_ok { b.1 += 1 } else { b.2 += 1 }
+                    if ok { b.1 += 1 } else { b.2 += 1 }
                 });
-                if mism_ok {
+                if ok {
                     return if w == x {
                         std::cmp::Ordering::Less
                     } else {
@@ -1682,6 +1701,40 @@ fn log_mism_stat(where_: &str) {
             if b.5 > f32::NEG_INFINITY { b.5 } else { 0.0 }
         );
         *b = (0, 0, 0, 0, 0.0, f32::NEG_INFINITY);
+    });
+}
+
+/// ⭐⭐ S166 —— 打印并清空 `dip` 那一支的诊断。
+///
+/// ⛔ 为什么它到 S166 才存在:`DIP_STAT` 从 S165 就在**写**,而全仓**没有一处读它**
+/// ⇒ 那根轴的对手闸到底拦没拦过,一整场都是不可观测的。
+/// —— 与 S166 跨周期对消那次是**同一个形状**的漏洞。
+fn log_dip_stat(where_: &str) {
+    DIP_STAT.with(|st| {
+        let mut b = st.borrow_mut();
+        if b.0 == 0 {
+            return;
+        }
+        tracing::info!(
+            "range: dip-axis [{}] spoke {} times, gate PASSED {} / BLOCKED {}",
+            where_, b.0, b.1, b.2
+        );
+        *b = (0, 0, 0);
+    });
+}
+
+/// ⭐⭐ S166 —— 打印并清空**天花板闸**的诊断。见 [`REACH_STAT`]。
+fn log_reach_stat(where_: &str) {
+    REACH_STAT.with(|st| {
+        let mut b = st.borrow_mut();
+        if b.0 == 0 {
+            return;
+        }
+        tracing::info!(
+            "range: reach-gate [{}] asked {} times, BLOCKED {} candidate(s), worst overshoot {:+} st above the model's reach",
+            where_, b.0, b.1, b.2
+        );
+        *b = (0, 0, 0);
     });
 }
 
@@ -4780,6 +4833,16 @@ thread_local! {
         const { std::cell::RefCell::new((0, 0, 0)) };
 }
 
+thread_local! {
+    /// ⭐⭐ S166 —— **天花板闸**的诊断计数(问了几次, 挡下几个候选, 见过的最大超顶度数)。
+    ///
+    /// ⛔ 它是承重的,而且是 S166 自己刚付过学费的那一条:跨周期对消第一版
+    /// **漏了诊断出口** ⇒ 两条臂读数接近时**分不清「刀没用」还是「刀没开火」**,
+    /// 白损一条渲染臂。同族:`DIP_STAT` 写了一场**从来没人读**(S166 补上 `log_dip_stat`)。
+    static REACH_STAT: std::cell::RefCell<(u32, u32, i64)> =
+        const { std::cell::RefCell::new((0, 0, 0)) };
+}
+
 /// ⚙ 出厂 **0 = 关 = 逐位不变**;`UTAI_RANGE_DIP=<dB>` 打开。
 ///
 /// ⛔ 为什么出厂关:这根轴的**收益依赖 `mism` 把候选渲出来**(实测出厂 `mism=0` 时
@@ -5894,6 +5957,19 @@ impl CandScore {
     /// **4.40 → −1.85 = 闷 6.25 dB**,而组内其它音没那么闷 ⇒ 中位没超门限 ⇒ 放行,
     /// 那个净亏的换档在两轮渲染里都照做不误。
     /// ⇒ **代价不是「整组一起付」的平均量,是「哪个音被牺牲了」** ⇒ 必须逐音取最差。
+    /// ⭐ S166 —— 这个候选**自己**最大的音内跌幅(dB)。
+    ///
+    /// ⛔ 只许用在**日志**里。排序一律走 [`Self::worst_dip_vs`] 的双向差 ——
+    /// 跨候选直接比绝对值会把「只量到了不同的音」读成差异(S162 栏过三次)。
+    fn worst_dip(&self) -> f32 {
+        self.dip.iter().map(|&(_, v)| v).fold(0.0f32, f32::max)
+    }
+
+    /// ⭐ S166 —— 这个候选**自己**最低的上方谐波电平(dB)。同上:**只给日志看**。
+    fn worst_uplev(&self) -> f32 {
+        self.uplev.iter().map(|&(_, v)| v).fold(f32::INFINITY, f32::min)
+    }
+
     fn worst_dim_vs(&self, other: &CandScore) -> f32 {
         self.uplev
             .iter()
@@ -6078,6 +6154,14 @@ pub fn donor_keep_samples_with(
     out
 }
 
+/// ⭐ S166 —— 目标基频 → 十二平均律的 MIDI 号。
+///
+/// ⛔ 只许用在 [`NoteSpan::hz`] 上:那个值**就是**从 `note_num + transpose` 算出来的
+/// (见 [`note_spans`]),所以这里取整是无损的 —— 它**不是**一把测量工具。
+fn note_midi(hz: f32) -> i64 {
+    (69.0 + 12.0 * (hz / 440.0).log2()).round() as i64
+}
+
 /// Active RMS (50 ms windows above -40 dBFS mean) — the dead-only donor level match. Silence /
 /// no active window ⇒ None (caller skips matching rather than amplifying noise).
 fn active_rms(x: &[f32], sample_rate: u32) -> Option<f32> {
@@ -6124,7 +6208,7 @@ pub fn apply_dead_only_windows(
     donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
     apply_dead_only_windows_alts(
-        base, sample_rate, total_frames, jobs, &[], &[], match_levels, donor_render,
+        base, sample_rate, total_frames, jobs, &[], &[], None, match_levels, donor_render,
     )
 }
 
@@ -6158,6 +6242,8 @@ pub fn apply_dead_only_windows_alts(
     // ⭐ S163 —— 打分改成**逐音**(见 [`CandScore`])⇒ 需要音符表。
     //    空切片 ⇒ 没有候选可选,逐位回到今天(cover 车道恒如此)。
     notes: &[NoteSpan],
+    // ⭐ S166 —— 模型音域(修补遍的正确性闸);`None` ⇒ 逐位回到今天。
+    range: Option<SpeakerRange>,
     match_levels: bool,
     donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
@@ -6168,6 +6254,7 @@ pub fn apply_dead_only_windows_alts(
         jobs,
         alts,
         notes,
+        range,
         match_levels,
         join_rests_enabled(),
         // S159zm —— env 只在这一个入口读一次(见 [`seam_align_ms`])。
@@ -6199,6 +6286,9 @@ pub fn apply_dead_only_windows_with(
     alts: &[Option<i64>],
     // ⭐ S163 —— 音符表(输出时间轴)。逐音打分要它;没有候选时一行都不碰它。
     notes: &[NoteSpan],
+    // ⛔⭐⭐⭐ S166 —— **模型的音域**(不是用户的线)。修补遍拿它挡住
+    //    「把音推到唱不动的格上」的候选。`None` ⇒ 那道闸不存在 ⇒ **逐位回到今天**。
+    range: Option<SpeakerRange>,
     match_levels: bool,
     join_enabled: bool,
     // S159zm —— 拼接前的对齐半径(**样本**)。⛔ 与 `join_enabled` 同一条理由:
@@ -6561,6 +6651,31 @@ pub fn apply_dead_only_windows_with(
                 }) || spread(ji) > REPAIR_SPREAD_DB
             })
             .collect();
+        // ⛔⭐⭐ S166 —— **全组的音内跌幅分布**(纯诊断,不改任何行为)。
+        //
+        // 它存在的理由:`dip` 今天**只能在 `mism` 把候选渲出来的组上发言**
+        // (S165 实测:出厂 `mism=0` 时 4:07 那一组一个候选都没有)。
+        // 要让它自己也能触发修补遍(像 ⑥⑦⑧ 那样),就得先知道门限定在哪里
+        // 才不会把渲染代价翻上去 —— 而用户 2026-08-30 刚好就在担心这一点
+        // (「如果把渲染速度慢完了可能也得不偿失」)。
+        // ⇒ 先把分布量出来,下一轮按**数据**定门限,不拍脑袋。
+        // ⚠ 只在有候选时才有读数(无候选 ⇒ `cand` 为空 ⇒ 这里自然不打)。
+        {
+            let mut ds: Vec<f32> = (0..jobs.len())
+                .filter_map(|ji| chosen[ji].map(|c| cand[c].4.worst_dip()))
+                .collect();
+            if !ds.is_empty() {
+                ds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let q = |p: f32| ds[((ds.len() - 1) as f32 * p).round() as usize];
+                tracing::info!(
+                    "range: in-note dip over {} group(s) — p10 {:.1} / p50 {:.1} / p75 {:.1} / p90 {:.1} / max {:.1} dB;                      over 8/12/16 dB: {}/{}/{}",
+                    ds.len(), q(0.10), q(0.50), q(0.75), q(0.90), q(1.0),
+                    ds.iter().filter(|&&d| d > 8.0).count(),
+                    ds.iter().filter(|&&d| d > 12.0).count(),
+                    ds.iter().filter(|&&d| d > 16.0).count(),
+                );
+            }
+        }
         if !need.is_empty() {
             for &ji in &need {
                 tracing::warn!(
@@ -6609,6 +6724,60 @@ pub fn apply_dead_only_windows_with(
                     let s2 = cur + d;
                     if s2 == 0 || s2.abs() > MAX_RANGE_SHIFT {
                         continue;
+                    }
+                    // ⛔⛔⭐⭐⭐ S166 —— **候选不许把组内任何一个音推到模型唱不动的格上**。
+                    //
+                    // ⛔ 用户 2026-08-30 耳判抓到的回归:`dip` 在 4:21.38-4:23.14
+                    //    (`す ば ら し`)把落点从计划的 **−8 换成 −3** —— 组内最高音
+                    //    midi **83**,−3 之后 donor 要唱 **80**,而 yachiyo 的 `reach` 顶是 **79**
+                    //    ⇒ **模型唱不动 ⇒ 整段塌**(实测 `755 ば` 电平掉 **6.4 dB**、`756 ら` 掉 3.6)。
+                    //    而这里**原来只检查「不为 0」与「不超上限」** ——
+                    //    一条「它还救不救得动」的判据都没有。
+                    //
+                    // ⭐⭐ **为什么偏偏是 `dip` 把它选上**:一个塌掉的音是**均匀地轻**,
+                    //    音内跌幅反而**最小** ⇒ **`dip` 轴天然奖励塌陷**。
+                    //    ⇒ 除了这道正确性闸,那根轴自己还必须有一道挡「变闷」的对手闸。
+                    // ⚠ `PITCH_GATE_CENTS` 拦不住这一族:PSOLA 会把音高抬回去,
+                    //    **音准没错,错的是电平与音色**。
+                    //
+                    // ⛔ **为什么是 `reach` 而不是 `usable`**:`usable` 是**用户的线**
+                    //    (「哪些音要救」),`reach` 才是**模型的物理能力**——
+                    //    两者混用正是 S146f 修过的那个 bug([`SpeakerRange::usable`] 的 doc)。
+                    //    实测 yachiyo:`usable` 顶 77 而 `reach` 顶 **79** ⇒
+                    //    拿 77 去闸会误伤 `base`(1 组),拿 79 去闸 **`base`/`pass` 零组受影响**。
+                    //
+                    // ⭐ 实测影响面(四条臂的日志重算):
+                    //    **base 0 组 · pass 0 组 · dip 3 组 · both 3 组**,
+                    //    而那 3+3 组**全部**是 `plan −8` 被换成 −3/−5/−6、donor 唱到 80/81/82/84。
+                    //    ⇒ 用户只听见了其中一处,人群视角又找出两处同族。
+                    // ⚠ `range` 为 `None`(所有判据调用点)⇒ 这道闸不存在 ⇒ **逐位回到今天**。
+                    if let Some(rg) = range.as_ref() {
+                        if scoring {
+                            let mut over = 0i64;
+                            let bad = job_notes[ji].iter().any(|&ni| {
+                                let nd = &notes[ni];
+                                if !(nd.sung && nd.hz > 0.0) {
+                                    return false;
+                                }
+                                let m = note_midi(nd.hz) + s2;
+                                if rg.slot_reachable(m) {
+                                    return false;
+                                }
+                                over = over.max(m - rg.reach.1.round() as i64);
+                                true
+                            });
+                            REACH_STAT.with(|st| {
+                                let mut b = st.borrow_mut();
+                                b.0 += 1;
+                                if bad {
+                                    b.1 += 1;
+                                    b.2 = b.2.max(over);
+                                }
+                            });
+                            if bad {
+                                continue;
+                            }
+                        }
                     }
                     // ⛔ 已经渲过这个 shift 的组不再重复(它本来就是候选之一)
                     if cand.iter().any(|c| c.0 == ji && c.1 == s2) {
@@ -6752,6 +6921,9 @@ pub fn apply_dead_only_windows_with(
                 );
                 log_h2_stat("repair");
                 log_mism_stat("repair");
+                // ⛔⭐ S166 —— 这两行是 S166 自己花了一条渲染臂买来的。
+                log_dip_stat("repair");
+                log_reach_stat("repair");
                 if let Some(&c) = mine.first() {
                     tracing::info!(
                         "range: group[{}..{}] repair — {:?} ⇒ kept {:+} (silence {:.0} ms)",
@@ -6761,7 +6933,19 @@ pub fn apply_dead_only_windows_with(
                             // ⭐ S165 —— 把 `2·f0` 一并打出来。⛔ 没有它的时候
                             //    「47 次触发 / 0 条落点改变」这种结果**无法归因**
                             //    (是候选都不够好,还是这根轴根本没发言?)。
-                            .map(|&x| (cand[x].1, cand[x].4.worst_gone(), cand[x].4.worst_h2()))
+                            // ⛔⭐ S166 —— **把 `dip` 与 `uplev` 也打出来**。
+                            //    不打它们的后果当场就付了代价:用户报 4:21 塌了之后,
+                            //    日志里只有 `(shift, gone, h2)` ⇒ 无法从既有臂里判断
+                            //    「`dim` 对手闸到底会不会拦住它」,只能重渲。
+                            .map(|&x| {
+                                (
+                                    cand[x].1,
+                                    cand[x].4.worst_gone(),
+                                    cand[x].4.worst_h2(),
+                                    cand[x].4.worst_dip(),
+                                    cand[x].4.worst_uplev(),
+                                )
+                            })
                             .collect::<Vec<_>>(),
                         cand[c].1,
                         cand[c].4.worst_gone()
@@ -10901,6 +11085,7 @@ mod tests {
             &jobs,
             &[],
             &[],
+            None,
             false,
             join_rests_enabled(),
             0, // ⛔ 关掉对齐:见上面那段
@@ -11166,7 +11351,7 @@ mod tests {
         let (base0, left, right) = join_fixture(n);
         let run = |join: bool| {
             let mut b = base0.clone();
-            apply_dead_only_windows_with(&mut b, sr, total, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, |s, _| {
+            apply_dead_only_windows_with(&mut b, sr, total, &jobs, &[], &[], None, false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, |s, _| {
                 Ok(if s == -9 { left.clone() } else { right.clone() })
             })
             .unwrap();
@@ -11251,7 +11436,7 @@ mod tests {
         };
         for join in [false, true] {
             let mut base = vec![0.02f32; base_len]; // −34 dBFS 的底,好让「洞」量得出来
-            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, |s, own| {
+            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, &[], &[], None, false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, |s, own| {
                 // ⭐ 生产走的就是 `donor_keep_samples` 这一个函数,判据不许自己再拼一遍公式。
                 let keep = donor_keep_samples_with(own, base_len, TOTAL_FRAMES, true);
                 let mut d = vec![-1.0f32; base_len];
@@ -11281,7 +11466,7 @@ mod tests {
             // ⛔ 阴性对照 ②:余量给不够时会怎样 —— 而**两条臂的答案不一样,那正是这条判据的重点**。
             let mut tight = vec![0.02f32; base_len];
             apply_dead_only_windows_with(
-                &mut tight, SR, TOTAL_FRAMES, &jobs, &[], &[], false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                &mut tight, SR, TOTAL_FRAMES, &jobs, &[], &[], None, false, join, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 |s, own| Ok(paint(own, 0, s)),
             )
             .expect("splice");
@@ -12289,6 +12474,44 @@ mod tests {
         assert_eq!(huge, today, "跨度门限 40 时必须回到今天(读到 {huge:?})");
     }
 
+
+    /// ⛔⛔⭐⭐⭐ S166 —— **`dip` 轴天然奖励塌陷,必须有一道挡「变闷」的闸**。
+    ///
+    /// 用户 2026-08-30 耳判抓到的回归:`dip` 在 4:21.38-4:23.14(`す ば ら し`)
+    /// 把落点从计划的 **−8 换成 −3**,而组内音是 midi 82/83 ⇒ −3 之后 donor 要唱 79/80,
+    /// 而 `usable` 顶是 77 ⇒ **模型唱不动、整段塌**(实测 `755 ば` 电平掉 **6.4 dB**)。
+    ///
+    /// ⭐⭐ **机理**:一个塌掉的音是**均匀地轻**,音内跌幅反而**最小**
+    /// ⇒ **这根轴的最优解就是把音唱没**。⇒ 没有 `dim` 闸它就是一把自毁的尺子。
+    /// ⚠ `PITCH_GATE_CENTS` 拦不住:PSOLA 会把音高抬回去,**音准没错,错的是电平与音色**。
+    #[test]
+    fn the_dip_axis_may_not_win_by_collapsing_the_note() {
+        let mk = |dip: f32, uplev: f32| {
+            let mut c = CandScore::default();
+            c.dip = vec![(0usize, dip)];
+            c.uplev = vec![(0usize, uplev)];
+            c
+        };
+        // A = 现落点(跌幅 16.0,上方谐波 −10);B = 塌掉的候选(跌幅 2.0 但上方谐波 −30)
+        let cand = vec![
+            (0usize, -8i64, 0usize, Vec::<f32>::new(), mk(16.0, -10.0)),
+            (0usize, -3i64, 0usize, Vec::<f32>::new(), mk(2.0, -30.0)),
+        ];
+        // ⛔ 没有 dim 闸(cap = 0 ⇒ 关)时它会赢 —— 这一条钉住「闸真的在起作用」
+        let no_gate = decide_group(&cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0);
+        assert_eq!(
+            cand[no_gate[0]].1, -3,
+            "阴性对照:闸关掉时那个塌掉的候选**确实会赢** —— 这条不成立,下面那条就是空的"
+        );
+        // ✅ 拿**出厂值** [`USAG_DIM_CAP_DEFAULT`] = 3.0 去拦 —— 生产里真正生效的就是它
+        let gated = decide_group(
+            &cand, 0, -8, 0.0, 0.0, 0.0, 0.0, 0.0, USAG_DIM_CAP_DEFAULT, 0.0, 0.0, 3.0,
+        );
+        assert_eq!(
+            cand[gated[0]].1, -8,
+            "塌掉 20 dB 的候选必须被 dim 闸拦住 —— 否则 dip 轴的最优解就是把音唱没"
+        );
+    }
     /// ⭐⭐⭐⭐ S166 —— **`dip`(音内跌幅)当排序键** + 与 `mism` 互为对手轴闸。
     ///
     /// 用户 2026-08-29 把设计定死:
@@ -13440,7 +13663,7 @@ mod tests {
         let run = |notes: &[NoteSpan]| -> usize {
             let mut base = vec![0.0f32; n];
             apply_dead_only_windows_with(
-                &mut base, SR, TF, &jobs, &[], notes, false, false, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                &mut base, SR, TF, &jobs, &[], notes, None, false, false, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 TIED_XFADE_MS_DEFAULT,
                 |_s, own| {
                     let mut d = vec![0.0f32; n];
@@ -13550,6 +13773,7 @@ mod tests {
                 &jobs,
                 &alts,
                 &notes,
+                None,
                 false,
                 false,
                 0,
@@ -13683,7 +13907,7 @@ mod tests {
         let run = |eps: f32| -> Vec<f32> {
             let mut b = base0.clone();
             apply_dead_only_windows_with(
-                &mut b, 44100, total, &jobs, &alts, &notes, false, false, 0, eps, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                &mut b, 44100, total, &jobs, &alts, &notes, None, false, false, 0, eps, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 |s, _| {
                     Ok(if s == -8 {
                         stack(440.0, 0.0537, base0.len())
@@ -13718,7 +13942,7 @@ mod tests {
         let run_pitch_ok = |eps: f32| -> Vec<f32> {
             let mut b = base0.clone();
             apply_dead_only_windows_with(
-                &mut b, 44100, total, &jobs, &alts, &notes, false, false, 0, eps, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                &mut b, 44100, total, &jobs, &alts, &notes, None, false, false, 0, eps, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 |s, _| {
                     Ok(if s == -8 {
                         stack(440.0, 0.0537, base0.len())
@@ -13803,7 +14027,7 @@ mod tests {
             calls.borrow_mut().clear();
             let mut b = base0.clone();
             apply_dead_only_windows_with(
-                &mut b, 44100, total, &jobs, &[], &notes, false, false, 0, 0.0, repair_ms, 0.0, 0.0, 0.0, 0.0, 0.0,
+                &mut b, 44100, total, &jobs, &[], &notes, None, false, false, 0, 0.0, repair_ms, 0.0, 0.0, 0.0, 0.0, 0.0,
                 |s, _| {
                     calls.borrow_mut().push(s);
                     Ok(if s == -8 && broken {
@@ -13856,6 +14080,96 @@ mod tests {
             "门限 0 时那 300 ms 必须还是静音,实际 {:.1} dBFS",
             mid(&off)
         );
+    }
+
+    /// ⛔⛔⭐⭐⭐ S166 —— **修补遍不许造出「把音推到模型唱不动的格上」的候选**。
+    ///
+    /// ## 它治的是用户 2026-08-30 报的 4:21.993-4:23.226
+    /// `dip` 把 `すばらし` 那一组的落点从计划的 **−8 换成 −3**。
+    /// 组内最高音 midi **83** ⇒ −3 之后 donor 要唱 **80**,而 yachiyo 的 `reach` 顶是 **79**
+    /// ⇒ 模型唱不动 ⇒ 整段塌(实测 `755 ば` 掉 **6.4 dB**、`756 ら` 掉 3.6)。
+    ///
+    /// 而候选生成处原来**只检查「不为 0」与「不超 [`MAX_RANGE_SHIFT`]」** ——
+    /// 一条「它还救不救得动」的判据都没有。
+    ///
+    /// ## ⭐⭐ 为什么偏偏是 `dip` 把它选上
+    /// 一个塌掉的音是**均匀地轻**,音内跌幅反而**最小**
+    /// ⇒ **`dip` 轴天然奖励塌陷**。—— 另一面的对手闸见
+    /// [`Self::the_dip_axis_may_not_win_by_collapsing_the_note`] 那一条。
+    ///
+    /// ## 这一条钉三件
+    /// ① 天花板之上的候选**一遍都不许渲**(不只是不选 —— 渲了就是白花钱);
+    /// ② 天花板之下的候选照旧渲(闸不能把修补遍整个关掉);
+    /// ③ ⛔ **阴性对照**:`range = None` ⇒ 那道闸不存在 ⇒ 超顶的候选**确实会被渲**
+    ///    —— 这一条不成立,上面两条就是空的。
+    #[test]
+    fn the_repair_pass_may_not_push_a_note_above_the_models_reach() {
+        let (base0, notes, jobs, _alts, spf) = pick_rig();
+        let total = 120i64;
+        // 夹具与 [`a_note_the_rescue_sang_into_silence_triggers_a_repair_pass`] 同一个:
+        // 计划 −8 那一遍唱出静音 ⇒ 触发修补遍 ⇒ 候选 −6/−7/−9/−10。
+        let tone = |hole: Option<(usize, usize)>| -> Vec<f32> {
+            let mut d = vec![0.0f32; base0.len()];
+            for i in 4..7usize {
+                let (a, b) = ((i * 10) * spf, ((i + 1) * 10) * spf);
+                for (t, v) in d[a..b].iter_mut().enumerate() {
+                    *v = 0.1 * (2.0 * std::f32::consts::PI * 440.0 * t as f32 / 44100.0).sin();
+                }
+            }
+            if let Some((a, b)) = hole {
+                for v in d[a..b].iter_mut() {
+                    *v = 0.0;
+                }
+            }
+            d
+        };
+        let hole = ((5 * 10 + 3) * spf, (5 * 10 + 6) * spf);
+        // 音都是 440 Hz = midi 69;计划 −8 ⇒ donor 唱 61。
+        // 天花板定在 **61** ⇒ −6(63) 与 −7(62) 超顶,−9(60) / −10(59) 在顶内。
+        let rg = SpeakerRange {
+            usable: (36.0, 69.0),   // 用户的线——故意设得比 `reach` 宽,钉住闸读的是 `reach`
+            comfort: (36.0, 60.0),
+            reach: (36.0, 61.0),
+            damage: None,
+            slot_flags: None,
+            thin: None,
+        };
+        let run = |range: Option<SpeakerRange>| -> Vec<i64> {
+            let calls = std::cell::RefCell::new(Vec::<i64>::new());
+            let mut b = base0.clone();
+            apply_dead_only_windows_with(
+                &mut b, 44100, total, &jobs, &[], &notes, range, false, false, 0, 0.0,
+                LANDING_REPAIR_MS_DEFAULT, 0.0, 0.0, 0.0, 0.0, 0.0,
+                |s, _| {
+                    calls.borrow_mut().push(s);
+                    Ok(tone(if s == -8 { Some(hole) } else { None }))
+                },
+            )
+            .unwrap();
+            let mut c = calls.borrow().clone();
+            c.sort_unstable();
+            c
+        };
+
+        // ③ 阴性对照先跑:没有闸 ⇒ 超顶的 −7 确实被渲了
+        let open = run(None);
+        assert!(
+            open.contains(&-7),
+            "阴性对照失败:没有闸的时候 −7 就应该被渲出来——实际渲了 {open:?}。             它不成立的话,下面两条就是空判据"
+        );
+
+        // ① 有闸 ⇒ 超顶的一个都不许渲
+        let gated = run(Some(rg));
+        assert!(
+            !gated.contains(&-7) && !gated.contains(&-6),
+            "天花板之上的候选被渲了:{gated:?}(reach 顶 61,−7 ⇒ 62 / −6 ⇒ 63)"
+        );
+        // ② 修补遍本身没被关掉
+        assert!(
+            gated.iter().any(|&s| s == -9 || s == -10),
+            "闸把整个修补遍关掉了:{gated:?} —— 顶内的 −9/−10 必须照旧渲"
+        );
+        assert!(gated.contains(&-8), "计划那一遍永远不该被闸挡住:{gated:?}");
     }
 
     /// ⛔ S163 —— [`silence_run_ms`] 的两条门必须**同时**成立。
@@ -13927,7 +14241,7 @@ mod tests {
             let (left, right) = make(hole_ms);
             let mut b = vec![0.0f32; n];
             apply_dead_only_windows_with(
-                &mut b, SR, total, &jobs, &[], &[], false, false, 0, 0.0, 0.0, 0.0, 0.0, 0.0, db, 0.0,
+                &mut b, SR, total, &jobs, &[], &[], None, false, false, 0, 0.0, 0.0, 0.0, 0.0, 0.0, db, 0.0,
                 |s, _| Ok(if s == -5 { left.clone() } else { right.clone() }),
             )
             .unwrap();
@@ -14003,7 +14317,7 @@ mod tests {
             let nd = spans(tied);
             let mut b = vec![0.0f32; n];
             apply_dead_only_windows_with(
-                &mut b, SR, total, &jobs, &[], &nd, false, false, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, xf_ms,
+                &mut b, SR, total, &jobs, &[], &nd, None, false, false, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, xf_ms,
                 |s, _| Ok(if s == -4 { loud.clone() } else { soft.clone() }),
             )
             .unwrap();
@@ -15884,7 +16198,7 @@ mod tests {
         let sr: u32 = plan["sample_rate"].as_u64().unwrap() as u32;
         eprintln!("[splice] {} jobs · base {} · sr {sr} · UTAI_RANGE_SEAM_ALIGN = {} ms",
                   jobs.len(), base.len(), seam_align_ms());
-        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, &[], &[], false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, landing_harm_eps(), landing_repair_ms(), comb_floor_db(), landing_width_eps(), landing_width_floor(), handover_deficit_db(), tied_xfade_ms(), |s, _own| {
+        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, &[], &[], None, false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, landing_harm_eps(), landing_repair_ms(), comb_floor_db(), landing_width_eps(), landing_width_floor(), handover_deficit_db(), tied_xfade_ms(), |s, _own| {
             Ok(rd(&dir.join(format!("donor_post_{s:+}.f32"))))
         })
         .unwrap();

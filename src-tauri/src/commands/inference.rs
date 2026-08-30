@@ -1837,6 +1837,10 @@ pub async fn render_vocal_segment(
     let mut range_alts: Vec<Option<i64>> = Vec::new();
     // ⭐ S163 —— 音符表(输出时间轴)。落点选法的逐音打分 + 两把电平刀**共用**它。
     let mut range_spans: Vec<crate::inference::vocal_range::NoteSpan> = Vec::new();
+    // ⛔⭐⭐⭐ S166 —— **模型的音域**也要传给拼接层:修补遍拿它挡住
+    //    「把音推到唱不动的格上」的候选(见 `apply_dead_only_windows_with` 里那道闸)。
+    //    ⚠ 不能只传一个顶:判据是 `slot_reachable`,除了界还要查扫描表的逐格旗。
+    let mut range_model: Option<crate::inference::vocal_range::SpeakerRange> = None;
     let range_windows: Vec<crate::inference::vocal_range::DeadJob> = if options.range_extend {
         let speaker = match backend_type {
             VoiceBackendType::SoVits => {
@@ -1848,6 +1852,7 @@ pub async fn render_vocal_segment(
         };
         match crate::inference::vocal_range::speaker_range(&entry.config, speaker) {
             Some(r) => {
+                range_model = Some(r);
                 let nn = plan_note_nums(&score, phoneme_set);
                 let fr: Vec<i64> = score.iter().map(|n| n.frames).collect();
                 // ⛔ 与计划**同一份** `nn`/`fr`:音符表和落点决策必须来自同一条时间轴。
@@ -2089,7 +2094,7 @@ pub async fn render_vocal_segment(
                     // 在这里算好传下去;渲染函数内部拿不到分母,现算一遍就是造第二份地图。
                     let base_len = result.audio.len();
 
-                    crate::inference::vocal_range::apply_dead_only_windows_alts(&mut result.audio, sr, total_frames, &range_windows, &range_alts, &range_spans, false, |s, own_windows| {
+                    crate::inference::vocal_range::apply_dead_only_windows_alts(&mut result.audio, sr, total_frames, &range_windows, &range_alts, &range_spans, range_model, false, |s, own_windows| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
@@ -2240,7 +2245,7 @@ pub async fn render_vocal_segment(
                     // 在这里算好传下去;渲染函数内部拿不到分母,现算一遍就是造第二份地图。
                     let base_len = result.audio.len();
 
-                    crate::inference::vocal_range::apply_dead_only_windows_alts(&mut result.audio, sr, total_frames, &range_windows, &range_alts, &range_spans, false, |s, own_windows| {
+                    crate::inference::vocal_range::apply_dead_only_windows_alts(&mut result.audio, sr, total_frames, &range_windows, &range_alts, &range_spans, range_model, false, |s, own_windows| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);

@@ -1631,6 +1631,9 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
         // ⭐ S162 —— 台子也走落点候选,否则离线读数与生产不是同一条链。
         if super::super::vocal_range::landing_pick() { &plan_alts } else { &[] },
         &spans,
+        // ⛔⭐ S166 —— 台子必须传与生产**同一份** `range`,否则那道天花板闸
+        //    在离线臂上**根本不开火**,而读数会看起来像「刀没用」。
+        Some(range),
         false, // 与生产同:donor 共用 base 的归一前峰 ⇒ 不需要 active-RMS 猜台阶
         |s, own| {
             // S159 —— 与生产同一条:保留区间由**拥有帧→样本地图的人**算,闭包只把 `own` 传进去。
