@@ -14920,6 +14920,38 @@ mod tests {
         );
     }
 
+    /// ⛔⛔⭐⭐⭐⭐ S166c —— **两条 cover 腿都必须真的把 `notes` 与 `range` 传下去**。
+    ///
+    /// ## 它为什么必须是**源码级**的判据
+    /// 整套落点打分对 cover 的开关是一行:`apply_dead_only_windows_with` 里
+    /// `scoring = (… ) && **!notes.is_empty()**`。
+    /// 只要有人把调用点改回 [`apply_dead_only_windows`](它内部 `notes = &[]`、`range = None`),
+    /// **候选生成 / 逐音打分 / 修补遍 / 天花板闸会整块变成死代码,而全仓一条判据都不会红** ——
+    /// 那正是「验证本身是空的」那一族最典型的形状。
+    /// ⚠ 而这两条腿都要真模型才跑得起来,**行为面测不到** ⇒ 只能钉源码。
+    ///
+    /// ⛔ S166c 第一版**只接了 RVC 腿**,SoVITS 腿漏了 —— 这条判据就是为那个漏而写的。
+    #[test]
+    fn both_cover_legs_feed_the_scoring_layer() {
+        for (name, src) in [
+            ("rvc.rs", include_str!("rvc.rs")),
+            ("sovits.rs", include_str!("sovits.rs")),
+        ] {
+            assert!(
+                src.contains("cover_note_spans("),
+                "{name} 的 cover 腿没有把 f0 铺成 `NoteSpan` —— 落点打分对它整块是死代码"
+            );
+            assert!(
+                src.contains("apply_dead_only_windows_alts("),
+                "{name} 的 cover 腿走的还是 `apply_dead_only_windows`(notes 恒空 / range 恒 None)"
+            );
+            assert!(
+                src.contains("cover_scoring_enabled()"),
+                "{name} 的 cover 腿没有读 `UTAI_COVER_SCORE` ⇒ 这一刀在那条腿上关不掉"
+            );
+        }
+    }
+
     /// ⛔ S163 —— [`silence_run_ms`] 的两条门必须**同时**成立。
     ///
     /// ⑴ 只低于绝对地板不算(整个音本来就很轻);⑵ 只相对该音中位低不算(**辅音凹陷**)。

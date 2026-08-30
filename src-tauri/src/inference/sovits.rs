@@ -340,11 +340,33 @@ pub fn run_pipeline(
         // 行数上限),曲尾夹紧窗的缺口若垫零会把数字零拼进窗内(咔哒+静默)——垫 base 则
         // 未覆盖样本自动回退旧契约「donor 短了保留 base」,整类缺口结构性消灭。
         let base_snapshot = audio_out.clone();
-        super::vocal_range::apply_dead_only_windows(
+        // ⭐⭐⭐⭐⭐ S166c —— **翻唱轨的落点打分**(`UTAI_COVER_SCORE`,出厂开)。
+        //    ⛔ 与 RVC 腿**同一条**:`notes` 空 ⇒ `scoring == false` ⇒ 候选生成 / 逐音打分 /
+        //    修补遍 / 天花板闸对 cover 全是死代码。见 [`cover_note_spans`]。
+        //    ⚠ 帧轴用 `probe_f0` —— 它就是计划器看到的那一条(`cover_dead_plan` 的入参),
+        //    而 `total_frames` 也是从它算的 ⇒ 三者同轴,不会有 S85d 那种 spf 前漂。
+        let cover_spans: Vec<super::vocal_range::NoteSpan> =
+            if super::vocal_range::cover_scoring_enabled() {
+                super::vocal_range::cover_note_spans(&probe_f0)
+            } else {
+                Vec::new()
+            };
+        if !cover_spans.is_empty() {
+            tracing::info!(
+                "range-extend(cover/sovits): scoring ON — {} note span(s) from f0 ({} sung)",
+                cover_spans.len(),
+                cover_spans.iter().filter(|n| n.sung).count()
+            );
+        }
+        super::vocal_range::apply_dead_only_windows_alts(
             &mut audio_out,
             m.sample_rate,
             total_frames,
             &range_jobs,
+            &[],
+            &cover_spans,
+            // ⭐ 天花板闸要它;`None` ⇒ 那道闸不存在 ⇒ 逐位回到今天。
+            if cover_spans.is_empty() { None } else { range },
             false, // cover 无逐渲归一——电平=模型对移调的真实响应,不全局拉平
             // ⚠ cover 侧不吃 `_own`(第二个参数):它要的是**样本域**、带 pad、已合并的跨度,
             // 由 `donor_slice_spans` 从同一批 jobs 现算 —— 那是另一种口径,不是这一份的重复。
