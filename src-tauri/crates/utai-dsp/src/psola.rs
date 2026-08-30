@@ -4483,8 +4483,6 @@ mod tests {
                 "κ 那一路又变回线性插值了 —— 本文件 TRANSPORT_SINC_HALF 的 doc 明令禁止");
     }
 
-    use super::*;
-
     /// A voiced test signal: harmonics of `f0` under a fixed formant envelope.
     /// ⛔ Synthetic periodic material systematically flatters/frames PSOLA-class algorithms
     /// (S81, three times) — these tests assert STRUCTURE (identity, length, that the pitch
@@ -4965,6 +4963,7 @@ mod tests {
     ///
     /// ⛔ 变异(写这条判据时逐个真跑过,读数记在各行后面)。
     #[test]
+    #[allow(non_snake_case)]
     fn the_island_edge_step_eye_reads_zero_before_S156_and_grows_with_the_shift() {
         let sr = 44_100u32;
         let f0 = 250.0;

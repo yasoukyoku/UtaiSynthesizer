@@ -1,0 +1,68 @@
+=== https://stable.repo.amd.com/rocm/whl-next/torch/
+torch-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+torch-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+torch-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/torchaudio/
+torchaudio-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+torchaudio-2.11.0.2%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1100/
+amd_torch_device_gfx1100-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1100-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1100-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1101/
+amd_torch_device_gfx1101-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1101-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1101-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1102/
+amd_torch_device_gfx1102-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1102-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1102-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1103/
+amd_torch_device_gfx1103-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1103-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1103-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx110x/
+amd_torch_device_gfx110x-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx110x-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx110x-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1030/
+amd_torch_device_gfx1030-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1030-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1030-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1035/
+amd_torch_device_gfx1035-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1035-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1035-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1201/
+amd_torch_device_gfx1201-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1201-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1201-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx1151/
+amd_torch_device_gfx1151-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1151-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx1151-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx12-0/
+amd_torch_device_gfx12_0-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx12_0-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx12_0-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx115x/
+amd_torch_device_gfx115x-2.11.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx115x-2.12.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+amd_torch_device_gfx115x-2.13.0%2Brocm10.0.0-cp310-cp310-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/amd-torch-device-gfx11/
+=== https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx1100/
+rocm_sdk_device_gfx1100-10.0.0-py3-none-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx1030/
+rocm_sdk_device_gfx1030-10.0.0-py3-none-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx1201/
+rocm_sdk_device_gfx1201-10.0.0-py3-none-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-device-gfx1151/
+rocm_sdk_device_gfx1151-10.0.0-py3-none-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-libraries/
+rocm_sdk_libraries-10.0.0-py3-none-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/rocm-sdk-core/
+rocm_sdk_core-10.0.0-py3-none-win_amd64.whl
+=== https://stable.repo.amd.com/rocm/whl-next/rocm/
+rocm-10.0.0.tar.gz
+=== https://stable.repo.amd.com/rocm/whl-next/rocm-bootstrap/
+rocm_bootstrap-0.1.0-py3-none-any.whl

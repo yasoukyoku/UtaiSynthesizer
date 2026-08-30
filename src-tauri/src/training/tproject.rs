@@ -1903,6 +1903,9 @@ fn detect_family(ws: &Path) -> std::result::Result<String, String> {
 ///
 /// Kept ALPHABETICAL, and asserted against the two Rust-side names plus this list's own length so
 /// that adding an entry is a deliberate edit rather than a drive-by.
+/// ⚠ S167: the lint proved NOTHING asserts this list today (its own doc above warned about exactly
+/// that decay) — read it as commentary for humans, never as a guarantee.
+#[allow(dead_code)]
 pub(crate) const WORKSPACE_SUBDIRS: &[&str] = &[
     "0_gt_wavs",     // rvc slices (gt sample rate)
     "1_16k_wavs",    // rvc slices (16k, the feature/f0 input)

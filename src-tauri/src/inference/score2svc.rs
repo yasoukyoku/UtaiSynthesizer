@@ -500,6 +500,7 @@ fn fill_isolated_uv_max(note_hz: &mut [f32], max_len: usize) -> usize {
 ///
 /// ⛔ 只填**长度恰好 1** 的段。见 [`fill_isolated_unvoiced`] 的 doc:两帧及以上是真辅音的长度,
 /// 动它就不再是「拿掉帧量化的假象」,而是「替模型决定这里该不该有辅音」。
+#[allow(dead_code)] // S167: the spec ANCHOR for fill_isolated_uv_max's max_len==1 contract (test-pinned)
 fn fill_isolated_uv(note_hz: &mut [f32]) -> usize {
     let n = note_hz.len();
     if n < 3 {
@@ -1175,6 +1176,9 @@ fn parse_valley_after(v: Option<&str>) -> bool {
 ///
 /// ⚠ **一个指纹、一条闸、一个版本号**:这里只出串,核对与 bump 仍然由
 /// `vocal_range` 那条唯一的判据做 —— 两条会互相不同意的闸比没有闸更糟。
+// S167: every caller is a cfg(test) gate (this file's dual-direction scan ×2 + vocal_range's
+// paired-bump gate at its :13710) — the lib lint cannot see them, hence the allow. NOT dead.
+#[allow(dead_code)]
 pub(crate) fn production_defaults_fingerprint() -> String {
     format!(
         "f0lerp={} fill1={} filluv={} fillmax={} uvgate={} uvgatek={} uvgateguard={} uvadapt={} uvrise={} valadapt={} valafter={} valhuman={} restshrink={} predamp={}/{},{},{},{},{},{} restbucket={} donorin={} valdb={}/{},{},{}/{},{} valenv={:.2},{:.2}/{:.2},{:.2}",
@@ -3323,6 +3327,7 @@ fn dump_donor_buffer(tag: &str, stem: &str, buf: &[f32], note_hz: &[f32]) {
 
 /// `w *= peak / (max|w| + 1e-9)` — render_ust.render_song's final output normalization.
 /// Normalize to `peak`; returns the peak the buffer had **before** the scaling.
+#[allow(dead_code)] // S167: test-facing twin of peak_normalize_to (production; S147 shared-target norm)
 fn peak_normalize(w: &mut [f32], peak: f32) -> f32 {
     let m = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(w, peak, None);

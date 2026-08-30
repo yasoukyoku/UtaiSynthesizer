@@ -4147,6 +4147,7 @@ const RESCUE_LEVEL_MATCH_DB: f32 = 6.0;
 /// ⛔ S162 起**不再使用**:软膝(ratio 6)把 rel +9.03 只压到 +6.93,用户耳判仍然听得到。
 /// 阈值以上现在是**硬限**。留着这个常量是为了让下一个人看见「我们试过软膝、它不够」。
 /// 软膝的压缩比(历史)。超出 [`RESCUE_LEVEL_MATCH_DB`] 的那部分按 `1 − 1/ratio` 压掉。
+#[allow(dead_code)] // S167: deliberate verdict record (soft-knee tried and rejected), not live code
 const RESCUE_LEVEL_MATCH_RATIO: f32 = 6.0;
 
 /// 单个音的最大压低量(dB)。⛔ 防止一个坏参照把音推到荒谬处。
@@ -4555,7 +4556,8 @@ pub fn landing_pick() -> bool {
     !matches!(std::env::var("UTAI_RANGE_LANDING_PICK").ok().as_deref(), Some("0"))
 }
 
-/// ⚙ 出厂默认。见 [`landing_pick`]。
+/// ⚙ 出厂默认。见 [`landing_pick`](它把极性写死在解析里,这里是给读者的镜子)。
+#[allow(dead_code)] // S167: doc-mirror of the shipped default; the parser encodes the polarity itself
 const LANDING_PICK_DEFAULT: bool = true;
 
 /// ⚙ 出厂默认 = 3.0(**dB**,见 [`LANDING_HARM_EPS_DEFAULT`])。
@@ -8590,6 +8592,7 @@ fn join_rests(
 /// * 按这个判据搜到的最优 p50 = **−240**(19/31 对的休止里有一段真数字静音)、p90 = −52.0;
 /// * 落在 −50 dBFS 以下的有 **29/31**。
 /// ⇒ −50 落在两个分布之间那 20 dB 宽的平台中间。
+#[allow(dead_code)] // S167: measured threshold for a DEFERRED edge-move knife — kept as the record
 const JOIN_QUIET_DBFS: f32 = -50.0;
 
 /// 要动这条边,新的洞必须比**今天**的浅至少这么多 dB。

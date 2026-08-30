@@ -439,6 +439,7 @@ mod f0_probe {
 /// ⚠ Runs BEFORE the octave repair on purpose, so anything filled here goes through the same
 /// Viterbi as the rest. Filling afterwards would hand the octave logic a run of frames it
 /// never had a chance to judge -- and a wrongly-octaved fill is worse than a hole.
+#[allow(dead_code)] // S167: test-facing twin of fill_voiced_holes_marked (the production S165 §106 path)
 fn fill_voiced_holes_inplace(f0: &mut [f32], audio16k: &[f32], hop: usize) -> usize {
     let mut marks = vec![false; f0.len()];
     fill_voiced_holes_marked(f0, audio16k, hop, &mut marks)
