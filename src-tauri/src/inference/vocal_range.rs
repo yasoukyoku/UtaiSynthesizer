@@ -7916,18 +7916,37 @@ fn splice_kept(
             };
             // ⭐⭐⭐⭐ S163 v8 —— **救援不许碰空拍**(见 [`REST_BASE_FADE_MS`])。
             //    先把这条窗里的休止段找出来(少数几段),逐样本只查这几段。
-            let rest_spans: Vec<(usize, usize)> = if rest_base {
+            // ⛔⛔⭐⭐⭐⭐ S166c —— 每段休止记 **4 个**下标:`(应用起, 应用止, 淡化锚起, 淡化锚止)`。
+            //
+            // # 它修的是什么(用户 2026-08-30 报的咔哒能被这把刀够着的**唯一**原因)
+            // 头尾护栏原来是按**窗切出来的那一段**算的(`head = (k−x)/hf`、`tail = (y−1−k)/tf`,
+            // 而 `x`/`y` 已经被 `.max(a)` / `.min(b)` 裁到窗里)。
+            // 一段休止**被两个窗劈开**时,每个窗只看到它的一半,而 40+40 ms 的头尾护栏
+            // **把那一半整个吃光** ⇒ 增益在那儿**从来没生效过**。
+            //
+            // 实测(鹅妈妈 +7 × 东雪莲,同一次 run 零噪声):休止 [1156](3:36.460,160 ms)里
+            // 救援臂在 **+75…+95 ms 有一个 −25 dB 的凸起**,而不救援臂同处只有 **−45**
+            // ⇒ 是我们造的;而逐格增益在那一处读到的效果只有 **−0.08 dB**。
+            //
+            // ⇒ 淡化的锚点必须是**休止本身**的两端(护栏的语义是「别碰前一个音的释放 /
+            //    别碰下一个音的辅音 preroll」,那两件事按定义挂在**休止**上,不挂在窗上),
+            //    而**应用范围**才裁到窗里。
+            let rest_spans: Vec<(usize, usize, usize, usize)> = if rest_base {
                 notes
                     .iter()
                     .filter(|nd| !nd.sung)
                     .filter_map(|nd| {
-                        let x = ((nd.start.max(0) as f64) * spf) as usize;
-                        let y = (((nd.start + nd.frames).max(0) as f64) * spf) as usize;
+                        let r0 = ((nd.start.max(0) as f64) * spf) as usize;
+                        let r1 = (((nd.start + nd.frames).max(0) as f64) * spf) as usize;
                         // ⭐ v10:整格都参与,头尾各留一段做**增益渐变**(不是裁掉)。
                         let hg = (f64::from(sample_rate) * f64::from(REST_HEAD_GUARD_MS) / 1000.0) as usize;
-                        let x = x.saturating_add(hg).max(a);
-                        let y = y.min(b);
-                        (y > x).then_some((x, y))
+                        let r0 = r0.saturating_add(hg);
+                        if r1 <= r0 {
+                            return None;
+                        }
+                        let x = r0.max(a);
+                        let y = r1.min(b);
+                        (y > x).then_some((x, y, r0, r1))
                     })
                     .collect()
             } else {
@@ -7961,7 +7980,7 @@ fn splice_kept(
             let rcell = ((f64::from(sample_rate) * f64::from(rest_cell_ms) / 1000.0) as usize).max(1);
             let rest_g: Vec<Vec<f32>> = rest_spans
                 .iter()
-                .map(|&(x, y)| {
+                .map(|&(x, y, _, _)| {
                     if rest_cell_ms <= 0.0 {
                         return vec![rest_gain_of(x, y)];
                     }
@@ -7988,7 +8007,7 @@ fn splice_kept(
             // 头 `hf` 从 1 渐变到 g;尾 `tf` 从 g 回到 1(辅音 preroll 落在尾部,必须原电平)。
             let rest_w = |k: usize| -> f32 {
                 let mut out = 1.0f32;
-                for (&(x, y), gs) in rest_spans.iter().zip(&rest_g) {
+                for (&(x, y, r0, r1), gs) in rest_spans.iter().zip(&rest_g) {
                     if k >= x && k < y {
                         // ⭐⭐ S166c —— 按格取增益,**格心之间线性插值**。
                         //    ⛔ 插值不是装饰:格与格之间硬跳增益就是一条新缝(v9 判负的形状),
@@ -8004,8 +8023,10 @@ fn splice_kept(
                             let f = (pos - i0 as f32).clamp(0.0, 1.0);
                             gs[i0] * (1.0 - f) + gs[i1] * f
                         };
-                        let head = ((k - x) as f32 / hf as f32).min(1.0);
-                        let tail = ((y - 1 - k) as f32 / tf as f32).min(1.0);
+                        // ⛔ 淡化锚在**休止**的两端(`r0`/`r1`),不是窗切出来的 `x`/`y` ——
+                        //    见 `rest_spans` 头上那段:锚错了,被两个窗劈开的休止上增益从不生效。
+                        let head = ((k.saturating_sub(r0)) as f32 / hf as f32).min(1.0);
+                        let tail = ((r1.saturating_sub(k + 1)) as f32 / tf as f32).min(1.0);
                         let t = head.min(tail);
                         out = out.min(1.0 + (g - 1.0) * t);
                     }
