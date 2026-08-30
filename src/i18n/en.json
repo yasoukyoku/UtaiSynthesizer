@@ -653,7 +653,9 @@
     "lane": {
       "loudness": "Loudness",
       "formant": "Formant",
-      "phoneme": "Phonemes"
+      "phoneme": "Phonemes",
+      "edited": "edited",
+      "stale": "outdated edit"
     },
     "sidebar": {
       "tabSinger": "Singer",
@@ -703,6 +705,13 @@
       "phonemeSet_xsampa": "X-SAMPA / GrayGlish",
       "phonemeSet_vccv": "VCCV English",
       "phonemeSetHint": "Read as aliases: what you type stays on ONE note, no space-splitting",
+      "esDialect": "Spanish dialect",
+      "esDialectTip": "How this track's SPANISH lyrics realize the two dialect axes: ⟨z⟩ / ⟨c⟩+e,i as [θ] (distinción) vs merged into [s] (seseo), and ⟨ll⟩ as [ʎ] vs merged into [ʝ] (yeísmo). The default keeps the dictionary's rows exactly as shipped — a mixture, mostly distinción; picking a dialect normalizes every Spanish word toward that one variety (using the dictionary's own variant rows first, the orthography second, and leaving a word alone when neither answers). Spanish notes only; [bracket hints] and per-note phoneme overrides always win.",
+      "esDialect_dictionary": "Dictionary default (mixed)",
+      "esDialect_castilian": "Castilian (distinción)",
+      "esDialect_castilian_yeista": "Castilian · yeísmo",
+      "esDialect_latam": "Latin American (seseo + yeísmo)",
+      "esDialect_andean": "Andean (seseo, ll = [ʎ])",
       "phonemeHint": "English lyrics may carry a phonetic hint, e.g. [dh ae dh]",
       "phonemeHintTip": "Put ARPABET phonemes in square brackets (the OpenUtau convention) and the note sings exactly those; read[r iy d] works too, and a multi-syllable hint spreads over the following + notes like an ordinary word. ARPABET written WITHOUT a stress digit is read as unstressed: a bare ah is ə — write ah1 for ʌ. Brackets that hold no valid phonemes (empty, or a word) are marked red and never sung as a lyric.",
       "noteTransition": "Note transition",

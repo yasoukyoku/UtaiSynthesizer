@@ -23,7 +23,7 @@ import { RangeBoundsEditor } from "../vocal/RangeBoundsEditor";
 import { effTransition } from "../../lib/f0eval";
 import { DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY, DEFAULT_BREATH_TOKEN, DEFAULT_REST_TOKEN } from "../../lib/vocalNotes";
 import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
-import type { PhonemeSetId } from "../../types/project";
+import type { EsDialectId, PhonemeSetId } from "../../types/project";
 import { backendOf, backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
 import { DIFFUSION_METHODS, RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../../lib/workflow/voiceDefaults";
 import { VocoderSelect } from "../workflow/nodes/VoiceModelPicker";
@@ -468,6 +468,33 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
                 : t("vocalEditor.sidebar.phonemeHint")}
             </div>
           </>
+        )}
+        {/* S167 (§E4): Spanish dialect. Same reveal contract as the phoneme convention above
+            (review S91): shown whenever SPANISH is in play — track default OR any selected note's
+            override — and a dialect that is SET is always visible so a live setting can never
+            become unreachable. It sits in the LANGUAGE section because it is a property of how
+            this track's Spanish lyrics turn into phones; only Spanish notes are affected. */}
+        {(langById(vocalParams.langId).code === "es" ||
+          !!vocalParams.esDialect ||
+          selected.some((n) => (n.lang ?? langById(vocalParams.langId).code) === "es")) && (
+          <div className="vsb-inline">
+            <label className="vsb-label" title={t("vocalEditor.sidebar.esDialectTip")}>
+              {t("vocalEditor.sidebar.esDialect")}
+            </label>
+            <select
+              className="sep-model-select vsb-inline-select"
+              value={vocalParams.esDialect ?? "dictionary"}
+              onChange={(e) =>
+                setVocalParams(trackId, {
+                  esDialect: e.target.value === "dictionary" ? undefined : (e.target.value as EsDialectId),
+                })
+              }
+            >
+              {(["dictionary", "castilian", "castilian_yeista", "latam", "andean"] as const).map((k) => (
+                <option key={k} value={k}>{t(`vocalEditor.sidebar.esDialect_${k}`)}</option>
+              ))}
+            </select>
+          </div>
         )}
       </div>
 

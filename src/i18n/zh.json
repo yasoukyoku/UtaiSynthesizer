@@ -653,7 +653,9 @@
     "lane": {
       "loudness": "响度",
       "formant": "共振腔",
-      "phoneme": "音素"
+      "phoneme": "音素",
+      "edited": "已编辑",
+      "stale": "编辑已失效"
     },
     "sidebar": {
       "tabSinger": "歌手",
@@ -703,6 +705,13 @@
       "phonemeSet_xsampa": "X-SAMPA / GrayGlish",
       "phonemeSet_vccv": "VCCV English",
       "phonemeSetHint": "这条轨按别名读：整串输入只落在一个音符上，不再按空格分配",
+      "esDialect": "西语方言",
+      "esDialectTip": "决定本轨【西语】歌词在两条方言轴上的读法：⟨z⟩ / ⟨c⟩+e,i 读 [θ]（distinción）还是并入 [s]（seseo）；⟨ll⟩ 读 [ʎ] 还是并入 [ʝ]（yeísmo）。默认 = 词典原样（实测是以 distinción 为主的混合）；选定方言后，每个西语单词都会向该方言统一（优先用词典自带的变体行，其次按正字法推导，两者都答不了的词保持原样、绝不硬猜）。只影响西语音符；[方括号提示] 与逐音符音素覆盖仍然优先。",
+      "esDialect_dictionary": "词典默认（混合）",
+      "esDialect_castilian": "卡斯蒂利亚（distinción）",
+      "esDialect_castilian_yeista": "卡斯蒂利亚 · yeísmo",
+      "esDialect_latam": "拉丁美洲（seseo + yeísmo）",
+      "esDialect_andean": "安第斯（seseo，ll = [ʎ]）",
       "phonemeHint": "英文可在歌词里写方括号音素提示，如 [dh ae dh]",
       "phonemeHintTip": "在方括号里直接写 ARPABET 音素（OpenUtau 约定），这个音符就按它发音；read[r iy d] 这样的写法也可以，多音节的提示会像普通单词一样分配到后面的 + 音符上。ARPABET 不带重音数字时一律按「不重读」处理：裸 ah 读作 ə，要 ʌ 请写 ah1。括号里写不出音素（空的、或写成单词）会标红，不会被当歌词唱出来。",
       "noteTransition": "音符间过渡",

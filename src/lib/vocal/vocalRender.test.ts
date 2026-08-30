@@ -748,7 +748,7 @@ describe("vocalRenderOptions — every per-track knob must actually reach the wi
     expect({ ...o, sovits: "…", rvc: "…" }).toEqual({
       backend: "sovits", cv_speaker_id: 49, lang_id: 2, transpose: 0,
       range_extend: true, consonant_emphasis_db: 2.5, consonant_valley: 1,
-      vowel_clarity: true, consonant_preroll: true, phoneme_set: null,
+      vowel_clarity: true, consonant_preroll: true, phoneme_set: null, es_dialect: null,
       sovits: "…", rvc: "…",
     });
   });
@@ -764,6 +764,7 @@ describe("vocalRenderOptions — every per-track knob must actually reach the wi
       [{ vowelClarity: false }, "vowel_clarity", false],
       [{ consonantPreroll: false }, "consonant_preroll", false],
       [{ phonemeSet: "vccv" }, "phoneme_set", "vccv"],
+      [{ esDialect: "latam" }, "es_dialect", "latam"],
       [{ transpose: -3 }, "transpose", -3],
       [{ langId: 1 }, "lang_id", 1],
       [{ speakerId: 32 }, "cv_speaker_id", 32],

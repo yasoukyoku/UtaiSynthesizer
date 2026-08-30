@@ -220,7 +220,19 @@ export interface Note {
   /** User override at the TRADITIONAL-phoneme layer (拼音/假名/ARPABET — NOT raw IPA); stage2 converts it
    *  to IPA at render (§3.7). Absent = derive from `lyric`. */
   phonemeInput?: string;
+  /** S167 (§E2): per-note phoneme timing/strength override (SynthV-style), made in the phoneme lane.
+   *  `phones` = the emitted phone sequence the edit was made against — the STALENESS key: if a later
+   *  change (lyric / language / dictionary update) makes the note emit a different sequence, the
+   *  render IGNORES the edit (and the lane shows it as stale) rather than misapply it. `scale` =
+   *  per-phone duration weights (1 = the allocator's own split; the note's total length is conserved,
+   *  so a phone grows at its neighbours' expense, never the timeline's). `gainDb` = per-phone output
+   *  gain in dB (0 = untouched). Absent = the allocator's own timing, byte-identical to pre-S167. */
+  phoneTiming?: { phones: string[]; scale: number[]; gainDb?: number[] };
 }
+
+/** S167 (§E4): the Spanish dialect ids the wire accepts (absent = the dictionary's primary rows,
+ *  today's behaviour). Rust parses tolerantly — an unknown value lands on the default. */
+export type EsDialectId = "castilian" | "castilian_yeista" | "latam" | "andean";
 
 /** ② SynthV Pitch Transition — how a note connects to its neighbours (§10.3). ALL times are ABSOLUTE ms
  *  (NOT ticks) so a glide sounds the same at any tempo; overshoot depths are cents. As a per-note override
@@ -355,6 +367,12 @@ export interface VocalTrackParams {
    *  fails LOUDLY (red note + VOCAL_ALIAS) and NEVER falls back to the dictionary — a third of these
    *  aliases are also real English words. Rust: `inference/g2p_alias.rs`. */
   phonemeSet?: PhonemeSetId;
+  /** S167 (§E4): Spanish dialect for DICTIONARY-derived phones (distinción/seseo · lleísmo/yeísmo).
+   *  Absent = the shipped primary rows exactly as they are (pre-S167, byte-identical). The named
+   *  dialects normalize toward one consistent variety (the shipped rows are a measured mixture —
+   *  ~11% of ⟨z/ce/ci⟩ keys are seseo-primary). Spanish notes only; a per-note phoneme override or
+   *  [bracket hint] still wins untouched. Rust: `g2p::EsDialect`. */
+  esDialect?: EsDialectId;
   /** S60-2 音域扩展: out-of-comfort parts render translated into the singer's tested comfort zone and are
    *  shifted back (TD-PSOLA inverse; needs a vocal_range record on the model — else a no-op).
    *

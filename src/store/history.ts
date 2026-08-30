@@ -111,10 +111,14 @@ function noteSig(n: Note): string {
   const tr = t ? `${t.offsetMs ?? ""}|${t.durLeftMs ?? ""}|${t.durRightMs ?? ""}|${t.depthLeftCents ?? ""}|${t.depthRightCents ?? ""}|${t.openEdgeCents ?? ""}` : "";
   const v = n.vibrato;
   const vib = v ? `${v.depthCents},${v.freqHz},${v.phase},${v.startMs},${v.easeInMs},${v.easeOutMs}` : "";
+  // S167 (§E2): the phone-timing override is an editable note field — omitting it here would make
+  // commitNotes/undo treat a timing edit as a no-op (silent-regression class). Absent folds to "".
+  const pt = n.phoneTiming;
+  const pts = pt ? `${pt.phones.join(",")}~${pt.scale.join(",")}~${(pt.gainDb ?? []).join(",")}` : "";
   return (
     `${n.id}.${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.phoneme ?? ""}.${n.velocity}` +
     `.${n.detune ?? 0}.${n.tie ? 1 : 0}.${n.pitchAuto === false ? 0 : 1}.${n.autoTuned ? 1 : 0}` +
-    `.${n.lang ?? ""}.${n.phonemeInput ?? ""}.${tr}.${vib}`
+    `.${n.lang ?? ""}.${n.phonemeInput ?? ""}.${tr}.${vib}.${pts}`
   );
 }
 
@@ -170,6 +174,9 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   // pre-S91 string, so adding the setting invalidates no existing bake. Switching it must re-render:
   // it changes what every English note SINGS, which is exactly what a render sig is for.
   const ps = p.phonemeSet ? `|ps:${p.phonemeSet}` : "";
+  // S167 (§E4): same fold — absent (dictionary default) hashes identically to the pre-S167 string,
+  // so adding the setting invalidates no existing bake; switching it must re-render Spanish notes.
+  const esd = p.esDialect ? `|esd:${p.esDialect}` : "";
   // S88 — the two lyric triggers enter through the CANONICALIZER, not raw. `restTokenKey`/`breathTokenKey`
   // return "" for every spelling that classifies exactly like the default (absent / blank / the canonical
   // token / a padded one), so a bake can only be declared dirty by a token that can really change a note's
@@ -181,7 +188,7 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   const bt = breathTokenKey(p.breathToken);
   const rt = restTokenKey(p.restToken);
   const tok = (bt ? `|bt:${bt}` : "") + (rt ? `|rt:${rt}` : "");
-  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|re:${p.rangeExtend !== false ? 1 : 0}${at}${ce}${cvl}${vcl}${cpr}${ps}${tok}`;
+  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|re:${p.rangeExtend !== false ? 1 : 0}${at}${ce}${cvl}${vcl}${cpr}${ps}${esd}${tok}`;
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {

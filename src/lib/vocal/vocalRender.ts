@@ -150,6 +150,9 @@ export interface ScoreTriple {
   lang: number;
   /** §3.7 traditional-phoneme override (pinyin/kana/ARPABET/MFA — never raw IPA). */
   phoneme_input?: string;
+  /** S167 (§E2): per-note phoneme timing/strength override (see `Note.phoneTiming`). Wire mirrors
+   *  Rust `PhoneEditWire`; `gain_db: null` = all-zero. */
+  phone_edit?: { phones: string[]; scale: number[]; gain_db: number[] | null };
 }
 
 /** Wire options mirroring Rust `VocalRenderOptions` (snake_case — Tauri passes them through verbatim).
@@ -175,6 +178,10 @@ export interface VocalRenderOptions {
    *  words through the dictionary (Rust's `#[serde(default)]` lands there, so an older caller — e.g.
    *  the range-scan literal in rangeTest.ts — is unaffected by construction). */
   phoneme_set?: string | null;
+  /** S167 (§E4): the track's Spanish dialect (`castilian` | `castilian_yeista` | `latam` |
+   *  `andean`). Omitted/`null` = the dictionary's primary rows untouched (Rust's tolerant parse
+   *  lands there, so an older caller is unaffected by construction). */
+  es_dialect?: string | null;
   sovits: SovitsOptions;
   rvc: RvcOptions;
 }
@@ -419,6 +426,10 @@ export function buildScoreTriples(
     // note. A BREATH keeps its drawn pitch: it is a real phone whose note_num merely goes unused.
     const t: ScoreTriple = { lyric: mapLyric(it.note.lyric), note_num: it.rest ? 0 : it.note.pitch, frames, lang: it.lang };
     if (it.note.phonemeInput) t.phoneme_input = it.note.phonemeInput;
+    // S167 (§E2): the phone edit rides the triple — Rust validates it against the phones it emits
+    // (a stale edit is ignored and reported, never misapplied), so no re-derivation happens here.
+    const pt = it.note.phoneTiming;
+    if (pt) t.phone_edit = { phones: pt.phones, scale: pt.scale, gain_db: pt.gainDb ?? null };
     triples.push(t);
     tripleNoteIds.push(it.note.id);
   }
@@ -1156,6 +1167,7 @@ export function vocalRenderOptions(vp: VocalTrackParams): VocalRenderOptions {
     vowel_clarity: vp.vowelClarity !== false,
     consonant_preroll: vp.consonantPreroll !== false,
     phoneme_set: vp.phonemeSet ?? null,
+    es_dialect: vp.esDialect ?? null,
     sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
     rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
   };

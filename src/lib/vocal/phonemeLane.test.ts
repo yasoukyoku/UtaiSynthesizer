@@ -17,6 +17,7 @@ function base(): PhonemeLaneInputs {
     // explicitly present-but-undefined: the default (words), while keeping the KEY visible to the
     // completeness check below — an optional field that is simply omitted would slip past it.
     phonemeSet: undefined,
+    esDialect: undefined,
   };
 }
 
@@ -37,6 +38,7 @@ describe("phoneme lane — the cache key and the IPC payload come from ONE input
     langId: (i) => ({ ...i, langId: 1 }),
     consonantPreroll: (i) => ({ ...i, consonantPreroll: false }),
     phonemeSet: (i) => ({ ...i, phonemeSet: "vccv" }),
+    esDialect: (i) => ({ ...i, esDialect: "latam" }),
   };
 
   it("every field of PhonemeLaneInputs moves the signature", () => {
@@ -55,12 +57,27 @@ describe("phoneme lane — the cache key and the IPC payload come from ONE input
     expect(phonemeLaneSig(base())).toBe(phonemeLaneSig(base()));
   });
 
+  it("S167: a note's phoneTiming edit moves the signature (the preview returns a different split)", () => {
+    const b = base();
+    const edited = {
+      ...b,
+      notes: [{ ...b.notes[0]!, phoneTiming: { phones: ["t", "a"], scale: [2, 1] } }, b.notes[1]!],
+    };
+    expect(phonemeLaneSig(edited)).not.toBe(phonemeLaneSig(b));
+    // …and rides the wire (through the triples the request builds)
+    const req = phonemeLaneRequest(edited);
+    const carried = req.args.score.some((t) => t.phone_edit?.phones.join(",") === "t,a");
+    expect(carried, "the edit must reach the preview payload").toBe(true);
+  });
+
   it("the IPC payload carries the switch, and the notes' own timing", () => {
     const on = phonemeLaneRequest(base());
     expect(on.args.consonantPreroll).toBe(true);
     expect(on.args.defaultLang).toBe(2);
     expect(on.args.score.length).toBeGreaterThan(0);
     expect(on.args.phonemeSet).toBe(null); // S91: absent → the words default, explicit on the wire
+    expect(on.args.esDialect).toBe(null); // S167: absent → the dictionary default, explicit on the wire
+    expect(phonemeLaneRequest({ ...base(), esDialect: "castilian" }).args.esDialect).toBe("castilian");
     const off = phonemeLaneRequest({ ...base(), consonantPreroll: false });
     expect(off.args.consonantPreroll).toBe(false);
     expect(phonemeLaneRequest({ ...base(), phonemeSet: "xsampa" }).args.phonemeSet).toBe("xsampa");

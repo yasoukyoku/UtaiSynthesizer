@@ -752,6 +752,18 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
             if (patch.phonemeInput === undefined) delete merged.phonemeInput;
             if (patch.phoneme === undefined) delete merged.phoneme;
           }
+          // S167 (§E2): a phone-timing edit belongs to the phones it was made against — anything
+          // that changes those phones (lyric / phoneme override / per-note language) drops it
+          // unless explicitly re-supplied. The render would only ignore it as stale; dropping here
+          // keeps the .usp from carrying dead weight and the lane from flagging ghosts.
+          if (
+            patch.phoneTiming === undefined &&
+            ((patch.lyric !== undefined && patch.lyric !== n.lyric) ||
+              (patch.phonemeInput !== undefined && patch.phonemeInput !== n.phonemeInput) ||
+              (patch.lang !== undefined && patch.lang !== n.lang))
+          ) {
+            delete merged.phoneTiming;
+          }
           return merged;
         });
       }

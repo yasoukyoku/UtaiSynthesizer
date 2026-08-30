@@ -121,6 +121,30 @@ export function normalizeNote(n: Note): Note {
   // corrupt/hand-edited .usp can never smuggle an arbitrary string into the render's lang resolution.
   if (n.lang && isVocalLangCode(n.lang)) out.lang = n.lang;
   if (n.phonemeInput) out.phonemeInput = sanitizeText(n.phonemeInput);
+  // S167 (§E2): per-note phoneme timing/strength — canonicalize HARD (a hand-edited .usp must not
+  // smuggle NaN/∞/unbounded arrays), and an all-default edit folds to ABSENT (§5 false-dirty: a
+  // no-op override and no override must be byte-identical).
+  const pt = n.phoneTiming;
+  if (
+    pt &&
+    Array.isArray(pt.phones) &&
+    Array.isArray(pt.scale) &&
+    pt.phones.length > 0 &&
+    pt.phones.length <= 64 &&
+    pt.scale.length === pt.phones.length &&
+    (pt.gainDb === undefined || (Array.isArray(pt.gainDb) && pt.gainDb.length === pt.phones.length))
+  ) {
+    const phones = pt.phones.map((p) => sanitizeText(String(p), 16));
+    const scale = pt.scale.map((s) => (Number.isFinite(s) ? Math.round(clampNum(s, 0.1, 10, 1) * 1000) / 1000 : 1));
+    const gain = (pt.gainDb ?? pt.phones.map(() => 0)).map((g) =>
+      Number.isFinite(g) ? Math.round(clampNum(g, -12, 12, 0) * 10) / 10 : 0,
+    );
+    const anyScale = scale.some((s) => s !== 1);
+    const anyGain = gain.some((g) => g !== 0);
+    if (phones.every((p) => p.length > 0) && (anyScale || anyGain)) {
+      out.phoneTiming = { phones, scale, ...(anyGain ? { gainDb: gain } : {}) };
+    }
+  }
   return out;
 }
 

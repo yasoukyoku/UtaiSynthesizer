@@ -1,4 +1,4 @@
-import type { Note } from "../../types/project";
+import type { EsDialectId, Note } from "../../types/project";
 import type { VocalTokens } from "../vocalNotes";
 import { buildScoreTriples, type ScoreTriple } from "./vocalRender";
 
@@ -30,18 +30,28 @@ export interface PhonemeLaneInputs {
   consonantPreroll: boolean;
   /** S91 「音素约定」: changes WHICH phones every English note has at all. */
   phonemeSet?: string;
+  /** S167 (§E4): changes WHICH phones every Spanish note has (θ/s · ʎ/ʝ). */
+  esDialect?: EsDialectId;
+}
+
+/** The per-note phone-timing term of the lane signature — the edit changes the SPLIT the preview
+ *  returns, so it must move the cache key (same hazard class as the S89 switch). */
+function phoneTimingSig(n: Note): string {
+  const pt = n.phoneTiming;
+  return pt ? `${pt.phones.join(",")}~${pt.scale.join(",")}~${(pt.gainDb ?? []).join(",")}` : "";
 }
 
 /** The lane's cache key. Cheap: reads the notes' fields directly, no triple building. */
 export function phonemeLaneSig(i: PhonemeLaneInputs): string {
   return JSON.stringify([
-    i.notes.map((n) => [n.tick, n.duration, n.lyric, n.pitch, n.lang ?? "", n.phonemeInput ?? ""]),
+    i.notes.map((n) => [n.tick, n.duration, n.lyric, n.pitch, n.lang ?? "", n.phonemeInput ?? "", phoneTimingSig(n)]),
     i.langId,
     i.tokens.breath,
     i.tokens.rest,
     i.tempo,
     i.consonantPreroll,
     i.phonemeSet ?? "",
+    i.esDialect ?? "",
   ]);
 }
 
@@ -53,6 +63,7 @@ export function phonemeLaneRequest(i: PhonemeLaneInputs): {
     defaultLang: number;
     consonantPreroll: boolean;
     phonemeSet: string | null;
+    esDialect: string | null;
   };
   tripleNoteIds: (string | null)[];
   ticksPerFrame: number;
@@ -64,6 +75,7 @@ export function phonemeLaneRequest(i: PhonemeLaneInputs): {
       defaultLang: i.langId,
       consonantPreroll: i.consonantPreroll,
       phonemeSet: i.phonemeSet ?? null,
+      esDialect: i.esDialect ?? null,
     },
     tripleNoteIds,
     ticksPerFrame,

@@ -66,8 +66,14 @@ const laneCfg = (p: LaneParam) => LANE_PARAMS.find((x) => x.id === p)!;
  *  the real per-phone frames incl. pre-beat onset consonants instead of guessing. */
 type LaneView = LaneParam | "phoneme";
 
-/** One emitted phone from the Rust DAW assembly (wire shape of `preview_vocal_phonemes`). */
-interface PhonemeSpan { phone: string; frames: number; evt: number; voiceless: boolean; nucleus: boolean }
+/** One emitted phone from the Rust DAW assembly (wire shape of `preview_vocal_phonemes`).
+ *  S167: `base_frames` = the allocator's own split (edit weights are derived against it);
+ *  `gain_db` = the user's per-phone strength; `dropped` = a zero-width marker for a phone the
+ *  allocator starved out (§E1); `stale` = this note carries an edit that no longer matches. */
+interface PhonemeSpan {
+  phone: string; frames: number; evt: number; voiceless: boolean; nucleus: boolean;
+  base_frames: number; gain_db: number; dropped: boolean; stale: boolean;
+}
 // S58: the default lyric for a newly drawn note follows the TRACK's language (a ja "あ" on a zh/en
 // track would be instant OOV — audit MAJOR). langById falls back to ja for an out-of-range id.
 // S91: on an ALIAS track a new ENGLISH note must start out legal in that CONVENTION — the English
@@ -89,7 +95,7 @@ const pitchChain = (notes: readonly Note[], tokens: VocalTokens): Note[] =>
 const MIN_LEN_TICKS = TICKS_PER_BEAT / 12; // shortest note the UI allows = 1/12 (40t), the finest grid — so you
 // can always drag down to it WITHOUT switching grid; the 60ms singability floor is a Phase-6 render concern (§user)
 
-type DragKind = "marquee" | "move" | "resize" | "create" | "marquee-delete" | "pitch-paint" | "param-point" | "ruler-seek";
+type DragKind = "marquee" | "move" | "resize" | "create" | "marquee-delete" | "pitch-paint" | "param-point" | "ruler-seek" | "phone-dur" | "phone-gain";
 interface DragState {
   kind: DragKind;
   clientX0: number; clientY0: number;
@@ -108,6 +114,10 @@ interface DragState {
   param?: LaneParam; // param-point: which lane is being edited
   pointCurve?: { xs: number[]; ys: number[] }; // param-point: the WORKING curve (points) being dragged
   pointIdx?: number; // param-point: index of the point under the cursor
+  phoneEvt?: number; // S167 phone-dur/phone-gain: the source event (note) being edited
+  phoneLeft?: number; // phone-dur: span index of the LEFT phone at the grabbed boundary
+  phoneSpan?: number; // phone-gain: span index being adjusted
+  phoneWork?: { frames: Map<number, number>; gain: Map<number, number> }; // working values by span index
   previewNotes?: () => Note[]; // off-ref draw source during the gesture (attached by withPreview)
 }
 
@@ -476,6 +486,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       langId: phonemeVp.langId,
       consonantPreroll: phonemeVp.consonantPreroll !== false,
       phonemeSet: phonemeVp.phonemeSet, // S91: decides WHICH phones an English note has at all
+      esDialect: phonemeVp.esDialect, // S167: decides WHICH phones a Spanish note has (θ/s · ʎ/ʝ)
     };
     const sig = phonemeLaneSig(laneInputs);
     // reopening onto notes edited while the lane was hidden: blank beats cross-state spans (the onset
@@ -788,9 +799,19 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         //    Nucleus = accent fill; voiced consonant = violet (note-selected hue); voiceless = dim;
         //    SP invisible; AP faint (an audible breath). Text = the vocab IPA token itself. ──
         const pd = phonemeLaneRef.current;
+        // S167: during a lane gesture, paint the WORKING split/gain instead of the cached answer.
+        const drP = dragRef.current;
+        const spansEff =
+          pd && drP && (drP.kind === "phone-dur" || drP.kind === "phone-gain") && drP.phoneWork
+            ? pd.spans.map((s, i) => ({
+                ...s,
+                frames: drP.phoneWork!.frames.get(i) ?? s.frames,
+                gain_db: drP.phoneWork!.gain.get(i) ?? s.gain_db,
+              }))
+            : pd?.spans;
         const bandY = laneTop + 14;
         const bandH = LANE_H - 20;
-        if (pd) {
+        if (pd && spansEff) {
           // note-onset reference lines first (under the blocks): the beat each vowel should sit on.
           ctx.strokeStyle = "rgba(226,232,244,0.4)"; ctx.lineWidth = 1;
           for (const n of notesRef.current) {
@@ -800,7 +821,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
           }
           ctx.font = "9px Consolas, monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
           let f = 0;
-          for (const s of pd.spans) {
+          for (const s of spansEff) {
             const t0 = f * pd.ticksPerFrame;
             const t1 = (f + s.frames) * pd.ticksPerFrame;
             f += s.frames;
@@ -809,6 +830,17 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             if (x1 < noteAreaX || x0 > w) continue;
             const bx0 = Math.max(x0, noteAreaX);
             const bw = Math.max(1, Math.min(x1, w) - bx0 - 1);
+            if (s.dropped) {
+              // S167 (§E1, S86#4): a phone the allocator STARVED OUT — a zero-width marker with the
+              // phone above it, so a silent discard is never invisible again (lengthen the note or
+              // re-split its timing to fund it).
+              ctx.fillStyle = col("--danger") || "#e0567b";
+              ctx.fillRect(Math.round(bx0) - 1, bandY - 4, 2, bandH + 8);
+              ctx.font = "8px Consolas, monospace"; ctx.textBaseline = "alphabetic";
+              ctx.fillText(s.phone, bx0, bandY - 6);
+              ctx.font = "9px Consolas, monospace"; ctx.textBaseline = "middle";
+              continue;
+            }
             if (s.phone === "SP") continue; // a true rest draws nothing (the grid shows through)
             if (s.phone === "AP") {
               ctx.fillStyle = "rgba(226,232,244,0.06)";
@@ -819,7 +851,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
               ctx.fillRect(bx0, bandY, bw, bandH);
               ctx.globalAlpha = 1;
               ctx.strokeStyle = "rgba(226,232,244,0.25)"; ctx.lineWidth = 1;
+              if (s.stale) ctx.setLineDash([3, 2]); // S167: this note's edit no longer matches — visibly dead
               ctx.strokeRect(Math.round(bx0) + 0.5, Math.round(bandY) + 0.5, Math.max(1, Math.round(bw) - 1), bandH - 1);
+              ctx.setLineDash([]);
+              if (s.frames !== s.base_frames || s.gain_db !== 0) {
+                // S167: an ACTIVE edit — accent underline (timing and/or strength moved off automatic)
+                ctx.fillStyle = col("--accent-primary") || "#39c5bb";
+                ctx.fillRect(bx0, bandY + bandH - 2, bw, 2);
+              }
             }
             if (x1 - x0 >= 14) {
               ctx.fillStyle = s.nucleus ? (col("--text-primary") || "#e2e8f4") : (col("--text-muted") || "#8896b4");
@@ -831,7 +870,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
           const mp2 = mouseRef.current;
           if (mp2 && mp2.y >= laneTop && mp2.x >= KEY_COL_W) {
             let hf = 0;
-            for (const s of pd.spans) {
+            for (const s of spansEff) {
               const hx0 = noteAreaX + noteTickToX(hf * pd.ticksPerFrame, start, v);
               hf += s.frames;
               const hx1 = noteAreaX + noteTickToX(hf * pd.ticksPerFrame, start, v);
@@ -840,7 +879,12 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
               const lyric = noteId ? notesRef.current.find((n) => n.id === noteId)?.lyric : undefined;
               ctx.fillStyle = col("--text-primary") || "#e2e8f4";
               ctx.font = "10px Consolas, monospace"; ctx.textAlign = "right"; ctx.textBaseline = "top";
-              ctx.fillText(`${lyric ? `${lyric} · ` : ""}${s.phone} · ${s.frames * 20}ms`, w - 6, laneTop + 3);
+              // S167: the readout carries the edit state too — strength, off-automatic, stale.
+              const extra =
+                (s.gain_db !== 0 ? ` · ${s.gain_db > 0 ? "+" : ""}${s.gain_db}dB` : "") +
+                (s.frames !== s.base_frames ? ` · ${t("vocalEditor.lane.edited")}` : "") +
+                (s.stale ? ` · ${t("vocalEditor.lane.stale")}` : "");
+              ctx.fillText(`${lyric ? `${lyric} · ` : ""}${s.phone} · ${s.frames * 20}ms${extra}`, w - 6, laneTop + 3);
               break;
             }
           }
@@ -1040,6 +1084,35 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     return null;
   };
 
+  // S167 (§E2): hit-test the phoneme lane against the CACHED spans (the same positions the paint
+  // uses). A BOUNDARY between two adjacent same-note phones = a timing handle (drag to re-split);
+  // a phone body = a strength handle (Alt+drag). Returns null when nothing editable is under x.
+  const PHONE_BOUNDARY_HIT = 5;
+  const phoneLaneHitAt = (clientX: number): { boundary?: number; span?: number } | null => {
+    const pd = phonemeLaneRef.current;
+    if (!pd) return null;
+    const cx = localXY(clientX, 0).x;
+    const v = viewRef.current, start = startRef.current;
+    let f = 0;
+    for (let i = 0; i < pd.spans.length; i++) {
+      const s = pd.spans[i]!;
+      const x0 = KEY_COL_W + noteTickToX(f * pd.ticksPerFrame, start, v);
+      f += s.frames;
+      const x1 = KEY_COL_W + noteTickToX(f * pd.ticksPerFrame, start, v);
+      if (s.frames <= 0) continue; // dropped markers are indicators, not handles
+      if (!pd.tripleNoteIds[s.evt]) continue; // a gap rest is not editable
+      const next = pd.spans[i + 1];
+      if (
+        Math.abs(cx - x1) <= PHONE_BOUNDARY_HIT &&
+        next && next.evt === s.evt && next.frames > 0
+      ) {
+        return { boundary: i };
+      }
+      if (cx >= x0 && cx < x1) return { span: i };
+    }
+    return null;
+  };
+
   // ② index of the lane control-point under the cursor (within LANE_PT_HIT px), or -1. Uses the CURRENTLY
   // selected lane's stored curve; the caller has already confirmed the cursor is in the lane band.
   const LANE_PT_HIT = 8;
@@ -1174,7 +1247,33 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     // a lane gesture never touches notes. Click on empty → insert a point + drag it; click ON a point → drag it;
     // right-click a point → delete (onContextMenu). Commits ONCE on pointerup (one undo step).
     if (laneOpenRef.current && y >= noteBottom() && x >= KEY_COL_W) {
-      if (laneParamRef.current === "phoneme") return; // S83: read-only view — no gestures in the band
+      if (laneParamRef.current === "phoneme") {
+        // S167 (§E2): the lane is EDITABLE now — drag a boundary between two phones of one note to
+        // re-split its timing (the note's total length never moves — Rust conserves it); Alt+drag a
+        // phone body to adjust its strength (dB). Anything else in the band stays gesture-free.
+        const pd = phonemeLaneRef.current;
+        const hit = pd ? phoneLaneHitAt(e.clientX) : null;
+        if (!pd || !hit) return;
+        if (hit.boundary !== undefined) {
+          const s = pd.spans[hit.boundary]!;
+          dragRef.current = withPreview({
+            kind: "phone-dur", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+            activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive: false,
+            phoneEvt: s.evt, phoneLeft: hit.boundary, phoneWork: { frames: new Map(), gain: new Map() },
+          });
+          requestRedraw();
+        } else if (hit.span !== undefined && e.altKey) {
+          const s = pd.spans[hit.span]!;
+          dragRef.current = withPreview({
+            kind: "phone-gain", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+            activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive: false,
+            phoneEvt: s.evt, phoneSpan: hit.span,
+            phoneWork: { frames: new Map(), gain: new Map([[hit.span, s.gain_db]]) },
+          });
+          requestRedraw();
+        }
+        return;
+      }
       const cfg = laneCfg(laneParamRef.current);
       const laneTop = noteBottom();
       const stored = paramCurvesRef.current?.[cfg.id];
@@ -1304,7 +1403,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       if (cv) {
         if (p.y < RULER_H && p.x >= KEY_COL_W) cv.style.cursor = "col-resize"; // ② ruler = seek the playhead
         else if (laneOpenRef.current && p.y >= noteBottom() && p.x >= KEY_COL_W)
-          cv.style.cursor = laneParamRef.current === "phoneme" ? "default" // S83 read-only view
+          cv.style.cursor = laneParamRef.current === "phoneme"
+            ? (() => { // S167: timing handle (boundary) vs strength handle (Alt over a phone) vs nothing
+                const h = phoneLaneHitAt(e.clientX);
+                return h?.boundary !== undefined ? "col-resize" : h?.span !== undefined && e.altKey ? "ns-resize" : "default";
+              })()
             : laneParamPointAt(e.clientX, e.clientY) >= 0 ? "grab" : "crosshair"; // ② over a point vs insert
         else if (toolRef.current === "delete") cv.style.cursor = "";
         else { const hov = noteAt(e.clientX, e.clientY); cv.style.cursor = hov && (toolRef.current === "pen" || hov.onEdge) ? "ew-resize" : ""; }
@@ -1348,6 +1451,28 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         const hi = i < c.xs.length - 1 ? c.xs[i + 1]! - 1 : Number.MAX_SAFE_INTEGER;
         c.xs[i] = Math.min(hi, Math.max(lo, rel));
         c.ys[i] = Math.round(yToParam(localXY(e.clientX, e.clientY).y, cfg.min, cfg.max, noteBottom(), LANE_H) * 10) / 10;
+      } else if (d.kind === "phone-dur" && d.phoneWork && d.phoneLeft !== undefined) {
+        // S167: move the boundary between the pair; each side keeps ≥1 frame, the pair total is fixed.
+        const pd = phonemeLaneRef.current;
+        if (pd) {
+          const li = d.phoneLeft, ri = li + 1;
+          const L = pd.spans[li]!, R = pd.spans[ri]!;
+          const total = L.frames + R.frames;
+          let f0 = 0;
+          for (let i = 0; i < li; i++) f0 += pd.spans[i]!.frames;
+          const bf = Math.round(Math.max(0, relTickAt(e.clientX)) / pd.ticksPerFrame) - f0;
+          const left = Math.min(total - 1, Math.max(1, bf));
+          d.phoneWork.frames.set(li, left);
+          d.phoneWork.frames.set(ri, total - left);
+        }
+      } else if (d.kind === "phone-gain" && d.phoneWork && d.phoneSpan !== undefined) {
+        // S167: vertical drag = dB, quantized to 0.5 (6 px per dB feels precise without jitter).
+        const pd = phonemeLaneRef.current;
+        if (pd) {
+          const s0 = pd.spans[d.phoneSpan]!;
+          const g = Math.max(-12, Math.min(12, Math.round((s0.gain_db - (e.clientY - d.clientY0) / 6) * 2) / 2));
+          d.phoneWork.gain.set(d.phoneSpan, g);
+        }
       } else if (d.kind === "ruler-seek") {
         // playback may have STARTED mid-drag (Space is a global key) → pin `seeking` here too, not just at
         // pointerdown, so the transport reschedules from the drop tick on release (mirrors TimelineRuler:124).
@@ -1403,6 +1528,38 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       requestRedraw();
       return;
     }
+    if ((d.kind === "phone-dur" || d.kind === "phone-gain") && part) {
+      // S167 (§E2): one applyNoteEdits = one undo step. The stored edit is keyed to the EMITTED
+      // phone sequence and weighted against the allocator's own split (`base_frames`), so a re-edit
+      // never compounds; an all-default result CLEARS the override (absent ≡ automatic).
+      const pd = phonemeLaneRef.current;
+      if (pd && d.moved && d.phoneWork && d.phoneEvt !== undefined) {
+        const noteId = pd.tripleNoteIds[d.phoneEvt];
+        const note = noteId ? part.notes.find((n) => n.id === noteId) : undefined;
+        if (note) {
+          const idxs: number[] = [];
+          pd.spans.forEach((s, i) => {
+            if (s.evt === d.phoneEvt && s.frames > 0) idxs.push(i);
+          });
+          const phones = idxs.map((i) => pd.spans[i]!.phone);
+          const scale = idxs.map((i) => {
+            const s = pd.spans[i]!;
+            const frames = d.phoneWork!.frames.get(i) ?? s.frames;
+            return Math.round((frames / Math.max(1, s.base_frames)) * 1000) / 1000;
+          });
+          const gainDb = idxs.map((i) => d.phoneWork!.gain.get(i) ?? pd.spans[i]!.gain_db);
+          const anyGain = gainDb.some((g) => g !== 0);
+          const any = anyGain || scale.some((s) => s !== 1);
+          applyNoteEdits(part.trackId, segmentId, {
+            add: [],
+            update: { [note.id]: { phoneTiming: any ? { phones, scale, ...(anyGain ? { gainDb } : {}) } : undefined } },
+            remove: [],
+          });
+        }
+      }
+      requestRedraw();
+      return;
+    }
     if (d.kind === "param-point" && d.pointCurve && d.param && part) {
       // ② one set() → one undo step. An empty curve (last point dragged out of use / deleted) clears the lane.
       // normalizeCurve(...,"param") rounds/dedups + canonical key order (sig↔serialize consistent).
@@ -1428,8 +1585,23 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     if (!part || !laneOpenRef.current) return;
     const { x, y } = localXY(e.clientX, e.clientY);
     if (y < noteBottom() || x < KEY_COL_W) return;
+    if (laneParamRef.current === "phoneme") {
+      // S167 (§E2): right-click a phone → clear this note's timing/strength edit (back to automatic).
+      const pd = phonemeLaneRef.current;
+      const h = pd ? phoneLaneHitAt(e.clientX) : null;
+      const si = h?.span ?? h?.boundary;
+      if (pd && si !== undefined) {
+        const noteId = pd.tripleNoteIds[pd.spans[si]!.evt];
+        const note = noteId ? part.notes.find((n) => n.id === noteId) : undefined;
+        if (note?.phoneTiming) {
+          applyNoteEdits(part.trackId, segmentId, { add: [], update: { [note.id]: { phoneTiming: undefined } }, remove: [] });
+          requestRedraw();
+        }
+      }
+      return;
+    }
     const idx = laneParamPointAt(e.clientX, e.clientY);
-    if (idx < 0 || laneParamRef.current === "phoneme") return; // (phoneme view always misses anyway)
+    if (idx < 0) return;
     const cfg = laneCfg(laneParamRef.current);
     const stored = paramCurvesRef.current?.[cfg.id];
     if (!stored) return;
@@ -1811,10 +1983,13 @@ function noteSig(n: Note): string {
   const tr = t ? `${t.offsetMs ?? ""}|${t.durLeftMs ?? ""}|${t.durRightMs ?? ""}|${t.depthLeftCents ?? ""}|${t.depthRightCents ?? ""}|${t.openEdgeCents ?? ""}` : "";
   const v = n.vibrato;
   const vib = v ? `${v.depthCents},${v.freqHz},${v.phase},${v.startMs},${v.easeInMs},${v.easeOutMs}` : "";
+  // S167 (§E2): keep in lockstep with history.ts noteSig — a timing-only edit must not be dropped.
+  const pt = n.phoneTiming;
+  const pts = pt ? `${pt.phones.join(",")}~${pt.scale.join(",")}~${(pt.gainDb ?? []).join(",")}` : "";
   return (
     `${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.phoneme ?? ""}.${n.velocity}` +
     `.${n.detune ?? 0}.${n.tie ? 1 : 0}.${n.pitchAuto === false ? 0 : 1}.${n.autoTuned ? 1 : 0}` +
-    `.${n.lang ?? ""}.${n.phonemeInput ?? ""}.${tr}.${vib}`
+    `.${n.lang ?? ""}.${n.phonemeInput ?? ""}.${tr}.${vib}.${pts}`
   );
 }
 
