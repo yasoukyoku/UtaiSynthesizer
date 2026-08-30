@@ -3076,7 +3076,7 @@ fn cover_landing() -> Option<i64> {
 }
 
 /// 返回 `(Vec<DeadJob>, Vec<无解区域(起,止)>)` — caller 恒审计带位置。
-/// ⚙ 出厂默认 = false —— `UTAI_COVER_SCORE=1` 打开:**给翻唱轨也开落点打分**。
+/// ⚙ 出厂默认 = **开**(S166c 翻的);`UTAI_COVER_SCORE=0` 关掉 ⇒ 逐位回到 S166 之前。
 ///
 /// # ⛔ 它治的是用户点名的「donor 也哑」(0:58)
 /// 实测那一处 donor 的谐波峰谷比:`−11 → 16.0 · −13 → 23.4 · **−16(今天)→ 21.0** · **−20 → 34.7**`
@@ -3089,9 +3089,20 @@ fn cover_landing() -> Option<i64> {
 /// ⇒ `scoring` 打开 ⇒ 候选生成 / 逐音打分 / 修补遍 / 天花板闸 **全部对 cover 生效**。
 ///
 /// ⚠ **代价**:修补遍会给 cover 也多渲 donor 遍(谱面轨上它占了整场渲染的大头)。
-/// ⛔ 所以出厂**先关**,量完代价与收益再翻。
+/// # ⭐⭐ 实测(yachiyo × SV_RENDER,同一个二进制,`UTAI_RVC_CHUNK_MAX_S=32` 钉死 tier)
+/// ```text
+/// 关:72 个死区 · donor 12 遍 · 修补组  0 · 226 s
+/// 开:72 个死区 · donor 34 遍 · 修补组 33 · 321 s（+42 %）· f0 铺出 356 个 note span（316 唱音）
+///     天花板闸挡下 25 个候选;**33 个修补组里 14 个落点真的变了**
+/// ```
+/// ⭐ 而用户点名的 **0:58 正在其中**:`frame 5800  −16 ⇒ −18`
+/// ⇒ 该处谐波峰谷比 **9.8 → 14.0 dB（+4.2）**;⛔ 阴性对照 t=100 s 读 **Δ −0.0**。
+/// ⚠ 代价如实登记:**+42 % 渲染时间**。用户 2026-08-30 先行授权了这一笔
+/// （「如果它能解决问题那我们可能也值得做」）。
+/// ⛔ 想省这一笔只能动 [`MISM_REPAIR_RADIUS`] / [`MISM_REPAIR_FLOOR`],而 S166c 量过
+/// （2884 组、1480 个真的变了的落点）:**34 % 的收益在 ±3 以上,缩半径 = 直接丢收益**。
 pub fn cover_scoring_enabled() -> bool {
-    std::env::var("UTAI_COVER_SCORE").ok().as_deref().map(str::trim) == Some("1")
+    std::env::var("UTAI_COVER_SCORE").ok().as_deref().map(str::trim) != Some("0")
 }
 
 /// ⭐ S166c —— 一个「音」至少这么多帧(100 fps)。比这短的浊音连段并进邻段。
@@ -14775,8 +14786,8 @@ mod tests {
 
         // ⑷ ⛔ 出厂必须是关的 —— 这一族会给 cover 也打开修补遍(代价)
         assert!(
-            !cover_scoring_enabled() || std::env::var("UTAI_COVER_SCORE").is_ok(),
-            "出厂必须关,只有显式 UTAI_COVER_SCORE=1 才开"
+            cover_scoring_enabled() || std::env::var("UTAI_COVER_SCORE").is_ok(),
+            "出厂必须开;只有显式 UTAI_COVER_SCORE=0 才关"
         );
     }
 
