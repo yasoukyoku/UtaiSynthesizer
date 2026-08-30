@@ -43,6 +43,10 @@ pub struct DxgiAdapterInfo {
     /// DXGI_ADAPTER_FLAG_SOFTWARE or the Basic Render Driver (VEN 0x1414 DEV 0x8c) —
     /// ORT's DML EP refuses these; the picker greys them out but keeps the index slot.
     pub software: bool,
+    /// Raw PCI device id (DXGI_ADAPTER_DESC1.DeviceId). S167 (§F6): the AMD training-pack gate
+    /// maps this to the GPU's gfx ISA target — the one identity a marketing name cannot fake
+    /// (names like "AMD Radeon(TM) Graphics" hide the die entirely).
+    pub device_id: u32,
     /// AdapterLuid as raw little-endian bytes (LowPart then HighPart) — the EXACT
     /// cross-API identity: cudaDeviceGetLuid returns the same 8 bytes, which is how an
     /// Auto-mode preferred DXGI adapter maps to a CUDA ordinal without name guessing.
@@ -98,6 +102,7 @@ pub fn dxgi_adapters() -> Vec<DxgiAdapterInfo> {
             vendor: vendor_from_pci_id(desc.VendorId),
             dedicated_mb: (desc.DedicatedVideoMemory / (1024 * 1024)) as u64,
             software,
+            device_id: desc.DeviceId,
             luid,
         });
     }

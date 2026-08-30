@@ -20,10 +20,24 @@ torch @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wh
 torchaudio @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/torchaudio-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
 amd-torch-device-gfx1103 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx1103-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
 amd-torch-device-gfx110x @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx110x-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+# ── S167 (§F6, pack v2): RDNA3 dGPU device kernels, SAME nightly tag (zero ABI risk). The six
+# wheels below were still live on the FROZEN whl-multi-arch index (rocm.nightlies.amd.com) on
+# 2026-08-31 and were mirrored to our HF wheels/amd/ the same night — that index carries an
+# explicit retention warning, so the mirror is the only durable copy. gfx1100 = Navi31 (RX 7900
+# XTX/XT/GRE/7900M, PRO W7800/W7900), gfx1101 = Navi32 (RX 7800 XT/7700 XT, PRO W7700),
+# gfx1102 = Navi33 (RX 7600 family, PRO W7500/W7600). RDNA2 (gfx1030) and RDNA4 (gfx120x) are
+# deliberately NOT here: this tag has no Windows sanity backing for them (the Iris-Xe lesson —
+# never ship a kernel set no one has watched run); they wait for the ROCm 10.0.0-stable rebuild.
+amd-torch-device-gfx1100 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx1100-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+amd-torch-device-gfx1101 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx1101-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+amd-torch-device-gfx1102 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx1102-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
 rocm @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm-7.15.0a20260707.tar.gz
 rocm-bootstrap @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_bootstrap-0.1.0-py3-none-any.whl
 rocm-sdk-core @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_core-7.15.0a20260707-py3-none-win_amd64.whl
 rocm-sdk-device-gfx1103 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_device_gfx1103-7.15.0a20260707-py3-none-win_amd64.whl
+rocm-sdk-device-gfx1100 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_device_gfx1100-7.15.0a20260707-py3-none-win_amd64.whl
+rocm-sdk-device-gfx1101 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_device_gfx1101-7.15.0a20260707-py3-none-win_amd64.whl
+rocm-sdk-device-gfx1102 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_device_gfx1102-7.15.0a20260707-py3-none-win_amd64.whl
 rocm-sdk-libraries @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_libraries-7.15.0a20260707-py3-none-win_amd64.whl
 absl-py==2.5.0
 aiohappyeyeballs==2.7.1

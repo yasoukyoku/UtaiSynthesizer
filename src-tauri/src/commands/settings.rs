@@ -51,6 +51,10 @@ pub struct GpuAdapter {
     pub name: String,
     /// "nvidia" | "amd" | "intel" | "other"
     pub vendor: String,
+    /// S167 (§F6): PCI device id when the probe carries one (DXGI DESC1.DeviceId; WMI PNPDeviceID's
+    /// DEV_xxxx on the fallback path). The AMD training-pack gate keys on it — the die is the one
+    /// identity a marketing name cannot hide ("AMD Radeon(TM) Graphics" names nothing).
+    pub pci_dev: Option<u32>,
 }
 
 /// One trainable GPU as the training-device dropdown offers it. `value` is what
@@ -476,7 +480,7 @@ pub(crate) fn query_gpu_adapters() -> Vec<GpuAdapter> {
     let dxgi: Vec<GpuAdapter> = crate::gpu::dxgi_adapters()
         .into_iter()
         .filter(|a| !a.software)
-        .map(|a| GpuAdapter { name: a.name, vendor: a.vendor.to_string() })
+        .map(|a| GpuAdapter { name: a.name, vendor: a.vendor.to_string(), pci_dev: Some(a.device_id) })
         .collect();
     if !dxgi.is_empty() {
         return dxgi;
@@ -521,7 +525,14 @@ fn query_gpu_adapters_wmi() -> Vec<GpuAdapter> {
                         } else {
                             "other"
                         };
-                        Some(GpuAdapter { name, vendor: vendor.to_string() })
+                        // S167: DEV_xxxx → pci device id (fail-soft: an unparseable PNP id just
+                        // means the AMD gate falls back to its name tokens).
+                        let pci_dev = pnp
+                            .split("DEV_")
+                            .nth(1)
+                            .and_then(|s| s.get(..4))
+                            .and_then(|h| u32::from_str_radix(h, 16).ok());
+                        Some(GpuAdapter { name, vendor: vendor.to_string(), pci_dev })
                     })
                     .collect();
                 if !adapters.is_empty() {
@@ -738,23 +749,64 @@ pub(crate) fn machine_sig() -> String {
 /// INVENTORY. Offering a 4.5 GB download on an untested guess is the Iris-Xe mistake with a
 /// bigger file, so this gate stays narrow until someone runs one.
 ///
-/// Token match on the adapter name, like `intel_is_xpu_capable` — reading the real gfx target
-/// needs ROCm tooling we do not bundle. "780m" cannot collide with "RX 7800M" (the char after 780
-/// is another digit there). The on-device envtest remains the authority and local-file install
-/// stays ungated, so a miss costs a hidden download entry, never a blocked user.
+/// S167 (§F6) — the gate WIDENED in the same commit that ships runtime-amd-v2 (the discipline the
+/// paragraph below wrote down): the v2 lockfile adds the RDNA3 dGPU device wheels
+/// (`amd-torch-device-gfx1100/1101/1102` + `rocm-sdk-device-gfx1100/1101/1102`, same pinned
+/// nightly tag), so the pack now carries ATen/BLAS kernels for gfx1100-1103 and the predicate
+/// answers by GFX TARGET, resolved from the PCI device id (`amd_gfx_target`). The name-token
+/// fallback below survives only for probes that carry no id (rare: DXGI always does).
+/// ⚠ Still narrow ON PURPOSE where the pack is: RDNA2 (gfx103x), RDNA4 (gfx120x) and the newer
+/// iGPU generations (gfx1035 / gfx115x) have no kernels in v2 and therefore no row in
+/// `AMD_PACK_GFX_TARGETS` — that is the Iris-Xe lesson, unchanged. Widen table and lockfile
+/// TOGETHER or not at all.
 ///
-/// ⚠ The NARROWNESS is the pack's, not this predicate's: broadening AMD coverage means shipping
-/// more device kernels (a packaging task, tracked in the backlog), and this predicate must widen
-/// in the same commit that does it.
 /// S75: split per-ADAPTER so the training-device gate can answer "can THIS card train" while the
 /// machine-level wrappers below keep answering "is this pack worth offering". One predicate, two
 /// granularities — the pack gate and the device gate can never disagree about the same card.
 fn amd_adapter_is_rocm_capable(g: &GpuAdapter) -> bool {
-    g.vendor == "amd" && {
-        let n = g.name.to_ascii_lowercase();
-        ["780m", "760m", "740m"].iter().any(|t| n.contains(t))
+    if g.vendor != "amd" {
+        return false;
     }
+    // Primary: PCI device id → gfx target → pack coverage. This also repairs the S114-noted false
+    // NEGATIVE: a gfx1103 machine whose driver reports the bare "AMD Radeon(TM) Graphics" (no
+    // 780m/760m/740m token anywhere) now passes on its die id.
+    if let Some(dev) = g.pci_dev {
+        if let Some(t) = amd_gfx_target(dev) {
+            return AMD_PACK_GFX_TARGETS.contains(&t);
+        }
+        // A device id we can classify as NOT ours would fall through to the name tokens — but the
+        // tokens only ever name gfx1103 iGPUs, whose ids ARE in the table, so the fallthrough can
+        // never re-open a gate the table closed. It only serves future dies the table has not met.
+    }
+    // Fallback (no id / unknown die): the S74b name tokens for the gfx1103 iGPU class.
+    // "780m" cannot collide with "RX 7800M" (the char after 780 is another digit there).
+    let n = g.name.to_ascii_lowercase();
+    ["780m", "760m", "740m"].iter().any(|t| n.contains(t))
 }
+
+/// S167 (§F6): PCI device id → amdgcn gfx ISA target, for the dies our AMD pack line cares about.
+/// Cross-checked against four sources (Linux kernel amdgpu, libdrm amdgpu.ids, the pci-ids
+/// database, AMD GPUOpen device_info) — every row below was CONFIRMED by at least two.
+/// gfx1100 = Navi 31 (RX 7900 XTX/XT/GRE/7900M, PRO W7800/W7900) · gfx1101 = Navi 32
+/// (RX 7800 XT / 7700 XT, PRO W7700/V710) · gfx1102 = Navi 33 (RX 7600 family, PRO W7500/W7600) ·
+/// gfx1103 = Phoenix/Phoenix2/Hawk Point iGPUs (Radeon 780M/760M/740M — ⚠ Hawk Point ships BOTH
+/// the Phoenix ids 0x15BF/0x15C8 AND its own 0x1900/0x1901; the second pair is the easy miss).
+/// 0x73A8 is deliberately absent: the kernel calls it Navi 21 (gfx1030); only an engineering
+/// table ever labelled it gfx1100, and no retail card shipped with it.
+fn amd_gfx_target(pci_dev: u32) -> Option<&'static str> {
+    Some(match pci_dev {
+        0x7448 | 0x7449 | 0x744A | 0x744B | 0x744C | 0x745E => "gfx1100",
+        0x7460 | 0x7461 | 0x7470 | 0x747E => "gfx1101",
+        0x7480 | 0x7481 | 0x7483 | 0x7487 | 0x7489 | 0x748B | 0x7499 | 0x73F0 => "gfx1102",
+        0x15BF | 0x15C8 | 0x1900 | 0x1901 => "gfx1103",
+        _ => return None,
+    })
+}
+
+/// The gfx targets the SHIPPED AMD pack carries general compute kernels (ATen + rocBLAS/
+/// hipBLASLt) for — runtime-amd-v2's lockfile, mirrored here. ⚠ The gate is the pack's mirror:
+/// this list changes ONLY in the commit that changes the lockfile's device-wheel set.
+const AMD_PACK_GFX_TARGETS: &[&str] = &["gfx1100", "gfx1101", "gfx1102", "gfx1103"];
 
 fn amd_is_rocm_capable(gpus: &[GpuAdapter]) -> bool {
     gpus.iter().any(amd_adapter_is_rocm_capable)
@@ -3084,7 +3136,7 @@ mod tests {
     use super::*;
 
     fn gpu(name: &str, vendor: &str) -> GpuAdapter {
-        GpuAdapter { name: name.to_string(), vendor: vendor.to_string() }
+        GpuAdapter { name: name.to_string(), vendor: vendor.to_string(), pci_dev: None }
     }
 
     fn nv(name: &str, uuid: &str, cc10: Option<i32>) -> NvSmiGpu {
@@ -3547,21 +3599,20 @@ mod tests {
         assert!(list[0].variant.is_none());
     }
 
-    /// The two NAME-based pack gates. Both exist because a vendor-only gate offered users a
-    /// multi-GB pack their hardware cannot run (Iris Xe first, then every AMD card) — these cases
-    /// are the ones that must not silently come back.
+    /// The NAME-token half of the AMD gate (probes with no PCI id) — S167: this is now the
+    /// FALLBACK path only, and it still names only the gfx1103 iGPU trio. A dGPU name without a
+    /// die id stays closed (a probe failure is not a licence to offer a 5 GB download); with its
+    /// id it passes through the table — see the S167 test below.
     #[test]
-    fn amd_gate_accepts_only_gfx1103_class_igpus() {
+    fn amd_gate_name_fallback_accepts_only_gfx1103_class_igpus() {
         for name in ["AMD Radeon 780M Graphics", "AMD Radeon(TM) 760M", "Radeon 740M Graphics"] {
             assert!(amd_is_rocm_capable(&[gpu(name, "amd")]), "{name}");
         }
         for name in [
-            "AMD Radeon RX 7900 XTX",   // gfx1100 — RDNA3, no ATen/BLAS kernel in the pack
-                                        // (S115: it DOES get the gfx110x flash-attn images —
-                                        //  "no kernels at all" was the third copy of that
-                                        //  falsehood; see amd_adapter_is_rocm_capable)
+            "AMD Radeon RX 7900 XTX",   // gfx1100 — in the v2 pack, but NAME alone ≠ die id:
+                                        //  without pci_dev this row must stay closed
             "AMD Radeon RX 7800M XT",   // must NOT match the "780m" token
-            "AMD Radeon RX 6800 XT",    // RDNA2
+            "AMD Radeon RX 6800 XT",    // RDNA2 — no kernels in the pack line at all
             "AMD Radeon RX 9070",       // RDNA4
             "AMD Radeon 890M",          // gfx115x
             "AMD Radeon 680M",          // gfx1035
@@ -3571,6 +3622,47 @@ mod tests {
         // Vendor still matters: a same-named adapter attributed to another vendor is not ours.
         assert!(!amd_is_rocm_capable(&[gpu("Radeon 780M", "intel")]));
         assert!(!amd_is_rocm_capable(&[]));
+    }
+
+    /// S167 (§F6): the PCI-id half — the pack targets pass on their die id even under a bare
+    /// marketing name (the S114 false negative), everything outside the v2 kernel set stays
+    /// closed, and vendor still gates.
+    #[test]
+    fn s167_amd_gate_answers_by_gfx_target_from_the_pci_id() {
+        let by_dev = |dev: u32| GpuAdapter {
+            name: "AMD Radeon(TM) Graphics".to_string(), // names nothing — the id must carry it
+            vendor: "amd".to_string(),
+            pci_dev: Some(dev),
+        };
+        for dev in [
+            0x744C, 0x745E, // gfx1100 (RX 7900 family, PRO W7800)
+            0x747E, 0x7470, // gfx1101 (RX 7800 XT / 7700 XT, PRO W7700)
+            0x7480, 0x7499, // gfx1102 (RX 7600 family, RX 7400)
+            0x15BF, 0x15C8, 0x1900, 0x1901, // gfx1103 (Phoenix + Hawk Point — BOTH id pairs)
+        ] {
+            assert!(amd_is_rocm_capable(&[by_dev(dev)]), "{dev:#06x}");
+        }
+        for dev in [
+            0x73BF, // Navi 21 (RX 6900 XT, gfx1030) — RDNA2 has no kernels in v2
+            0x73FF, // Navi 23 (RX 6600, gfx1032)
+            0x1681, // Rembrandt 680M (gfx1035)
+            0x164E, // Raphael iGPU (gfx1036)
+            0x150E, // Strix 890M (gfx1150)
+        ] {
+            assert!(!amd_is_rocm_capable(&[by_dev(dev)]), "{dev:#06x}");
+        }
+        // an unknown-die AMD adapter whose NAME carries an iGPU token still passes (fallback)
+        assert!(amd_is_rocm_capable(&[GpuAdapter {
+            name: "AMD Radeon 780M Graphics".to_string(),
+            vendor: "amd".to_string(),
+            pci_dev: Some(0xFFFF),
+        }]));
+        // vendor gates before everything: an id alone never opens the door
+        assert!(!amd_is_rocm_capable(&[GpuAdapter {
+            name: "NVIDIA GeForce RTX 3080".to_string(),
+            vendor: "nvidia".to_string(),
+            pci_dev: Some(0x744C),
+        }]));
     }
 
     /// ★S116 §G16 — the recommendation and the offer gate must never disagree.

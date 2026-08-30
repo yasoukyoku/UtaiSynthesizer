@@ -64,7 +64,10 @@ VARIANTS = {
         "lock": "runtime-amd.lock.txt",
         # AMD/TheRock ROCm; cp310 (SAME PBS interpreter as cpu/nv — no per-variant
         # python needed, the earlier ABI worry was moot). Experimental tier.
-        "label": "AMD 运行时（TheRock ROCm；RDNA3/4 训练 + 模型转换，实验性）",
+        # S167 (§F6): v2 adds the RDNA3 dGPU kernels (gfx1100/1101/1102) on the SAME pinned
+        # nightly tag; the label now promises exactly what the wheels carry — RDNA3, not
+        # "RDNA3/4" (v1's label over-promised: RDNA4 has zero kernels in this line).
+        "label": "AMD 运行时（TheRock ROCm；RX 7000 全系 + 780M/760M/740M 核显训练 + 模型转换，实验性）",
     },
     "xpu": {
         "lock": "runtime-xpu.lock.txt",

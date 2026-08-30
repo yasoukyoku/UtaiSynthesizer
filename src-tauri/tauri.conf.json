@@ -51,6 +51,7 @@
       "../converter/export_diffusion.py": "converter/export_diffusion.py",
       "../converter/export_nsf_hifigan.py": "converter/export_nsf_hifigan.py",
       "../converter/onnx_fp16.py": "converter/onnx_fp16.py",
+      "../converter/export_index.py": "converter/export_index.py",
       "../converter/architectures/": "converter/architectures/",
       "../training/utai_train/": "training/utai_train/",
       "../training/assets/": "training/assets/"

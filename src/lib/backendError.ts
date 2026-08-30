@@ -252,6 +252,19 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // longest-first, so EXPORT_MODEL_NOT_FOUND wins over MODEL_NOT_FOUND on an export failure.
   EXPORT_MODEL_NOT_FOUND: { key: "backend.EXPORT_MODEL_NOT_FOUND" },
   EXPORT_FAILED: { key: "backend.EXPORT_FAILED" },
+  // S167 (§F2⒟) community-format export (training archive → .pth + .index / config.json).
+  EXPORT_COMMUNITY_BAD_PROJECT: { key: "backend.EXPORT_COMMUNITY_BAD_PROJECT" },
+  EXPORT_COMMUNITY_CKPT_MISSING: { key: "backend.EXPORT_COMMUNITY_CKPT_MISSING" },
+  EXPORT_COMMUNITY_OUTSIDE_PROJECT: { key: "backend.EXPORT_COMMUNITY_OUTSIDE_PROJECT" },
+  EXPORT_COMMUNITY_DEST_MISSING: { key: "backend.EXPORT_COMMUNITY_DEST_MISSING" },
+  EXPORT_COMMUNITY_NOT_A_RELEASE: { key: "backend.EXPORT_COMMUNITY_NOT_A_RELEASE" },
+  EXPORT_COMMUNITY_NO_FEATURES: { key: "backend.EXPORT_COMMUNITY_NO_FEATURES" },
+  EXPORT_COMMUNITY_BAD_FEATURES: { key: "backend.EXPORT_COMMUNITY_BAD_FEATURES" },
+  EXPORT_COMMUNITY_NO_CONFIG: { key: "backend.EXPORT_COMMUNITY_NO_CONFIG" },
+  EXPORT_COMMUNITY_COPY: { key: "backend.EXPORT_COMMUNITY_COPY" },
+  EXPORT_COMMUNITY_INDEX_COPY: { key: "backend.EXPORT_COMMUNITY_INDEX_COPY" },
+  EXPORT_COMMUNITY_TASK: { key: "backend.EXPORT_COMMUNITY_TASK" },
+  EXPORT_COMMUNITY_UNSUPPORTED: { key: "backend.EXPORT_COMMUNITY_UNSUPPORTED" },
   PACKAGE_INVALID: { key: "backend.PACKAGE_INVALID" },
   PACKAGE_EXTRACT_FAILED: { key: "backend.PACKAGE_EXTRACT_FAILED" },
   // S68d: separation-model delete was a prose error before (i18n rule violation).

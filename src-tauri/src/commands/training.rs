@@ -889,6 +889,157 @@ pub async fn rename_training_run(
     crate::training::tproject::rename_run(&slot, &run, name).map_err(|e| e.to_string())
 }
 
+/// S167 (§F2⒟): export ONE archive checkpoint as the COMMUNITY-standard file set into `dest_dir`.
+///
+///   rvc         → `<name>.pth` — our `weights/*.pth` release snapshots ARE upstream savee()'s
+///                 community format — plus `added_IVF{n}_Flat_nprobe_1_<name>_<v>.index` built
+///                 from the run's `total_fea.npy` (upstream train_index()'s faiss half, run under
+///                 the CONVERTER role; ASCII temp + rename, faiss cannot open CJK paths — S68f2).
+///   sovits(_v2) → `<name>.pth` (the generator release snapshot) + `config.json` — the pair every
+///                 so-vits-svc 4.x tool expects.
+///
+/// Reads training assets only; writes only into the user-picked `dest_dir`. Holds the convert
+/// slot across the faiss build (the same interlock every converter user takes).
+#[tauri::command]
+pub async fn export_community_ckpt(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    backend: String,
+    ckpt_path: String,
+    name: String,
+    dest_dir: String,
+) -> Result<Vec<String>, String> {
+    checked_project_id(&project_id)?;
+    let name = crate::models::sanitize_file_stem(name.trim());
+    if name.is_empty() {
+        return Err("TRAINING_NAME_EMPTY".into());
+    }
+    let data_dir = data_root(&state);
+    let family = crate::training::backend_family(&backend).to_string();
+    let proj = crate::training::tproject::project_dir(&data_dir, &project_id);
+    // the row must live inside THIS project's tree — the command reads whatever path it is handed
+    let proj_canon =
+        proj.canonicalize().map_err(|e| format!("EXPORT_COMMUNITY_BAD_PROJECT: {e}"))?;
+    let ckpt_canon = std::path::PathBuf::from(&ckpt_path)
+        .canonicalize()
+        .map_err(|e| format!("EXPORT_COMMUNITY_CKPT_MISSING: {e}"))?;
+    if !ckpt_canon.starts_with(&proj_canon) {
+        return Err("EXPORT_COMMUNITY_OUTSIDE_PROJECT".into());
+    }
+    let dest = std::path::PathBuf::from(&dest_dir);
+    if !dest.is_dir() {
+        return Err("EXPORT_COMMUNITY_DEST_MISSING".into());
+    }
+    let app_dir = state.app_dir.clone();
+    let cache_dir = state.cache_dir.clone();
+    match family.as_str() {
+        "rvc" => {
+            // weights/<slug>*.pth → the run root (total_fea.npy's home) is two levels up
+            let run_dir = ckpt_canon
+                .parent()
+                .filter(|p| p.file_name().is_some_and(|n| n == "weights"))
+                .and_then(|p| p.parent())
+                .ok_or("EXPORT_COMMUNITY_NOT_A_RELEASE")?
+                .to_path_buf();
+            let features = run_dir.join("total_fea.npy");
+            if !features.exists() {
+                return Err("EXPORT_COMMUNITY_NO_FEATURES".into());
+            }
+            // v1/v2 from the feature dimension itself — the one witness that cannot drift from
+            // the matrix we are about to index (256 = ContentVec-256 = v1, 768 = v2).
+            let version = match npy_second_dim(&features) {
+                Some(256) => "v1",
+                Some(768) => "v2",
+                other => return Err(format!("EXPORT_COMMUNITY_BAD_FEATURES: dim {other:?}")),
+            };
+            let _convert = state.acquire_convert_slot()?;
+            let out_pth = dest.join(format!("{name}.pth"));
+            tauri::async_runtime::spawn_blocking(move || -> Result<Vec<String>, String> {
+                std::fs::copy(&ckpt_canon, &out_pth)
+                    .map_err(|e| format!("EXPORT_COMMUNITY_COPY: {e}"))?;
+                let tmp = cache_dir.join(format!("community_{}.index", std::process::id()));
+                let _ = std::fs::remove_file(&tmp);
+                let nlist =
+                    crate::models::convert::build_community_index(&features, &tmp, &app_dir)
+                        .map_err(|e| e.to_string())?;
+                let out_index =
+                    dest.join(format!("added_IVF{nlist}_Flat_nprobe_1_{name}_{version}.index"));
+                let _ = std::fs::remove_file(&out_index);
+                if std::fs::rename(&tmp, &out_index).is_err() {
+                    // cache and dest can sit on different volumes — rename cannot cross them
+                    std::fs::copy(&tmp, &out_index)
+                        .map_err(|e| format!("EXPORT_COMMUNITY_INDEX_COPY: {e}"))?;
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                Ok(vec![out_pth.display().to_string(), out_index.display().to_string()])
+            })
+            .await
+            .map_err(|e| format!("EXPORT_COMMUNITY_TASK: {e}"))?
+        }
+        "sovits" | "sovits_v2" => {
+            // release snapshots live under <run>/weights/; the community pair needs the run's
+            // own config.json (one level up)
+            let run_dir = ckpt_canon
+                .parent()
+                .map(|p| {
+                    if p.file_name().is_some_and(|n| n == "weights") {
+                        p.parent().unwrap_or(p)
+                    } else {
+                        p
+                    }
+                })
+                .ok_or("EXPORT_COMMUNITY_NOT_A_RELEASE")?
+                .to_path_buf();
+            let config = run_dir.join("config.json");
+            if !config.exists() {
+                return Err("EXPORT_COMMUNITY_NO_CONFIG".into());
+            }
+            let out_pth = dest.join(format!("{name}.pth"));
+            let out_cfg = dest.join("config.json");
+            tauri::async_runtime::spawn_blocking(move || -> Result<Vec<String>, String> {
+                std::fs::copy(&ckpt_canon, &out_pth)
+                    .map_err(|e| format!("EXPORT_COMMUNITY_COPY: {e}"))?;
+                std::fs::copy(&config, &out_cfg)
+                    .map_err(|e| format!("EXPORT_COMMUNITY_COPY: {e}"))?;
+                Ok(vec![out_pth.display().to_string(), out_cfg.display().to_string()])
+            })
+            .await
+            .map_err(|e| format!("EXPORT_COMMUNITY_TASK: {e}"))?
+        }
+        _ => Err("EXPORT_COMMUNITY_UNSUPPORTED".into()),
+    }
+}
+
+/// Minimal .npy header reader: the SECOND dimension of a 2-D array, None on anything else —
+/// enough to tell a 256-dim (v1) retrieval matrix from a 768-dim (v2) one without numpy.
+fn npy_second_dim(path: &std::path::Path) -> Option<u64> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 10];
+    f.read_exact(&mut head).ok()?;
+    if &head[..6] != b"\x93NUMPY" {
+        return None;
+    }
+    let hlen = if head[6] >= 2 {
+        // format 2.0+: u32 header length at offset 8 (we already consumed 2 of its bytes)
+        let mut rest = [0u8; 2];
+        f.read_exact(&mut rest).ok()?;
+        u32::from_le_bytes([head[8], head[9], rest[0], rest[1]]) as usize
+    } else {
+        u16::from_le_bytes([head[8], head[9]]) as usize
+    };
+    let mut hdr = vec![0u8; hlen.min(65536)];
+    f.read_exact(&mut hdr).ok()?;
+    let text = String::from_utf8_lossy(&hdr);
+    let inner = text.split("'shape':").nth(1)?.split('(').nth(1)?.split(')').next()?;
+    let dims: Vec<u64> = inner.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    if dims.len() == 2 {
+        Some(dims[1])
+    } else {
+        None
+    }
+}
+
 /// Import audio INTO the project's shared dataset, independent of any training run.
 ///
 /// Appends — the run-time import replaces wholesale, this one adds. `speaker` is a display name

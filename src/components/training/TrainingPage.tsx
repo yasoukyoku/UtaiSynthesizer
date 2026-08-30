@@ -2566,6 +2566,45 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     }
   };
 
+  /** S167 (§F2⒟): export a release snapshot as the COMMUNITY file set — rvc: `.pth` (already
+   *  upstream savee()'s format) + a faiss `added_*.index` built from the run's own features;
+   *  sovits: `.pth` + `config.json`. The ecosystem-compat counterpart of our lossless .zip
+   *  package (which only WE can read back). */
+  const exportCommunity = async (ckpt: {
+    kind: string;
+    epoch?: number;
+    step: number | null;
+    rel?: string;
+    path: string;
+    runId?: string | null;
+  }) => {
+    const rowId = await rowIdentityFor(ckpt.runId);
+    const name = await showConfirm({
+      title: t("training.exportCommunity"),
+      body: t("training.exportCommunityName"),
+      buttons: [
+        { id: "ok", label: t("training.exportCommunity"), kind: "primary" },
+        { id: "__cancel", label: t("training.cancel") },
+      ],
+      input: { initial: suggestedName(ckpt, rowId.name) },
+    });
+    if (!name || name === "__cancel") return;
+    const dir = await open({ directory: true, title: t("training.exportCommunityPick") });
+    if (!dir || typeof dir !== "string") return;
+    try {
+      const files = await invoke<string[]>("export_community_ckpt", {
+        projectId: route.projectId,
+        backend: archiveBackend,
+        ckptPath: ckpt.path,
+        name,
+        destDir: dir,
+      });
+      showToast(t("training.exportCommunityDone", { n: files.length }), "success");
+    } catch (e) {
+      showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
+    }
+  };
+
   /** S41 batch import of the checked candidates, auto-named by the single-
    *  import suggestion rules with in-batch dedupe (red-team A9: a stop archive
    *  can share its step/epoch with a periodic — REPLACE would silently eat
@@ -2787,6 +2826,17 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
                             onClick={() => void importCkpt(r)}
                           >
                             {t("training.import")}
+                          </button>
+                        )}
+                        {/* S167 (§F2⒟): community-format export — rvc/sovits only (a vocoder
+                            ckpt has no community pair format to speak of). */}
+                        {canImport && backendFamily(archiveBackend) !== "vocoder" && (
+                          <button
+                            className="training-btn small"
+                            disabled={importingAll}
+                            onClick={() => void exportCommunity(r)}
+                          >
+                            {t("training.exportCommunity")}
                           </button>
                         )}
                       </span>
@@ -3122,12 +3172,23 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
                           </button>
                         )
                       ) : (
-                        <button
-                          className="training-btn small"
-                          onClick={() => void importCkpt(c)}
-                        >
-                          {t("training.import")}
-                        </button>
+                        <>
+                          <button
+                            className="training-btn small"
+                            onClick={() => void importCkpt(c)}
+                          >
+                            {t("training.import")}
+                          </button>
+                          {/* S167 (§F2⒟): community-format export, same gate as the archive list */}
+                          {!isVocoderRun && (
+                            <button
+                              className="training-btn small"
+                              onClick={() => void exportCommunity(c)}
+                            >
+                              {t("training.exportCommunity")}
+                            </button>
+                          )}
+                        </>
                       )}
                     </>
                   )}

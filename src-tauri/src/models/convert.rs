@@ -115,6 +115,50 @@ pub fn convert_index_to_npy(
     Ok(())
 }
 
+/// S167 (§F2⒟): build the COMMUNITY faiss retrieval index (`added_IVF{n}_Flat_nprobe_1_….index`)
+/// from a training run's `total_fea.npy` — converter/export_index.py, which is upstream RVC
+/// train_index()'s faiss half over the exact matrix our index_npy.py already prepared.
+/// ⚠ `out_index` must be an ASCII path (faiss's narrow fopen — the S68f2 CJK lesson, from the
+/// import side); the caller renames the file to its final community name afterwards.
+/// Returns the IVF `nlist` the exporter chose (the community filename carries it).
+pub fn build_community_index(features_npy: &Path, out_index: &Path, app_dir: &Path) -> Result<u32> {
+    let python = crate::pyenv::converter_python_checked(app_dir)?;
+    let script = app_dir.join("converter").join("export_index.py");
+    if !script.exists() {
+        return Err(UtaiError::Model(format!("Index exporter not found: {}", script.display())));
+    }
+    let output = crate::util::python_command(&python)
+        .arg(&script)
+        .arg(features_npy)
+        .arg(out_index)
+        .output()
+        .map_err(|e| {
+            UtaiError::Model(format!(
+                "Failed to run index exporter (python={}): {}",
+                python.display(),
+                e
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(UtaiError::Model(format!(
+            "Community index build failed: {}",
+            spawn_error_detail(&output)
+        )));
+    }
+    if !out_index.exists() {
+        return Err(UtaiError::Model(
+            "Community index build completed but .index file not found".to_string(),
+        ));
+    }
+    // `EXPORT_INDEX_OK rows=<n> dim=<d> nlist=<k>` — the one machine-readable line the script prints.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("EXPORT_INDEX_OK")?.split("nlist=").nth(1)?.trim().parse::<u32>().ok())
+        .ok_or_else(|| UtaiError::Model("Community index build reported no nlist".to_string()))
+}
+
 /// so-vits-svc companion assets: cluster kmeans .pt / feature-retrieval .pkl →
 /// per-speaker .npy files in `outdir` (converter/export_cluster.py naming:
 /// `<speaker_name>.centers.npy` / `<speaker_id>.index_vectors.npy` — exactly what the
