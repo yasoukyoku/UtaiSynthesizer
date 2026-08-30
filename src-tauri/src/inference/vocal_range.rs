@@ -1723,6 +1723,21 @@ fn log_dip_stat(where_: &str) {
     });
 }
 
+/// ⭐⭐⭐ S166c —— 打印并清空**起音形状整形**的诊断。见 [`OFIT_STAT`]。
+fn log_ofit_stat(where_: &str) {
+    OFIT_STAT.with(|st| {
+        let mut b = st.borrow_mut();
+        if b.0 == 0 {
+            return;
+        }
+        tracing::info!(
+            "range: onset-fit [{}] asked {} note(s), reshaped {}, deepest cut {:.1} dB",
+            where_, b.0, b.1, b.2
+        );
+        *b = (0, 0, 0.0);
+    });
+}
+
 /// ⭐⭐ S166 —— 打印并清空**天花板闸**的诊断。见 [`REACH_STAT`]。
 fn log_reach_stat(where_: &str) {
     REACH_STAT.with(|st| {
@@ -4994,6 +5009,17 @@ thread_local! {
 }
 
 thread_local! {
+    /// ⭐⭐⭐ S166c —— **起音形状整形**的诊断计数(问了几个音, 真的动了几个, 见过的最深压制 dB)。
+    ///
+    /// ⛔ 它到 S166c 才有,而缺它**当场害我下了一个错结论**:辅音族的残留我先推断是
+    /// 「[`onset_fit_max_db`] 夹持太紧」,渲了两条臂(18/24 dB)才发现无效 ——
+    /// 而当时**根本不知道这把刀在那些音上开没开火**。
+    /// ⇒ 与 S166 跨周期对消漏诊断出口、`DIP_STAT` 写了没人读,是**同一个形状**的第三次。
+    static OFIT_STAT: std::cell::RefCell<(u32, u32, f32)> =
+        const { std::cell::RefCell::new((0, 0, 0.0)) };
+}
+
+thread_local! {
     /// ⭐⭐ S166 —— **天花板闸**的诊断计数(问了几次, 挡下几个候选, 见过的最大超顶度数)。
     ///
     /// ⛔ 它是承重的,而且是 S166 自己刚付过学费的那一条:跨周期对消第一版
@@ -8262,6 +8288,8 @@ fn splice_kept(
                     if on < a || on + span > b {
                         continue;
                     }
+                    OFIT_STAT.with(|st| st.borrow_mut().0 += 1);
+                    let mut touched = false;
                     // 稳态：两侧各自取自己的
                     let (q0, q1) = ((on + s_lo).min(b), (on + s_hi).min(b));
                     if q1 <= q0 {
@@ -8286,6 +8314,15 @@ fn splice_kept(
                             let idx = (p - a) / ofit_cell;
                             if idx < g.len() {
                                 let db = 20.0 * shape.max(1e-6).log10();
+                                if db < -0.5 {
+                                    touched = true;
+                                    OFIT_STAT.with(|st| {
+                                        let mut q = st.borrow_mut();
+                                        if db < q.2 {
+                                            q.2 = db;
+                                        }
+                                    });
+                                }
                                 // ⛔⛔ **只压不抬**：上限硬钉在 0 dB。
                                 //    v17 第一版允许 +9 dB ⇒ donor 本来就贴着满刻度，
                                 //    一放大就削：splice 后峰值 **+8.83 dBFS**、
@@ -8296,6 +8333,9 @@ fn splice_kept(
                             }
                         }
                         p = q;
+                    }
+                    if touched {
+                        OFIT_STAT.with(|st| st.borrow_mut().1 += 1);
                     }
                 }
                 // 10 ms 移动平均:增益自己不许跳变(4 ms 时 16-24 kHz 涨了 21.5 dB)
@@ -8340,6 +8380,8 @@ fn splice_kept(
                 base[k] = base[k] * (1.0 - w) + seg[si as usize] * w * rg * og;
             }
         }
+    // ⭐ S166c —— 起音整形的诊断出口(它到 S166c 才有)。
+    log_ofit_stat("splice");
     Ok(())
 }
 
