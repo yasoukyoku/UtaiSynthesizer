@@ -7582,6 +7582,24 @@ fn splice_kept(
 ) -> crate::Result<()> {
     // ⛔ `join_enabled` 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
     let n = base.len();
+    // ⛔⛔⭐⭐⭐⭐⭐ S166c —— **休止增益的参照必须是【拼接前】的 `base`**。
+    //
+    // # 它修的是什么
+    // 一段休止常常**被两个窗劈开**,而窗是按时间序依次写进 `base` 的。
+    // 第二个窗算 `rest_gain_of` 时,`base` 在那一段上**已经被第一个窗写成 donor 了**
+    // ⇒ 比值 ≈ 1 ⇒ **增益 ≈ 0**,那一刀在重叠区等于不存在。
+    //
+    // 实测(鹅妈妈 +7 × 东雪莲,休止 [1156] 3:36.460,逐格增益打开):
+    // ```text
+    // 窗 215.946..216.556 → 它那一半的增益  0, 0, −10.4, −13.4, −13.5   ← 压得很狠
+    // 窗 216.546..219.146 → 它那一半的增益  0, 0, 0, −1.1, −2.2, ...    ← 几乎不压
+    // ```
+    // 而**后拼的那个窗覆盖前一个** ⇒ 成品里那个 −25 dB 的凸起原样留着
+    // (同 run 零噪声对照读到 **−0.08 dB**)。
+    //
+    // ⇒ 「这段休止本来该是什么样」的参照,按定义是**没被任何一条窗碰过**的那一份。
+    // ⚠ 代价:一份整曲拷贝(268 s @44.1k ≈ 47 MB),只在 `rest_base` 开着时拍。
+    let base0: Option<Vec<f32>> = rest_base.then(|| base.to_vec());
     // ⛔ 时间序,不是位移序。窗互不重叠时两者等价(实测这首歌 0 对重叠),但**接上之后
     // 相邻两窗会重叠一个淡化宽度**,而那一次淡化的意义正是「从上一条 donor 淡到下一条」——
     // 顺序错了就会淡回 base,也就是这一刀本来要消灭的那个洞。
@@ -7967,7 +7985,10 @@ fn splice_kept(
                 let sx = (x as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize) as usize;
                 let sy = (y as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize) as usize;
                 let dn = if sy > sx { rest_e(&seg[sx..sy]) } else { 0.0 };
-                let bs = rest_e(&base[x.min(base.len())..y.min(base.len())]);
+                // ⛔ 参照是**拼接前**的那一份(见 `base0` 的注释)——
+                //    用进行中的 `base` 会让后拼的窗读到「上一条窗刚写进去的 donor」。
+                let bref: &[f32] = base0.as_deref().unwrap_or(&*base);
+                let bs = rest_e(&bref[x.min(bref.len())..y.min(bref.len())]);
                 if dn <= 0.0 || bs <= 0.0 {
                     return 1.0;
                 }
@@ -7980,7 +8001,7 @@ fn splice_kept(
             let rcell = ((f64::from(sample_rate) * f64::from(rest_cell_ms) / 1000.0) as usize).max(1);
             let rest_g: Vec<Vec<f32>> = rest_spans
                 .iter()
-                .map(|&(x, y, _, _)| {
+                .map(|&(x, y, r0, r1)| {
                     if rest_cell_ms <= 0.0 {
                         return vec![rest_gain_of(x, y)];
                     }
