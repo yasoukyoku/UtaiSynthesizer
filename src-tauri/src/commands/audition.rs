@@ -386,7 +386,7 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
             // ⛔ 不 bump 的后果正是这条 doc 头上写的那一条:**缓存会继续供旧音频**,
             //    而用户听到的是「我改了他什么都没听见」。
             format!(
-                "_s166c_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_s166d_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }

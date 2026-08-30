@@ -3116,8 +3116,29 @@ fn cover_landing() -> Option<i64> {
 /// （「如果它能解决问题那我们可能也值得做」）。
 /// ⛔ 想省这一笔只能动 [`MISM_REPAIR_RADIUS`] / [`MISM_REPAIR_FLOOR`],而 S166c 量过
 /// （2884 组、1480 个真的变了的落点）:**34 % 的收益在 ±3 以上,缩半径 = 直接丢收益**。
+/// # ⛔⛔⛔ S166d —— **翻回出厂关。上面那整段论据已被耐判推翻。**
+///
+/// 用户 2026-08-30 耳判：**0:45.943-0:47.360 整段退化**（修补遍把它从 −16 改成了 −18），
+/// 而「其他在 s0 里就塔得明显的地方，在 s1 里也仍然没得到什么改善」。
+/// 频谱图坐实：那一段在 s1 里**谐波线全没了，变成宽带噪声**（只剩气声）；
+/// 电平在段内狂跳：46.54-46.84 s **+11…+14 dB**，46.94-47.05 s **−14…−15 dB**。
+///
+/// # ⛔⛔⛔ 而我拿来翻默认的尺子在**同一段**读到 s1 **好 +2.67 dB** ⇒ 尺子判死
+///
+/// 「谐波峰谷比」（峰 = k·f0 附近最大值，谷 = 相邻谐波中间的中位）**不归一化电平**，
+/// 于是它会把「安静而干净的一瞬」读得比「响而噪的一瞬」差
+/// （t=46.543：s0 − 27.6 dBFS 读 3.53，s1 − 13.2 dBFS 读 13.25）。
+/// ⇒ **它奖励的是「响」不是「有谐波结构」**。
+/// ⚠ 同族血训已登记两次：S166b 的「`dip` 轴天然奖励塔陷」与本条 ——
+/// **凡不拿「还是不是一个人声」当闸的打分轴，都会选出不是人声的候选。**
+///
+/// # ▶ 重新打开它之前必须先有的东西（别直接翻回去）
+/// 一把**否决型**的「还是不是人声」闸（HNR / 谱平坦度 / 浊音度），
+/// 在**成品层**上判，候选只要比计划差过阀就**直接剔掉**，而不是进排序。
+/// ⛔ 而且这把闸自己先要过**阴性对照 + 本段回放**：它必须能把
+/// 0:45.943-0:47.360 的 −18 候选判死，否则它跟老尺子一样是空的。
 pub fn cover_scoring_enabled() -> bool {
-    std::env::var("UTAI_COVER_SCORE").ok().as_deref().map(str::trim) != Some("0")
+    std::env::var("UTAI_COVER_SCORE").ok().as_deref().map(str::trim) == Some("1")
 }
 
 /// ⚙ 出厂默认 = 10.0 —— **逐格增益打开时**的休止尾部护栏(ms)。
@@ -13693,7 +13714,7 @@ mod tests {
             //    它**会改音频**（所以在指纹里、不在 `EXEMPT` 里），但**出厂没设 ⇒ off ⇒ 不改音频**
             //    ⇒ 按本判据自己的规矩（“若它出厂关 = 不改音频，就不要 bump 版本号”）**不跟着 bump**，
             //    与 `valhuman=` 当初同例。进指纹的意义是：下一个人想把它变成默认之前，必须先来这里改一行。
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 h2=0 mism=1.2 dip=3 spread=8 restcell=10 resttail=10 restfrac=1 coverscore=true | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true donorin=false valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=120 lock=0.3 kappa=0 join=false wininv=true sliver=0 tiethin=true tilt=1 pick=true harm=3 repair=200 comb=6 handover=15 tiedxf=120 split=3000 interior=3 xdith=0 xslide=0 tiedst=2 width=0 wfloor=0 tiltfade=85/90              usag=3 usagdim=3 gonesort=15 dipfill=0 restwin=4/4 h2=0 mism=1.2 dip=3 spread=8 restcell=10 resttail=10 restfrac=1 coverscore=false | f0lerp=true fill1=true filluv=true fillmax=1 uvgate=true uvgatek=1.5 uvgateguard=20 valadapt=false valafter=false valhuman=true restshrink=true predamp=true/40,-40,0.6,2,5,35 restbucket=true donorin=false valdb=1.1/12,15,17/6.5,9 valenv=0.96,0.08/0.98,0.02",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         // ⛔ S163e 盖着的:①`SPLIT_MIN_COST_DEFAULT` 3000 → 2000;
@@ -13710,7 +13731,7 @@ mod tests {
         //    yuyuko 68 +9.15 / 71 +7.84 / 75 +5.31 / 78 +3.65 / 80 +2.91 / 82,83 +2.08 /
         //    **87 −0.84** / **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
         //    修后：低音侧 68-83 **逐字不变**，87 的损害减半、90 归零。
-        const TAG: &str = "s166c";
+        const TAG: &str = "s166d";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -14924,11 +14945,27 @@ mod tests {
             g.len()
         );
 
-        // ⑷ ⛔ 出厂必须是关的 —— 这一族会给 cover 也打开修补遍(代价)
+        // ➕ ⛔⛔⛔ S166d —— **出厂必须关**。用户 2026-08-30 耳判：开着时
+        // 0:45.943-0:47.360 整段退化（修补遍 −16 → −18），频谱上谐波全没了、变成宽带噪声；
+        // 而当初翻默认所用的「谐波峰谷比」尺子在**同一段**读到 s1 好 +2.67 dB ⇒ 尺子已判死。
+        // ▶ 重新翻开之前必须先有一把**否决型**的「还是不是人声」闸（HNR / 谱平坦度），
+        //   而且那把闸自己要先能把 0:45.943-0:47.360 的 −18 候选判死。详见 `cover_scoring_enabled` 头上。
         assert!(
-            cover_scoring_enabled() || std::env::var("UTAI_COVER_SCORE").is_ok(),
-            "出厂必须开;只有显式 UTAI_COVER_SCORE=0 才关"
+            !cover_scoring_enabled(),
+            "出厂必须关（S166d 耳判退化）；只有显式 UTAI_COVER_SCORE=1 才开"
         );
+        // ⛔ 而且旋钮必须真的能把它打开 —— 否则上面那条可以靠「永远返回 false」造假，
+        // 这整条路径就又变成没人盯的了（同 `UTAI_COVER_LANDING` 那一条的理由）。
+        {
+            let saved = std::env::var("UTAI_COVER_SCORE").ok();
+            unsafe { std::env::set_var("UTAI_COVER_SCORE", "1") };
+            let on = cover_scoring_enabled();
+            match saved {
+                Some(v) => unsafe { std::env::set_var("UTAI_COVER_SCORE", v) },
+                None => unsafe { std::env::remove_var("UTAI_COVER_SCORE") },
+            }
+            assert!(on, "UTAI_COVER_SCORE=1 必须能把它打开");
+        }
     }
 
     /// ⛔⛔⭐⭐⭐⭐ S166c —— **两条 cover 腿都必须真的把 `notes` 与 `range` 传下去**。
