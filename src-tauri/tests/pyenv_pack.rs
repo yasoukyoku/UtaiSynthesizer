@@ -22,14 +22,36 @@
 #[test]
 #[ignore]
 fn install_local_pack_and_envtest() {
-    utai_lib::suppress_windows_dll_error_dialogs();
-    let file = std::env::var("UTAI_PACK_FILE").expect("set UTAI_PACK_FILE to the built .tar.zst");
-    let picked = std::path::PathBuf::from(&file);
-
     let root = std::env::var("UTAI_TEST_ROOT")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("utai_pyenv_test"));
     let _ = std::fs::remove_dir_all(&root);
+    run_chain(root);
+}
+
+/// S167: the same chain WITHOUT the wipe, for restoring a pack into a root that already
+/// holds data (the dev repo's `data/` after the S96 blast, a user's data root, ...).
+/// `UTAI_TEST_ROOT` is MANDATORY here — there is no temp default, because the only reason
+/// to reach for this variant is that the root is precious. `extract_and_commit` itself
+/// handles a pre-existing install of the same id (moved aside, restored on failure).
+///
+///   UTAI_TEST_ROOT=D:\MyDev\Utai_v2-dev\data UTAI_PACK_FILE=...\runtime-cpu-v1.tar.zst \
+///     cargo test --test pyenv_pack install_local_pack_into_root_no_wipe -- --ignored --nocapture
+#[test]
+#[ignore]
+fn install_local_pack_into_root_no_wipe() {
+    let root = std::path::PathBuf::from(
+        std::env::var("UTAI_TEST_ROOT").expect("set UTAI_TEST_ROOT explicitly (this variant never wipes)"),
+    );
+    assert!(root.is_dir(), "UTAI_TEST_ROOT must already exist: {}", root.display());
+    run_chain(root);
+}
+
+fn run_chain(root: std::path::PathBuf) {
+    utai_lib::suppress_windows_dll_error_dialogs();
+    let file = std::env::var("UTAI_PACK_FILE").expect("set UTAI_PACK_FILE to the built .tar.zst");
+    let picked = std::path::PathBuf::from(&file);
+
     std::fs::create_dir_all(&root).unwrap();
     utai_lib::pyenv::init_runtime_root(&root);
 
