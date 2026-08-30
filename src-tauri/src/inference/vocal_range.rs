@@ -3105,6 +3105,39 @@ pub fn cover_scoring_enabled() -> bool {
     std::env::var("UTAI_COVER_SCORE").ok().as_deref().map(str::trim) != Some("0")
 }
 
+/// ⚙ 出厂默认 = 10.0 —— **逐格增益打开时**的休止尾部护栏(ms)。
+/// `UTAI_RANGE_REST_TAIL=<ms>` 可扫;设成 [`REST_TAIL_GUARD_MS`] 的 40 就回到 S166c 之前。
+///
+/// # ⛔ 为什么 40 ms 那一版在逐格时代是**冗余**的
+/// [`REST_TAIL_GUARD_MS`] = 40 存在的理由是「`consonant_preroll` 把下一个音的辅音搬进休止尾部,
+/// 那一段必须保持原电平」。⚠ 但那是**整段一个增益**时代的护栏 —— 一个数会把 preroll 一起压死。
+/// **改成逐格之后它自己就成立了**:含 preroll 的那一格,`base` 里**也有**同一个 preroll
+/// ⇒ 比值 ≈ 1 ⇒ 增益 ≈ 1 ⇒ **那一格本来就不会被动**。
+///
+/// # ⭐⭐ 而它正在吃掉修复(实测)
+/// 用户 2026-08-30 报的咔哒修完之后,残留的凸起**全都落在休止的 +60…+100 ms**
+/// —— 正是 40 ms 尾护栏开始把增益放回 1.0 的地方。
+/// 而 140 ms 的休止上,`40(头) + 20(头淡化) + 40(尾)` 之后**只剩 40 ms 是满增益**。
+///
+/// ⛔⛔ **更硬的一条:那几处根本没有 preroll 要保护**。
+/// 逐个查了残留最大的五处,下一个音是:
+/// `[1243]うぉ · [1157]うぉ(= 用户点名的 3:36.549)· [562]うぉ` —— **元音起头,没有辅音**;
+/// 只有 `[619]こ · [1148]か` 是辅音起头。⇒ **3/5 处的护栏在保护一个不存在的东西。**
+///
+/// ⚙ 留 10 ms:只为避免休止末端的增益台阶(硬跳本身就是一条缝,v9 判负的形状)。
+/// ⛔ **铁律「辅音时序一个字节不许动」没有被破坏** —— 这里动的是**增益包络**,不是时序;
+/// 而且逐格增益对真正的 preroll 本来就读到 ≈1。
+const REST_TAIL_GUARD_CELL_MS_DEFAULT: f32 = 10.0;
+
+/// ⚙ 出厂默认 = 10.0。见 [`REST_TAIL_GUARD_CELL_MS_DEFAULT`]。
+pub fn rest_tail_guard_cell_ms() -> f32 {
+    std::env::var("UTAI_RANGE_REST_TAIL")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (0.0..=200.0).contains(v))
+        .unwrap_or(REST_TAIL_GUARD_CELL_MS_DEFAULT)
+}
+
 /// ⭐ S166c —— 一个「音」至少这么多帧(100 fps)。比这短的浊音连段并进邻段。
 /// ⚙ 5 帧 = 50 ms:短于一个日语短音节,再短就不是「音」而是抖动了。
 const COVER_NOTE_MIN_FRAMES: i64 = 5;
@@ -8072,7 +8105,10 @@ fn splice_kept(
             // ⭐⭐⭐⭐ S163 v10 —— 每段休止一个**增益**(压到 `base` 的电平),不换内容。
             //    ⛔ 只在这里算一次,不许放进逐样本循环。
             let hf = ((f64::from(sample_rate) * f64::from(REST_GAIN_FADE_MS) / 1000.0) as usize).max(1);
-            let tf = ((f64::from(sample_rate) * f64::from(REST_TAIL_GUARD_MS) / 1000.0) as usize).max(1);
+            // ⭐⭐ S166c —— 逐格增益打开时用**短**尾护栏(见 [`REST_TAIL_GUARD_CELL_MS_DEFAULT`]);
+            //    关掉逐格 ⇒ 回到 [`REST_TAIL_GUARD_MS`] = 40 ⇒ **逐位回到 S166 之前**。
+            let tail_ms = if rest_cell_ms > 0.0 { rest_tail_guard_cell_ms() } else { REST_TAIL_GUARD_MS };
+            let tf = ((f64::from(sample_rate) * f64::from(tail_ms) / 1000.0) as usize).max(1);
             let rest_e = |v: &[f32]| -> f64 {
                 if v.is_empty() {
                     return 0.0;
@@ -13648,6 +13684,7 @@ mod tests {
             ("LANDING_MISMATCH_EPS_DEFAULT", "pub fn landing_mismatch_eps("),
             ("LANDING_DIP_EPS_DEFAULT", "pub fn landing_dip_eps("),
             ("REST_GAIN_CELL_MS_DEFAULT", "pub fn rest_gain_cell_ms("),
+            ("REST_TAIL_GUARD_CELL_MS_DEFAULT", "pub fn rest_tail_guard_cell_ms("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
