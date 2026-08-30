@@ -922,7 +922,7 @@ const UVGATE_GUARD_MS_DEFAULT: f32 = 20.0;
 ///
 /// ⛔ 出厂先关：这一族的每一把刀都要先有**治愈 + 代价两张账**（S160k 血训）。
 fn parse_uvgate_adapt(v: Option<&str>) -> bool {
-    matches!(v.map(str::trim), Some("1" | "true" | "on" | "yes"))
+    !matches!(v.map(str::trim), Some("0"))
 }
 
 /// ⚙ 自适应护栏的**分析窗**（ms，从 run 末端往回量）。
@@ -940,10 +940,19 @@ const UVGATE_TAIL_HOP_MS: f32 = 5.0;
 /// 2:44.029 て→こ /k/   落差 **43.8 dB**   ← 该撤
 /// 0:00.280 [2]し        落差 ** 5.5 dB**   ← **不该撤**
 /// ```
-/// ⭐ 第一版取 3.0，于是把 `0:00.280` 的 5.5 也当成鼓包 ⇒ **把曲子开头第三个音的 /ʃ/
-/// 吃掉了 12 dB**（而不救援臂同处也有那个能量 ⇒ 它是正当内容）。
-/// ⚠ 阈值是从**三个点**分开的，不是人群 ⇒ 所以它是**旋钮**，而不是写死的常数。
-const UVGATE_RISE_DB_DEFAULT: f32 = 8.0;
+/// # ⛔⛔ 而上面那三个数是在**错的层**量的 —— 它们是**成品域**的读数，
+/// 而门跑在 **donor 域**（逆变换之前）。我据此把阈值定到 8.0，结果**把治愈也一起丢了**
+/// （`1:36.450` 读 31.3 = 没动）。⭐ **凡给一个内部判据选阈值，必须从它自己那一层的分布里选。**
+///
+/// # ✅ 出厂 = **3.0**（用户 2026-08-30 耳判）
+/// 仪器曾报 `0:00.280` 的 /ʃ/ 被吃掉 12 dB，我据此判过一次负；
+/// 用户实听三个坐标（`0:00.28` / `1:36.45` / `1:20`）**一个都没炸**，
+/// 而 `1:36.45` 「打中了伪影反而听感更好了」。
+/// ⇒ **那一条「代价」是纯仪器的，不可闻** —— 而人群面的代价本来就在噪声底以内
+/// （77 格 / 0.77 s vs 噪声底 74 格 / 0.74 s）。
+/// ⚠ 判别式在分布上**分不开两族**（见 [`uvgate_tail_is_rising`] 头上）——
+/// 它说明的是「这把刀不干净」，**不是「这把刀没用」**；净效果一直是正的。
+const UVGATE_RISE_DB_DEFAULT: f32 = 3.0;
 
 fn parse_uvgate_rise_db(v: Option<&str>) -> f32 {
     v.and_then(|x| x.trim().parse::<f32>().ok())
@@ -5266,7 +5275,7 @@ mod tests {
 
 #[cfg(test)]
 mod s160k_uvgate_tests {
-    use super::{gate_unvoiced_tone, highpass_span, parse_uvgate_adapt};
+    use super::{gate_unvoiced_tone, highpass_span, parse_uvgate_adapt, parse_uvgate_rise_db};
 
     fn tone(n: usize, sr: f32, f: f32) -> Vec<f32> {
         (0..n).map(|i| (2.0 * std::f32::consts::PI * f * i as f32 / sr).sin()).collect()
@@ -5370,16 +5379,27 @@ mod s160k_uvgate_tests {
         );
     }
 
-    /// ⛔ S166d —— 自适应护栏 **出厂必须关**（治愈与代价两张账齐了才能翻），
-    /// 而且旋钮必须真的能把它打开 —— 否则上面那条判据可以靠「永远返回 false」造假。
+    /// ✅ S166e —— 自适应护栏 **出厂必须开**（用户 2026-08-30 耳判），
+    /// 而且 `=0` 必须真的关得掉 —— 否则上面那条判据可以靠「永远返回 true」造假。
+    ///
+    /// # ⛔ 我先前据仪器判过一次负，被耳判推翻
+    /// 仪器报 `0:00.280` 的 /ʃ/ 被吃掉 **12 dB**，我据此把这把刀判了负；
+    /// 用户实听三个坐标（`0:00.28` / `1:36.45` / `1:20`）**一个都没炸**，
+    /// 而 `1:36.45`「打中了伪影反而听感更好了」。
+    /// ⇒ ⭐⭐ **那条「代价」不可闻**；而人群面的代价本来就在噪声底以内
+    /// （77 格 / 0.77 s vs 同构型两渲的 74 格 / 0.74 s）。
+    /// ⚠ 判别式在分布上分不开两族 —— 那说明「不干净」，**不是「没用」**。
     #[test]
-    fn the_adaptive_guard_is_off_by_default_and_the_knob_really_turns_it_on() {
-        assert!(!parse_uvgate_adapt(None), "出厂必须关");
-        assert!(!parse_uvgate_adapt(Some("0")), "0 关");
-        assert!(!parse_uvgate_adapt(Some("垃圾")), "垃圾值一律落回出厂");
-        for v in ["1", "true", "on", "yes"] {
-            assert!(parse_uvgate_adapt(Some(v)), "{v} 应当能打开它");
+    fn the_adaptive_guard_is_on_by_default_and_zero_really_turns_it_off() {
+        assert!(parse_uvgate_adapt(None), "出厂必须开（S166e 耳判翻的）");
+        assert!(!parse_uvgate_adapt(Some("0")), "只有字面量 0 关得掉");
+        for v in ["1", "true", "on", "yes", "垃圾"] {
+            assert!(parse_uvgate_adapt(Some(v)), "{v} 不该关掉它（垃圾值一律落回出厂）");
         }
+        // ⛔ 阈值也要钉住：用户耳判的那一版就是 **3**，而我把它改成 8 那一次
+        //    **把治愈也一起丢了**（`1:36.450` 读 31.3 = 没动）。
+        assert_eq!(parse_uvgate_rise_db(None), 3.0, "出厂阈值必须是 3（耳判的那一版）");
+        assert_eq!(parse_uvgate_rise_db(Some("8")), 8.0, "旋钮必须真的能换阈值");
     }
     /// S160k —— 门只碰 `note_hz == 0` 的连续帧,而且**必须有一个浊音参照**才动手。
     #[test]
