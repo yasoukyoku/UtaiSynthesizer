@@ -7097,6 +7097,20 @@ pub fn apply_dead_only_windows_with(
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty());
     let control = nodip.as_ref().map(|_| base.to_vec());
+    // ⭐⭐⭐⭐⭐ S166c —— **只切换逐格休止增益**的同 run 对照臂(`UTAI_RANGE_DUMP_NOCELL=<目录>`)。
+    //
+    // ⛔⛔ 它存在的理由是一次当场判负:我先拿**两条独立渲染**(`REST_CELL=0` vs `=10`)去比
+    //    休止峰值,读到「逐格开之后 20 个休止反而更响、最差 +22.86 dB」——
+    //    而 `rest_w` 的增益按构造 **≤ 1(只压不抬)**,那是**不可能**的。
+    //    根因:**donor 的解码本身跨 run 就不一样**(S162 登记),噪声压过了要量的 3 dB 效应。
+    //    ⇒ 这一族的验收**只能**走同一次 run:同一份 `kept` = 同一份 donor、同一次解码,
+    //      两条只差 `rest_cell_ms` 一个变量,**零解码噪声、零对齐抖动**。
+    // ⛔ 判据不许读这个 env —— 它只写文件,不改本次渲染的音频(与 `dump_donor_buffer` 同性质)。
+    let nocell = std::env::var("UTAI_RANGE_DUMP_NOCELL")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let cell_control = nocell.as_ref().map(|_| base.to_vec());
     let tied_xf_samples = (tied_xf_ms * f64::from(sample_rate) / 1000.0) as usize;
 
     let out = splice_kept(
@@ -7177,6 +7191,58 @@ pub fn apply_dead_only_windows_with(
             ) {
                 Ok(()) => dump("nodip.f32", &buf),
                 Err(e) => tracing::warn!("range: same-run control arm failed: {e}"),
+            }
+        }
+        // ⭐ S166c —— 逐格休止增益的同 run 对照(见上面 `nocell` 的注释)。
+        if let (Some(dir), Some(mut buf)) = (nocell, cell_control) {
+            let dump = |name: &str, b: &[f32]| {
+                let dir = std::path::Path::new(&dir);
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    tracing::warn!("range: same-run cell arm cannot mkdir {}: {e}", dir.display());
+                    return;
+                }
+                let mut bytes = Vec::with_capacity(b.len() * 4);
+                for v in b {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let p = dir.join(name);
+                match std::fs::write(&p, &bytes) {
+                    Ok(()) => tracing::info!(
+                        "range: same-run cell arm {} samples -> {}",
+                        b.len(),
+                        p.display()
+                    ),
+                    Err(e) => tracing::warn!("range: same-run cell arm write failed {}: {e}", p.display()),
+                }
+            };
+            // ⑴ 逐格**开**(= 本次渲染真正用的那一条)
+            dump("cell.f32", base);
+            // ⑵ 逐格**关**,同一份 `kept`,**其余一个字节不差**(dipfill / onset_fit 都照生产)
+            match splice_kept(
+                &mut buf,
+                sample_rate,
+                spf,
+                jobs,
+                &kept,
+                xf,
+                join_enabled,
+                align,
+                handover_db,
+                notes,
+                tied_xf_samples,
+                dipfill_depth_db(),
+                rest_base_enabled(),
+                0.0,
+                if seam_ramp_enabled() {
+                    (SEAM_RAMP_MS * f64::from(sample_rate) / 1000.0) as usize
+                } else {
+                    0
+                },
+                onset_fit_enabled(),
+                seam_align_wide(),
+            ) {
+                Ok(()) => dump("nocell.f32", &buf),
+                Err(e) => tracing::warn!("range: same-run cell arm failed: {e}"),
             }
         }
     }
