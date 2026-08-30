@@ -3076,6 +3076,94 @@ fn cover_landing() -> Option<i64> {
 }
 
 /// 返回 `(Vec<DeadJob>, Vec<无解区域(起,止)>)` — caller 恒审计带位置。
+/// ⚙ 出厂默认 = false —— `UTAI_COVER_SCORE=1` 打开:**给翻唱轨也开落点打分**。
+///
+/// # ⛔ 它治的是用户点名的「donor 也哑」(0:58)
+/// 实测那一处 donor 的谐波峰谷比:`−11 → 16.0 · −13 → 23.4 · **−16(今天)→ 21.0** · **−20 → 34.7**`
+/// ⇒ **好落点存在,差 13.7 dB,只是没选到**。而深度预算那条路**已判负**
+/// (`UTAI_COVER_LANDING` 接上之后实测 **0/72 段落点没变**),扫描表也预测不了它
+/// (`low_ratio` 226 对一致率只有 66 %)⇒ **只能渲了再量**。
+///
+/// # 它做了什么
+/// 把 [`cover_note_spans`] 铺出来的表 + `SpeakerRange` 一起传进拼接层
+/// ⇒ `scoring` 打开 ⇒ 候选生成 / 逐音打分 / 修补遍 / 天花板闸 **全部对 cover 生效**。
+///
+/// ⚠ **代价**:修补遍会给 cover 也多渲 donor 遍(谱面轨上它占了整场渲染的大头)。
+/// ⛔ 所以出厂**先关**,量完代价与收益再翻。
+pub fn cover_scoring_enabled() -> bool {
+    std::env::var("UTAI_COVER_SCORE").ok().as_deref().map(str::trim) == Some("1")
+}
+
+/// ⭐ S166c —— 一个「音」至少这么多帧(100 fps)。比这短的浊音连段并进邻段。
+/// ⚙ 5 帧 = 50 ms:短于一个日语短音节,再短就不是「音」而是抖动了。
+const COVER_NOTE_MIN_FRAMES: i64 = 5;
+
+/// ⭐ S166c —— 一段清音/静音要这么长才算「休止」。
+/// ⚙ 20 帧 = 200 ms。⛔ **别调小**:cover 的清音段大多是**辅音**,不是空拍;
+/// 把辅音标成休止会让 [`REST_BASE_FADE_MS`] 那一层去压它 —— 那是另一把刀,不该被这里顺手打开。
+const COVER_REST_MIN_FRAMES: i64 = 20;
+
+/// ⭐ S166c —— 浊音连段内部,相邻两帧音高跳过这么多半音就断开成两个「音」。
+/// ⚙ 2 个半音:大于常见颤音(±0.5)与滑音的逐帧步长,小于真正的换音。
+const COVER_NOTE_SPLIT_ST: f32 = 2.0;
+
+/// ⭐⭐⭐⭐⭐ S166c —— **从 cover 自己的 f0 铺出 [`NoteSpan`] 表**。
+///
+/// # ⛔ 它是打开整套落点打分机器的**唯一**钥匙
+/// `apply_dead_only_windows_with` 里的 `scoring` 是
+/// `(alts 非空 || repair_ms>0 || comb_floor>0 || usag>0 || h2>0 || mism>0) && **!notes.is_empty()**`。
+/// 而 cover 今天 `notes` 传的是**空切片** ⇒ `scoring == false`
+/// ⇒ **候选生成 / 逐音打分 / 修补遍 / 天花板闸 全是死代码**。
+/// ⚠ 而括号里那几个出厂本来就非零(`repair_ms` / `mism`)⇒ **只要把这张表喂进去,机器就自己转起来**。
+///
+/// # ⛔ 「传 notes」不是「传 MIDI」
+/// [`NoteSpan`] 只要四样:起始帧 · 帧数 · 是不是唱音 · **目标基频 hz**。
+/// cover 手上正好有全部材料(RMVPE 的逐帧 f0 + 浊音标志)⇒ **f0 就是唯一来源**,
+/// 「notes」只是这个结构体的名字。用户 2026-08-30 问的就是这一点。
+///
+/// # 口径
+/// * **浊音连段** → 一个「音」,`hz` = 该段 f0 的**中位**(⛔ 不用均值:颤音与八度离群点会拖偏);
+///   段内相邻两帧跳过 [`COVER_NOTE_SPLIT_ST`] 半音 ⇒ 在那里断开(滑音不算换音);
+///   短于 [`COVER_NOTE_MIN_FRAMES`] 的段**丢掉**(不进表 = 那一段既不是音也不是休止)。
+/// * **清音/静音连段** ≥ [`COVER_REST_MIN_FRAMES`] → 一个「休止」(`sung: false`)。
+///   ⛔ 短的**不进表** —— cover 的清音大多是辅音,标成休止会误开另一把刀。
+///
+/// ⚠ 帧轴 = **调用者的 f0 帧轴**(cover 是 100 fps),与 `DeadJob.start/end` 同一条。
+pub fn cover_note_spans(f0_hz: &[f32]) -> Vec<NoteSpan> {
+    let midi = |v: f32| 69.0 + 12.0 * (v / 440.0).log2();
+    let mut out: Vec<NoteSpan> = Vec::new();
+    let mut i = 0usize;
+    while i < f0_hz.len() {
+        let voiced = f0_hz[i] > 0.0;
+        let mut j = i + 1;
+        while j < f0_hz.len() && (f0_hz[j] > 0.0) == voiced {
+            // 浊音段内:音高跳变 ⇒ 断开
+            if voiced && (midi(f0_hz[j]) - midi(f0_hz[j - 1])).abs() > COVER_NOTE_SPLIT_ST {
+                break;
+            }
+            j += 1;
+        }
+        let n = (j - i) as i64;
+        if voiced {
+            if n >= COVER_NOTE_MIN_FRAMES {
+                let mut v: Vec<f32> = f0_hz[i..j].to_vec();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                out.push(NoteSpan {
+                    start: i as i64,
+                    frames: n,
+                    sung: true,
+                    hz: v[v.len() / 2],
+                    tied: false,
+                });
+            }
+        } else if n >= COVER_REST_MIN_FRAMES {
+            out.push(NoteSpan { start: i as i64, frames: n, sung: false, hz: 0.0, tied: false });
+        }
+        i = j;
+    }
+    out
+}
+
 pub fn cover_dead_plan(
     f0_hz: &[f32],
     fps: f32,
@@ -14625,6 +14713,70 @@ mod tests {
             (q_on - q_off).abs() <= q_off * 0.05 + 1e-6,
             "donor 在休止里本来就安静,逐格增益却动了电平:{q_off:.5} ⇒ {q_on:.5} —— \
              v14『砍电平』就是这样被否掉的"
+        );
+    }
+
+    /// ⭐⭐⭐⭐ S166c —— **从 cover 自己的 f0 铺 [`NoteSpan`]**(打开落点打分机器的钥匙)。
+    ///
+    /// ⛔ 用户 2026-08-30 问的正是这一条:「把 notes 传进 cover 是指传 MIDI 吗?f0 用不了嘛?」
+    /// —— [`NoteSpan`] 只要「起始帧 · 帧数 · 是不是唱音 · 目标 hz」,**f0 就是唯一来源**。
+    ///
+    /// 四条:⑴ 浊音连段成「音」、`hz` 取中位;⑵ 音高跳变处断开(滑音不断);
+    /// ⑶ ⛔ 太短的浊音段**不进表**;⑷ ⛔ **短清音段不进表** ——
+    /// cover 的清音大多是**辅音**不是空拍,标成休止会误开 [`REST_BASE_FADE_MS`] 那一层。
+    #[test]
+    fn cover_note_spans_are_built_from_f0_not_from_a_score() {
+        // 0-9 静音(10 帧,短于 COVER_REST_MIN_FRAMES=20)· 10-39 浊音 440 Hz ·
+        // 40-44 静音(5 帧,短)· 45-79 浊音 880 Hz · 80-109 静音(30 帧,够长)· 110-112 浊音(3 帧,太短)
+        let mut f0 = vec![0.0f32; 113];
+        for v in f0[10..40].iter_mut() {
+            *v = 440.0;
+        }
+        for v in f0[45..80].iter_mut() {
+            *v = 880.0;
+        }
+        for v in f0[110..113].iter_mut() {
+            *v = 660.0;
+        }
+        let sp = cover_note_spans(&f0);
+        let sung: Vec<&NoteSpan> = sp.iter().filter(|n| n.sung).collect();
+        let rests: Vec<&NoteSpan> = sp.iter().filter(|n| !n.sung).collect();
+        assert_eq!(
+            sung.iter().map(|n| (n.start, n.frames, n.hz)).collect::<Vec<_>>(),
+            vec![(10, 30, 440.0), (45, 35, 880.0)],
+            "浊音连段该成两个音、`hz` 取中位(读到 {sp:?})"
+        );
+        assert_eq!(
+            rests.iter().map(|n| (n.start, n.frames)).collect::<Vec<_>>(),
+            vec![(80, 30)],
+            "⛔ 只有 >= COVER_REST_MIN_FRAMES 的清音段才算休止 —— \
+             短的是**辅音**,标成休止会误开 rest_base 那一层(读到 {sp:?})"
+        );
+        assert!(
+            !sp.iter().any(|n| n.start == 110),
+            "⛔ 太短的浊音段不许进表(读到 {sp:?})"
+        );
+
+        // ⑵ 音高跳变断开 vs 滑音不断
+        let mut jump = vec![440.0f32; 40];
+        for v in jump[20..].iter_mut() {
+            *v = 880.0; // 一个八度 = 12 半音 > COVER_NOTE_SPLIT_ST
+        }
+        let j = cover_note_spans(&jump);
+        assert_eq!(j.len(), 2, "跳一个八度必须断开成两个音(读到 {j:?})");
+        let glide: Vec<f32> = (0..40).map(|k| 440.0 * 2f32.powf(k as f32 / 12.0 / 8.0)).collect();
+        let g = cover_note_spans(&glide);
+        assert_eq!(
+            g.len(),
+            1,
+            "⛔ 阴性对照:每帧只滑 1/8 半音的滑音**不许**被切碎(读到 {} 段)",
+            g.len()
+        );
+
+        // ⑷ ⛔ 出厂必须是关的 —— 这一族会给 cover 也打开修补遍(代价)
+        assert!(
+            !cover_scoring_enabled() || std::env::var("UTAI_COVER_SCORE").is_ok(),
+            "出厂必须关,只有显式 UTAI_COVER_SCORE=1 才开"
         );
     }
 

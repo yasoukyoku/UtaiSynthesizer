@@ -1661,11 +1661,31 @@ pub fn run_pipeline(
         // floor+ContentVec 行数上限),曲尾夹紧窗的缺口若垫零会把数字零拼进窗内(咔哒+
         // 静默)——垫 base 则未覆盖样本自动回退旧契约「donor 短了保留 base」。
         let base_snapshot = audio_opt.clone();
-        super::vocal_range::apply_dead_only_windows(
+        // ⭐⭐⭐⭐⭐ S166c —— **翻唱轨的落点打分**(`UTAI_COVER_SCORE=1`,出厂关)。
+        //    ⛔ `notes` 空 ⇒ `scoring == false` ⇒ 候选/打分/修补遍/天花板闸对 cover 全是死代码。
+        //    见 [`cover_note_spans`] 与 [`cover_scoring_enabled`]。
+        let cover_spans: Vec<super::vocal_range::NoteSpan> =
+            if super::vocal_range::cover_scoring_enabled() {
+                super::vocal_range::cover_note_spans(&pf_out)
+            } else {
+                Vec::new()
+            };
+        if !cover_spans.is_empty() {
+            tracing::info!(
+                "range-extend(cover/rvc): scoring ON — {} note span(s) from f0 ({} sung)",
+                cover_spans.len(),
+                cover_spans.iter().filter(|n| n.sung).count()
+            );
+        }
+        super::vocal_range::apply_dead_only_windows_alts(
             &mut audio_opt,
             final_sr,
             out_frames as i64,
             &range_jobs,
+            &[],
+            &cover_spans,
+            // ⭐ 天花板闸要它;`None` ⇒ 那道闸不存在 ⇒ 逐位回到今天。
+            if cover_spans.is_empty() { None } else { range },
             false, // cover 无逐渲归一——电平=模型对移调的真实响应,不全局拉平
             // ⚠ 同 sovits cover 臂:第二个参数用不上,cover 要的是样本域带 pad 的合并跨度。
             |s, _own| {
