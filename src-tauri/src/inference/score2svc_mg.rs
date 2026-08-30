@@ -59,13 +59,46 @@ fn mg_device() -> DeviceConfig {
 }
 
 fn mg_out_dir() -> std::path::PathBuf {
-    match std::env::var("UTAI_MG_OUTDIR") {
+    let p = match std::env::var("UTAI_MG_OUTDIR") {
         Ok(s) if !s.trim().is_empty() => {
             let p = std::path::PathBuf::from(s.trim());
             if p.is_absolute() { p } else { Path::new(WORK).join("probe").join(p) }
         }
         _ => Path::new(WORK).join("probe"),
+    };
+    mg_ensure_writable(&p);
+    p
+}
+
+/// S166c —— **出口先建先验**。⛔ 起因:`UTAI_COVER_OUT` 指到一个不存在的目录,
+/// 而 `write_wav16` 是裸 `unwrap` ⇒ 一条 **147 秒**的 cover 臂渲完了才 panic 在落盘上,
+/// 整轮白烧;换成整曲谱面臂就是 CPU 上 5-7 分钟。
+///
+/// ⛔ 这正是铁律那条的形状:**「跑不起来」与「被测的东西不对」报成同一种红**——
+/// 台子尾巴上一个 `unwrap` panic,看上去和「渲染失败」没有区别。
+/// ⇒ 建目录(顺手把「目录不存在」这一族彻底消掉)+ **真写一个探针文件再删掉**
+/// (权限/只读盘/路径非法这些 `create_dir_all` 看不出来的,必须真写一次才知道),
+/// 失败时的措辞明说是**落盘**不是渲染。
+///
+/// ⚠ 只给台子用(`#[cfg(test)]` 模块内)。生产落盘另有 `write_wav_norm` 的错误链,不走这里。
+fn mg_ensure_writable(dir: &Path) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        panic!("[mg] 出口目录建不出来(落盘问题,不是渲染问题):{} —— {e}", dir.display());
     }
+    let probe = dir.join(".utai_write_probe");
+    if let Err(e) = std::fs::write(&probe, b"utai") {
+        panic!("[mg] 出口目录写不进去(落盘问题,不是渲染问题):{} —— {e}", dir.display());
+    }
+    let _ = std::fs::remove_file(&probe);
+}
+
+/// 同上,但给的是**文件**路径(`UTAI_COVER_OUT` 这一族)——验它的父目录。
+fn mg_ensure_out_file(path: &str) {
+    let p = Path::new(path);
+    if p.extension().is_none() {
+        panic!("[mg] 出口 {path:?} 没有扩展名 —— 这一族要的是**文件**路径不是目录");
+    }
+    mg_ensure_writable(p.parent().unwrap_or(Path::new(".")));
 }
 
 #[derive(serde::Deserialize)]
@@ -1513,6 +1546,8 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
         std::env::var("UTAI_MG_SLICE").is_err(),
         "dead-only 臂必须整曲渲:计划与窗都是全曲三元组坐标,切片会让它们指到别的音上"
     );
+    // ⭐ S166c —— 整曲臂在 CPU 上 5-7 分钟,出口先验(见 `mg_ensure_writable`)。
+    let _ = mg_out_dir();
     let sj = load_score();
     let triples = &sj.triples[..];
     let evts = to_evts(triples);
@@ -1747,6 +1782,9 @@ fn mg_cover_rvc() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
     let inp = std::env::var("UTAI_COVER_IN").expect("UTAI_COVER_IN=<wav> required");
     let out = std::env::var("UTAI_COVER_OUT").expect("UTAI_COVER_OUT=<wav> required");
+    // ⭐ S166c —— **在加载模型之前**验出口:这条臂要跑 147-321 秒,
+    //    出口写不出去的话,不验就要等渲完才知道(见 `mg_ensure_writable` 的注释)。
+    mg_ensure_out_file(&out);
     // ⛔ 解析不了就 panic,不许静默回落 —— 与 `probe_arm` 同一条规矩:
     //    「臂开着」与「臂做了事」必须可查,而 `UTAI_COVER_RANGE=on` 手滑读成 0 会伪造一条阴性臂。
     let want_range = match std::env::var("UTAI_COVER_RANGE").as_deref() {
@@ -1850,6 +1888,9 @@ fn mg_cover_sovits() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
     let inp = std::env::var("UTAI_COVER_IN").expect("UTAI_COVER_IN=<wav> required");
     let out = std::env::var("UTAI_COVER_OUT").expect("UTAI_COVER_OUT=<wav> required");
+    // ⭐ S166c —— **在加载模型之前**验出口:这条臂要跑 147-321 秒,
+    //    出口写不出去的话,不验就要等渲完才知道(见 `mg_ensure_writable` 的注释)。
+    mg_ensure_out_file(&out);
     // ⛔ 解析不了就 panic,不许静默回落(同 `mg_cover_rvc`):
     //   「臂开着」与「臂做了事」必须可查,而 `UTAI_COVER_RANGE=on` 手滑读成 0 会伪造一条阴性臂。
     let want_range = match std::env::var("UTAI_COVER_RANGE").as_deref() {

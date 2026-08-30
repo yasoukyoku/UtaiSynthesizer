@@ -285,11 +285,41 @@ pub(super) fn write_wav16(path: &Path, samples: &[f32], sr: u32) {
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut w = hound::WavWriter::create(path, spec).unwrap();
-    for &s in samples {
-        w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
+    // ⭐ S166c —— 兜底建父目录 + **归因措辞**。原来这三行是裸 `unwrap`，于是
+    // 「出口目录不存在」会在**渲染跑完之后**炸成一个看不出所以然的 panic
+    // （实测烧掉过一条 147 秒的 cover 臂）。⛔ 铁律：「跑不起来」不许和
+    // 「被测的东西不对」报成同一种红 —— 所以这里明说是**落盘**。
+    // ⚠ 真正的闸在台子入口（`mg_ensure_writable`）；这里只是最后一道。
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
-    w.finalize().unwrap();
+    let mut w = hound::WavWriter::create(path, spec)
+        .unwrap_or_else(|e| panic!("落盘失败（渲染已完成）：{} —— {e}", path.display()));
+    for &s in samples {
+        w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .unwrap_or_else(|e| panic!("落盘失败（渲染已完成）：{} —— {e}", path.display()));
+    }
+    w.finalize()
+        .unwrap_or_else(|e| panic!("落盘收尾失败（渲染已完成）：{} —— {e}", path.display()));
+}
+
+/// S166c —— **真触发一次那条错误路径**（规矩：「一条从没被执行过的错误分支就是一条空判据」）。
+/// 这条判据保的是：出口目录不存在时，**渲染的产物不会丢**。
+#[test]
+fn a_missing_output_directory_may_not_swallow_a_finished_render() {
+    let root = std::env::temp_dir()
+        .join("utai_s166c_ff")
+        .join(format!("{:?}", std::thread::current().id()));
+    let _ = std::fs::remove_dir_all(&root);
+    // 故意多套两层还不存在的目录 —— 这正是烧掉那条 147 秒臂的形状。
+    let out = root.join("nope").join("deeper").join("a.wav");
+    assert!(!out.parent().unwrap().exists(), "前提：父目录本来不存在");
+    write_wav16(&out, &[0.0, 0.5, -0.5, 0.0], 44_100);
+    assert!(out.exists(), "落盘应当自己把父目录建出来，而不是把渲染结果丢掉");
+    let r = hound::WavReader::open(&out).expect("写出来的应当是一份能读的 wav");
+    assert_eq!(r.spec().sample_rate, 44_100);
+    assert_eq!(r.len(), 4, "四个样本应当一个不少地落盘");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
