@@ -5275,6 +5275,49 @@ const ONSET_FIT_STEADY_LO_MS: f32 = 50.0;
 /// 见 [`ONSET_FIT_STEADY_LO_MS`]。
 const ONSET_FIT_STEADY_HI_MS: f32 = 150.0;
 
+/// ⭐⭐⭐⭐⭐ S166c —— **休止增益的格宽(ms)**;`0.0` = 关 = 整段一个增益 = 逐位回到 S166 之前。
+///
+/// # ⛔ 它治的缺陷:v10 的增益是**整段一个数、用 RMS 算的**,而缺陷是**孤立的短爆发**
+/// 用户 2026-08-30 报的 3:36.549(鹅妈妈 +7 × 东雪莲):休止 [1156] 160 ms 里,
+/// 数字静音之后有一段**孤立的 20 ms 爆发**(±0.11),与后面那个音**完全断开**
+/// ⇒ 听感就是「咔哒」。
+///
+/// **隔离口径**(同一个模型、同一条路,唯一变量是救援开/关 —— `UTAI_MG_PLAN` 把计划缩到
+/// 一个远处的组):不救援时那段休止是**平的**,救援打开后爆发出现 ⇒ **是我们造的**。
+///
+/// # ⭐⭐ 为什么 v10 结构上够不着它
+/// `rest_g` 用**整段 RMS** 比 `base` 与 donor。一个 20 ms 的爆发在 60 ms 的段里
+/// 只把 RMS 抬约 5 dB,再乘 [`REST_GAIN_FRACTION`] 的 0.5 ⇒ **对一个 20 dB 的爆发只压 2.5 dB**。
+/// ⇒ 不是门限调得不好,是**时间分辨率**不够。
+///
+/// # ⛔ 与三把判负的刀的区别(别重造)
+/// * **v9**(往窗里插 `base` 段)= **内容切换 = 缝**;这里**只改增益,不换内容**,与 v10 同性质。
+/// * **v14**(压到 `base + 6 dB` 以内)= **砍电平**(p10 −9.91 dB);这里沿用 v10 的
+///   `0.5 ×` 与 [`REST_GAIN_MIN_DB`] 夹持,**一个字节没放宽**,只是把同一条公式按格算。
+/// * **v16**(拉长淡入)= 只是整体延后;这里不动任何时序。
+///
+/// ⛔ [`REST_HEAD_GUARD_MS`] / [`REST_TAIL_GUARD_MS`] **一个字节不动** ——
+/// 尾部那 40 ms 是给 `consonant_preroll` 留的,铁律「辅音时序一个字节不许动」。
+///
+/// ⚙ 10 ms + **居中两格宽**的取样窗 ⇒ 有效响应约 30 ms,正好是那一族爆发的尺度;
+/// 而两格宽(20 ms)仍长于最低基频的一个周期(50 Hz ⇒ 20 ms),所以增益不会跟着单个周期抖。
+const REST_GAIN_CELL_MS_DEFAULT: f32 = 10.0;
+
+/// ⚙ 出厂默认 = 10.0 —— `UTAI_RANGE_REST_CELL=<ms>`(`0` = 关 = 整段一个增益 = 逐位回到 S166 之前)。
+/// 见 [`REST_GAIN_CELL_MS_DEFAULT`]。
+pub fn rest_gain_cell_ms() -> f32 {
+    std::env::var("UTAI_RANGE_REST_CELL")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && (0.0..=200.0).contains(v))
+        .unwrap_or(REST_GAIN_CELL_MS_DEFAULT)
+}
+
+/// ⭐ S163 v10 —— 休止增益只补**一半**的 dB 差。⛔ 别调大:v14 把它推到「压进 base+6 dB」
+/// 时 p10 掉了 9.91 dB(单点 −15.2)= 砍电平,用户耳判否决。S166c 把增益改成逐格时
+/// **这个系数一个字节没动** —— 一把刀一次只许改一个变量。
+const REST_GAIN_FRACTION: f32 = 0.5;
+
 /// S163 v8 -- rest head guard (ms): the previous note's natural release lives here.
 /// The previous note IS rescued, so its tail must stay donor.
 const REST_HEAD_GUARD_MS: f32 = 40.0;
@@ -7071,6 +7114,7 @@ pub fn apply_dead_only_windows_with(
         // ⭐⭐⭐⭐ S163 §34 —— donor 静音坑回填（出厂 0 = 关 = 逐位不变）。
         dipfill_depth_db(),
         rest_base_enabled(),
+        rest_gain_cell_ms(),
         if seam_ramp_enabled() {
             (SEAM_RAMP_MS * f64::from(sample_rate) / 1000.0) as usize
         } else {
@@ -7121,6 +7165,7 @@ pub fn apply_dead_only_windows_with(
                 tied_xf_samples,
                 0.0,
                 rest_base_enabled(),
+                rest_gain_cell_ms(),
                 if seam_ramp_enabled() {
                     (SEAM_RAMP_MS * f64::from(sample_rate) / 1000.0) as usize
                 } else {
@@ -7458,6 +7503,9 @@ fn splice_kept(
     // ⭐⭐⭐⭐ S163 v8 —— 窗内的**休止**是否保持 `base`(见 [`REST_BASE_FADE_MS`])。
     //    ⛔ 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
     rest_base: bool,
+    // ⭐⭐⭐⭐⭐ S166c —— 休止增益的格宽(ms);`0.0` = 整段一个增益 = 逐位回到 S166 之前。
+    //    ⛔ 同上:参数不是 env,判据才关得掉。见 [`REST_GAIN_CELL_MS_DEFAULT`]。
+    rest_cell_ms: f32,
     // ⭐⭐⭐⭐⭐ S163 v16 —— 短间隙/重叠之后的窗淡入拉长(样本);`0` = 关。见 [`SEAM_RAMP_MS`]。
     seam_ramp: usize,
     // ⭐⭐⭐⭐⭐ S163 v17 —— **起音形状整形**(见 [`ONSET_FIT_MS`])。
@@ -7823,33 +7871,73 @@ fn splice_kept(
             //    ⛔ 只在这里算一次,不许放进逐样本循环。
             let hf = ((f64::from(sample_rate) * f64::from(REST_GAIN_FADE_MS) / 1000.0) as usize).max(1);
             let tf = ((f64::from(sample_rate) * f64::from(REST_TAIL_GUARD_MS) / 1000.0) as usize).max(1);
-            let rest_g: Vec<f32> = rest_spans
+            let rest_e = |v: &[f32]| -> f64 {
+                if v.is_empty() {
+                    return 0.0;
+                }
+                v.iter().map(|&z| f64::from(z) * f64::from(z)).sum::<f64>() / v.len() as f64
+            };
+            // 一格的增益:与 v10 **同一条公式、同一个夹持**,只是作用范围可以是一格而不是整段。
+            let rest_gain_of = |x: usize, y: usize| -> f32 {
+                let sx = (x as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize) as usize;
+                let sy = (y as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize) as usize;
+                let dn = if sy > sx { rest_e(&seg[sx..sy]) } else { 0.0 };
+                let bs = rest_e(&base[x.min(base.len())..y.min(base.len())]);
+                if dn <= 0.0 || bs <= 0.0 {
+                    return 1.0;
+                }
+                // ⛔ 只压不抬:抬会把 donor 的伪影一起放大。
+                let g_db = (10.0 * (bs / dn).log10()) as f32 * REST_GAIN_FRACTION;
+                10f32.powf(g_db.clamp(REST_GAIN_MIN_DB, 0.0) / 20.0)
+            };
+            // ⭐⭐⭐⭐⭐ S166c —— **逐格**增益(见 [`REST_GAIN_CELL_MS_DEFAULT`])。
+            //    `0` ⇒ 每段只有一格 = 整段一个增益 = **逐位回到 S166 之前**。
+            let rcell = ((f64::from(sample_rate) * f64::from(rest_cell_ms) / 1000.0) as usize).max(1);
+            let rest_g: Vec<Vec<f32>> = rest_spans
                 .iter()
                 .map(|&(x, y)| {
-                    let e = |v: &[f32]| -> f64 {
-                        if v.is_empty() {
-                            return 0.0;
-                        }
-                        v.iter().map(|&z| f64::from(z) * f64::from(z)).sum::<f64>() / v.len() as f64
-                    };
-                    // donor 在这段休止上(`seg` 坐标,带对齐偏移 `d`)
-                    let sx = (x as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize) as usize;
-                    let sy = (y as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize) as usize;
-                    let dn = if sy > sx { e(&seg[sx..sy]) } else { 0.0 };
-                    let bs = e(&base[x.min(base.len())..y.min(base.len())]);
-                    if dn <= 0.0 || bs <= 0.0 {
-                        return 1.0;
+                    if rest_cell_ms <= 0.0 {
+                        return vec![rest_gain_of(x, y)];
                     }
-                    // ⛔ 只压不抬:抬会把 donor 的伪影一起放大。
-                    let g_db = (10.0 * (bs / dn).log10()) as f32 * 0.5;
-                    10f32.powf(g_db.clamp(REST_GAIN_MIN_DB, 0.0) / 20.0)
+                    let n = (y.saturating_sub(x)).div_ceil(rcell).max(1);
+                    let raw: Vec<f32> = (0..n)
+                        .map(|c| {
+                            // ⭐⭐ 格窗**居中且两格宽** —— 第二版判负的原因:
+                            //    窗与格对齐时,一个恰好压在格边界上的爆发会被
+                            //    格心插值与邻格(增益 1.0)**对半掺掉** ⇒ 只压了 5.7 %。
+                            //    居中窗 ⇒ 爆发两侧的格也看得见它,插值之后深度才保得住。
+                            let p = x + c * rcell;
+                            let w0 = p.saturating_sub(rcell / 2).max(x);
+                            let w1 = (p + rcell + rcell / 2).min(y);
+                            rest_gain_of(w0, w1)
+                        })
+                        .collect();
+                    // ⛔⛔ 连续性由 `rest_w` 的**格心线性插值**负责,这里**不做移动平均**。
+                    //    第一版做了 ±1 格的移动平均,当场判负:爆发格的增益被两个安静邻格
+                    //    (增益 1.0)平均掉 ⇒ 实际只压了 13 %(判据读到 0.0759 ⇒ 0.0658)。
+                    //    ⇒ **平滑必须发生在【应用】那一层,不是【计算】那一层**,否则深度被稀释。
+                    raw
                 })
                 .collect();
             // 头 `hf` 从 1 渐变到 g;尾 `tf` 从 g 回到 1(辅音 preroll 落在尾部,必须原电平)。
             let rest_w = |k: usize| -> f32 {
                 let mut out = 1.0f32;
-                for (&(x, y), &g) in rest_spans.iter().zip(&rest_g) {
+                for (&(x, y), gs) in rest_spans.iter().zip(&rest_g) {
                     if k >= x && k < y {
+                        // ⭐⭐ S166c —— 按格取增益,**格心之间线性插值**。
+                        //    ⛔ 插值不是装饰:格与格之间硬跳增益就是一条新缝(v9 判负的形状),
+                        //    而**在计算侧做移动平均会把爆发格的深度稀释掉**(第一版判负,只压了 13 %)。
+                        //    ⇒ 深度留在计算侧,连续性交给这里。
+                        let g = if gs.len() == 1 {
+                            gs[0]
+                        } else {
+                            let pos = (k - x) as f32 / rcell as f32 - 0.5;
+                            let i0 = pos.max(0.0).floor() as usize;
+                            let i0 = i0.min(gs.len() - 1);
+                            let i1 = (i0 + 1).min(gs.len() - 1);
+                            let f = (pos - i0 as f32).clamp(0.0, 1.0);
+                            gs[i0] * (1.0 - f) + gs[i1] * f
+                        };
                         let head = ((k - x) as f32 / hf as f32).min(1.0);
                         let tail = ((y - 1 - k) as f32 / tf as f32).min(1.0);
                         let t = head.min(tail);
@@ -9651,7 +9739,7 @@ mod tests {
         let mut out = base.clone();
         splice_kept(
             &mut out, sr, (sr as f64) / 50.0, &jobs, &kept,
-            (sr as usize) / 100, false, 0, 0.0, &notes, 0, 0.0, true, 0, true, false,
+            (sr as usize) / 100, false, 0, 0.0, &notes, 0, 0.0, true, 0.0, 0, true, false,
         )
         .unwrap();
         let peak_out = out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -10784,7 +10872,7 @@ mod tests {
             }
             // ⚠ `tied_xf = 0` ⇒ `xf_at` 恒空 ⇒ 宽窗退化成 `xf` ⇒ 两档必须逐位相同。
             splice_kept(
-                &mut b, SR, spf, &jobs, &kept, xf, false, 48, 0.0, &[], 0, 0.0, true, 0, false, wide,
+                &mut b, SR, spf, &jobs, &kept, xf, false, 48, 0.0, &[], 0, 0.0, true, 0.0, 0, false, wide,
             )
             .unwrap();
             b
@@ -10802,7 +10890,7 @@ mod tests {
             kept.push((0, lo, donor[lo..hi].to_vec()));
         }
         splice_kept(
-            &mut b0, SR, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true, 0, false, false,
+            &mut b0, SR, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true, 0.0, 0, false, false,
         )
         .unwrap();
         assert_ne!(b0, run(false), "对齐半径 0 与 48 必须给出不同结果 —— 否则这个夹具测不到对齐");
@@ -10995,7 +11083,7 @@ mod tests {
                 kept.push((0, lo, donor[lo..hi].to_vec()));
             }
             let xf = (SR as usize / 100).max(2);
-            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0, true, 0, false, false).unwrap();
+            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align, 0.0, &[], 0, 0.0, true, 0.0, 0, false, false).unwrap();
             b
         };
 
@@ -11278,9 +11366,9 @@ mod tests {
         let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left), (1, 0, right)];
 
         let mut off = base.clone();
-        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true, 0, false, false).unwrap();
+        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &[], 0, 0.0, true, 0.0, 0, false, false).unwrap();
         let mut on = base.clone();
-        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0, true, 0, false, false).unwrap();
+        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0, 0.0, &[], 0, 0.0, true, 0.0, 0, false, false).unwrap();
 
         // ⓐ 关着 ⇒ 那个洞必须还在:52800 开窗之后是右 donor 的静音。
         assert!(
@@ -11384,7 +11472,7 @@ mod tests {
             (1, 53_000, right[53_000..(380 * 480)].to_vec()),
         ];
         let mut out = base.clone();
-        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0, true, 0, false, false).unwrap();
+        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0, 0.0, &[], 0, 0.0, true, 0.0, 0, false, false).unwrap();
         assert_eq!(out[0], -1.0, "窗外仍是 base");
         assert!((out[30_000] - 0.5).abs() < 1e-6, "左窗内仍是左 donor");
     }
@@ -13352,6 +13440,7 @@ mod tests {
             ("LANDING_H2_EPS_DEFAULT", "pub fn landing_h2_eps("),
             ("LANDING_MISMATCH_EPS_DEFAULT", "pub fn landing_mismatch_eps("),
             ("LANDING_DIP_EPS_DEFAULT", "pub fn landing_dip_eps("),
+            ("REST_GAIN_CELL_MS_DEFAULT", "pub fn rest_gain_cell_ms("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
@@ -14321,6 +14410,114 @@ mod tests {
             "闸把整个修补遍关掉了:{gated:?} —— 顶内的 −9/−10 必须照旧渲"
         );
         assert!(gated.contains(&-8), "计划那一遍永远不该被闸挡住:{gated:?}");
+    }
+
+    /// ⛔⛔⭐⭐⭐⭐ S166c —— **休止里的孤立爆发必须被压掉,而整段一个增益结构上做不到**。
+    ///
+    /// ## 它治的是用户 2026-08-30 报的 3:36.549(鹅妈妈 +7 × 东雪莲)
+    /// 休止 [1156](160 ms)里,数字静音之后有一段**孤立的 20 ms 爆发**(±0.11),
+    /// 与后面那个音**完全断开** ⇒ 听感就是「咔哒」。
+    /// **隔离口径**(同一个模型、同一条路,唯一变量是救援开/关):不救援时那段休止是**平的**
+    /// ⇒ **是我们造的**。人群面:全曲 180 个休止里,救援把 **24 个**弄响 >3 dB、**10 个** >6 dB,
+    /// 而阴性对照「两侧都没救援」的 42 个里 **0 个** >3 dB。
+    ///
+    /// ## ⭐⭐ 为什么 v10 够不着它
+    /// v10 的增益是**整段一个数、用 RMS 算的**。一个 20 ms 的爆发在 60 ms 的段里
+    /// 只把 RMS 抬约 5 dB,再乘 [`REST_GAIN_FRACTION`] 的 0.5 ⇒ **只压 2.5 dB**。
+    /// ⇒ 不是门限调得不好,是**时间分辨率**不够。
+    ///
+    /// ## 这一条钉三件
+    /// ⑴ 逐格增益**确实压掉**了孤立爆发;
+    /// ⑵ ⛔ **阴性对照 A**:`rest_cell_ms = 0`(整段一个增益)⇒ 爆发**几乎原样留下**
+    ///    —— 这一条不成立,⑴ 就只是「压了一点」而不是「这一刀在起作用」;
+    /// ⑶ ⛔ **阴性对照 B**:donor 在休止里本来就**均匀地安静** ⇒ 逐格与整段**读数一致**
+    ///    (这一刀不许在没有爆发的地方乱动电平 —— v14「砍电平」就是这样被否掉的)。
+    #[test]
+    fn an_isolated_burst_inside_a_rest_is_pulled_down_but_a_quiet_rest_is_not() {
+        const SR: u32 = 44100;
+        let spf = f64::from(SR) / 50.0;
+        // 5 个音:唱 · 唱 · **休止(20 帧 = 400 ms)** · 唱 · 唱
+        let nf = 20i64;
+        let notes: Vec<NoteSpan> = (0..5i64)
+            .map(|i| NoteSpan {
+                start: i * nf,
+                frames: nf,
+                sung: i != 2,
+                hz: 440.0,
+                tied: false,
+            })
+            .collect();
+        let total = 5 * nf;
+        let n = (total as f64 * spf) as usize;
+        let jobs = vec![DeadJob { shift: -6, start: 0, end: total }];
+
+        // base:唱音有声、休止**很安静**(−60 dBFS 的噪声底)
+        let mk_base = || {
+            let mut v = vec![0.0f32; n];
+            for (i, nd) in notes.iter().enumerate() {
+                let (a, b) = ((nd.start as f64 * spf) as usize, ((nd.start + nd.frames) as f64 * spf) as usize);
+                // ⛔ 休止里的 base **不是绝对静音**(真实渲染里是气声/噪声底)。
+                //    第一版写 0.001 ⇒ 整段增益直接撞上 `REST_GAIN_MIN_DB` 夹持、把爆发一并压死
+                //    ⇒ **阴性对照当场失效**(读到 0.0186 而不是「基本留着」)。
+                let amp = if nd.sung { 0.2f32 } else { 0.02f32 };
+                for (t, x) in v[a..b].iter_mut().enumerate() {
+                    *x = amp * (2.0 * std::f32::consts::PI * 200.0 * t as f32 / SR as f32).sin();
+                    let _ = i;
+                }
+            }
+            v
+        };
+        // donor:与 base 同形,但在休止**正中**塞一段 30 ms 的爆发(0.10)
+        let mk_donor = |burst: bool| {
+            let mut v = mk_base();
+            if burst {
+                let mid = ((notes[2].start as f64 + 10.0) * spf) as usize;
+                let w = (SR as usize) * 30 / 1000;
+                for (t, x) in v[mid..mid + w].iter_mut().enumerate() {
+                    *x = 0.10 * (2.0 * std::f32::consts::PI * 900.0 * t as f32 / SR as f32).sin();
+                }
+            }
+            v
+        };
+        // 休止中段(掐掉两端各 50 ms)的峰值
+        let rest_peak = |v: &[f32]| -> f32 {
+            let a = ((notes[2].start as f64) * spf) as usize + (SR as usize) * 50 / 1000;
+            let b = (((notes[2].start + notes[2].frames) as f64) * spf) as usize - (SR as usize) * 50 / 1000;
+            v[a..b].iter().fold(0.0f32, |m, &x| m.max(x.abs()))
+        };
+        let run = |cell: f32, burst: bool| -> Vec<f32> {
+            let mut b = mk_base();
+            let d = mk_donor(burst);
+            let kept = vec![(0i64, 0usize, d)];
+            splice_kept(
+                &mut b, SR, spf, &jobs, &kept, (SR as usize) / 100, false, 0, 0.0, &notes, 0, 0.0,
+                true, cell, 0, false, false,
+            )
+            .unwrap();
+            b
+        };
+
+        // ⑵ ⛔ 阴性对照 A:整段一个增益 ⇒ 爆发基本原样
+        let off = rest_peak(&run(0.0, true));
+        assert!(
+            off > 0.05,
+            "阴性对照失败:整段一个增益的时候那个爆发就该基本留着(读到 {off:.4})—— \
+             它不成立的话,下面那条就只是『压了一点』"
+        );
+        // ⑴ 逐格增益 ⇒ 压下去
+        let on = rest_peak(&run(20.0, true));
+        assert!(
+            on < off * 0.75,
+            "逐格增益没把孤立爆发压下去:整段 {off:.4} ⇒ 逐格 {on:.4}"
+        );
+        // ⑶ ⛔ 阴性对照 B:donor 本来就安静 ⇒ 两者读数一致(不许乱动电平)
+        let q_off = rest_peak(&run(0.0, false));
+        let q_on = rest_peak(&run(20.0, false));
+        assert!(
+            (q_on - q_off).abs() <= q_off * 0.05 + 1e-6,
+            "donor 在休止里本来就安静,逐格增益却动了电平:{q_off:.5} ⇒ {q_on:.5} —— \
+             v14『砍电平』就是这样被否掉的"
+        );
     }
 
     /// ⛔ S163 —— [`silence_run_ms`] 的两条门必须**同时**成立。
