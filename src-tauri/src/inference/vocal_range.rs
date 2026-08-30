@@ -5448,9 +5448,9 @@ pub fn rest_gain_cell_ms() -> f32 {
 /// ⭐ S163 v10 —— 休止增益只补**一半**的 dB 差。⛔ 别调大:v14 把它推到「压进 base+6 dB」
 /// 时 p10 掉了 9.91 dB(单点 −15.2)= 砍电平,用户耳判否决。S166c 把增益改成逐格时
 /// **这个系数一个字节没动** —— 一把刀一次只许改一个变量。
-const REST_GAIN_FRACTION_DEFAULT: f32 = 0.5;
+const REST_GAIN_FRACTION_DEFAULT: f32 = 1.0;
 
-/// ⚙ 出厂默认 = 0.5。见 [`REST_GAIN_FRACTION_DEFAULT`];`UTAI_RANGE_REST_FRAC=<0..1>` 可扫。
+/// ⚙ 出厂默认 = 1.0(S166c 翻的)。见 [`REST_GAIN_FRACTION_DEFAULT`];`UTAI_RANGE_REST_FRAC=0.5` 回到之前。
 ///
 /// ⛔ **它为什么可能该调大**:0.5 是**整段一个增益**时代定的 —— 那时补满会把
 /// `consonant_preroll` 一起压死。改成**逐格**之后,含 preroll 的那一格 `base` 里也有 preroll
@@ -5458,6 +5458,14 @@ const REST_GAIN_FRACTION_DEFAULT: f32 = 0.5;
 /// **对齐 `base`**(= 补满 = 1.0)。
 /// ⛔ 与 v14 判负**不是一件事**:v14 是「压进 `base + 6 dB` 的**硬夹**」⇒ 砍电平(p10 −9.91);
 /// 这里仍然是同一条**逐格比值**公式,只是补的比例。
+///
+/// # ⭐⭐ 实测(鹅妈妈 +7 × 东雪莲,可闻的 78 个休止,相对**不救援**的超额凸起)
+/// ```text
+/// 0.5:中位 −2.15  p90 +1.60  最大 +8.39  >6 dB **2 个**
+/// 1.0:中位 −0.62  p90 +1.12  最大 **+6.86**  >6 dB **1 个**
+/// 最差那一处 3:58.100:−16.0 ⇒ **−20.6**(不救援是 −24.4)
+/// 用户点名的 3:36.549:−38.5 ⇒ **−40.5**(不救援 −35.5 ⇒ 已经比它还低 5 dB)
+/// ```
 pub fn rest_gain_fraction() -> f32 {
     std::env::var("UTAI_RANGE_REST_FRAC")
         .ok()
