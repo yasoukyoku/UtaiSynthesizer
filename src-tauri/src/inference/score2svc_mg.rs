@@ -159,7 +159,7 @@ fn to_evts(triples: &[TripleJson]) -> Vec<ScoreEvt<'_>> {
             frames: t.frames,
             lang: Lang::from_id(t.lang).unwrap_or(Lang::Ja),
             phoneme_input: t.phoneme_input.as_deref(),
-            phoneme_set: set,
+            phoneme_set: set, es_dialect: Default::default(), phone_edit: None,
         })
         .collect()
 }

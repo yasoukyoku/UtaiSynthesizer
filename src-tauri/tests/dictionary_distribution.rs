@@ -170,7 +170,7 @@ fn migrated_data_root_gets_the_new_dictionary_and_the_render_sings_it() {
         frames: 64,
         lang: Lang::Fr,
         phoneme_input: None,
-        phoneme_set: PhonemeSet::Words,
+        phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
     }];
     let resolved = g2p::resolve_score(&evts, &GlobalDicts).expect("strict resolve of a French word");
     let ResolvedKind::Phones(phones) = &resolved[0].kind else {

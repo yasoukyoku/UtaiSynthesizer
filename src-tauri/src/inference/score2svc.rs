@@ -1422,6 +1422,8 @@ pub fn render_score_sovits(
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
     let vl_onset = voiceless_onset_flags(&arr);
+    // S167 (§E2): the user's per-phone strength gains (0 everywhere unless a note was edited).
+    let phone_gains = arr.phone_gain_db.clone();
     // S163 —— 被 `consonant_preroll` 提前到休止里的辅音串。见 `PREROLL_DAMP_DEFAULT`。
     let pre_cons = preroll_consonant_flags(&arr);
     let mut preroll_damped = 0usize;
@@ -1529,6 +1531,10 @@ pub fn render_score_sovits(
         // S83 knife 6: crisp up voiceless onsets (+2.5 dB trapezoid on their windows)
         let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
         apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
+        // S167 (§E2): per-phone strength from the user's phone edits — the same trapezoid machinery
+        // as the emphasis knife, at each phone's own dB (0 dB phones emit no window, bit-transparent).
+        let user_gain_wins = chunk_gain_windows(chunk, wav.len(), &phone_gains[chunk.start..chunk.end]);
+        apply_phone_gain_windows(&mut wav, &user_gain_wins, emphasis_fade_samples(m.sample_rate));
         // ⭐ S163 —— 压 preroll 辅音窗的**前部**（紧贴音头的真辅音不动）。见 `PREROLL_DAMP_DEFAULT`。
         // ⛔ 放在 `apply_emphasis` **之后**：那一刀给清辅音 onset +2.5 dB，先压后抬会互相抵消。
         if preroll_damp_enabled() {
@@ -1716,6 +1722,8 @@ pub fn render_score_rvc(
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
     let vl_onset = voiceless_onset_flags(&arr);
+    // S167 (§E2): the user's per-phone strength gains (0 everywhere unless a note was edited).
+    let phone_gains = arr.phone_gain_db.clone();
     // S163 —— 被 `consonant_preroll` 提前到休止里的辅音串。见 `PREROLL_DAMP_DEFAULT`。
     let pre_cons = preroll_consonant_flags(&arr);
     let mut preroll_damped = 0usize;
@@ -1811,6 +1819,10 @@ pub fn render_score_rvc(
         // S83 knife 6: crisp up voiceless onsets (+2.5 dB trapezoid on their windows)
         let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
         apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
+        // S167 (§E2): per-phone strength from the user's phone edits — the same trapezoid machinery
+        // as the emphasis knife, at each phone's own dB (0 dB phones emit no window, bit-transparent).
+        let user_gain_wins = chunk_gain_windows(chunk, wav.len(), &phone_gains[chunk.start..chunk.end]);
+        apply_phone_gain_windows(&mut wav, &user_gain_wins, emphasis_fade_samples(m.sample_rate));
         // ⭐ S163 —— 压 preroll 辅音窗的**前部**（紧贴音头的真辅音不动）。见 `PREROLL_DAMP_DEFAULT`。
         // ⛔ 放在 `apply_emphasis` **之后**：那一刀给清辅音 onset +2.5 dB，先压后抬会互相抵消。
         if preroll_damp_enabled() {
@@ -2243,6 +2255,49 @@ fn apply_preroll_damp(
         }
     }
     hit
+}
+
+/// S167 (§E2): per-phone GAIN windows — the gain-carrying twin of `chunk_flag_windows`. Adjacent
+/// phones at the SAME nonzero dB coalesce into one window (same junction-valley rationale as the
+/// flag version); 0 dB phones emit nothing, so an unedited score is bit-transparent here.
+fn chunk_gain_windows(chunk: &Chunk, out_len: usize, gains: &[f32]) -> Vec<(usize, usize, f32)> {
+    let t = chunk.t.max(1);
+    let mut wins: Vec<(usize, usize, f32)> = Vec::new();
+    let mut cursor: i64 = 0;
+    for (i, &d) in chunk.phone_dur.iter().enumerate() {
+        let d = d.max(0);
+        let g = gains.get(i).copied().unwrap_or(0.0);
+        if d > 0 && g != 0.0 {
+            let s = (cursor as f64 / t as f64 * out_len as f64).round() as usize;
+            let e = ((((cursor + d) as f64) / t as f64) * out_len as f64).round() as usize;
+            let e = e.min(out_len);
+            if e > s {
+                match wins.last_mut() {
+                    Some(last) if last.1 == s && last.2 == g => last.1 = e,
+                    _ => wins.push((s, e, g)),
+                }
+            }
+        }
+        cursor += d;
+    }
+    wins
+}
+
+/// Trapezoid at each window's own dB. ⛔ Edges interpolate in the **dB domain** (the S166c lesson on
+/// `preroll damp`: amplitude-domain ramps make the dB slope uneven and steepest at the ends).
+fn apply_phone_gain_windows(audio: &mut [f32], windows: &[(usize, usize, f32)], fade: usize) {
+    let fade = fade.max(1) as f32;
+    for &(s, e, db) in windows {
+        let e = e.min(audio.len());
+        if e <= s {
+            continue;
+        }
+        for i in s..e {
+            let edge = (i - s).min(e - 1 - i) as f32;
+            let ramp = (edge / fade).min(1.0);
+            audio[i] = (f64::from(audio[i]) * 10f64.powf(f64::from(db) * f64::from(ramp) / 20.0)) as f32;
+        }
+    }
 }
 
 /// Trapezoid gain over each window: edges ramp 1→gain over `fade` samples (no clicks), plateau at
@@ -3951,6 +4006,10 @@ mod tests {
             phon,
             lang: vec![2; dur.len()],
             evt: vec![0; dur.len()],
+            phone_gain_db: vec![0.0; dur.len()],
+            phone_base_dur: dur.clone(),
+            dropped: Vec::new(),
+            edit_stale: Vec::new(),
             // S92k: test-build-only audit fields, irrelevant to this fixture
             borrow_ledger: Vec::new(),
             in_note_alloc: Vec::new(),
@@ -3992,7 +4051,7 @@ mod tests {
         let refined = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"),
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let arr2 = build_arrays_daw(&[refined], &NoDicts, ArticulationTiming::Auto).unwrap();
         let flags2 = voiceless_onset_flags(&arr2);
@@ -4065,7 +4124,7 @@ mod tests {
         let refined = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"),
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let arr2 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 10)), refined], &NoDicts, ArticulationTiming::Auto).unwrap();
         let d2 = boundary_valley_depths(&arr2);
@@ -4087,7 +4146,7 @@ mod tests {
         let sta = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 30, lang: g2p::Lang::Ja,
             phoneme_input: Some("s t a"),
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let arr4 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), sta], &NoDicts, ArticulationTiming::Auto).unwrap();
         let d4 = boundary_valley_depths(&arr4);
@@ -4099,7 +4158,7 @@ mod tests {
         let sta2 = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 30, lang: g2p::Lang::Ja,
             phoneme_input: Some("s t a"),
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let arr5 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 10)), sta2], &NoDicts, ArticulationTiming::Auto).unwrap();
         let d5 = boundary_valley_depths(&arr5);
@@ -4130,7 +4189,7 @@ mod tests {
             let ma = g2p::ScoreEvt {
                 lyric: "x", note_num: 69, frames: 20, lang: g2p::Lang::Ja,
                 phoneme_input: Some("m a"),
-                phoneme_set: PhonemeSet::Words,
+                phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
             };
             let score = [g2p::ScoreEvt::ja(&("R", 0, 10)), ma];
             // the DAW's layered pitch: 10 silent frames, then 20 frames of A4 (6900 cents)
@@ -4279,6 +4338,10 @@ mod tests {
             phon,
             lang: vec![lang_id; dur.len()],
             evt,
+            phone_gain_db: vec![0.0; dur.len()],
+            phone_base_dur: dur.clone(),
+            dropped: Vec::new(),
+            edit_stale: Vec::new(),
             #[cfg(test)]
             borrow_ledger: Vec::new(),
             #[cfg(test)]
@@ -5806,5 +5869,33 @@ mod s160q_f0_lerp_tests {
         let eq = |v: &[f32]| v.windows(2).filter(|w| w[0] == w[1]).count();
         assert_eq!(eq(&hold), 8, "零阶保持:8 对相等(每个源帧一对)");
         assert_eq!(eq(&lerp), 1, "线性:只剩末尾那一对(最后一点没有下一点)");
+    }
+}
+
+// ─── S167 (§E2): the per-phone strength trapezoid ────────────────────────────────────────────────
+#[cfg(test)]
+mod phone_gain_tests {
+    use super::*;
+
+    #[test]
+    fn phone_gain_trapezoid_is_db_domain_and_transparent_at_zero() {
+        let mut a = vec![0.5f32; 100];
+        apply_phone_gain_windows(&mut a, &[], 8);
+        assert!(a.iter().all(|&v| v == 0.5), "no windows = bit-transparent");
+        apply_phone_gain_windows(&mut a, &[(20, 80, 6.0)], 8);
+        let target = 0.5 * 10f32.powf(6.0 / 20.0);
+        assert!((a[50] - target).abs() < 1e-4, "plateau reaches the full dB");
+        assert!((a[20] - 0.5).abs() < 1e-4, "the window edge starts at unity");
+        assert!(a[10] == 0.5 && a[90] == 0.5, "outside the window nothing moves");
+        // dB-domain ramp: equal dB steps per sample on the edge (the S166c slope lesson)
+        let db = |v: f32| 20.0 * (v / 0.5).log10();
+        let steps: Vec<f32> = (21..28).map(|i| db(a[i]) - db(a[i - 1])).collect();
+        for s in &steps {
+            assert!((s - steps[0]).abs() < 0.02, "uneven dB slope: {steps:?}");
+        }
+        // negative gains attenuate
+        let mut b = vec![0.5f32; 40];
+        apply_phone_gain_windows(&mut b, &[(0, 40, -12.0)], 1);
+        assert!((b[20] - 0.5 * 10f32.powf(-12.0 / 20.0)).abs() < 1e-4);
     }
 }

@@ -422,6 +422,21 @@ pub struct ScoreArrays {
     /// lane maps phones back to notes/rests through it (a zh same-pitch hold that merely EXTENDS the
     /// previous entry emits no phone of its own, so its frames show as the carrier stretching through).
     pub evt: Vec<usize>,
+    /// S167 (§E2): per-phone output gain in dB from the user's phone edits (0 = untouched — the
+    /// render's output stage multiplies by 1.0 exactly, bit-transparent). Same length as `phon`.
+    pub phone_gain_db: Vec<f32>,
+    /// S167 (§E2): the allocator's OWN per-phone frames, before any user phone edit was applied —
+    /// the editor derives edit weights against this, so re-editing never compounds. Byte-equal to
+    /// `phone_dur` when no edit applied.
+    pub phone_base_dur: Vec<i64>,
+    /// S167 (§E1, S86#4): phones the DAW allocator DROPPED (starved coda/medial, sub-minimum onset)
+    /// as `(evt index, phone)` in emission order — the lane surfaces them instead of them vanishing
+    /// silently. The render arrays themselves never carry a 0-frame phone (OOD), so this is a side
+    /// record, not extra entries.
+    pub dropped: Vec<(usize, &'static str)>,
+    /// S167 (§E2): evt indices whose `phone_edit` no longer matches the emitted phones (lyric /
+    /// dictionary / language changed since the edit) — IGNORED, and visibly so in the lane.
+    pub edit_stale: Vec<usize>,
     /// S92k, **测试构建专有**(生产二进制里这个字段不存在,零运行时代价):Auto 臂的前借账本
     /// `(出借音素下标, 借走的帧数)`,已扣掉「onset 被丢弃后还回去」的那部分 = **净额**。
     ///
@@ -1550,6 +1565,8 @@ fn assemble_arrays(
     // frames ended up in the NEXT word's onset and the release was no better off. Same self-defeating
     // shape S92e already had to bound once (a deep borrow re-draining a consonant it had just fed).
     let mut coda_preroll_fed: Vec<usize> = Vec::new();
+    // S167 (§E1): dropped-phone record — see `ScoreArrays::dropped`.
+    let mut dropped: Vec<(usize, &'static str)> = Vec::new();
     #[cfg(test)]
     let mut alloc_snap: Vec<(usize, Vec<i64>)> = Vec::new();
 
@@ -2230,6 +2247,7 @@ fn assemble_arrays(
                     // globally, after the whole loop — see `coda_floor_top_up` below for why.)
                     for (i, (&p, &d)) in ph.iter().zip(durs.iter()).enumerate() {
                         if d <= 0 {
+                            dropped.push((k, p)); // S167 §E1: surfaced in the lane, never silent
                             continue; // dropped medial/coda / sub-minimum onset — never emit a 0-frame phone
                         }
                         if preroll_fed[i] {
@@ -2377,6 +2395,15 @@ fn assemble_arrays(
         }
     }
 
+    // S167 (§E2): per-note phone edits — LAST, after every allocation/borrow/floor pass, so the
+    // user's split is the final word on a note's interior and every pass above stayed untouched.
+    // `phone_base_dur` snapshots the allocator's own split first (the editor derives edit weights
+    // against it, so re-editing never compounds); Σ frames per note is conserved by construction.
+    let phone_base_dur = pdur.clone();
+    let mut phone_gain_db = vec![0.0f32; phon.len()];
+    let mut edit_stale: Vec<usize> = Vec::new();
+    apply_phone_edits(score, &phon, &pevt, &mut pdur, &mut phone_gain_db, &mut edit_stale);
+
     // phone → id (LOUD error on any phone outside the 210-token vocab; the reference SP-falls-back).
     let map = phone_to_id_map();
     let mut phonemes = Vec::with_capacity(phon.len());
@@ -2417,11 +2444,94 @@ fn assemble_arrays(
         phon,
         lang: plang,
         evt: pevt,
+        phone_gain_db,
+        phone_base_dur,
+        dropped,
+        edit_stale,
         #[cfg(test)]
         borrow_ledger: ledger,
         #[cfg(test)]
         in_note_alloc: alloc_snap,
     })
+}
+
+/// S167 (§E2): apply per-note phoneme edits — duration redistribution + per-phone gain. Runs once,
+/// after the whole assembly (see the call site for why the ORDER is the design). An edit whose
+/// `phones` no longer match what this score emits is IGNORED and its evt index reported in
+/// `edit_stale` — a stale edit must be visibly dead, never silently misapplied to the wrong phones.
+fn apply_phone_edits(
+    score: &[g2p::ScoreEvt],
+    phon: &[&'static str],
+    pevt: &[usize],
+    pdur: &mut [i64],
+    gains: &mut [f32],
+    stale: &mut Vec<usize>,
+) {
+    for (k, evt) in score.iter().enumerate() {
+        let Some(edit) = evt.phone_edit else { continue };
+        let idx: Vec<usize> = (0..phon.len()).filter(|&i| pevt[i] == k).collect();
+        let matches = idx.len() == edit.phones.len()
+            && edit.scale.len() == edit.phones.len()
+            && edit.gain_db.len() == edit.phones.len()
+            && idx.iter().zip(edit.phones.iter()).all(|(&i, p)| phon[i] == p.as_str());
+        if !matches {
+            stale.push(k);
+            continue;
+        }
+        let total: i64 = idx.iter().map(|&i| pdur[i]).sum();
+        if total >= idx.len() as i64 && !idx.is_empty() {
+            let w: Vec<f64> = idx
+                .iter()
+                .zip(edit.scale.iter())
+                .map(|(&i, &s)| (pdur[i].max(1) as f64) * f64::from(s.clamp(0.1, 10.0)))
+                .collect();
+            let new = redistribute_conserving(total, &w);
+            for (&i, &d) in idx.iter().zip(new.iter()) {
+                pdur[i] = d;
+            }
+        }
+        for (&i, &g) in idx.iter().zip(edit.gain_db.iter()) {
+            gains[i] = g.clamp(-12.0, 12.0);
+        }
+    }
+}
+
+/// Split `total` frames by weight with every share ≥ 1 and Σ == total exactly (floor-1 + the spare
+/// by largest remainder; ties break on index, so the result is deterministic). Caller guarantees
+/// `total ≥ w.len()` (every emitted phone already held ≥ 1 frame).
+fn redistribute_conserving(total: i64, w: &[f64]) -> Vec<i64> {
+    let n = w.len();
+    let spare = total - n as i64;
+    let sum: f64 = w.iter().map(|&x| x.max(0.0)).sum();
+    let mut out = vec![1i64; n];
+    if spare <= 0 {
+        // exactly 1 frame each (spare == 0 by the caller's guarantee)
+        return out;
+    }
+    if sum <= 0.0 {
+        out[n - 1] += spare;
+        return out;
+    }
+    let exact: Vec<f64> = w.iter().map(|&x| spare as f64 * x.max(0.0) / sum).collect();
+    let mut extra: Vec<i64> = exact.iter().map(|&e| e.floor() as i64).collect();
+    let mut left = spare - extra.iter().sum::<i64>();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let ra = exact[a] - extra[a] as f64;
+        let rb = exact[b] - extra[b] as f64;
+        rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+    });
+    for &i in &order {
+        if left <= 0 {
+            break;
+        }
+        extra[i] += 1;
+        left -= 1;
+    }
+    for i in 0..n {
+        out[i] += extra[i];
+    }
+    out
 }
 
 // ─── SP-boundary chunking (≤ max_frames) + per-chunk rebase ──────────────────────────────────────
@@ -2973,7 +3083,7 @@ mod tests {
             frames,
             lang: g2p::Lang::En,
             phoneme_input: None,
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         }
     }
 
@@ -3023,7 +3133,7 @@ mod tests {
     pub(super) fn raw(phones: &'static str, frames: i64) -> g2p::ScoreEvt<'static> {
         g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames, lang: g2p::Lang::Ja,
-            phoneme_input: Some(phones), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(phones), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         }
     }
 
@@ -3086,7 +3196,7 @@ mod tests {
         let d = en_dicts();
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let a = build_arrays_daw(&[en("F L AW1 ER0 Z", 22)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["f", "l", "aʊ", "ɝ", "z"], "the /f/ must never be deleted");
@@ -3122,7 +3232,7 @@ mod tests {
         let d = en_dicts();
         let mk = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         for (stressed, plain) in
             [("EH1 V ER0 IY0", "EH V ER IY"), ("V EH1 R IY0", "V EH R IY"), ("AE1 F T ER0", "AE F T ER")]
@@ -3155,7 +3265,7 @@ mod tests {
     fn s96_stressed_medial_nucleus_gets_its_share() {
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let a = build_arrays_daw(&[en("EH1 V ER0 IY0", 18)], &en_dicts(), ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["ɛ", "v", "ɝ", "i"]);
@@ -3179,11 +3289,11 @@ mod tests {
         // en: raw-IPA override so no dictionary is needed; [m i] after a 10-frame rest.
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let rest = |fr: i64| g2p::ScoreEvt {
             lyric: "R", note_num: 0, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: None, phoneme_set: PhonemeSet::Words,
+            phoneme_input: None, phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let a = build_arrays_daw(&[rest(10), en("M IY1", 10)], &en_dicts(), ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["SP", "m", "i"]);
@@ -3192,7 +3302,7 @@ mod tests {
         // ja, same shape (raw IPA): the rest lends and the vowel sits on the boundary, as shipped.
         let ja_rest = g2p::ScoreEvt {
             lyric: "R", note_num: 0, frames: 10, lang: g2p::Lang::Ja,
-            phoneme_input: None, phoneme_set: PhonemeSet::Words,
+            phoneme_input: None, phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let j = build_arrays_daw(&[ja_rest, raw("m i", 10)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(j.phon, vec!["SP", "m", "i"]);
@@ -3306,7 +3416,7 @@ mod tests {
         let d = en_dicts();
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let a = build_arrays_daw(&[en("D OW1 N T", 8), en("S IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["d", "oʊ", "n", "t", "s", "i"]);
@@ -3345,7 +3455,7 @@ mod tests {
         let d = en_dicts();
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let a = build_arrays_daw(&[en("M AY1 N D", 20), en("S IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["m", "aɪ", "n", "d", "s", "i"]);
@@ -3387,7 +3497,7 @@ mod tests {
     fn s92p_ja_melisma_head_exemption_is_pinned_not_gated() {
         let hold = |fr: i64| g2p::ScoreEvt {
             lyric: "ー", note_num: 60, frames: fr, lang: g2p::Lang::Ja,
-            phoneme_input: None, phoneme_set: PhonemeSet::Words,
+            phoneme_input: None, phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         // ⚠ 必须给「こ」一个**出借者**,否则两臂都会落进 2 帧兜底、测不出任何差别 ——
         //   第一版就是这么写的,是一条空测试(ja 不走 S92c 补齐,谱首又无人可借)。
@@ -3504,7 +3614,7 @@ mod tests {
     fn s93_rescue_is_gated_by_the_chaining_predicate_not_by_ja() {
         let zh = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::Zh,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let z = build_arrays_daw(&[zh("k ɯ", 4), zh("n o", 3)], &zh_dicts(), ArticulationTiming::Auto).unwrap();
         // (zh 的记号归一把裸 k 写成送气 kʰ —— 与本测试无关,rescue 才是被测物。)
@@ -3514,7 +3624,7 @@ mod tests {
         let d = en_dicts();
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let e = build_arrays_daw(&[en("K UH1", 4), en("N OW1", 3)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(e.phon, vec!["k", "ʊ", "oʊ"], "chaining arm: the boundary is intentional (see doc)");
@@ -3543,7 +3653,7 @@ mod tests {
         let d = en_dicts();
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         // ★S92p: the REAL `ear` shape — the dictionary word spread over two notes, so
         // `resolve_west_span` defers /ɹ/ onto the second note AND marks it `is_sustain`.
@@ -3606,7 +3716,7 @@ mod tests {
         let d = en_dicts();
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         // 先钉表本身:长音桶的 coda 目标必须真的超过旧上限,否则下面测的是空气。
         assert!(coda_target_frames("ɹ", 28) > 7, "ɹ 的 coda 目标还被钳在 7 —— 表没重生成?");
@@ -3640,7 +3750,7 @@ mod tests {
         let d = en_dicts();
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let alone = build_arrays_daw(&[en("S OW1", 8)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(alone.phon, vec!["s", "oʊ"]);
@@ -3724,7 +3834,7 @@ mod tests {
         let d = en_dicts();
         let en_note = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let cases: [(Vec<g2p::ScoreEvt<'static>>, &'static str, i64); 2] = [
             (vec![raw("ə n ə n ə", 6)], "ə n ə n ə", 6),
@@ -3792,7 +3902,7 @@ mod tests {
         let d = en_dicts();
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         // single coda on a dense-line note: /l/ 2 → 3, paid by the vowel's spare above its floor
         // a note with a nucleus that HAS spare pays for the release out of it
@@ -3839,7 +3949,7 @@ mod tests {
         let d = en_dicts_from("smell\tS M EH1 L\nmine\tM AY1\nthat\tDH AE1 T\nand\tAH0 N D\n");
         let ev = |lyric: &'static str, fr: i64| g2p::ScoreEvt {
             lyric, note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: None, phoneme_set: PhonemeSet::Words,
+            phoneme_input: None, phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         // The user's own shape, reproduced end to end: `smell` allocates its /l/ at 3, the NEXT
         // word's onset borrows that third frame straight back, and this pass would then re-fill it
@@ -3885,7 +3995,7 @@ mod tests {
         let d = en_dicts();
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let a = build_arrays_daw(
             &[en("M AY1", 8), en("AH0 N D", 8), en("M AO1 R", 7)],
@@ -4037,7 +4147,7 @@ mod tests {
     fn in_note_timing_cluster_is_last_first_and_keeps_the_vowel_share() {
         let sta = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 10, lang: g2p::Lang::Ja, phoneme_input: Some("s t a"),
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let off = build_arrays_daw(&[sta.clone()], &NoDicts, ArticulationTiming::InNote).unwrap();
         assert_eq!(off.phon, vec!["s", "t", "a"]);
@@ -4067,7 +4177,7 @@ mod tests {
         let refined = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 20, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"),
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let score = [g2p::ScoreEvt::ja(&("R", 0, 10)), refined];
         let off = build_arrays_daw(&score, &NoDicts, ArticulationTiming::InNote).unwrap();
@@ -4105,7 +4215,7 @@ mod tests {
             let w = g2p::ScoreEvt {
                 lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::Ja,
                 phoneme_input: Some("ɹ ə f aɪ n d"),
-                phoneme_set: PhonemeSet::Words,
+                phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
             };
             let arr = build_arrays_daw(&[w], &NoDicts, ArticulationTiming::InNote).unwrap();
             assert_eq!(arr.phone_dur.iter().sum::<i64>(), fr, "conservation at fr={fr}");
@@ -4198,11 +4308,11 @@ mod tests {
         // to the lender (ʔ got nothing and drops too).
         let tta = g2p::ScoreEvt {
             lyric: "x", note_num: 62, frames: 2, lang: g2p::Lang::Ja, phoneme_input: Some("ʔ t a"),
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let at = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 10, lang: g2p::Lang::Ja, phoneme_input: Some("a t"),
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let daw = build_arrays_daw(&[at, tta.clone()], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(daw.phon, vec!["a", "t", "a"]);
@@ -4224,7 +4334,7 @@ mod tests {
     fn medial_vowels_get_two_frames_or_drop() {
         let evt = |fr| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::Ja, phoneme_input: Some("p i u"),
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let a10 = build_arrays_daw(&[evt(10)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(a10.phon, vec!["p", "i", "u"]);
@@ -4241,7 +4351,7 @@ mod tests {
         let evt = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"), // refined's shape as a raw-IPA override
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let arr = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), evt], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(arr.phon, vec!["SP", "ɹ", "ə", "f", "aɪ", "n", "d"]);
@@ -4291,7 +4401,7 @@ mod tests {
             frames,
             lang: g2p::Lang::Zh,
             phoneme_input: None,
-            phoneme_set: PhonemeSet::Words,
+            phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         }
     }
 
@@ -4544,6 +4654,115 @@ mod tests {
                 assert!((sumsq - r.sumsq).abs() <= 0.1 + r.sumsq * 1e-4, "{} c{}: sumsq {} vs {}", model, ci, sumsq, r.sumsq);
                 eprintln!("[1d] {} chunk{}: T={} dim={} sampled-worst={:.2e} sum={:.2} PASS", model, ci, r.t, r.dim, worst, sum);
             }
+        }
+    }
+}
+
+// ─── S167 (§E2): per-note phoneme edits — applied LAST, conserving, stale-safe ───────────────────
+#[cfg(test)]
+mod phone_edit_tests {
+    use super::*;
+    use crate::inference::g2p::{EsDialect, PhoneEdit, ScoreEvt};
+    use crate::inference::g2p_alias::PhonemeSet;
+
+    fn evt(pi: &'static str, frames: i64, edit: Option<&'static PhoneEdit>) -> ScoreEvt<'static> {
+        ScoreEvt {
+            lyric: "x",
+            note_num: 60,
+            frames,
+            lang: g2p::Lang::Ja,
+            phoneme_input: Some(pi),
+            phoneme_set: PhonemeSet::Words,
+            es_dialect: EsDialect::Dictionary,
+            phone_edit: edit,
+        }
+    }
+
+    #[test]
+    fn a_phone_edit_redistributes_inside_its_note_and_conserves_every_total() {
+        static EDIT: std::sync::OnceLock<PhoneEdit> = std::sync::OnceLock::new();
+        let edit = EDIT.get_or_init(|| PhoneEdit {
+            phones: vec!["t".into(), "a".into()],
+            scale: vec![3.0, 1.0],
+            gain_db: vec![4.0, 0.0],
+        });
+        let plain = [evt("t a", 10, None), evt("t a", 10, None)];
+        let edited = [evt("t a", 10, Some(edit)), evt("t a", 10, None)];
+        let base = build_arrays_daw(&plain, &NoDicts, ArticulationTiming::Auto).unwrap();
+        let arr = build_arrays_daw(&edited, &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phone_base_dur, base.phone_dur, "base_dur IS the allocator's own split");
+        assert!(arr.edit_stale.is_empty(), "a matching edit is never stale");
+        // conservation: per-evt totals byte-equal to the unedited run (neighbours untouched)
+        for k in 0..2 {
+            let tot = |a: &ScoreArrays| -> i64 {
+                a.phone_dur.iter().zip(a.evt.iter()).filter(|(_, &e)| e == k).map(|(d, _)| d).sum()
+            };
+            assert_eq!(tot(&arr), tot(&base), "evt {k} total conserved");
+        }
+        // the scaled /t/ really grew, at its vowel's expense
+        let at = |a: &ScoreArrays, k: usize, p: &str| -> i64 {
+            a.phon
+                .iter()
+                .zip(a.phone_dur.iter())
+                .zip(a.evt.iter())
+                .find(|((ph, _), &e)| e == k && **ph == p)
+                .map(|((_, &d), _)| d)
+                .unwrap()
+        };
+        assert!(at(&arr, 0, "t") > at(&base, 0, "t"), "scale 3× must move frames toward /t/");
+        assert!(at(&arr, 0, "a") < at(&base, 0, "a"));
+        assert!(at(&arr, 0, "a") >= 1, "no phone ever drops to 0 frames");
+        // the UNEDITED note is byte-identical
+        assert_eq!(at(&arr, 1, "t"), at(&base, 1, "t"));
+        assert_eq!(at(&arr, 1, "a"), at(&base, 1, "a"));
+        // gains land on exactly the edited phones
+        for i in 0..arr.phon.len() {
+            let want = if arr.evt[i] == 0 && arr.phon[i] == "t" { 4.0 } else { 0.0 };
+            assert_eq!(arr.phone_gain_db[i], want, "gain at {} {}", arr.evt[i], arr.phon[i]);
+        }
+        // and an unedited score has an all-zero, same-length gain array (bit-transparent contract)
+        assert_eq!(base.phone_gain_db.len(), base.phon.len());
+        assert!(base.phone_gain_db.iter().all(|&g| g == 0.0));
+        assert_eq!(base.phone_base_dur, base.phone_dur);
+    }
+
+    #[test]
+    fn a_stale_edit_is_ignored_and_reported_never_misapplied() {
+        static EDIT: std::sync::OnceLock<PhoneEdit> = std::sync::OnceLock::new();
+        let edit = EDIT.get_or_init(|| PhoneEdit {
+            phones: vec!["k".into(), "a".into()], // the note now sings [t a] — the key mismatches
+            scale: vec![5.0, 1.0],
+            gain_db: vec![6.0, 0.0],
+        });
+        let arr = build_arrays_daw(&[evt("t a", 10, Some(edit))], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.edit_stale, vec![0], "the stale edit is REPORTED");
+        assert_eq!(arr.phone_dur, arr.phone_base_dur, "…and IGNORED: the split is the allocator's own");
+        assert!(arr.phone_gain_db.iter().all(|&g| g == 0.0), "…gains included");
+    }
+
+    #[test]
+    fn dropped_phones_are_recorded_with_their_note() {
+        // 3 frames cannot fund [f aɪ n d] — the starved codas must DROP (never a 0-frame phone)
+        // and the drop must be VISIBLE in the side record (S86#4: silent discard was the defect).
+        let arr = build_arrays_daw(&[evt("f aɪ n d", 3, None)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert!(arr.phone_dur.iter().all(|&d| d > 0), "the arrays never carry a 0-frame phone");
+        assert!(!arr.dropped.is_empty(), "the starved codas are recorded, not silently gone");
+        assert!(arr.dropped.iter().all(|&(k, _)| k == 0));
+        let emitted: Vec<&str> = arr.phon.iter().copied().collect();
+        for &(_, p) in &arr.dropped {
+            assert!(!emitted.contains(&p) || p == "SP", "a dropped phone is not also emitted: {p}");
+        }
+    }
+
+    #[test]
+    fn redistribute_conserving_floors_sums_and_is_deterministic() {
+        assert_eq!(redistribute_conserving(10, &[6.0, 8.0]), vec![4, 6]);
+        assert_eq!(redistribute_conserving(3, &[100.0, 1.0, 1.0]), vec![1, 1, 1], "spare 0 → floor 1 each");
+        assert_eq!(redistribute_conserving(7, &[0.0, 0.0]), vec![1, 6], "degenerate weights fail safe");
+        for w in [&[1.0, 1.0, 1.0][..], &[5.0, 1.0, 1.0], &[0.1, 0.1, 9.0]] {
+            let out = redistribute_conserving(17, w);
+            assert_eq!(out.iter().sum::<i64>(), 17, "{w:?}");
+            assert!(out.iter().all(|&d| d >= 1), "{w:?}");
         }
     }
 }

@@ -399,7 +399,7 @@ fn e1_cross_probe() {
                 frames: t.frames,
                 lang: Lang::Ja,
                 phoneme_input: None,
-                phoneme_set: PhonemeSet::Words,
+                phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
             })
             .collect();
         let vf0 = VocalF0 { cents: &sj.f0_cents, voiced: &sj.f0_voiced };
@@ -417,7 +417,7 @@ fn e1_cross_probe() {
                     frames: t.frames,
                     lang: Lang::Ja,
                     phoneme_input: None,
-                    phoneme_set: PhonemeSet::Words,
+                    phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
                 })
                 .collect();
             let a = build_arrays_daw(&evts_dump, &NoDicts, ArticulationTiming::Auto).unwrap();

@@ -112,7 +112,7 @@ fn a_reclaim_landing_after_the_sync_cannot_make_this_session_sing_the_old_phones
         frames: 64,
         lang: Lang::Fr,
         phoneme_input: None,
-        phoneme_set: PhonemeSet::Words,
+        phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
     }];
     let resolved = g2p::resolve_score(&evts, &GlobalDicts).expect("strict resolve of a French word");
     let ResolvedKind::Phones(phones) = &resolved[0].kind else {

@@ -1352,6 +1352,10 @@ pub async fn validate_lyrics(
                     .as_deref()
                     .filter(|p| p.chars().count() <= MAX_LYRIC_CHARS),
                 phoneme_set,
+                // S167: OOV-ness is dialect-invariant (the policy remaps phones AFTER a successful
+                // lookup, it never changes whether a word resolves) — the classifier stays default.
+                es_dialect: Default::default(),
+                phone_edit: None,
             })
             .collect();
         // Err = infrastructure (VOCAL_DICT_MISSING) — the watcher must NOT paint OOV marks for it.
@@ -1374,6 +1378,17 @@ pub struct PhonemeSpan {
     pub evt: usize,
     pub voiceless: bool,
     pub nucleus: bool,
+    /// S167 (§E2): the allocator's OWN frames for this phone, before the note's phone edit (equal to
+    /// `frames` when unedited) — the editor derives edit weights against it so re-edits never compound.
+    pub base_frames: i64,
+    /// S167 (§E2): the user's per-phone strength (dB; 0 = untouched).
+    pub gain_db: f32,
+    /// S167 (§E1, S86#4): a phone the allocator DROPPED (starved coda/medial, sub-minimum onset).
+    /// Dropped spans carry `frames == 0` — they occupy no time, the lane draws them as a marker.
+    pub dropped: bool,
+    /// S167 (§E2): this phone's note carries a phone edit that no longer matches what the score
+    /// emits (lyric/dictionary/language changed since the edit) — the edit was IGNORED.
+    pub stale: bool,
 }
 
 /// S83: dry-run the ② DAW assembly (`build_arrays_daw` — THE render's allocator, single source) and
@@ -1394,6 +1409,8 @@ pub async fn preview_vocal_phonemes(
     // S91: same rationale — the lane's contract is "exactly what a render would sing", so it must
     // read the track's alias convention or it would show the dictionary's phones for an alias score.
     phoneme_set: Option<String>,
+    // S167 (§E4): the track's Spanish dialect — the lane must preview the phones the render sings.
+    es_dialect: Option<String>,
 ) -> Result<Vec<PhonemeSpan>, String> {
     // Same 1× cap as render_vocal_segment: the payload here is byte-for-byte the SAME triples array the
     // render caps at MAX_SCORE_NOTES — an over-cap score can never render, so previewing it has no value
@@ -1422,9 +1439,14 @@ pub async fn preview_vocal_phonemes(
     }
     .articulation_timing(); // ONE bool→enum conversion, shared with the render
     let phoneme_set = crate::inference::g2p_alias::PhonemeSet::from_wire(phoneme_set.as_deref());
+    let es_dialect = g2p::EsDialect::from_wire(es_dialect.as_deref());
     tauri::async_runtime::spawn_blocking(move || {
+        // S167 (§E2): sanitize the per-note phone edits ONCE, outside the borrow (ScoreEvt holds a
+        // reference). Same hygiene as the render path — `sanitize_phone_edit` is the single source.
+        let edits: Vec<Option<g2p::PhoneEdit>> =
+            score.iter().map(|n| sanitize_phone_edit(n.phone_edit.as_ref())).collect();
         let mut evts: Vec<g2p::ScoreEvt> = Vec::with_capacity(score.len());
-        for n in &score {
+        for (i, n) in score.iter().enumerate() {
             evts.push(g2p::ScoreEvt {
                 lyric: n.lyric.as_str(),
                 note_num: n.note_num,
@@ -1432,11 +1454,14 @@ pub async fn preview_vocal_phonemes(
                 lang: n.lang.and_then(g2p::Lang::from_id).unwrap_or(fallback),
                 phoneme_input: n.phoneme_input.as_deref().filter(|p| p.chars().count() <= MAX_LYRIC_CHARS),
                 phoneme_set,
+                es_dialect,
+                phone_edit: edits[i].as_ref(),
             });
         }
         let arr =
             score2cv::build_arrays_daw(&evts, &g2p::GlobalDicts, timing).map_err(|e| e.to_string())?;
-        Ok(arr
+        let stale: std::collections::HashSet<usize> = arr.edit_stale.iter().copied().collect();
+        let mut spans: Vec<PhonemeSpan> = arr
             .phon
             .iter()
             .enumerate()
@@ -1446,8 +1471,37 @@ pub async fn preview_vocal_phonemes(
                 evt: arr.evt[i],
                 voiceless: score2cv::is_voiceless_phone(p),
                 nucleus: score2cv::is_nucleus_phone(p),
+                base_frames: arr.phone_base_dur[i],
+                gain_db: arr.phone_gain_db[i],
+                dropped: false,
+                stale: stale.contains(&arr.evt[i]),
             })
-            .collect())
+            .collect();
+        // S167 (§E1): weave the DROPPED phones in as zero-width markers, each after the last real
+        // span of its own note (frames == 0 ⇒ the lane's cumulative x never moves — additive wire).
+        for &(k, p) in &arr.dropped {
+            let at = spans
+                .iter()
+                .rposition(|s| s.evt == k)
+                .map(|i| i + 1)
+                .or_else(|| spans.iter().position(|s| s.evt > k))
+                .unwrap_or(spans.len());
+            spans.insert(
+                at,
+                PhonemeSpan {
+                    phone: p.to_string(),
+                    frames: 0,
+                    evt: k,
+                    voiceless: score2cv::is_voiceless_phone(p),
+                    nucleus: score2cv::is_nucleus_phone(p),
+                    base_frames: 0,
+                    gain_db: 0.0,
+                    dropped: true,
+                    stale: stale.contains(&k),
+                },
+            );
+        }
+        Ok(spans)
     })
     .await
     .map_err(|e| format!("preview_vocal_phonemes task failed: {e}"))?
@@ -1469,6 +1523,56 @@ pub struct ScoreNote {
     /// Traditional-phoneme override (§3.7 user layer: pinyin/kana/ARPABET/MFA — never raw IPA).
     #[serde(default)]
     pub phoneme_input: Option<String>,
+    /// S167 (§E2): per-note phoneme timing/strength override (SynthV-style). Absent (old callers /
+    /// unedited notes) → the allocator's own split, byte-identical to pre-S167.
+    #[serde(default)]
+    pub phone_edit: Option<PhoneEditWire>,
+}
+
+/// S167 (§E2): the wire shape of a per-note phoneme edit. `phones` keys the edit to the emitted
+/// sequence it was made against (staleness guard — the assembler ignores a non-matching edit and
+/// reports it, never misapplies it); `scale` = per-phone duration weights; `gain_db` = per-phone
+/// output gain (optional — absent means all-zero).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PhoneEditWire {
+    pub phones: Vec<String>,
+    pub scale: Vec<f32>,
+    #[serde(default)]
+    pub gain_db: Option<Vec<f32>>,
+}
+
+/// Sanitize a wire phone edit into the assembler's shape, or `None` when it cannot be honoured:
+/// length mismatch (a hand-edited payload) and non-finite numbers are refused whole — a half-applied
+/// edit would be worse than none — and the knobs are clamped to the same bounds the UI enforces
+/// (scale ∈ [0.1, 10], gain ∈ [−12, +12] dB) so a hostile payload cannot smuggle extremes.
+fn sanitize_phone_edit(w: Option<&PhoneEditWire>) -> Option<g2p::PhoneEdit> {
+    let w = w?;
+    let n = w.phones.len();
+    if n == 0 || n > 64 || w.scale.len() != n {
+        return None;
+    }
+    if let Some(g) = &w.gain_db {
+        if g.len() != n {
+            return None;
+        }
+    }
+    if !w.scale.iter().all(|s| s.is_finite()) {
+        return None;
+    }
+    if let Some(g) = &w.gain_db {
+        if !g.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+    }
+    Some(g2p::PhoneEdit {
+        phones: w.phones.clone(),
+        scale: w.scale.iter().map(|s| s.clamp(0.1, 10.0)).collect(),
+        gain_db: w
+            .gain_db
+            .as_ref()
+            .map(|g| g.iter().map(|v| v.clamp(-12.0, 12.0)).collect())
+            .unwrap_or_else(|| vec![0.0; n]),
+    })
 }
 
 /// The note-pitch list the RANGE-EXTEND dead-zone planner reads, with SILENT tokens zeroed — exactly the
@@ -1549,6 +1653,11 @@ pub struct VocalRenderOptions {
     /// default, byte-for-byte the pre-S91 behaviour). A `String` rather than the enum on purpose: an
     /// unknown value from a newer frontend must land on the default, not fail the whole render.
     pub phoneme_set: Option<String>,
+    /// S167 (§E4): the track's Spanish dialect — `"castilian"` | `"castilian_yeista"` | `"latam"` |
+    /// `"andean"`. Absent/unknown → the dictionary's primary rows untouched (the pre-S167 behaviour,
+    /// byte-identical by construction). Same tolerant-`String` rationale as `phoneme_set`.
+    #[serde(default)]
+    pub es_dialect: Option<String>,
     /// Reused SoVITS quality contract (backend=="sovits"): noise_scale/seed/cluster_ratio/spk_mix/speaker_id
     /// + the shallow/only-diffusion group + NSF enhancer + vocoder + gpu_extract. auto_f0/f0_shift/
     /// loudness_envelope/only_diffusion are force-neutralized by the command (they'd break Option-A / need
@@ -1571,6 +1680,7 @@ impl Default for VocalRenderOptions {
             consonant_valley: crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
             vowel_clarity: true,
             consonant_preroll: true,
+            es_dialect: None,
             phoneme_set: None,
             sovits: Default::default(),
             rvc: Default::default(),
@@ -1828,6 +1938,11 @@ pub async fn render_vocal_segment(
     // S91: ONE place converts the wire string to the enum, and the track's single setting is fanned
     // out over every note below (a score never mixes conventions — see `ScoreEvt::phoneme_set`).
     let phoneme_set = crate::inference::g2p_alias::PhonemeSet::from_wire(options.phoneme_set.as_deref());
+    let es_dialect = g2p::EsDialect::from_wire(options.es_dialect.as_deref());
+    // S167 (§E2): per-note phone edits, sanitized once (ScoreEvt borrows them; `score` is moved
+    // into `score_owned` further down — this borrow ends before that move).
+    let phone_edits: Vec<Option<g2p::PhoneEdit>> =
+        score.iter().map(|n| sanitize_phone_edit(n.phone_edit.as_ref())).collect();
     // S60-2 → S85 音域扩展(score):整曲平移废除(三轮耳判「开了不如不开」——救 1.7% 极端音
     // 却让其余音符各自去赌 per-(音素×落点) 渲染死区 + 随深度增长的往返税;memory S85)。
     // dead-only:仅含「真死音」(记录 f0 判据连音高都发不出)的休止分界短语,以最小深度渲染到
@@ -2023,13 +2138,16 @@ pub async fn render_vocal_segment(
                 let score_ref: Vec<g2p::ScoreEvt> = score_owned
                     .iter()
                     .zip(note_langs.iter())
-                    .map(|(n, &lang)| g2p::ScoreEvt {
+                    .zip(phone_edits.iter())
+                    .map(|((n, &lang), edit)| g2p::ScoreEvt {
                         lyric: n.lyric.as_str(),
                         note_num: n.note_num,
                         frames: n.frames,
                         lang,
                         phoneme_input: n.phoneme_input.as_deref(),
                         phoneme_set,
+                        es_dialect,
+                        phone_edit: edit.as_ref(),
                     })
                     .collect();
                 let f0 = if f0_cents.is_empty() {
@@ -2194,13 +2312,16 @@ pub async fn render_vocal_segment(
                 let score_ref: Vec<g2p::ScoreEvt> = score_owned
                     .iter()
                     .zip(note_langs.iter())
-                    .map(|(n, &lang)| g2p::ScoreEvt {
+                    .zip(phone_edits.iter())
+                    .map(|((n, &lang), edit)| g2p::ScoreEvt {
                         lyric: n.lyric.as_str(),
                         note_num: n.note_num,
                         frames: n.frames,
                         lang,
                         phoneme_input: n.phoneme_input.as_deref(),
                         phoneme_set,
+                        es_dialect,
+                        phone_edit: edit.as_ref(),
                     })
                     .collect();
                 let f0 = if f0_cents.is_empty() {
@@ -2321,7 +2442,7 @@ mod tests {
     use super::*;
 
     fn note(lyric: &str, note_num: i64) -> ScoreNote {
-        ScoreNote { lyric: lyric.to_string(), note_num, frames: 10, lang: None, phoneme_input: None }
+        ScoreNote { lyric: lyric.to_string(), note_num, frames: 10, lang: None, phoneme_input: None, phone_edit: None }
     }
 
     /// A rest/breath written as a NOTE keeps whatever pitch it was drawn on. The dead-zone planner

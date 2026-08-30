@@ -102,6 +102,74 @@ pub struct ScoreEvt<'a> {
     /// spelling, the default and the pre-S91 behaviour). Per-note like `lang`, but the command layer
     /// fans ONE per-track setting out over every note — a score never mixes conventions.
     pub phoneme_set: PhonemeSet,
+    /// S167 (§E4): Spanish dialect policy for DICTIONARY-derived phones (θ/s · ʎ/ʝ). Track-level,
+    /// fanned out per note exactly like `phoneme_set`. `Dictionary` (the default) is byte-for-byte
+    /// the pre-S167 behaviour; an explicit `phoneme_input`/bracket hint always wins untouched.
+    pub es_dialect: EsDialect,
+    /// S167 (§E2): per-note phoneme timing/strength override (SynthV-style). Applied by the DAW
+    /// assembler AFTER all allocation/borrowing, keyed to the exact emitted phone sequence — a
+    /// stale override (lyric/dict changed since the edit) is IGNORED and reported, never misapplied.
+    pub phone_edit: Option<&'a PhoneEdit>,
+}
+
+/// S167 (§E2): a user's per-note phoneme timing/strength override. `phones` is the emitted phone
+/// sequence the user edited (the staleness key); `scale` are per-phone duration weights (1 = the
+/// allocator's own split; the note's TOTAL frames are conserved — scaling one phone up takes frames
+/// from its neighbours, never from other notes); `gain_db` is a per-phone output-domain gain
+/// (0 = untouched), the same trapezoid machinery as the S83 consonant-emphasis knife.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhoneEdit {
+    pub phones: Vec<String>,
+    pub scale: Vec<f32>,
+    pub gain_db: Vec<f32>,
+}
+
+/// S167 (§E4): the per-track Spanish dialect. `Dictionary` = the primary rows exactly as shipped
+/// (today's behaviour, the default — it MUST stay byte-identical: the stage2 golden gate and every
+/// existing bake are pinned to it). The named dialects normalize the two real dialect axes Spanish
+/// has (S100/S113 measured both in the corpus and in the shipped rows):
+///   · distinción vs seseo — ⟨z⟩/⟨c⟩+e,i as [θ] vs merged into [s];
+///   · lleísmo vs yeísmo — ⟨ll⟩ as [ʎ] vs merged into [ʝ]/[ɟʝ].
+/// The shipped primaries are a MIXTURE (mostly distinción + lleísmo, ~11% seseo rows), which is why
+/// "Castilian" exists as an explicit option: it repairs the seseo-primary keys toward θ using the
+/// dictionary's own variant rows first and the orthography second (validated: the spelling rule
+/// reproduces 9411/9411 alignable shipped θ rows with zero mismatches).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EsDialect {
+    /// Primary dictionary rows untouched (the shipped default).
+    #[default]
+    Dictionary,
+    /// distinción, normalized (θ wherever the orthography has ⟨z⟩/⟨c⟩+e,i) · ⟨ll⟩ as the rows ship.
+    Castilian,
+    /// distinción + yeísmo (modern peninsular standard).
+    CastilianYeista,
+    /// seseo + yeísmo (the general Latin-American standard).
+    Latam,
+    /// seseo only (Andean/Paraguayan: ⟨ll⟩ keeps [ʎ]).
+    Andean,
+}
+
+impl EsDialect {
+    /// Tolerant wire parse — an unknown value from a newer frontend lands on the default, never an
+    /// error (same policy as `PhonemeSet::from_wire`).
+    pub fn from_wire(v: Option<&str>) -> EsDialect {
+        match v {
+            Some("castilian") => EsDialect::Castilian,
+            Some("castilian_yeista") => EsDialect::CastilianYeista,
+            Some("latam") => EsDialect::Latam,
+            Some("andean") => EsDialect::Andean,
+            _ => EsDialect::Dictionary,
+        }
+    }
+    fn seseo(self) -> bool {
+        matches!(self, EsDialect::Latam | EsDialect::Andean)
+    }
+    fn yeismo(self) -> bool {
+        matches!(self, EsDialect::CastilianYeista | EsDialect::Latam)
+    }
+    fn normalize_distinction(self) -> bool {
+        matches!(self, EsDialect::Castilian | EsDialect::CastilianYeista)
+    }
 }
 
 impl<'a> ScoreEvt<'a> {
@@ -114,6 +182,8 @@ impl<'a> ScoreEvt<'a> {
             lang: Lang::Ja,
             phoneme_input: None,
             phoneme_set: PhonemeSet::Words,
+            es_dialect: EsDialect::Dictionary,
+            phone_edit: None,
         }
     }
 }
@@ -2032,6 +2102,129 @@ impl ZhDict {
 /// Dictionary provider — the resolve pass asks for a language's dictionary only when the score uses it
 /// (a pure-JA score never touches disk). The global impl lazy-loads from `data/dictionaries`; tests
 /// inject in-memory fixtures.
+// ─── S167 (§E4): Spanish dialect policy over dictionary-derived phones ───────────────────────────
+//
+// Where it sits: `resolve_west_span` applies it to the traditional phones the DICTIONARY produced
+// (lookup ladder or fragment merge). It never touches `phoneme_input`/bracket hints, never runs for
+// any other language, and `EsDialect::Dictionary` is an exact no-op — so the default path stays
+// byte-identical (the stage2 golden gate keeps pinning it).
+//
+// Design (measured on the shipped es.tsv, 95998 rows):
+//   · seseo: θ→s is EXACT — θ only ever arises from ⟨z⟩/⟨c⟩+e,i (24 foreign-name exceptions);
+//   · distinción normalization: 4469 of 4478 multi-row ⟨z/ce/ci⟩ keys ship a θ variant row, and for
+//     the 1368 single-row seseo keys the orthography rule below reproduces the shipped θ rows
+//     9411/9411 with 0 mismatches (157 unalignable → left untouched, fail-safe);
+//   · yeísmo: prefer a variant row that differs from the primary ONLY on ʎ-sites; else remap ʎ→ɟʝ
+//     word-initially / ʝ elsewhere (the shipped rows' own convention: ɟʝ is 100% word-initial).
+impl WordDict {
+    /// The variant rows for `word`, under the SAME tolerance ladder the primary lookup uses —
+    /// `map` and `alts` are filled from the same keys, so the first candidate that hits `map`
+    /// is the key the alternates live under.
+    fn alts_for(&self, word: &str) -> Option<&Vec<String>> {
+        lookup_candidates(word).iter().find(|k| self.map.contains_key(*k)).and_then(|k| self.alts.get(k))
+    }
+
+    /// Apply a Spanish dialect policy to dictionary-derived traditional phones. `word` = the
+    /// spelling (None for merged fragments, where only variant-row and remap repairs apply).
+    /// `Dictionary` returns `trad` untouched.
+    pub fn es_apply_dialect(&self, word: Option<&str>, trad: Vec<String>, d: EsDialect) -> Vec<String> {
+        if self.lang != Lang::Es || d == EsDialect::Dictionary {
+            return trad;
+        }
+        let mut out = trad;
+        if d.seseo() {
+            for p in &mut out {
+                if p == "θ" {
+                    *p = "s".to_string();
+                }
+            }
+        } else if d.normalize_distinction() && !out.iter().any(|p| p == "θ") {
+            out = self.es_distinction_repair(word, out);
+        }
+        if d.yeismo() && out.iter().any(|p| p == "ʎ") {
+            out = self.es_yeismo(word, out);
+        }
+        out
+    }
+
+    /// distinción repair for a row with no θ: prefer a variant row that differs from the primary
+    /// ONLY at s/θ sites; else derive θ sites from the orthography (⟨z⟩ and ⟨c⟩ before e/é/i/í).
+    /// Unalignable spellings (⟨x⟩ words, foreign shapes) are left untouched — fail-safe.
+    fn es_distinction_repair(&self, word: Option<&str>, trad: Vec<String>) -> Vec<String> {
+        let Some(w) = word else { return trad };
+        if let Some(alts) = self.alts_for(w) {
+            for alt in alts {
+                let toks: Vec<&str> = alt.split_whitespace().collect();
+                if toks.iter().any(|&t| t == "θ")
+                    && toks.len() == trad.len()
+                    && toks.iter().zip(trad.iter()).all(|(&a, b)| {
+                        a == b.as_str() || (matches!(a, "s" | "θ") && matches!(b.as_str(), "s" | "θ"))
+                    })
+                {
+                    return toks.iter().map(|&t| t.to_string()).collect();
+                }
+            }
+        }
+        // Orthography arm. Sibilant SOURCES in spelling order: ⟨s⟩→s, ⟨z⟩→θ, ⟨c⟩+e/é/i/í→θ.
+        // ⟨x⟩ yields a variable number of sibilants (ks/s/x) — bail out on any ⟨x⟩.
+        let w = w.to_lowercase();
+        if w.contains('x') {
+            return trad;
+        }
+        let chars: Vec<char> = w.chars().collect();
+        let mut src: Vec<&'static str> = Vec::new();
+        for (i, &c) in chars.iter().enumerate() {
+            match c {
+                'z' => src.push("θ"),
+                'c' if matches!(chars.get(i + 1), Some('e' | 'é' | 'i' | 'í')) => src.push("θ"),
+                's' => src.push("s"),
+                _ => {}
+            }
+        }
+        let sites: Vec<usize> =
+            trad.iter().enumerate().filter(|(_, p)| matches!(p.as_str(), "s" | "θ")).map(|(i, _)| i).collect();
+        if sites.len() != src.len() {
+            return trad; // unalignable — never guess
+        }
+        let mut out = trad;
+        for (&i, &cls) in sites.iter().zip(src.iter()) {
+            out[i] = cls.to_string();
+        }
+        out
+    }
+
+    /// yeísmo: prefer a variant row that differs from the current phones ONLY at ʎ↔ʝ/ɟʝ sites;
+    /// else remap ʎ → ɟʝ word-initially / ʝ elsewhere (the shipped rows' own positional convention).
+    fn es_yeismo(&self, word: Option<&str>, cur: Vec<String>) -> Vec<String> {
+        if let Some(w) = word {
+            if let Some(alts) = self.alts_for(w) {
+                for alt in alts {
+                    let toks: Vec<&str> = alt.split_whitespace().collect();
+                    if !toks.iter().any(|&t| t == "ʎ")
+                        && toks.len() == cur.len()
+                        && toks.iter().zip(cur.iter()).all(|(&a, b)| {
+                            a == b.as_str()
+                                || (matches!(a, "ʝ" | "ɟʝ") && b == "ʎ")
+                        })
+                    {
+                        return toks.iter().map(|&t| t.to_string()).collect();
+                    }
+                }
+            }
+        }
+        cur.into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if p == "ʎ" {
+                    if i == 0 { "ɟʝ".to_string() } else { "ʝ".to_string() }
+                } else {
+                    p
+                }
+            })
+            .collect()
+    }
+}
+
 pub trait DictSource {
     fn zh(&self) -> Result<&ZhDict>;
     fn words(&self, lang: Lang) -> Result<&WordDict>;
@@ -3298,6 +3491,16 @@ fn resolve_west_span(
     if trad.is_empty() {
         return Ok(Err(NoteFail::Oov));
     }
+    // S167 (§E4): Spanish dialect policy — DICTIONARY-derived phones only (an explicit
+    // `phoneme_input` is the user's own transcription and must never be second-guessed). A merged
+    // fragment word has no single spelling here, so it gets the variant-row/remap repairs but not
+    // the orthography arm (`word: None`). `EsDialect::Dictionary` returns `trad` untouched.
+    let trad = if evt.phoneme_input.is_some() {
+        trad
+    } else {
+        let word = if merged_trad.is_some() { None } else { Some(evt.lyric.trim()) };
+        dict.es_apply_dialect(word, trad, evt.es_dialect)
+    };
     // S106 §C3 — the compound seam is looked up from the LYRIC the author wrote (the same string
     // the dictionary lookup above used), and it only ever binds when one head+tail pronunciation
     // concatenates to exactly `trad`. So an override, a merged fragment or a plural/elision reading
@@ -3627,7 +3830,7 @@ mod tests {
     /// The complaint's REAL content — "the probe stops short of the render" — is answered by the
     /// label on the print block in `g2p_probe`, not by these numbers. Don't re-file it.
     fn evt_set(lyric: &str, lang: Lang, phoneme_set: PhonemeSet) -> ScoreEvt<'_> {
-        ScoreEvt { lyric, note_num: 60, frames: 20, lang, phoneme_input: None, phoneme_set }
+        ScoreEvt { lyric, note_num: 60, frames: 20, lang, phoneme_input: None, phoneme_set, es_dialect: Default::default(), phone_edit: None }
     }
     fn phones_of(nt: &ResolvedNote) -> Vec<&'static str> {
         match &nt.kind {
@@ -3834,10 +4037,10 @@ mod tests {
         // frames=1 / note_num=60, so the merge must reach identical verdicts regardless of
         // frames/pitch — otherwise the editor clears a red mark the render then trips over.
         let real = [
-            ScoreEvt { lyric: "nev", note_num: 72, frames: 37, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words },
-            ScoreEvt { lyric: "ver", note_num: 48, frames: 3, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words },
-            ScoreEvt { lyric: "be", note_num: 60, frames: 9, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words },
-            ScoreEvt { lyric: "leeve", note_num: 84, frames: 100, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words },
+            ScoreEvt { lyric: "nev", note_num: 72, frames: 37, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None },
+            ScoreEvt { lyric: "ver", note_num: 48, frames: 3, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None },
+            ScoreEvt { lyric: "be", note_num: 60, frames: 9, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None },
+            ScoreEvt { lyric: "leeve", note_num: 84, frames: 100, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None },
         ];
         let dummy: Vec<ScoreEvt> = real
             .iter()
@@ -7851,4 +8054,149 @@ mod tests {
         );
     }
 
+}
+
+// ─── S167 (§E4): Spanish dialect policy — hermetic (inline TSV, no data/ dependency) ─────────────
+#[cfg(test)]
+mod es_dialect_tests {
+    use super::*;
+
+    fn dict() -> WordDict {
+        WordDict::from_tsv(
+            Lang::Es,
+            concat!(
+                "cielo\tθ j e l o\n",
+                "cielo\ts j e l o\n",
+                "cerveza\ts e r β e s a\n",   // seseo PRIMARY (the shipped mixture is real)
+                "cerveza\tθ e r β e θ a\n",   // …with a distinción variant row
+                "abrazaba\ta β ɾ a s a β a\n", // single-row seseo key → orthography arm
+                "examen\te k s a m e n\n",     // ⟨x⟩ → unalignable, must stay untouched
+                "calle\tk a ʎ e\n",
+                "calle\tk a ʝ e\n",
+                "llamar\tʎ a m a ɾ\n",
+                "llamar\tɟʝ a m a ɾ\n",
+                "lluvia\tʎ u β j a\n",         // single-row ʎ key → positional remap
+                "sol\ts o l\n",
+            ),
+        )
+    }
+    fn phones(d: &WordDict, w: &str) -> Vec<String> {
+        d.lookup(w).expect("fixture word resolves")
+    }
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn dictionary_default_is_the_identity() {
+        let d = dict();
+        for w in ["cielo", "cerveza", "abrazaba", "examen", "calle", "llamar", "lluvia", "sol"] {
+            let p = phones(&d, w);
+            assert_eq!(d.es_apply_dialect(Some(w), p.clone(), EsDialect::Dictionary), p, "{w}");
+        }
+    }
+
+    #[test]
+    fn seseo_merges_every_theta_and_touches_nothing_else() {
+        let d = dict();
+        assert_eq!(d.es_apply_dialect(Some("cielo"), phones(&d, "cielo"), EsDialect::Latam), s(&["s", "j", "e", "l", "o"]));
+        assert_eq!(
+            d.es_apply_dialect(Some("cerveza"), phones(&d, "cerveza"), EsDialect::Andean),
+            s(&["s", "e", "r", "β", "e", "s", "a"]),
+            "an already-seseo row is untouched"
+        );
+        assert_eq!(d.es_apply_dialect(Some("sol"), phones(&d, "sol"), EsDialect::Latam), s(&["s", "o", "l"]));
+        // Andean does NOT merge ⟨ll⟩:
+        assert_eq!(d.es_apply_dialect(Some("calle"), phones(&d, "calle"), EsDialect::Andean), s(&["k", "a", "ʎ", "e"]));
+    }
+
+    #[test]
+    fn castilian_repairs_a_seseo_primary_from_its_variant_row() {
+        let d = dict();
+        assert_eq!(
+            d.es_apply_dialect(Some("cerveza"), phones(&d, "cerveza"), EsDialect::Castilian),
+            s(&["θ", "e", "r", "β", "e", "θ", "a"]),
+            "the θ variant row wins over the seseo primary"
+        );
+        assert_eq!(
+            d.es_apply_dialect(Some("cielo"), phones(&d, "cielo"), EsDialect::Castilian),
+            s(&["θ", "j", "e", "l", "o"]),
+            "a row that already has θ stays put"
+        );
+    }
+
+    #[test]
+    fn castilian_orthography_arm_covers_single_row_keys_and_fails_safe() {
+        let d = dict();
+        assert_eq!(
+            d.es_apply_dialect(Some("abrazaba"), phones(&d, "abrazaba"), EsDialect::Castilian),
+            s(&["a", "β", "ɾ", "a", "θ", "a", "β", "a"]),
+            "the ⟨z⟩ site is rewritten from the spelling"
+        );
+        assert_eq!(
+            d.es_apply_dialect(Some("examen"), phones(&d, "examen"), EsDialect::Castilian),
+            phones(&d, "examen"),
+            "an ⟨x⟩ word is unalignable and must be left untouched — never guess"
+        );
+        assert_eq!(
+            d.es_apply_dialect(None, phones(&d, "abrazaba"), EsDialect::Castilian),
+            phones(&d, "abrazaba"),
+            "a merged fragment has no single spelling → variant rows only, no orthography guess"
+        );
+    }
+
+    #[test]
+    fn yeismo_prefers_the_variant_row_then_remaps_positionally() {
+        let d = dict();
+        assert_eq!(d.es_apply_dialect(Some("calle"), phones(&d, "calle"), EsDialect::Latam), s(&["k", "a", "ʝ", "e"]));
+        assert_eq!(
+            d.es_apply_dialect(Some("llamar"), phones(&d, "llamar"), EsDialect::CastilianYeista),
+            s(&["ɟʝ", "a", "m", "a", "ɾ"]),
+            "word-initial ⟨ll⟩ takes the rows' own ɟʝ convention via the variant row"
+        );
+        assert_eq!(
+            d.es_apply_dialect(Some("lluvia"), phones(&d, "lluvia"), EsDialect::Latam),
+            s(&["ɟʝ", "u", "β", "j", "a"]),
+            "no variant row: word-initial ʎ → ɟʝ, the positional remap"
+        );
+    }
+
+    struct EsOnly(WordDict);
+    impl DictSource for EsOnly {
+        fn zh(&self) -> Result<&ZhDict> {
+            Err(UtaiError::Inference("fixture has no zh".into()))
+        }
+        fn words(&self, lang: Lang) -> Result<&WordDict> {
+            if lang == Lang::Es {
+                Ok(&self.0)
+            } else {
+                Err(UtaiError::Inference("fixture is es-only".into()))
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_score_applies_the_dialect_to_dictionary_phones_but_never_to_a_phoneme_input() {
+        let src = EsOnly(dict());
+        let mk = |dialect, pi: Option<&'static str>| ScoreEvt {
+            lyric: "cielo",
+            note_num: 60,
+            frames: 10,
+            lang: Lang::Es,
+            phoneme_input: pi,
+            phoneme_set: PhonemeSet::Words,
+            es_dialect: dialect,
+            phone_edit: None,
+        };
+        let out = resolve_score(&[mk(EsDialect::Latam, None)], &src).unwrap();
+        let ResolvedKind::Phones(p) = &out[0].kind else { panic!("resolves") };
+        assert!(p.contains(&"s") && !p.contains(&"θ"), "dictionary phones follow the dialect: {p:?}");
+        let out2 = resolve_score(&[mk(EsDialect::Latam, Some("θ j e l o"))], &src).unwrap();
+        let ResolvedKind::Phones(p2) = &out2[0].kind else { panic!("resolves") };
+        assert!(p2.contains(&"θ"), "the user's own phones are never second-guessed: {p2:?}");
+        // and the default really is the identity at the resolve level too:
+        let out3 = resolve_score(&[mk(EsDialect::Dictionary, None)], &src).unwrap();
+        let ResolvedKind::Phones(p3) = &out3[0].kind else { panic!("resolves") };
+        assert!(p3.contains(&"θ"), "Dictionary keeps the primary row byte-for-byte: {p3:?}");
+    }
 }

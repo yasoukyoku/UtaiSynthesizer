@@ -684,7 +684,7 @@ mod selfcheck {
     fn en(p: &'static str, fr: i64) -> g2p::ScoreEvt<'static> {
         g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
-            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         }
     }
 
@@ -879,7 +879,7 @@ mod selfcheck {
     fn audit_models_the_zh_sustain_paths() {
         let zh = |lyric: &'static str, nn: i64| g2p::ScoreEvt {
             lyric, note_num: nn, frames: 20, lang: g2p::Lang::Zh,
-            phoneme_input: None, phoneme_set: PhonemeSet::Words,
+            phoneme_input: None, phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let score = vec![zh("x", 60), zh("-", 60), zh("-", 62)];
         let note = |ph: Vec<&'static str>, sustain: bool| g2p::ResolvedNote {
@@ -912,7 +912,7 @@ mod selfcheck {
     fn audit_models_ja_sustains() {
         let hold = |nn: i64| g2p::ScoreEvt {
             lyric: "-", note_num: nn, frames: 16, lang: g2p::Lang::Ja,
-            phoneme_input: None, phoneme_set: PhonemeSet::Words,
+            phoneme_input: None, phoneme_set: PhonemeSet::Words, es_dialect: Default::default(), phone_edit: None,
         };
         let score = vec![raw("k a", 16), hold(60), hold(62)];
         let rep = audit_score(&score, &NoDicts, ArticulationTiming::Auto).unwrap();

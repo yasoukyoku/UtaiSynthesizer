@@ -1318,6 +1318,8 @@ pub async fn render_candidate_scale(
                 // lyrics at lang=ja — there is no track and no alias convention here, the same reason
                 // this path hard-wires `ScoreShaping::default()`.
                 phoneme_set: g2p_alias::PhonemeSet::Words,
+                es_dialect: Default::default(),
+                phone_edit: None,
             })
             .collect();
 
