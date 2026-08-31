@@ -739,6 +739,9 @@ function VoiceModelsTab({ lang }: { lang: string }) {
   // S146f: 音域边界编辑器展开时,四条滑条会占满整行 —— 试听按钮与它挤在同一行里视觉重叠
   // (用户实机报的)。编辑态提到这一层,让同排的动作按钮能让位。
   const [rangeEditing, setRangeEditing] = useState<string | null>(null);
+  // S167c: which model's EXPORT format chooser is open — the chooser owns its row (audition /
+  // range row / delete yield), same tab-level pattern as rangeEditing (S146f: 同排按钮要跟着让位).
+  const [exportPick, setExportPick] = useState<string | null>(null);
   // Shared store — the SAME list the RVC/SoVITS workflow nodes read (one source of truth).
   const models = useVoiceModelStore((s) => s.models[voiceType]);
   const voiceError = useVoiceModelStore((s) => s.error);
@@ -1020,7 +1023,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                   )}
                 </span>
                 )}
-                {!isVocoder && (
+                {!isVocoder && exportPick !== m.name && (
                   <VoiceRangeRow
                     m={m}
                     voiceType={voiceType as "rvc" | "sovits"}
@@ -1032,18 +1035,29 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                   />
                 )}
               </div>
-              {!isVocoder && rangeEditing !== m.name && (
+              {/* S167c: while the export chooser is open it OWNS the row (user: the extra
+                  buttons burst the row) — audition, the range row and delete all yield,
+                  leaving only 包 / 社区格式 / 取消. Same yield pattern as rangeEditing. */}
+              {!isVocoder && rangeEditing !== m.name && exportPick !== m.name && (
                 <VoiceAuditionButton m={m} voiceType={voiceType as "rvc" | "sovits"} lang={lang} spk={spk} />
               )}
-              {rangeEditing !== m.name && <VoiceExportButton m={m} voiceType={voiceType} lang={lang} />}
-              {deleteConfirm === m.name ? (
+              {rangeEditing !== m.name && (
+                <VoiceExportButton
+                  m={m}
+                  voiceType={voiceType}
+                  lang={lang}
+                  picking={exportPick === m.name}
+                  onPicking={(on) => { setExportPick(on ? m.name : null); if (on) setDeleteConfirm(null); }}
+                />
+              )}
+              {exportPick !== m.name && (deleteConfirm === m.name ? (
                 <div className="model-confirm-delete">
                   <button className="danger" onClick={() => handleDelete(m.name)}>{lang === "zh" ? "确认" : "OK"}</button>
                   <button onClick={() => setDeleteConfirm(null)}>{lang === "zh" ? "取消" : "Cancel"}</button>
                 </div>
               ) : (
                 <button className="model-delete-btn" onClick={() => setDeleteConfirm(m.name)}>{lang === "zh" ? "删除" : "Delete"}</button>
-              )}
+              ))}
             </div>
           );
         })}
@@ -1081,13 +1095,18 @@ function sanitizeExportName(name: string): string {
 // S78 batch 7: export ONE installed voice model as a portable `.zip` package (re-importable via
 // "Import Package"). Per-row so each has its own busy state; guards against a live test/audition
 // (Rust re-checks) before opening the native save dialog.
-function VoiceExportButton({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: VoiceType; lang: string }) {
+function VoiceExportButton({ m, voiceType, lang, picking, onPicking }: {
+  m: VoiceModelEntry; voiceType: VoiceType; lang: string;
+  /** S167c: the chooser OWNS the row while open (user: the extra buttons burst the row) — the
+   *  open state lives at the tab level (the S146f rangeEditing pattern) so the row can hide its
+   *  audition / range / delete controls and show ONLY 包 / 社区格式 / 取消. */
+  picking: boolean; onPicking: (on: boolean) => void;
+}) {
   const [busy, setBusy] = useState(false);
-  // S167: on Export the user picks the format inline (same pattern as the delete confirm):
-  // UTAI .zip (lossless re-importable package) vs community-standard files into a plain folder.
-  // The community choice is enabled only when the training-side source still exists — installed
-  // models are ONNX-only, so the `.pth` must come from the export ledger (has_community_source).
-  const [pick, setPick] = useState(false);
+  // S167: on Export the user picks the format inline: UTAI .zip (lossless re-importable package)
+  // vs community-standard files into a plain folder. The community choice is enabled only when
+  // the training-side source still exists — installed models are ONNX-only, so the `.pth` must
+  // come from the export ledger (has_community_source).
   const [communityOk, setCommunityOk] = useState<boolean | null>(null);
 
   const guardBusyModel = useCallback((): boolean => {
@@ -1160,16 +1179,16 @@ function VoiceExportButton({ m, voiceType, lang }: { m: VoiceModelEntry; voiceTy
       ok = false;
     }
     setCommunityOk(ok);
-    setPick(true);
-  }, [busy, guardBusyModel, m.name, voiceType, zipFlow]);
+    onPicking(true);
+  }, [busy, guardBusyModel, m.name, voiceType, zipFlow, onPicking]);
 
-  if (pick) {
+  if (picking) {
     return (
       <div className="model-confirm-delete">
         <button
           className="model-export-btn"
           disabled={busy}
-          onClick={() => { setPick(false); void zipFlow(); }}
+          onClick={() => { onPicking(false); void zipFlow(); }}
           title={t18({ zh: "UTAI 模型包，可在其它设备导入", en: "UTAI package — import on another device", ja: "UTAI パッケージ。他のデバイスで取り込めます" }, lang)}
         >
           {t18({ zh: "UTAI 包 (.zip)", en: "UTAI package (.zip)", ja: "UTAI パッケージ (.zip)" }, lang)}
@@ -1177,14 +1196,14 @@ function VoiceExportButton({ m, voiceType, lang }: { m: VoiceModelEntry; voiceTy
         <button
           className="model-export-btn"
           disabled={busy || communityOk !== true}
-          onClick={() => { setPick(false); void communityFlow(); }}
+          onClick={() => { onPicking(false); void communityFlow(); }}
           title={communityOk === true
             ? t18({ zh: "导出社区通用格式到文件夹（不打包）", en: "Community-standard files into a plain folder (no zip)", ja: "コミュニティ標準形式でフォルダーに書き出し（zip なし）" }, lang)
             : t18({ zh: "找不到训练侧来源：已安装模型只有 ONNX，社区 .pth 需要它的训练工程仍然在", en: "No training-side source: installed models are ONNX-only; the community .pth needs its original training project", ja: "学習側ソースがありません：インストール済みモデルは ONNX のみ。コミュニティ .pth には元の学習プロジェクトが必要です" }, lang)}
         >
           {t18({ zh: "社区格式（文件夹）", en: "Community format (folder)", ja: "コミュニティ形式（フォルダー）" }, lang)}
         </button>
-        <button className="model-export-btn" disabled={busy} onClick={() => setPick(false)}>
+        <button className="model-export-btn" disabled={busy} onClick={() => onPicking(false)}>
           {t18({ zh: "取消", en: "Cancel", ja: "キャンセル" }, lang)}
         </button>
       </div>
