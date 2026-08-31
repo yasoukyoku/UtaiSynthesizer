@@ -532,6 +532,41 @@ impl ModelRegistry {
                 }
                 return Err(e);
             }
+            // S167c: RETAIN the community source so the manager can re-export it later —
+            // installed models are ONNX-only and a community `.pth` cannot be reconstructed
+            // from them. The checkpoint keeps its original extension under `<stem>.src.*`;
+            // for SoVITS the config the converter read (`config.json` next to the .pth —
+            // convert.py's own discovery rule) rides along as `<stem>.src.config.json`.
+            // Both are PORTABLE family members (they travel in the .zip package and die with
+            // the family — collect_stem_family). Copy failures are warnings, never errors:
+            // the model itself imported fine.
+            if matches!(model_type, ModelType::Rvc | ModelType::SoVits) {
+                let ext = src_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .filter(|e| ["pth", "ckpt", "pt"].contains(&e.as_str()))
+                    .unwrap_or_else(|| "pth".to_string());
+                if let Err(e) = std::fs::copy(src_path, subdir.join(format!("{}.src.{}", stem, ext)))
+                {
+                    warnings.push(format!("WARN_COMMUNITY_SRC_RETAIN_FAILED: {}", e));
+                }
+                if matches!(model_type, ModelType::SoVits) {
+                    match src_path.parent().map(|p| p.join("config.json")).filter(|c| c.is_file()) {
+                        Some(c) => {
+                            if let Err(e) =
+                                std::fs::copy(&c, subdir.join(format!("{}.src.config.json", stem)))
+                            {
+                                warnings.push(format!("WARN_COMMUNITY_SRC_RETAIN_FAILED: {}", e));
+                            }
+                        }
+                        None => warnings.push(
+                            "WARN_COMMUNITY_SRC_RETAIN_FAILED: config.json not found beside the checkpoint"
+                                .into(),
+                        ),
+                    }
+                }
+            }
         }
 
         let config = match finalize_sidecar(&onnx_path, name, &model_type, &mut warnings) {
@@ -1318,6 +1353,13 @@ pub(crate) fn collect_stem_family(dir: &Path, stem: &str) -> StemFamily {
     push_if(&mut portable, dir.join(format!("{}.npy", stem)));
     // SoVITS auto-f0 predictor graph (converter writes `<stem>.f0.onnx`, S36).
     push_if(&mut portable, dir.join(format!("{}.f0.onnx", stem)));
+    // S167c: the RETAINED community source (a torch-ckpt import keeps its original file, plus —
+    // for SoVITS — the config it was converted with) so the manager can re-export the community
+    // file set later. Portable: it travels in the .zip package and dies with the family.
+    for ext in ["pth", "ckpt", "pt"] {
+        push_if(&mut portable, dir.join(format!("{}.src.{}", stem, ext)));
+    }
+    push_if(&mut portable, dir.join(format!("{}.src.config.json", stem)));
     push_if(&mut portable, dir.join(format!("{}.cluster", stem)));
     push_if(&mut portable, dir.join(format!("{}.diffusion", stem)));
     push_if(&mut portable, dir.join(format!("{}_mel.npy", stem)));
@@ -2048,7 +2090,7 @@ mod tests {
     fn collect_stem_family_partitions_portable_and_caches() {
         let dir = temp_models_dir();
         let stem = "たろう";
-        for suffix in [".onnx", ".json", ".npy", ".f0.onnx", "_mel.npy", ".avatar.png"] {
+        for suffix in [".onnx", ".json", ".npy", ".f0.onnx", "_mel.npy", ".avatar.png", ".src.pth", ".src.config.json"] {
             std::fs::write(dir.join(format!("{}{}", stem, suffix)), b"x").unwrap();
         }
         std::fs::create_dir_all(dir.join(format!("{}.cluster", stem))).unwrap();
@@ -2064,7 +2106,7 @@ mod tests {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        assert_eq!(fam.portable.len(), 8, "onnx+json+npy+f0+cluster+diffusion+mel+avatar");
+        assert_eq!(fam.portable.len(), 10, "onnx+json+npy+f0+cluster+diffusion+mel+avatar+src.pth+src.config");
         assert!(names.contains(&format!("{}.cluster", stem)));
         assert!(names.contains(&format!("{}.diffusion", stem)));
         assert!(!names.contains(&format!("{}z.onnx", stem)), "prefix sibling must not be captured");

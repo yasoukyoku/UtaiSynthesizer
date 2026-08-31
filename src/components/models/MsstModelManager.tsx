@@ -1199,7 +1199,7 @@ function VoiceExportButton({ m, voiceType, lang, picking, onPicking }: {
           onClick={() => { onPicking(false); void communityFlow(); }}
           title={communityOk === true
             ? t18({ zh: "导出社区通用格式到文件夹（不打包）", en: "Community-standard files into a plain folder (no zip)", ja: "コミュニティ標準形式でフォルダーに書き出し（zip なし）" }, lang)
-            : t18({ zh: "找不到训练侧来源：已安装模型只有 ONNX，社区 .pth 需要它的训练工程仍然在", en: "No training-side source: installed models are ONNX-only; the community .pth needs its original training project", ja: "学習側ソースがありません：インストール済みモデルは ONNX のみ。コミュニティ .pth には元の学習プロジェクトが必要です" }, lang)}
+            : t18({ zh: "没有可用的社区源：v0.12 起导入模型会保留源 .pth（此模型更早导入，或当初就是 ONNX）——重新导入一次即可解锁；本机训练的模型请在训练页的存档里导出", en: "No community source: since v0.12 importing a model retains its source .pth (this one predates that, or was imported as bare ONNX) — re-import it once to unlock; locally trained models export from the training page's archive", ja: "コミュニティソースがありません：v0.12 以降のインポートは元の .pth を保持します（このモデルはそれ以前、または ONNX 直接インポート）——一度再インポートすると有効になります。ローカル学習モデルは学習ページのアーカイブから書き出してください" }, lang)}
         >
           {t18({ zh: "社区格式（文件夹）", en: "Community format (folder)", ja: "コミュニティ形式（フォルダー）" }, lang)}
         </button>

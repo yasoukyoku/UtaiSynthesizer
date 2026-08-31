@@ -934,8 +934,51 @@ pub async fn export_community_ckpt(
     let cache_dir = state.cache_dir.clone();
     // S167: the family dispatch is shared with the resource manager's community export
     // (`models::export_model_community`) — ONE source of truth for the file-set contract.
+    let (feat, cfg) = community_run_assets(&family, &ckpt_canon)?;
     let _convert = state.acquire_convert_slot()?;
-    community_export_files(app_dir, cache_dir, &family, ckpt_canon, &name, dest).await
+    community_export_files(app_dir, cache_dir, &family, ckpt_canon, &name, dest, feat, cfg).await
+}
+
+/// S167c: companion assets for a TRAINING-RUN checkpoint (`…/weights/<slug>.pth`):
+/// rvc → the run's `total_fea.npy` (required — a run always has one), sovits → the run's
+/// `config.json` (required). The manager's retained-source path supplies its own instead.
+pub(crate) fn community_run_assets(
+    family: &str,
+    ckpt_canon: &std::path::Path,
+) -> Result<(Option<std::path::PathBuf>, Option<std::path::PathBuf>), String> {
+    match family {
+        "rvc" => {
+            // weights/<slug>*.pth → the run root (total_fea.npy's home) is one level above weights/
+            let run_dir = ckpt_canon
+                .parent()
+                .filter(|p| p.file_name().is_some_and(|n| n == "weights"))
+                .and_then(|p| p.parent())
+                .ok_or("EXPORT_COMMUNITY_NOT_A_RELEASE")?;
+            let features = run_dir.join("total_fea.npy");
+            if !features.exists() {
+                return Err("EXPORT_COMMUNITY_NO_FEATURES".into());
+            }
+            Ok((Some(features), None))
+        }
+        "sovits" | "sovits_v2" => {
+            let run_dir = ckpt_canon
+                .parent()
+                .map(|p| {
+                    if p.file_name().is_some_and(|n| n == "weights") {
+                        p.parent().unwrap_or(p)
+                    } else {
+                        p
+                    }
+                })
+                .ok_or("EXPORT_COMMUNITY_NOT_A_RELEASE")?;
+            let config = run_dir.join("config.json");
+            if !config.exists() {
+                return Err("EXPORT_COMMUNITY_NO_CONFIG".into());
+            }
+            Ok((None, Some(config)))
+        }
+        _ => Err("EXPORT_COMMUNITY_UNSUPPORTED".into()),
+    }
 }
 
 /// S167: community file-set builder shared by the training page (`export_community_ckpt`) and
@@ -948,21 +991,28 @@ pub(crate) async fn community_export_files(
     ckpt_canon: std::path::PathBuf,
     name: &str,
     dest: std::path::PathBuf,
+    // S167c: companion assets are the CALLER's problem — a training run derives them from the
+    // run tree (community_run_assets), the manager's retained-source path hands over the
+    // family's own files. rvc: retrieval matrix (None ⇒ export the .pth alone: an imported
+    // model may have come without an index); sovits: config.json (required).
+    rvc_features: Option<std::path::PathBuf>,
+    sovits_config: Option<std::path::PathBuf>,
 ) -> Result<Vec<String>, String> {
     let name = name.to_string();
     match family {
         "rvc" => {
-            // weights/<slug>*.pth → the run root (total_fea.npy's home) is two levels up
-            let run_dir = ckpt_canon
-                .parent()
-                .filter(|p| p.file_name().is_some_and(|n| n == "weights"))
-                .and_then(|p| p.parent())
-                .ok_or("EXPORT_COMMUNITY_NOT_A_RELEASE")?
-                .to_path_buf();
-            let features = run_dir.join("total_fea.npy");
-            if !features.exists() {
-                return Err("EXPORT_COMMUNITY_NO_FEATURES".into());
-            }
+            let out_pth = dest.join(format!("{name}.pth"));
+            let Some(features) = rvc_features else {
+                // no retrieval matrix (an imported model without an index): the .pth alone is
+                // still the community-standard checkpoint — export just it.
+                return tauri::async_runtime::spawn_blocking(move || -> Result<Vec<String>, String> {
+                    std::fs::copy(&ckpt_canon, &out_pth)
+                        .map_err(|e| format!("EXPORT_COMMUNITY_COPY: {e}"))?;
+                    Ok(vec![out_pth.display().to_string()])
+                })
+                .await
+                .map_err(|e| format!("EXPORT_COMMUNITY_TASK: {e}"))?;
+            };
             // v1/v2 from the feature dimension itself — the one witness that cannot drift from
             // the matrix we are about to index (256 = ContentVec-256 = v1, 768 = v2).
             let version = match npy_second_dim(&features) {
@@ -970,7 +1020,6 @@ pub(crate) async fn community_export_files(
                 Some(768) => "v2",
                 other => return Err(format!("EXPORT_COMMUNITY_BAD_FEATURES: dim {other:?}")),
             };
-            let out_pth = dest.join(format!("{name}.pth"));
             tauri::async_runtime::spawn_blocking(move || -> Result<Vec<String>, String> {
                 std::fs::copy(&ckpt_canon, &out_pth)
                     .map_err(|e| format!("EXPORT_COMMUNITY_COPY: {e}"))?;
@@ -994,20 +1043,7 @@ pub(crate) async fn community_export_files(
             .map_err(|e| format!("EXPORT_COMMUNITY_TASK: {e}"))?
         }
         "sovits" | "sovits_v2" => {
-            // release snapshots live under <run>/weights/; the community pair needs the run's
-            // own config.json (one level up)
-            let run_dir = ckpt_canon
-                .parent()
-                .map(|p| {
-                    if p.file_name().is_some_and(|n| n == "weights") {
-                        p.parent().unwrap_or(p)
-                    } else {
-                        p
-                    }
-                })
-                .ok_or("EXPORT_COMMUNITY_NOT_A_RELEASE")?
-                .to_path_buf();
-            let config = run_dir.join("config.json");
+            let config = sovits_config.ok_or("EXPORT_COMMUNITY_NO_CONFIG")?;
             if !config.exists() {
                 return Err("EXPORT_COMMUNITY_NO_CONFIG".into());
             }

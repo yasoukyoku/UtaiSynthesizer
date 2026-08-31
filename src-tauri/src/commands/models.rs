@@ -376,7 +376,16 @@ pub async fn has_community_source(
         return Ok(false);
     }
     let data_dir = crate::commands::training::data_root(&state);
-    Ok(resolve_community_source(&data_dir, &name, &model_type).is_some())
+    if resolve_community_source(&data_dir, &name, &model_type).is_some() {
+        return Ok(true);
+    }
+    // S167c: the retained import source beside the ONNX (v0.12+ imports keep it)
+    let Some(mt) = parse_voice_type(&model_type) else { return Ok(false) };
+    let Some(entry) = state.models.get_by_type(&name, &mt) else { return Ok(false) };
+    Ok(match retained_community_source(&entry.path) {
+        Some((_, cfg)) => !matches!(mt, ModelType::SoVits) || cfg.is_some(),
+        None => false,
+    })
 }
 
 /// S167: export an INSTALLED model in the COMMUNITY-standard format — plain files into a
@@ -400,7 +409,7 @@ pub async fn export_model_community(
         return Err("MODEL_BUSY_AUDITION".to_string());
     }
     // per-row button in the manager ⇒ the registry entry must exist
-    state
+    let entry = state
         .models
         .get_by_type(&name, &mt)
         .ok_or_else(|| "EXPORT_MODEL_NOT_FOUND".to_string())?;
@@ -409,12 +418,38 @@ pub async fn export_model_community(
         return Err("EXPORT_COMMUNITY_DEST_MISSING".to_string());
     }
     let data_dir = crate::commands::training::data_root(&state);
-    let (ckpt, backend) = resolve_community_source(&data_dir, &name, &model_type)
-        .ok_or_else(|| "EXPORT_COMMUNITY_NO_SOURCE".to_string())?;
-    let ckpt = ckpt
-        .canonicalize()
-        .map_err(|e| format!("EXPORT_COMMUNITY_CKPT_MISSING: {e}"))?;
-    let family = crate::training::backend_family(&backend).to_string();
+    let (ckpt, family, feat, cfg) = match resolve_community_source(&data_dir, &name, &model_type) {
+        Some((ckpt, backend)) => {
+            let ckpt = ckpt
+                .canonicalize()
+                .map_err(|e| format!("EXPORT_COMMUNITY_CKPT_MISSING: {e}"))?;
+            let family = crate::training::backend_family(&backend).to_string();
+            let (feat, cfg) = crate::commands::training::community_run_assets(&family, &ckpt)?;
+            (ckpt, family, feat, cfg)
+        }
+        None => {
+            // S167c: fall back to the RETAINED import source (`<stem>.src.*` beside the ONNX —
+            // v0.12 imports keep it exactly for this; older imports have none ⇒ honest refusal,
+            // one re-import unlocks it).
+            let (ckpt, cfg) = retained_community_source(&entry.path)
+                .ok_or_else(|| "EXPORT_COMMUNITY_NO_SOURCE".to_string())?;
+            let family = match mt {
+                ModelType::Rvc => "rvc",
+                ModelType::SoVits => "sovits",
+                _ => return Err("EXPORT_COMMUNITY_UNSUPPORTED".to_string()),
+            };
+            if matches!(mt, ModelType::SoVits) && cfg.is_none() {
+                return Err("EXPORT_COMMUNITY_NO_SOURCE".to_string());
+            }
+            let feat = if matches!(mt, ModelType::Rvc) {
+                let npy = entry.path.with_extension("npy");
+                npy.is_file().then_some(npy)
+            } else {
+                None
+            };
+            (ckpt, family.to_string(), feat, cfg)
+        }
+    };
     let out_name = crate::models::sanitize_file_stem(name.trim());
     if out_name.is_empty() {
         return Err("TRAINING_NAME_EMPTY".to_string());
@@ -429,8 +464,24 @@ pub async fn export_model_community(
         ckpt,
         &out_name,
         dest,
+        feat,
+        cfg,
     )
     .await
+}
+
+/// S167c: the import-retained community source beside the installed ONNX — `<stem>.src.pth`
+/// (or `.ckpt`/`.pt`) plus, for SoVITS, `<stem>.src.config.json` (see `Models::import_file`).
+/// Pure over the ONNX path so the unit test needs no registry entry.
+fn retained_community_source(onnx_path: &Path) -> Option<(PathBuf, Option<PathBuf>)> {
+    let dir = onnx_path.parent()?;
+    let stem = onnx_path.file_stem()?.to_string_lossy().to_string();
+    let ckpt = ["pth", "ckpt", "pt"]
+        .iter()
+        .map(|e| dir.join(format!("{stem}.src.{e}")))
+        .find(|p| p.is_file())?;
+    let cfg = dir.join(format!("{stem}.src.config.json"));
+    Some((ckpt, cfg.is_file().then_some(cfg)))
 }
 
 #[cfg(test)]
@@ -469,6 +520,31 @@ mod community_source_tests {
         assert!(resolve_community_source(&root, "dead", "rvc").is_none());
         // vocoder / unknown types never resolve
         assert!(resolve_community_source(&root, "m", "vocoder").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S167c: the retained-source fallback — `<stem>.src.*` beside the ONNX, SoVITS gated on
+    /// its retained config (a `.pth` without the config it was converted with is not the
+    /// community pair and must not light the button).
+    #[test]
+    fn retained_source_resolves_beside_the_onnx_and_sovits_needs_its_config() {
+        let root = std::env::temp_dir().join(format!("utai_retained_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let onnx = root.join("たろう.onnx");
+        std::fs::write(&onnx, b"o").unwrap();
+        assert!(retained_community_source(&onnx).is_none(), "nothing retained ⇒ None");
+        std::fs::write(root.join("たろう.src.pth"), b"p").unwrap();
+        let (ckpt, cfg) = retained_community_source(&onnx).expect("pth retained");
+        assert!(ckpt.ends_with("たろう.src.pth"));
+        assert!(cfg.is_none(), "no config retained yet");
+        std::fs::write(root.join("たろう.src.config.json"), b"{}").unwrap();
+        let (_, cfg) = retained_community_source(&onnx).expect("pair retained");
+        assert!(cfg.is_some(), "the retained config must surface for the sovits gate");
+        // a prefix sibling must not leak into another stem's family
+        let other = root.join("たろ.onnx");
+        std::fs::write(&other, b"o").unwrap();
+        assert!(retained_community_source(&other).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
