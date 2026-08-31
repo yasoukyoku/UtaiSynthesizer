@@ -2,13 +2,12 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) | **日本語**
 
-**公式サイト**: https://utaisynthesizer.net
-
 [![Release](https://img.shields.io/github/v/release/yasoukyoku/UtaiSynthesizer)](https://github.com/yasoukyoku/UtaiSynthesizer/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-informational)
 [![QQ グループ](https://img.shields.io/badge/QQ-1058227212-1EBAFC)](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2)](https://discord.com/invite/p3fGh942fJ)
+[![Website](https://img.shields.io/badge/Website-utaisynthesizer.net-2B6D51?labelColor=202321)](https://utaisynthesizer.net)
 
 Windows 向けの歌声合成 DAW。ピアノロールに書いた譜面を **SVC ボイスモデルが直接歌います**
 (譜面 → [Score2ConVec](https://github.com/yasoukyoku/Score2ConVec) → SVC デコード。
