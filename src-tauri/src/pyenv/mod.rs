@@ -210,6 +210,21 @@ pub fn find_pack(id: &str) -> Option<PackStatus> {
     list_packs().into_iter().find(|p| p.meta.id == id)
 }
 
+/// Highest installed pack VERSION for a variant (None = none installed with a usable
+/// python). Same existence filter as `available_training_variants`, so the two can never
+/// disagree about whether a pack counts. S168: the device gate needs the VERSION because a
+/// variant's kernel inventory grows per version (amd v1 = gfx1103 only, v2 adds the RDNA3
+/// dGPUs) — "the variant is installed" is not the same fact as "the installed pack can run
+/// this die", and conflating them handed an RX 7700S user v1 + backend=cuda +
+/// hipErrorInvalidImage (the first community report after v0.12.0).
+pub fn max_installed_version(variant: &str) -> Option<u32> {
+    list_packs()
+        .into_iter()
+        .filter(|p| p.meta.variant == variant && pack_python(Path::new(&p.path)).exists())
+        .map(|p| p.meta.version)
+        .max()
+}
+
 /// The CONVERTER-role interpreter (S42 — replaces the 7 scattered
 /// `find_python(app_dir/converter, app_dir)` call sites). Priority:
 ///   1. dev venv `converter/.venv` (dev machines keep their known-good env);
@@ -335,15 +350,18 @@ pub fn training_interpreter_for(
     if venv.exists() && matches!(want, "nv-cu130" | "cpu") {
         return Some(TrainingInterpreter::non_pack(venv, backend));
     }
+    // ⚠ python-bearing packs only, BEFORE max_by_key — the same filter
+    // `available_training_variants` and `max_installed_version` use. Reviewed S168: taking
+    // the max over ALL packs and then requiring that one's python meant a python-less v2
+    // dir could shadow a working v1, and the version gate would be reasoning about a pack
+    // the spawner then refuses — three pickers, one rule.
     if let Some(p) = list_packs()
         .into_iter()
-        .filter(|p| p.meta.variant == want)
+        .filter(|p| p.meta.variant == want && pack_python(Path::new(&p.path)).exists())
         .max_by_key(|p| p.meta.version)
     {
         let py = pack_python(Path::new(&p.path));
-        if py.exists() {
-            return Some(TrainingInterpreter::from_pack(py, backend, want));
-        }
+        return Some(TrainingInterpreter::from_pack(py, backend, want));
     }
     let manual = crate::util::manual_python_slot(app_dir);
     if manual.exists() && matches!(want, "nv-cu130" | "cpu") {
@@ -470,6 +488,10 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
     manifest_urls: &[
         "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-cpu-v1.manifest.json",
         "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-cpu-v1.manifest.json",
+        // S168: GH release mirror (tag packs-v1) — the first fallback that actually leaves
+        // the huggingface.co network path (hf-mirror 308s back to it); expanded through the
+        // gh proxies by manifest_url_candidates.
+        "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/runtime-cpu-v1.manifest.json",
     ],
 }, CatalogEntry {
     id: "runtime-nv-cu130-v1",
@@ -486,6 +508,8 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
     manifest_urls: &[
         "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-nv-cu130-v1.manifest.json",
         "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-nv-cu130-v1.manifest.json",
+        // S168: GH release mirror — see the cpu entry.
+        "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/runtime-nv-cu130-v1.manifest.json",
     ],
 }, CatalogEntry {
     // S167 (§F6): v2 REPLACES v1 in the catalog — same variant, superset kernels (the RDNA3 dGPU
@@ -510,6 +534,9 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
     manifest_urls: &[
         "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v2.manifest.json",
         "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v2.manifest.json",
+        // S168: GH release mirror — see the cpu entry. The first community report's six
+        // MANIFEST_REQUEST_FAILED were exactly this pack with no route off huggingface.co.
+        "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/runtime-amd-v2.manifest.json",
     ],
 }, CatalogEntry {
     id: "runtime-xpu-v1",
@@ -537,15 +564,72 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
     manifest_urls: &[
         "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-xpu-v1.manifest.json",
         "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-xpu-v1.manifest.json",
+        // S168: GH release mirror — see the cpu entry.
+        "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/runtime-xpu-v1.manifest.json",
     ],
 }];
 
-/// Manifest URL candidates for a catalog entry: published URLs + the dev override.
-pub fn manifest_url_candidates(entry: &CatalogEntry) -> Vec<String> {
-    let mut urls: Vec<String> = entry.manifest_urls.iter().map(|s| s.to_string()).collect();
+/// Manifest URL candidates for a catalog entry: an optional user-chosen HF host swap first
+/// (assets.rs precedent — the 下载源 preset must reorder the rotation, not be ignored), the
+/// published URLs (github-family rows expanded through the caller's gh proxy routes — ONE
+/// builder, `download::expand_routes`), the dev override last.
+///
+/// S168: hf-mirror.com 308-redirects this dataset straight back to huggingface.co, so the
+/// two HF rows are ONE network path in practice — the first community report failed six
+/// installs with both "routes" dying on the same unreachable host. The GitHub release
+/// mirror (tag `packs-v1`) is the first fallback that actually leaves that path, and the gh
+/// proxies make it reachable where github.com itself is not. Part URLs inherit whichever
+/// base wins (`fetch_manifest` returns every candidate's base, winner first), so a manifest
+/// served through a proxy downloads its parts through the same proxy.
+///
+/// ⛔ TRUST CONTRACT on `gh_routes` (reviewed S168): the manifest is UNSIGNED and its own
+/// sha256 table is the only integrity gate over the pack's parts — a rogue proxy serving a
+/// forged manifest also serves matching parts, and the pack's python.exe gets executed.
+/// Callers therefore pass ONLY routes the user explicitly configured (frontend:
+/// `ghTrustedRoutes` — explicit choice + direct), NEVER the community preset tail that the
+/// hashed/signed consumers (updater, GAME model) may use. Build-pinned hosts (the two HF
+/// rows, github.com direct) plus an explicit user choice is the whole trusted set.
+pub fn manifest_url_candidates(
+    entry: &CatalogEntry,
+    hf_base: Option<&str>,
+    gh_routes: Option<&[String]>,
+) -> Vec<String> {
+    fn push(urls: &mut Vec<String>, u: String) {
+        if !urls.contains(&u) {
+            urls.push(u);
+        }
+    }
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(base) = hf_base {
+        let base = base.trim().trim_end_matches('/');
+        if !base.is_empty()
+            && base.starts_with("http")
+            && base != crate::commands::assets::HF_HOST
+        {
+            for s in entry.manifest_urls {
+                if let Some(rest) = s.strip_prefix(crate::commands::assets::HF_HOST) {
+                    push(&mut urls, format!("{base}{rest}"));
+                    break;
+                }
+            }
+        }
+    }
+    let routes: Option<Vec<String>> = gh_routes.map(|r| r.to_vec());
+    for s in entry.manifest_urls {
+        let is_gh = tauri::Url::parse(s)
+            .map(|u| crate::download::is_github_family(&u))
+            .unwrap_or(false);
+        if is_gh {
+            for u in crate::download::expand_routes(&routes, s) {
+                push(&mut urls, u.to_string());
+            }
+        } else {
+            push(&mut urls, s.to_string());
+        }
+    }
     if let Ok(bases) = std::env::var("UTAI_PACK_BASE_URL") {
         for base in bases.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            urls.push(format!("{}/{}.manifest.json", base.trim_end_matches('/'), entry.id));
+            push(&mut urls, format!("{}/{}.manifest.json", base.trim_end_matches('/'), entry.id));
         }
     }
     urls
@@ -575,6 +659,13 @@ pub struct ManifestPart {
 /// Fetch the manifest from the first reachable candidate. Returns (manifest,
 /// base_url_of_the_winning_candidate) — part URLs resolve against that base first,
 /// with every other candidate base as fallback mirror.
+///
+/// ⚠ EVERY failed candidate is kept (warn-logged as it happens AND joined into the final
+/// error), not just the last one. S168: the first community report failed six installs in a
+/// row and the log named only hf-mirror.com — huggingface.co had been tried first and had
+/// ALSO failed each time, but its error was overwritten per-candidate, so "which routes are
+/// actually unreachable from that machine" was undiagnosable from the log. An error that
+/// merges several failures into one line must name each of them.
 pub async fn fetch_manifest(
     client: &reqwest::Client,
     candidates: &[String],
@@ -582,7 +673,15 @@ pub async fn fetch_manifest(
     if candidates.is_empty() {
         return Err(err("PACK_NO_DOWNLOAD_SOURCE"));
     }
-    let mut last: Option<String> = None;
+    let mut failures: Vec<String> = Vec::new();
+    // One failure entry stays readable inside a joined line; reqwest error chains can run long.
+    fn push_failure(failures: &mut Vec<String>, msg: String) {
+        tracing::warn!("manifest candidate failed: {msg}");
+        const PER_CANDIDATE_MAX: usize = 220;
+        let short: String = msg.chars().take(PER_CANDIDATE_MAX).collect();
+        let ellipsis = if msg.chars().count() > PER_CANDIDATE_MAX { "…" } else { "" };
+        failures.push(format!("{short}{ellipsis}"));
+    }
     for url in candidates {
         match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.text().await {
@@ -597,15 +696,28 @@ pub async fn fetch_manifest(
                         }
                         return Ok((man, bases));
                     }
-                    Err(e) => last = Some(format!("MANIFEST_PARSE_FAILED: {e} ({url})")),
+                    Err(e) => push_failure(&mut failures, format!("MANIFEST_PARSE_FAILED: {e} ({url})")),
                 },
-                Err(e) => last = Some(format!("MANIFEST_READ_FAILED: {e} ({url})")),
+                Err(e) => push_failure(&mut failures, format!("MANIFEST_READ_FAILED: {e} ({url})")),
             },
-            Ok(resp) => last = Some(format!("MANIFEST_REQUEST_FAILED: HTTP {} ({url})", resp.status())),
-            Err(e) => last = Some(format!("MANIFEST_REQUEST_FAILED: {e} ({url})")),
+            Ok(resp) => push_failure(&mut failures, format!("MANIFEST_REQUEST_FAILED: HTTP {} ({url})", resp.status())),
+            Err(e) => push_failure(&mut failures, format!("MANIFEST_REQUEST_FAILED: {e} ({url})")),
         }
     }
-    Err(err(last.unwrap_or_else(|| "MANIFEST_FETCH_FAILED".into())))
+    // The error carries ONLY the first candidate's failure (the primary source — the one
+    // the user should see); the rest are counted, not joined. Joining them was tried and
+    // reviewed away: the frontend's findCode matches the LONGEST code anywhere in the
+    // string and drops everything before it, so a joined line showed one arbitrary late
+    // candidate. The per-candidate detail all went to the log above (push_failure warns as
+    // it happens), which is where S168's diagnosability gap actually was.
+    match failures.split_first() {
+        None => Err(err("MANIFEST_FETCH_FAILED")),
+        Some((first, [])) => Err(err(first.clone())),
+        Some((first, rest)) => Err(err(format!(
+            "{first} (+{} more route(s) failed — see the log)",
+            rest.len()
+        ))),
+    }
 }
 
 // ─── install ────────────────────────────────────────────────────────────────
@@ -1199,5 +1311,40 @@ mod tests {
         // assertion over a table needs a second one that only the table can fail).
         assert_eq!(CATALOG.len(), 4, "catalog size changed — re-read the loop above");
         assert_eq!(CATALOG.iter().filter(|e| e.variant != "cpu").count(), 3);
+    }
+
+    /// S168 — the candidate builder: user HF base first, HF rows in catalog order, the GH
+    /// row expanded through the given proxy routes (one URL per route, "" = direct), all
+    /// deduped. The reporter's failure mode — six installs dying on one unreachable host
+    /// while the log named another — is only fixable if the rotation actually leaves
+    /// huggingface.co, which is what the gh expansion pins here.
+    #[test]
+    fn manifest_candidates_expand_gh_routes_and_put_the_custom_hf_base_first() {
+        let entry = CATALOG.iter().find(|e| e.id == "runtime-amd-v2").unwrap();
+        let gh = "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/runtime-amd-v2.manifest.json";
+
+        let routes = vec!["https://gh-proxy.com".to_string(), String::new()];
+        let urls = manifest_url_candidates(entry, Some("https://hf.example.cn"), Some(&routes));
+        assert_eq!(
+            urls[0],
+            "https://hf.example.cn/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v2.manifest.json"
+        );
+        assert!(urls[1].starts_with("https://huggingface.co/"), "{}", urls[1]);
+        assert!(urls[2].starts_with("https://hf-mirror.com/"), "{}", urls[2]);
+        assert_eq!(urls[3], format!("https://gh-proxy.com/{gh}"));
+        assert_eq!(urls[4], gh);
+        assert_eq!(urls.len(), 5, "{urls:?}");
+
+        // No routes → GH direct only; no custom base → the HF pair leads unchanged.
+        let plain = manifest_url_candidates(entry, None, None);
+        assert!(plain[0].starts_with("https://huggingface.co/"));
+        assert_eq!(plain[2], gh);
+        assert_eq!(plain.len(), 3, "{plain:?}");
+
+        // A custom base equal to a fixed row REORDERS the rotation instead of duplicating
+        // (the hf-mirror preset must not be silently ignored — audit S64's asset rule).
+        let dup = manifest_url_candidates(entry, Some("https://hf-mirror.com"), None);
+        assert!(dup[0].starts_with("https://hf-mirror.com/"));
+        assert_eq!(dup.len(), 3, "{dup:?}");
     }
 }

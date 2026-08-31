@@ -636,6 +636,15 @@ pub fn migrate_all(data_dir: &Path) {
     let (mut migrated, mut failed) = (0usize, 0usize);
     for entry in rd.flatten() {
         let proj = entry.path();
+        // S168: the bundled code dirs are never projects, even when an earlier boot stamped
+        // them — the repair removes the stamp, this guard keeps the walk safe if it could not.
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(crate::training::tproject::is_reserved_training_dir)
+        {
+            continue;
+        }
         // `project.json` is the authority for "this is a project" one level up, exactly as
         // `tproject` uses it; `.del_*` tombstones and `.migrating_*` markers are skipped by it.
         if !proj.join(crate::training::tproject::PROJECT_META).is_file() {
@@ -1367,6 +1376,14 @@ pub fn migrate_identity_all(data_dir: &Path) {
     let (mut done, mut refused, mut failed) = (0usize, 0usize, 0usize);
     for entry in rd.flatten() {
         let proj = entry.path();
+        // S168: bundled code dirs are never projects (see the twin guard in `migrate_all`).
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(crate::training::tproject::is_reserved_training_dir)
+        {
+            continue;
+        }
         if !proj.join(crate::training::tproject::PROJECT_META).is_file() {
             continue;
         }

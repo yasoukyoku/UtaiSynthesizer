@@ -70,50 +70,10 @@ struct UpdateProgress {
     total: Option<u64>,
 }
 
-/// Same host family as the frontend's applyGhMirror (precise set + subdomain fallback) — the
-/// download_url in OUR latest.json is always a github.com release asset, the redirect targets
-/// (objects.githubusercontent.com) are chased by the proxy itself.
-fn is_github_family(url: &tauri::Url) -> bool {
-    match url.host_str() {
-        Some(h) => {
-            h == "github.com"
-                || h == "codeload.github.com"
-                || h.ends_with(".github.com")
-                || h.ends_with(".githubusercontent.com")
-        }
-        None => false,
-    }
-}
-
-/// Expand an ordered route list ("" = direct, else proxy prefix) over `base`, sanitizing each
-/// prefix and deduping — the SINGLE builder for both the check endpoints and the download
-/// candidates, so their orders can never drift.
-fn expand_routes(routes: &Option<Vec<String>>, base: &str) -> Vec<tauri::Url> {
-    let mut out: Vec<tauri::Url> = Vec::new();
-    let mut push = |u: Option<tauri::Url>| {
-        if let Some(u) = u {
-            if !out.contains(&u) {
-                out.push(u);
-            }
-        }
-    };
-    let direct = tauri::Url::parse(base).ok();
-    let mut had_direct = false;
-    if let Some(rs) = routes {
-        for r in rs {
-            if r.is_empty() {
-                had_direct = true;
-                push(direct.clone());
-            } else if let Some(p) = crate::download::sanitize_gh_prefix(Some(r.clone())) {
-                push(tauri::Url::parse(&format!("{p}/{base}")).ok());
-            }
-        }
-    }
-    if !had_direct {
-        push(direct);
-    }
-    out
-}
+// S168: `is_github_family` and `expand_routes` moved to `crate::download` — runtime-pack
+// installs became their third consumer (updater · GAME model · packs), and the route builder
+// must stay ONE (its own doc says why the orders can never be allowed to drift).
+use crate::download::{expand_routes, is_github_family};
 
 /// S68d fullportable: aim the NSIS run at the DIRECTORY THIS COPY RUNS FROM.
 /// `/D=` pre-sets $INSTDIR before .onInit, whose default+registry-restore block only

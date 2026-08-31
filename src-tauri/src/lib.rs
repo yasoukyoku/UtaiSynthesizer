@@ -765,7 +765,7 @@ fn webview_data_dir() -> Option<std::path::PathBuf> {
                 // Disk preflight (S68d posture): stay on the legacy profile rather
                 // than half-copy on a tight volume; retried once space frees up.
                 let needed =
-                    commands::settings::migrate_tree_needed(&legacy, &dir.join("EBWebView"), false);
+                    commands::settings::migrate_tree_needed(&legacy, &dir.join("EBWebView"), false, &[]);
                 if let Some(free) = util::free_bytes_at(dir.parent()?) {
                     if free < needed.saturating_mul(2) {
                         tracing::warn!(
@@ -779,7 +779,7 @@ fn webview_data_dir() -> Option<std::path::PathBuf> {
                 let staging = dir.with_extension(format!("staging{}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&staging);
                 let copied =
-                    commands::settings::copy_dir_all(&legacy, &staging.join("EBWebView"), false);
+                    commands::settings::copy_dir_all(&legacy, &staging.join("EBWebView"), false, &[]);
                 match copied {
                     Ok(()) => {
                         if std::fs::rename(&staging, &dir).is_ok() {
@@ -1070,6 +1070,13 @@ pub fn run() {
                     }
                 }
             }
+            // S168: verify/restore the bundled trainer code (training/utai_train) from the copy
+            // embedded in this binary — an earlier boot's migration fold, an AV quarantine, or a
+            // user deleting the phantom "utai_train" project row all produced installs where the
+            // .py tree next to the exe was gone while everything else kept running. BEFORE the
+            // layout chain, so `unfold_reserved_dirs` finds the canonical tree back in place.
+            // No-op on dev checkouts (training/.venv present).
+            training::bundled_code::sync_bundled_training_code(&app_dir_early);
             // S76: fold every pre-project training workspace into the project layout. MUST run
             // before the reclaim below (which can copy legacy-shaped trees in from an old root)
             // and before anything opens a handle under <data>/training — at this point in setup

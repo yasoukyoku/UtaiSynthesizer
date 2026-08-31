@@ -278,6 +278,13 @@ fn checked_project_id(id: &str) -> Result<(), String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         return Err("PROJECT_ID_INVALID".into());
     }
+    // S168: the bundled code dirs were once stamped into phantom projects by the migration —
+    // a delete on such a row erases the trainer itself (the first community report's
+    // ENVTEST_SCRIPT_MISSING). Minted ids always end `_<8 hex>`, so nothing legitimate is
+    // refused; only a stale cache row or a hand-rename can present one of these.
+    if crate::training::tproject::is_reserved_training_dir(id) {
+        return Err("TRAINING_PROJECT_RESERVED".into());
+    }
     Ok(())
 }
 
@@ -436,6 +443,13 @@ pub async fn training_delete_project(
     tauri::async_runtime::spawn_blocking(move || {
         let report = crate::training::tproject::delete_project(&data_dir, &project_id)
             .map_err(|e| e.to_string())?;
+        // S168: a whole-project delete must leave a trace in the log — the incident where a
+        // phantom project's deletion erased the bundled trainer was unattributable precisely
+        // because this command logged nothing.
+        tracing::info!(
+            "training project deleted: {project_id} ({} MB freed)",
+            report.freed_bytes / (1024 * 1024)
+        );
         // Drop the listing cache's row too, or a project the user just deleted on purpose comes
         // straight back as a MISSING ghost. Only after the delete SUCCEEDED — a refused delete
         // must leave every trace of the project exactly as it was.
@@ -1394,6 +1408,18 @@ mod tests {
         for bad in ["", "..", "../..", "a/b", "a\\b", ".del_x", "C:", "a:b", "a b", "项目"] {
             assert!(checked_project_id(bad).is_err(), "must refuse {bad:?}");
         }
+        // S168: the bundled code dirs — a delete on a phantom row with one of these ids
+        // erases the trainer itself, so the trust boundary refuses them by name (with the
+        // specific CODE, not the charset one: the UI must explain, not just fail).
+        for reserved in ["utai_train", "Utai_Train", "assets", "packs"] {
+            assert_eq!(
+                checked_project_id(reserved),
+                Err("TRAINING_PROJECT_RESERVED".into()),
+                "must refuse the reserved name {reserved:?}"
+            );
+        }
+        // …while the minted shape that merely CONTAINS a reserved word stays legal.
+        assert!(checked_project_id("utai_train_1a2b3c4d").is_ok());
     }
 
     /// ★S141 §E2E-M5 —— 槽卡片上「预处理 N 份 · X」的那两个数,第一次有判据。

@@ -14,7 +14,7 @@ import { useWorkflowStore } from "../../store/workflow";
 import { useTrainingStore, type DeleteReport } from "../../store/training";
 import { isRunningState } from "../../lib/training/liveRun";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { applyMirror, applyGhMirror, hfBaseForMirror } from "../../lib/models/msst-catalog";
+import { applyMirror, applyGhMirror, hfBaseForMirror, ghTrustedRoutes } from "../../lib/models/msst-catalog";
 import { stretchedArtifactPaths, stretchInFlight } from "../../lib/audio/stretchCache";
 import { clipboardReferencedPaths } from "../../lib/clipboard";
 import { historyReferencedAudioPaths } from "../../store/history";
@@ -477,7 +477,17 @@ export function Settings({ onClose }: { onClose: () => void }) {
     setRtNotice(null);
     setRtProgress(null);
     try {
-      await invoke("download_runtime_pack", { id });
+      // S168: pack installs finally ride the mirror choices — the 下载源 HF base (tried
+      // first, deduped into the fixed rotation) and the GH routes for the packs-v1 release
+      // mirror (the only route that actually leaves the huggingface.co network path —
+      // hf-mirror 308s back to it). TRUSTED routes only (explicit choice + direct), never
+      // the community preset tail: the manifest is the pack's unsigned integrity root
+      // (ghTrustedRoutes' doc has the full rule; reviewed S168).
+      await invoke("download_runtime_pack", {
+        id,
+        hfBase: hfBaseForMirror(mirror),
+        ghRoutes: ghTrustedRoutes(ghMirror, ghPresets),
+      });
     } catch (e) {
       const disp = backendErrText(e);
       if (!maybeShowErrorModal(e, disp)) setRtError(disp);
@@ -485,7 +495,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       setRtBusy(false);
       refreshRuntime();
     }
-  }, [refreshRuntime]);
+  }, [refreshRuntime, mirror, ghMirror, ghPresets]);
 
   const handleRtLocalInstall = useCallback(async () => {
     const file = await open({

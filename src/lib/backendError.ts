@@ -355,6 +355,8 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // plus the start-time refusals when the choice no longer resolves.
   TRAINING_GPU_CC_UNKNOWN: { key: "backend.TRAINING_GPU_CC_UNKNOWN" },
   TRAINING_GPU_NO_RUNTIME: { key: "backend.TRAINING_GPU_NO_RUNTIME" },
+  TRAINING_GPU_NEEDS_PACK_UPDATE: { key: "backend.TRAINING_GPU_NEEDS_PACK_UPDATE" },
+  TRAINING_PROJECT_RESERVED: { key: "backend.TRAINING_PROJECT_RESERVED" },
   TRAINING_GPU_PACK_MISSING: { key: "backend.TRAINING_GPU_PACK_MISSING" },
   TRAINING_GPU_UNAVAILABLE: { key: "backend.TRAINING_GPU_UNAVAILABLE" },
   TRAINING_GPU_UNKNOWN: { key: "backend.TRAINING_GPU_UNKNOWN" },

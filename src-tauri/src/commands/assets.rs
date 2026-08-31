@@ -21,8 +21,8 @@ use tauri::{Emitter, State};
 
 use crate::AppState;
 
-const HF_HOST: &str = "https://huggingface.co";
-const HF_MIRROR_HOST: &str = "https://hf-mirror.com";
+pub(crate) const HF_HOST: &str = "https://huggingface.co";
+pub(crate) const HF_MIRROR_HOST: &str = "https://hf-mirror.com";
 const REPO_PATH: &str = "datasets/yasoukyoku/utai-runtimes/resolve/main/models";
 
 struct AssetFile {

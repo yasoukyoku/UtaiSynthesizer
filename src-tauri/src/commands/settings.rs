@@ -219,6 +219,7 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
             &gpus,
             smi_gpus,
             &crate::pyenv::available_training_variants(&state.app_dir),
+            crate::pyenv::max_installed_version("amd"),
         ),
         gpus,
     })
@@ -289,6 +290,7 @@ fn training_gpu_list(
     gpus: &[GpuAdapter],
     smi: Vec<NvSmiGpu>,
     available: &[&'static str],
+    amd_installed_version: Option<u32>,
 ) -> Vec<TrainingGpu> {
     let nv_cc10 = nvidia_compute_caps_cc10();
     let judge = |variant: &'static str, hw_ok: bool, cc_unknown: bool| -> (bool, Option<String>) {
@@ -346,7 +348,24 @@ fn training_gpu_list(
         ("intel", "xpu", &intel_adapter_is_xpu_capable as &dyn Fn(&GpuAdapter) -> bool),
     ] {
         for (i, g) in gpus.iter().filter(|g| g.vendor == vendor).enumerate() {
-            let (selectable, reason) = judge(variant, capable(g), false);
+            let (mut selectable, mut reason) = judge(variant, capable(g), false);
+            // S168: `judge` proves "SOME offerable pack can run this die" + "the variant is
+            // installed" — but the resolver spawns the highest INSTALLED pack, whose kernel
+            // inventory may be older than the catalog's (amd v1 = gfx1103 only). Selectable
+            // must mean "the pack that would actually be spawned runs this die", or the run
+            // dies in HIP (hipErrorInvalidImage — the first community report on v0.12.0,
+            // RX 7700S + leftover v1). The reason CODE is actionable: install the newer pack.
+            if selectable && variant == "amd" {
+                let covered = amd_adapter_gfx_target(g).is_some_and(|t| {
+                    amd_installed_version
+                        .map(amd_pack_targets_for_version)
+                        .is_some_and(|ts| ts.contains(&t))
+                });
+                if !covered {
+                    selectable = false;
+                    reason = Some("TRAINING_GPU_NEEDS_PACK_UPDATE".to_string());
+                }
+            }
             out.push(TrainingGpu {
                 id: format!("{vendor}:{i}"),
                 label: g.name.clone(),
@@ -397,7 +416,14 @@ fn training_gpu_list(
 pub(crate) fn training_gpu_by_id(app_dir: &std::path::Path, id: &str) -> Option<TrainingGpu> {
     let gpus = query_gpu_adapters();
     let available = crate::pyenv::available_training_variants(app_dir);
-    training_gpu_list(&gpus, nvidia_gpu_uuids(), &available).into_iter().find(|g| g.id == id)
+    training_gpu_list(
+        &gpus,
+        nvidia_gpu_uuids(),
+        &available,
+        crate::pyenv::max_installed_version("amd"),
+    )
+    .into_iter()
+    .find(|g| g.id == id)
 }
 
 /// NVIDIA cards as (name, UUID) via nvidia-smi — the only enumeration whose identity
@@ -764,24 +790,71 @@ pub(crate) fn machine_sig() -> String {
 /// machine-level wrappers below keep answering "is this pack worth offering". One predicate, two
 /// granularities — the pack gate and the device gate can never disagree about the same card.
 fn amd_adapter_is_rocm_capable(g: &GpuAdapter) -> bool {
+    amd_adapter_gfx_target(g).is_some_and(|t| AMD_PACK_GFX_TARGETS.contains(&t))
+}
+
+/// The adapter's gfx target, as far as our gates can resolve it. Split out of
+/// `amd_adapter_is_rocm_capable` (S168) so the version-aware selectability check below can
+/// ask "WHICH die is this" with the same resolution rules — two resolvers would drift.
+///
+/// Primary: PCI device id → gfx target. This also repairs the S114-noted false NEGATIVE: a
+/// gfx1103 machine whose driver reports the bare "AMD Radeon(TM) Graphics" (no
+/// 780m/760m/740m token anywhere) resolves on its die id.
+/// A device id the table can classify as NOT ours falls through to the name tokens — but
+/// the tokens only ever name gfx1103 iGPUs, whose ids ARE in the table, so the fallthrough
+/// can never re-open a gate the table closed. It only serves future dies the table has not
+/// met. Fallback (no id / unknown die): the S74b name tokens for the gfx1103 iGPU class —
+/// "780m" cannot collide with "RX 7800M" (the char after 780 is another digit there).
+fn amd_adapter_gfx_target(g: &GpuAdapter) -> Option<&'static str> {
     if g.vendor != "amd" {
-        return false;
+        return None;
     }
-    // Primary: PCI device id → gfx target → pack coverage. This also repairs the S114-noted false
-    // NEGATIVE: a gfx1103 machine whose driver reports the bare "AMD Radeon(TM) Graphics" (no
-    // 780m/760m/740m token anywhere) now passes on its die id.
     if let Some(dev) = g.pci_dev {
         if let Some(t) = amd_gfx_target(dev) {
-            return AMD_PACK_GFX_TARGETS.contains(&t);
+            return Some(t);
         }
-        // A device id we can classify as NOT ours would fall through to the name tokens — but the
-        // tokens only ever name gfx1103 iGPUs, whose ids ARE in the table, so the fallthrough can
-        // never re-open a gate the table closed. It only serves future dies the table has not met.
     }
-    // Fallback (no id / unknown die): the S74b name tokens for the gfx1103 iGPU class.
-    // "780m" cannot collide with "RX 7800M" (the char after 780 is another digit there).
     let n = g.name.to_ascii_lowercase();
-    ["780m", "760m", "740m"].iter().any(|t| n.contains(t))
+    if ["780m", "760m", "740m"].iter().any(|t| n.contains(t)) {
+        return Some("gfx1103");
+    }
+    None
+}
+
+/// The gfx targets a given INSTALLED amd pack version carries kernels for. v1 shipped
+/// gfx1103 only (the iGPU line); v2 added the RDNA3 dGPUs. ⚠ Mirror discipline is the same
+/// as `AMD_PACK_GFX_TARGETS`: a new pack version's row is added in the commit that changes
+/// the lockfile's device-wheel set, never separately.
+///
+/// S168 (the first community report after v0.12.0): `variant_supported`/`training_gpu_list`
+/// answered by the CATALOG pack's inventory while `training_interpreter_for` hands out the
+/// highest INSTALLED pack — an RX 7700S (gfx1102) box still holding only v1 was declared
+/// selectable, got backend=cuda, and crashed in HIP with hipErrorInvalidImage. The
+/// selectable verdict must be about the pack that would actually be spawned.
+fn amd_pack_targets_for_version(version: u32) -> &'static [&'static str] {
+    if version >= 2 {
+        AMD_PACK_GFX_TARGETS
+    } else {
+        // v0 = a pack.json predating the `version` field; that generation only ever
+        // shipped the gfx1103 line, so it reads the same as v1.
+        //
+        // ⚠ The local-install escape hatch stays open THROUGH this map, not around it
+        // (reviewed S168): a side-loaded/community pack with a wider kernel inventory
+        // declares `"version": 2` (or higher) in its own pack.json and passes — the map
+        // describes OUR shipped inventories per version, and a pack that is not ours gets
+        // to describe itself.
+        &["gfx1103"]
+    }
+}
+
+/// Can an INSTALLED amd pack of `version` drive any adapter in this box? The per-pack
+/// refinement of `variant_supported("amd", …)` — same resolution rules, one extra fact
+/// (the version's kernel inventory). S168: an RX 7700S box holding only v1 showed the v1
+/// card as usable; it was not, and the gap surfaced as a HIP crash instead of a badge.
+pub(crate) fn amd_pack_version_supported(version: u32, gpus: &[GpuAdapter]) -> bool {
+    gpus.iter()
+        .filter_map(amd_adapter_gfx_target)
+        .any(|t| amd_pack_targets_for_version(version).contains(&t))
 }
 
 /// S167 (§F6): PCI device id → amdgcn gfx ISA target, for the dies our AMD pack line cares about.
@@ -1244,22 +1317,42 @@ fn skips_dot_top(subtree: &str) -> bool {
     subtree == "runtimes"
 }
 
+/// S168: top-level names a data-dir migration must NOT carry out of a subtree — the bundled
+/// code dirs belong to the install, not to whichever data root they happen to sit inside
+/// (the old-root reclaim skips them with the same list; two rules would drift).
+fn migrate_skip_top(subtree: &str) -> &'static [&'static str] {
+    if subtree == "training" {
+        &crate::training::tproject::RESERVED_TRAINING_DIRS
+    } else {
+        &[]
+    }
+}
+
 /// Recursively copy a directory's contents into `dst` (creating it). Cross-drive safe (copy, not rename).
 /// pub(crate): also the S68e webview-profile migration's copier (lib.rs) — ONE walker.
-pub(crate) fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> std::io::Result<()> {
+pub(crate) fn copy_dir_all(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    skip_dot_top: bool,
+    skip_top_names: &[&str],
+) -> std::io::Result<()> {
     if !src.exists() {
         return Ok(());
     }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        if skip_dot_top && entry.file_name().to_string_lossy().starts_with('.') {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if skip_dot_top && name.starts_with('.') {
+            continue;
+        }
+        if skip_top_names.iter().any(|n| name.eq_ignore_ascii_case(n)) {
             continue;
         }
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_dir() {
-            copy_dir_all(&from, &to, false)?;
+            copy_dir_all(&from, &to, false, &[])?;
         } else {
             // S68d: a mid-copy failure in a tens-of-GB migration must name the file —
             // io::Error's Display alone gives "os error 112" with no idea where.
@@ -1278,17 +1371,26 @@ pub(crate) fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path, skip_do
 /// will actually copy it); crediting only the same-path target file keeps unrelated
 /// pre-existing target content from shrinking the estimate (both review S68d).
 /// pub(crate): also sizes the S68e webview-profile migration (lib.rs).
-pub(crate) fn migrate_tree_needed(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> u64 {
+pub(crate) fn migrate_tree_needed(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    skip_dot_top: bool,
+    skip_top_names: &[&str],
+) -> u64 {
     let mut needed = 0u64;
     let Ok(rd) = std::fs::read_dir(src) else { return 0 };
     for entry in rd.flatten() {
-        if skip_dot_top && entry.file_name().to_string_lossy().starts_with('.') {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if skip_dot_top && name.starts_with('.') {
+            continue;
+        }
+        if skip_top_names.iter().any(|n| name.eq_ignore_ascii_case(n)) {
             continue;
         }
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_dir() {
-            needed = needed.saturating_add(migrate_tree_needed(&from, &to, false));
+            needed = needed.saturating_add(migrate_tree_needed(&from, &to, false, &[]));
         } else {
             let src_len = std::fs::metadata(&from).map(|m| m.len()).unwrap_or(0);
             let dst_len = std::fs::metadata(&to).map(|m| m.len()).unwrap_or(0);
@@ -1302,20 +1404,29 @@ pub(crate) fn migrate_tree_needed(src: &std::path::Path, dst: &std::path::Path, 
 /// `dst` with the same byte length. Metadata-only (no re-read of tens of GB) — `fs::copy` already
 /// fails loudly on content errors; this catches whole-file misses (skipped entries, torn traversal).
 /// Returns the number of files checked.
-fn verify_dir_copy(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> Result<u64, String> {
+fn verify_dir_copy(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    skip_dot_top: bool,
+    skip_top_names: &[&str],
+) -> Result<u64, String> {
     if !src.exists() {
         return Ok(0);
     }
     let mut checked = 0u64;
     for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
         let entry = entry.map_err(|e| format!("read {}: {e}", src.display()))?;
-        if skip_dot_top && entry.file_name().to_string_lossy().starts_with('.') {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if skip_dot_top && name.starts_with('.') {
+            continue;
+        }
+        if skip_top_names.iter().any(|n| name.eq_ignore_ascii_case(n)) {
             continue;
         }
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_dir() {
-            checked += verify_dir_copy(&from, &to, false)?;
+            checked += verify_dir_copy(&from, &to, false, &[])?;
         } else {
             let src_len = entry.metadata().map_err(|e| format!("stat {}: {e}", from.display()))?.len();
             let dst_len = std::fs::metadata(&to)
@@ -1564,7 +1675,14 @@ fn sync_dir_delta(
         if skip_dot_top && entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
-        if skip_top_names.iter().any(|n| *n == entry.file_name().to_string_lossy()) {
+        // eq_ignore_ascii_case, like every other reserved-name guard in the batch: NTFS is
+        // case-insensitive, so an exact match would let `Utai_Train` slip past a lowercase
+        // skip list (reviewed S168). Harmless for the dictionary names, which never differ
+        // by case on one machine.
+        if skip_top_names
+            .iter()
+            .any(|n| entry.file_name().to_string_lossy().eq_ignore_ascii_case(n))
+        {
             continue;
         }
         let from = entry.path();
@@ -1906,6 +2024,7 @@ pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) 
                 &src_root.join(name),
                 &target.join(name),
                 skips_dot_top(name),
+                migrate_skip_top(name),
             ));
         }
         if let Some(free) = crate::util::free_bytes_at(&canon_target) {
@@ -1919,7 +2038,7 @@ pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) 
             }
         }
         for name in MIGRATED_SUBTREES {
-            copy_dir_all(&src_root.join(name), &target.join(name), skips_dot_top(name))
+            copy_dir_all(&src_root.join(name), &target.join(name), skips_dot_top(name), migrate_skip_top(name))
                 .map_err(|e| format!("Copy {name}: {e}"))?;
         }
         // S68c: the old tree gets auto-deleted after this — a silent copy gap must therefore fail
@@ -1927,7 +2046,7 @@ pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) 
         // surfacing later as lost data.
         let mut checked = 0u64;
         for name in MIGRATED_SUBTREES {
-            checked += verify_dir_copy(&src_root.join(name), &target.join(name), skips_dot_top(name))
+            checked += verify_dir_copy(&src_root.join(name), &target.join(name), skips_dot_top(name), migrate_skip_top(name))
                 .map_err(|e| format!("MIGRATE_VERIFY_FAILED: {e}"))?;
         }
         tracing::info!("data-dir migration verified: {} files intact under {}", checked, target.display());
@@ -2096,6 +2215,12 @@ pub fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::
     // every launch (S68c review major). ~18 MB — keep it; every other subtree is user data.
     let old_is_default_root = canon_old
         == std::fs::canonicalize(app_dir.join("data")).unwrap_or_else(|_| app_dir.join("data"));
+    // S168 (reviewed): the reserved-dir keep below must fire ONLY when the old root IS the
+    // install root — pre-fix migrations seeded stale utai_train/assets copies into ordinary
+    // data roots (the copier had no skip then), and keying the keep on mere presence would
+    // strand those copies forever while logging a fully-successful reclaim.
+    let old_is_install_root = canon_old
+        == std::fs::canonicalize(app_dir).unwrap_or_else(|_| app_dir.to_path_buf());
     // Derived from tauri.conf.json (ONE authority, same as the sync and the fingerprint) — never a
     // hand-kept sixth copy of the file list.
     //
@@ -2108,6 +2233,12 @@ pub fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::
         .iter()
         .filter_map(|t| std::path::Path::new(t).file_name().map(|n| n.to_string_lossy().to_string()))
         .flat_map(|n| [format!("{n}.syncing"), n])
+        .collect();
+    // S168: the bundled code dirs belong to the INSTALL, not to the data root being
+    // reclaimed — syncing them over would seed a stale trainer copy into the new root.
+    let reserved_names: Vec<String> = crate::training::tproject::RESERVED_TRAINING_DIRS
+        .iter()
+        .map(|s| s.to_string())
         .collect();
     let mut synced = 0u64;
     let mut freed = 0u64;
@@ -2168,7 +2299,13 @@ pub fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::
         // it; see `sync_dir_delta`'s doc for why the version argument is the load-bearing one, and
         // for the full mechanism). Note this is about the COPY; the `old_is_default_root` branch
         // below only governs the DELETE.
-        let skip_top: &[String] = if name == "dictionaries" { &bundled_names } else { &[] };
+        let skip_top: &[String] = match name {
+            "dictionaries" => &bundled_names,
+            // S168: never carry the bundled code dirs (utai_train/assets) out of an old root
+            // that happened to be the install root.
+            "training" => &reserved_names,
+            _ => &[],
+        };
         let (c, sync_failed) = sync_dir_delta(
             &sub,
             &active_data_dir.join(name),
@@ -2191,6 +2328,46 @@ pub fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::
         // keep the whole subtree and say so (space stays used; data survives).
         if sync_failed > 0 {
             kept.push(format!("{} ({sync_failed} unsynced file(s))", sub.display()));
+            continue;
+        }
+        // S168: when the OLD root was the install root itself, training/ holds the bundled
+        // trainer code (utai_train/assets) next to the projects — deleting the subtree
+        // wholesale would take the trainer with it, and the app would keep running until the
+        // next training/self-test failed far from the cause (ENVTEST_SCRIPT_MISSING). Delete
+        // the children individually and leave the reserved dirs to the install they belong to.
+        if name == "training"
+            && old_is_install_root
+            && crate::training::tproject::RESERVED_TRAINING_DIRS
+                .iter()
+                .any(|r| sub.join(r).is_dir())
+        {
+            if let Ok(rd) = std::fs::read_dir(&sub) {
+                for child in rd.flatten() {
+                    let cname = child.file_name().to_string_lossy().into_owned();
+                    if crate::training::tproject::is_reserved_training_dir(&cname) {
+                        tracing::info!(
+                            "data-dir reclaim: keeping {} (bundled install resource)",
+                            child.path().display()
+                        );
+                        continue;
+                    }
+                    let p = child.path();
+                    let size = if p.is_dir() {
+                        crate::commands::storage::dir_size(&p)
+                    } else {
+                        std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
+                    };
+                    let removed = if p.is_dir() {
+                        std::fs::remove_dir_all(&p)
+                    } else {
+                        std::fs::remove_file(&p)
+                    };
+                    match removed {
+                        Ok(()) => freed += size,
+                        Err(e) => kept.push(format!("{} (locked: {e})", p.display())),
+                    }
+                }
+            }
             continue;
         }
         let size = crate::commands::storage::dir_size(&sub);
@@ -2396,9 +2573,16 @@ fn dll_on_path_or_dir(name: &str, extra: &std::path::Path) -> bool {
 /// Remote mirror list (mirrors.json on the utai-runtimes HF dataset; hf-mirror twin).
 /// Public GH proxies rot in 6-18 months — shipped builds refresh their preset list from
 /// here (frontend caches it; builtin list is the offline fallback). Schema gate = `schema: 1`.
-const MIRROR_LIST_URLS: [&str; 2] = [
+const MIRROR_LIST_URLS: [&str; 4] = [
     "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/mirrors.json",
     "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/mirrors.json",
+    // S168: the two HF rows above are ONE network path in practice (hf-mirror 308s straight
+    // back to huggingface.co for this dataset), and mirrors.json is the very file that
+    // carries the gh proxy list — a copy on the GH packs release breaks that bootstrap
+    // circle for a client that can reach a gh proxy but not HF. Proxy row first: the client
+    // that needs this fallback is precisely the one that cannot reach github.com directly.
+    "https://gh-proxy.com/https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/mirrors.json",
+    "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/mirrors.json",
 ];
 
 #[tauri::command]
@@ -3462,7 +3646,7 @@ mod tests {
     fn mixed_vendor_box_lists_both_cards() {
         let gpus = [gpu("NVIDIA GeForce RTX 3080 Ti", "nvidia"), gpu("AMD Radeon 780M Graphics", "amd")];
         let smi = vec![nv("NVIDIA GeForce RTX 3080 Ti", "GPU-abc", Some(86))];
-        let list = training_gpu_list(&gpus, smi, &["nv-cu130", "amd"]);
+        let list = training_gpu_list(&gpus, smi, &["nv-cu130", "amd"], Some(1));
         assert_eq!(list.len(), 2, "both vendors must be listed, not just the first match");
         let n = find(&list, "NVIDIA GeForce RTX 3080 Ti");
         assert!(n.selectable && n.value == "GPU-abc" && n.variant.as_deref() == Some("nv-cu130"));
@@ -3486,7 +3670,7 @@ mod tests {
             gpu("Intel Arc A770", "intel"),
             gpu("Microsoft Basic Render Driver", "other"),
         ];
-        let list = training_gpu_list(&gpus, vec![], &["amd", "xpu"]);
+        let list = training_gpu_list(&gpus, vec![], &["amd", "xpu"], Some(1));
         let ids: std::collections::HashSet<&str> = list.iter().map(|g| g.id.as_str()).collect();
         assert_eq!(ids.len(), list.len(), "ids must be unique");
 
@@ -3525,7 +3709,7 @@ mod tests {
         println!("smi       = {:?}", smi.iter().map(|g| (&g.name, g.cc10)).collect::<Vec<_>>());
         println!("available = {available:?}");
         println!("nv_cc10   = {:?}", nvidia_compute_caps_cc10());
-        for g in training_gpu_list(&gpus, smi, &available) {
+        for g in training_gpu_list(&gpus, smi, &available, crate::pyenv::max_installed_version("amd")) {
             println!(
                 "  [{}] id={} value={:?} variant={:?} selectable={} reason={:?}",
                 g.label, g.id, g.value, g.variant, g.selectable, g.reason
@@ -3549,7 +3733,7 @@ mod tests {
     #[test]
     fn unsupported_card_is_listed_but_not_selectable() {
         let gpus = [gpu("AMD Radeon RX 7900 XTX", "amd")];
-        let list = training_gpu_list(&gpus, vec![], &["amd", "cpu"]);
+        let list = training_gpu_list(&gpus, vec![], &["amd", "cpu"], Some(2));
         assert_eq!(list.len(), 1, "it stays VISIBLE — a card the user owns must not vanish");
         assert!(!list[0].selectable);
         assert_eq!(list[0].reason.as_deref(), Some("TRAINING_GPU_UNSUPPORTED"));
@@ -3560,9 +3744,36 @@ mod tests {
     #[test]
     fn supported_card_without_its_pack_says_pack_missing() {
         let gpus = [gpu("AMD Radeon 780M Graphics", "amd")];
-        let list = training_gpu_list(&gpus, vec![], &["cpu"]);
+        let list = training_gpu_list(&gpus, vec![], &["cpu"], None);
         assert!(!list[0].selectable);
         assert_eq!(list[0].reason.as_deref(), Some("TRAINING_GPU_PACK_MISSING"));
+    }
+
+    /// S168 — the first community report on v0.12.0. The widened PCI-id gate said an RX 7700S
+    /// (gfx1102) could train, but the box still held only runtime-amd-v1 (gfx1103 kernels) —
+    /// the resolver spawned v1 and the run died in HIP (hipErrorInvalidImage). "The variant is
+    /// installed" is not "the installed pack runs this die": the verdict must be about the pack
+    /// that would actually be spawned, and the reason must name the fix (install v2).
+    #[test]
+    fn rdna3_dgpu_with_only_v1_installed_needs_the_pack_update() {
+        let mk = || GpuAdapter {
+            name: "AMD Radeon RX 7700S".to_string(),
+            vendor: "amd".to_string(),
+            pci_dev: Some(0x7480), // Navi 33 → gfx1102
+        };
+        let v1_only = training_gpu_list(&[mk()], vec![], &["amd", "cpu"], Some(1));
+        assert!(!v1_only[0].selectable);
+        assert_eq!(v1_only[0].reason.as_deref(), Some("TRAINING_GPU_NEEDS_PACK_UPDATE"));
+
+        // Same card, v2 on disk → selectable (v2's inventory covers gfx1102)…
+        let v2 = training_gpu_list(&[mk()], vec![], &["amd", "cpu"], Some(2));
+        assert!(v2[0].selectable, "{:?}", v2[0].reason);
+
+        // …and the gfx1103 iGPU class never waits for v2 — v1 covers it, so an upgraded app on
+        // a 780M box holding only v1 must NOT start demanding a 1.7 GB download.
+        let igpu =
+            training_gpu_list(&[gpu("AMD Radeon 780M Graphics", "amd")], vec![], &["amd"], Some(1));
+        assert!(igpu[0].selectable, "{:?}", igpu[0].reason);
     }
 
     /// Below the shared CUDA_CC10_FLOOR = unsupported; an unreadable cap is its OWN verdict
@@ -3571,11 +3782,11 @@ mod tests {
     #[test]
     fn nvidia_cap_decides_per_card() {
         let gpus = [gpu("NVIDIA GeForce GTX 1080", "nvidia")];
-        let old = training_gpu_list(&gpus, vec![nv("GTX 1080", "GPU-old", Some(61))], &["nv-cu130"]);
+        let old = training_gpu_list(&gpus, vec![nv("GTX 1080", "GPU-old", Some(61))], &["nv-cu130"], None);
         assert!(!old[0].selectable);
         assert_eq!(old[0].reason.as_deref(), Some("TRAINING_GPU_UNSUPPORTED"));
 
-        let unknown = training_gpu_list(&gpus, vec![nv("GTX 1080", "GPU-old", None)], &["nv-cu130"]);
+        let unknown = training_gpu_list(&gpus, vec![nv("GTX 1080", "GPU-old", None)], &["nv-cu130"], None);
         assert!(!unknown[0].selectable);
         assert_eq!(unknown[0].reason.as_deref(), Some("TRAINING_GPU_CC_UNKNOWN"));
 
@@ -3584,6 +3795,7 @@ mod tests {
             &gpus,
             vec![nv("RTX 2060", "GPU-new", Some(crate::gpu::CUDA_CC10_FLOOR))],
             &["nv-cu130"],
+            None,
         );
         assert!(ok[0].selectable);
     }
@@ -3592,7 +3804,7 @@ mod tests {
     /// fact from an unsupported card, and must never carry a pickable value.
     #[test]
     fn vendorless_adapter_has_no_runtime_and_no_value() {
-        let list = training_gpu_list(&[gpu("Microsoft Basic Render Driver", "other")], vec![], &["cpu"]);
+        let list = training_gpu_list(&[gpu("Microsoft Basic Render Driver", "other")], vec![], &["cpu"], None);
         assert!(!list[0].selectable);
         assert_eq!(list[0].reason.as_deref(), Some("TRAINING_GPU_NO_RUNTIME"));
         assert!(list[0].value.is_empty(), "an empty value can never be masked into device.py");

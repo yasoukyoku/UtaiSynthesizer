@@ -738,6 +738,17 @@ export function ghRouteOrder(gh: GhMirror, presets: GhPreset[] = BUILTIN_GH_PRES
   return out;
 }
 
+/** S168: routes for a fetch whose CONTENT is itself the integrity root — the runtime-pack
+ *  manifest is unsigned and its own sha256 table is the only thing that verifies the pack's
+ *  parts, so it must never ride community proxies the user did not explicitly choose (the
+ *  S66 un-hashed rule, one level up: here the HASH TABLE is the un-hashed download). Trusted
+ *  routes = the user's explicit proxy choice (if any) + direct, nothing more. The preset
+ *  tail stays reserved for consumers that verify content independently (ghRouteOrder's doc). */
+export function ghTrustedRoutes(gh: GhMirror, presets: GhPreset[] = BUILTIN_GH_PRESETS): string[] {
+  const chosen = ghProxyPrefix(gh, presets);
+  return chosen ? [chosen, ""] : [""];
+}
+
 /** S66 failover candidates for a GH-hosted url: the chosen prefix first, then the direct
  *  url — and, ONLY when `presetFallbacks` is true, every other preset as a tail.
  *

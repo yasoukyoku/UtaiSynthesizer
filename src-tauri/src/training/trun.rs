@@ -903,6 +903,13 @@ pub fn migrate_all(data_dir: &Path) {
     let (mut migrated, mut failed) = (0usize, 0usize);
     for entry in rd.flatten() {
         let proj = entry.path();
+        // S168: the bundled code dirs are never projects, even when an earlier boot stamped
+        // them — the repair removes the stamp, this guard keeps the walk safe if it could not
+        // (this walk is the one that MOVED `utai_train/sovits/diffusion`, so it gets the
+        // guard even though the stamp is gone by the time it runs).
+        if entry.file_name().to_str().is_some_and(tproject::is_reserved_training_dir) {
+            continue;
+        }
         // `project.json` is the authority for "this is a project", exactly as `tpool::migrate_all`
         // has it; `.del_*` tombstones and `.migrating_*` markers do not have one.
         if !proj.join(tproject::PROJECT_META).is_file() {
@@ -2008,6 +2015,16 @@ mod tests {
         // migration skips these by the same rule, and a tombstone must not be folded
         let bogus = tproject::training_root(&data).join(".del_pthree_33333333");
         touch(&bogus.join("rvc").join("G_1.pth"));
+        // S168 decoy: the bundled code dir, WITH a stamp left by an older build — the walk
+        // must skip it by NAME even though project.json exists (this very walk is the one
+        // that moved `utai_train/sovits/diffusion` into runs/ in the field, via
+        // RunEntry::Exact("diffusion")). The two real projects above are the positive
+        // control proving the walk itself ran.
+        let code = tproject::training_root(&data).join("utai_train");
+        std::fs::create_dir_all(code.join("sovits").join("diffusion")).unwrap();
+        std::fs::write(code.join(tproject::PROJECT_META), "{}").unwrap();
+        std::fs::write(code.join("sovits").join("diffusion").join("__init__.py"), "d").unwrap();
+        std::fs::write(code.join("sovits").join(tpool::SLOT_META), r#"{"layout":2}"#).unwrap();
 
         migrate_all(&data);
 
@@ -2021,6 +2038,11 @@ mod tests {
             }
         }
         assert!(bogus.join("rvc").join("G_1.pth").is_file(), "a tombstone is not a project");
+        assert!(
+            code.join("sovits").join("diffusion").join("__init__.py").is_file()
+                && !code.join("sovits").join(RUNS_DIR).exists(),
+            "the bundled code dir must not be folded even when stamped (S168)"
+        );
 
         // idempotent: a second boot folds nothing and breaks nothing
         migrate_all(&data);

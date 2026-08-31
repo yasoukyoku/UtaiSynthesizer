@@ -58,6 +58,54 @@ pub fn sanitize_gh_prefix(gh_proxy: Option<String>) -> Option<String> {
     (p.starts_with("https://")).then_some(p)
 }
 
+/// Same host family as the frontend's applyGhMirror (precise set + subdomain fallback) — a
+/// github.com release asset's redirect targets (objects.githubusercontent.com) are chased by
+/// the proxy itself. Moved here from update.rs (S168): runtime-pack installs became the
+/// third consumer alongside the updater and the GAME model download, and the predicate must
+/// stay ONE.
+pub fn is_github_family(url: &tauri::Url) -> bool {
+    match url.host_str() {
+        Some(h) => {
+            h == "github.com"
+                || h == "codeload.github.com"
+                || h.ends_with(".github.com")
+                || h.ends_with(".githubusercontent.com")
+        }
+        None => false,
+    }
+}
+
+/// Expand an ordered route list ("" = direct, else proxy prefix) over `base`, sanitizing each
+/// prefix and deduping — the SINGLE builder for the updater's check endpoints, its download
+/// candidates, and (S168) the runtime-pack manifest candidates, so their orders can never
+/// drift. Moved here from update.rs when packs became the third consumer.
+pub fn expand_routes(routes: &Option<Vec<String>>, base: &str) -> Vec<tauri::Url> {
+    let mut out: Vec<tauri::Url> = Vec::new();
+    let mut push = |u: Option<tauri::Url>| {
+        if let Some(u) = u {
+            if !out.contains(&u) {
+                out.push(u);
+            }
+        }
+    };
+    let direct = tauri::Url::parse(base).ok();
+    let mut had_direct = false;
+    if let Some(rs) = routes {
+        for r in rs {
+            if r.is_empty() {
+                had_direct = true;
+                push(direct.clone());
+            } else if let Some(p) = sanitize_gh_prefix(Some(r.clone())) {
+                push(tauri::Url::parse(&format!("{p}/{base}")).ok());
+            }
+        }
+    }
+    if !had_direct {
+        push(direct);
+    }
+    out
+}
+
 pub fn part_path(dest: &Path) -> PathBuf {
     let mut os = dest.as_os_str().to_owned();
     os.push(".part");

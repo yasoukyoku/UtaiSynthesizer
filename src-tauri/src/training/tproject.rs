@@ -150,6 +150,31 @@ pub const DATASET_DIR: &str = "dataset";
 /// Every family that owns a slot directory. `sovits_diff` is absent by design — it lives in
 /// the `sovits` slot (see [`crate::training::backend_family`]).
 pub const FAMILIES: [&str; 4] = ["rvc", "sovits", "sovits_v2", "vocoder"];
+/// Directory names at the TRAINING ROOT that are never projects: the bundled trainer code
+/// and its assets (tauri.conf.json maps `../training/{utai_train,assets}` next to the exe)
+/// plus the dev checkout's pack-builder dir.
+///
+/// ⛔ Why this list exists (S168, the first community report on v0.12.0): `data_dir` may be
+/// pointed at the INSTALL root — then `training_root(data_dir)` holds these next to real
+/// projects, and `has_family_slot(utai_train)` is TRUE by construction (the python package
+/// has subpackages named exactly rvc/sovits/sovits_v2/vocoder). 0.12.0's first boot on such
+/// a layout stamped project.json into `utai_train`, folded `sovits/diffusion` into
+/// `runs/r0041a9726c54/` (breaking shallow-diffusion), and put a deletable phantom
+/// "utai_train" project in the UI — deleting that row deletes the trainer itself, which is
+/// exactly what produced the reporter's ENVTEST_SCRIPT_MISSING + "No module named
+/// 'utai_train'". `unfold_reserved_dirs` undoes the damage; this list keeps every scanner
+/// out from now on.
+///
+/// A legit project id can never collide: `new_project_id`/`slugify` always append `_<8 hex>`
+/// (pinned by `new_project_id_is_stable_charset_safe_and_dodges_reserved_names`). The only
+/// way a REAL project could carry one of these names is a hand-rename, and refusing that is
+/// the safe direction.
+pub const RESERVED_TRAINING_DIRS: [&str; 3] = ["utai_train", "assets", "packs"];
+
+/// Case-insensitive on purpose: NTFS is, so `Utai_Train` addresses the same directory.
+pub fn is_reserved_training_dir(name: &str) -> bool {
+    RESERVED_TRAINING_DIRS.iter().any(|r| name.eq_ignore_ascii_case(r))
+}
 /// Marker for an in-flight migration: `<training>/.migrating_<id>.json`. A FILE at the
 /// training root, so it survives every rename the migration performs.
 const MARKER_PREFIX: &str = ".migrating_";
@@ -279,7 +304,7 @@ pub fn list_projects(data_dir: &Path) -> Vec<ProjectMeta> {
             continue;
         }
         let id = e.file_name().to_string_lossy().into_owned();
-        if id.starts_with('.') {
+        if id.starts_with('.') || is_reserved_training_dir(&id) {
             continue;
         }
         match read_meta(data_dir, &id) {
@@ -1772,7 +1797,7 @@ pub fn list_project_summaries(app_dir: &Path, data_dir: &Path, measure: bool) ->
     if let Ok(rd) = std::fs::read_dir(training_root(data_dir)) {
         for e in rd.flatten() {
             let id = e.file_name().to_string_lossy().into_owned();
-            if id.starts_with('.') || !e.path().is_dir() {
+            if id.starts_with('.') || !e.path().is_dir() || is_reserved_training_dir(&id) {
                 continue;
             }
             if !e.path().join(PROJECT_META).is_file() {
@@ -1957,6 +1982,150 @@ pub struct MigrationReport {
     pub failed: Vec<String>,
 }
 
+/// S168 repair: undo what earlier boots' migrations did to the bundled code dirs.
+///
+/// Shipped 0.10.0–0.12.0 stamped `project.json` into `utai_train`/`assets` whenever the data
+/// root was the install root (see [`RESERVED_TRAINING_DIRS`]), and 0.12.0's run fold then
+/// moved `utai_train/sovits/diffusion` into `sovits/runs/r0041a9726c54/` — breaking every
+/// shallow-diffusion start on such installs. This runs FIRST in
+/// [`crate::training::migrate_layouts`] (both call sites: boot and the old-root reclaim), so
+/// a damaged install heals on its next launch, before any scanner looks again.
+///
+/// Scope-bounded on purpose: it only ever touches directories named in
+/// [`RESERVED_TRAINING_DIRS`], and inside them only the migration's own artifacts
+/// (project.json / slot.json / `runs/` / `pools/` / markers). Idempotent — a healthy tree
+/// does nothing and logs nothing.
+pub fn unfold_reserved_dirs(data_dir: &Path) {
+    let root = training_root(data_dir);
+    for name in RESERVED_TRAINING_DIRS {
+        let dir = root.join(name);
+        if !dir.is_dir() {
+            continue;
+        }
+        // A reserved NAME is not proof of the bundled CONTENT (reviewed S168): a real
+        // project someone hand-renamed to a reserved name must not be dismantled. Each dir
+        // must show its own signature content before the repair touches it. The heal runs
+        // BEFORE this (lib.rs order), so even a gutted utai_train shows runner.py by now;
+        // a name-squatter is reported and left alone — the scanners still skip it by name,
+        // so the report tells the user to rename it back.
+        let looks_bundled = match name {
+            "utai_train" => {
+                dir.join("runner.py").is_file()
+                    || dir.join("envtest.py").is_file()
+                    || dir.join("__init__.py").is_file()
+            }
+            "assets" => {
+                dir.join("mute").is_dir()
+                    || dir.join("configs").is_dir()
+                    || dir.join("audition_10s.wav").is_file()
+            }
+            "packs" => dir.join("build_pack.py").is_file() || dir.join("locks").is_dir(),
+            _ => false,
+        };
+        if !looks_bundled {
+            tracing::warn!(
+                "reserved-dir repair: {} carries a reserved name but not the bundled content — \
+                 left untouched (reserved names are invisible to the project scanners; rename \
+                 the directory to make it reachable again)",
+                dir.display()
+            );
+            continue;
+        }
+        let mut undone = 0usize;
+        let meta = dir.join(PROJECT_META);
+        if meta.is_file() {
+            match std::fs::remove_file(&meta) {
+                Ok(()) => undone += 1,
+                Err(e) => {
+                    tracing::warn!("reserved-dir repair: could not remove {} ({e})", meta.display())
+                }
+            }
+        }
+        // A marker for a reserved id could only come from an old boot's stamp attempt — pure
+        // bookkeeping, safe to drop. A staging TREE would be the bundled code mid-rename;
+        // that is not ours to guess about, so it is reported and left alone.
+        let _ = std::fs::remove_file(marker_path(data_dir, name));
+        let staging = staging_path(data_dir, name);
+        if staging.is_dir() {
+            tracing::warn!(
+                "reserved-dir repair: {} exists — an interrupted migration staged the bundled code; leaving it for inspection",
+                staging.display()
+            );
+        }
+        for family in FAMILIES {
+            let slot = dir.join(family);
+            if !slot.is_dir() {
+                continue;
+            }
+            let sj = slot.join(crate::training::tpool::SLOT_META);
+            if sj.is_file() {
+                match std::fs::remove_file(&sj) {
+                    Ok(()) => undone += 1,
+                    Err(e) => tracing::warn!(
+                        "reserved-dir repair: could not remove {} ({e})",
+                        sj.display()
+                    ),
+                }
+            }
+            for container in [crate::training::trun::RUNS_DIR, crate::training::tpool::POOLS_DIR] {
+                let cont = slot.join(container);
+                if !cont.is_dir() {
+                    continue;
+                }
+                undone += unfold_container(&cont, &slot);
+                // Only ever removed when empty — anything unexpected left inside stays visible.
+                let _ = std::fs::remove_dir(&cont);
+            }
+        }
+        if undone > 0 {
+            tracing::info!(
+                "reserved-dir repair: {} — undid {undone} artifact(s) an earlier boot's migration left in the bundled code dir (S168)",
+                dir.display()
+            );
+        }
+    }
+}
+
+/// Move every entry of every child of `cont` (a `runs/`/`pools/` container the fold created
+/// inside a reserved dir) back to `slot`. A target that already exists means the canonical
+/// file is back (app reinstall, or the bundled-code heal that runs before this) — the folded
+/// copy is then a stale duplicate of OUR OWN shipped code, never user data, and is removed.
+fn unfold_container(cont: &Path, slot: &Path) -> usize {
+    let mut n = 0usize;
+    let Ok(rd) = std::fs::read_dir(cont) else { return 0 };
+    for sub in rd.flatten() {
+        let subdir = sub.path();
+        if !subdir.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&subdir) {
+            for e in entries.flatten() {
+                let from = e.path();
+                let to = slot.join(e.file_name());
+                let outcome = if to.exists() {
+                    if from.is_dir() {
+                        crate::util::remove_dir_all_robust(&from).map_err(|e| e.to_string())
+                    } else {
+                        std::fs::remove_file(&from).map_err(|e| e.to_string())
+                    }
+                } else {
+                    crate::util::rename_with_retry(&from, &to, "RESERVED_DIR_REPAIR")
+                        .map_err(|e| e.to_string())
+                };
+                match outcome {
+                    Ok(()) => n += 1,
+                    Err(err) => tracing::warn!(
+                        "reserved-dir repair: could not restore {} ({err})",
+                        from.display()
+                    ),
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(&subdir);
+    }
+    n
+}
+
 /// Fold every legacy workspace under `<data>/training` into the project layout.
 ///
 /// Called once at startup, BEFORE anything can hold a handle into these trees and before the
@@ -2008,6 +2177,11 @@ fn migrate_all(data_dir: &Path) -> MigrationReport {
     }
     ids.sort();
     ids.dedup();
+    // S168: the bundled code dirs must never enter the fold — `has_family_slot(utai_train)`
+    // is true by construction, so without this line the walk stamps them (see
+    // RESERVED_TRAINING_DIRS). Applied after dedup so it also covers a stray
+    // `.migrating_utai_train.json` marker or `.mig_utai_train` staging dir.
+    ids.retain(|id| !is_reserved_training_dir(id));
 
     sweep_orphan_dataset_copies(data_dir);
     for id in ids {
@@ -2379,6 +2553,138 @@ mod tests {
         std::fs::write(ws.join("run_manifest.json"), br#"{"backend":"rvc"}"#).unwrap();
         std::fs::write(ws.join("run.json"), r#"{"model_name":"歌姫テスト"}"#).unwrap();
         ws
+    }
+
+    /// S168 §1 — the reserved-name predicate itself: the three bundled names in any case
+    /// (NTFS is case-insensitive), while every minted-shape id passes.
+    #[test]
+    fn reserved_training_dir_names_are_refused_in_any_case() {
+        for name in ["utai_train", "Utai_Train", "UTAI_TRAIN", "assets", "Assets", "packs"] {
+            assert!(is_reserved_training_dir(name), "{name}");
+        }
+        for name in ["utai_train_1a2b3c4d", "assets_00000000", "mon3tr_eacea4e4", "song"] {
+            assert!(!is_reserved_training_dir(name), "{name}");
+        }
+    }
+
+    /// S168 — the first community report on v0.12.0: with data_dir pointed at the install
+    /// root, the bundled python package sits at `<training>/utai_train` and holds subdirs
+    /// named exactly rvc/sovits/sovits_v2/vocoder, so `has_family_slot` is true BY
+    /// CONSTRUCTION and shipped 0.10.0–0.12.0 stamped it into a phantom project. The walk
+    /// must skip it — and the control beside it pins that the exclusion did not weaken the
+    /// migration itself (a vacuous "nothing was stamped" would also pass on a walk that
+    /// never ran).
+    #[test]
+    fn the_bundled_code_dirs_are_never_stamped_while_a_real_workspace_still_migrates() {
+        let data = tmp_root("reserved");
+        let code = training_root(&data).join("utai_train");
+        for fam in FAMILIES {
+            std::fs::create_dir_all(code.join(fam)).unwrap();
+        }
+        std::fs::write(code.join("__init__.py"), "x").unwrap();
+        std::fs::write(code.join("envtest.py"), "x").unwrap();
+        std::fs::write(code.join("runner.py"), "x").unwrap();
+        std::fs::create_dir_all(code.join("sovits").join("diffusion")).unwrap();
+        std::fs::write(code.join("sovits").join("diffusion").join("__init__.py"), "x").unwrap();
+        let assets = training_root(&data).join("assets");
+        std::fs::create_dir_all(assets.join("mute")).unwrap();
+
+        // Control: a real legacy workspace that must still migrate through the same walk.
+        legacy_rvc(&data, "song_1a2b3c4d");
+        let rep = migrate_all(&data);
+        assert!(
+            rep.migrated.contains(&"song_1a2b3c4d".to_string()),
+            "the control workspace must still migrate: {rep:?}"
+        );
+        assert!(!code.join(PROJECT_META).exists(), "utai_train must never be stamped");
+        assert!(!assets.join(PROJECT_META).exists(), "assets must never be stamped");
+        assert!(
+            code.join("sovits").join("diffusion").join("__init__.py").is_file(),
+            "the code tree must be untouched"
+        );
+        // …and the phantom never reaches a listing either.
+        assert!(
+            list_projects(&data).iter().all(|m| !is_reserved_training_dir(&m.id)),
+            "a reserved dir must never appear as a project"
+        );
+    }
+
+    /// S168 repair — drives `unfold_reserved_dirs` on the EXACT damaged shape shipped
+    /// 0.12.0 left in the field (verified against the reporter's log + the fold's code):
+    /// project.json + slot.json ×4 + `sovits/diffusion` moved into `runs/r0041a9726c54/`.
+    /// A real project's `runs/` beside it must survive untouched (the repair may never leak
+    /// outside the reserved names), the repair must be idempotent, and when the canonical
+    /// file is already back (app reinstall / embedded heal) the stale folded copy must lose.
+    #[test]
+    fn unfold_reserved_dirs_heals_the_exact_damage_shipped_0_12_0_left() {
+        let data = tmp_root("unfold");
+        let code = training_root(&data).join("utai_train");
+        for fam in FAMILIES {
+            std::fs::create_dir_all(code.join(fam)).unwrap();
+            std::fs::write(code.join(fam).join("slot.json"), r#"{"layout":4}"#).unwrap();
+        }
+        std::fs::write(code.join(PROJECT_META), r#"{"id":"utai_train","name":"utai_train"}"#)
+            .unwrap();
+        std::fs::write(code.join("runner.py"), "x").unwrap();
+        let moved = code.join("sovits").join("runs").join("r0041a9726c54").join("diffusion");
+        std::fs::create_dir_all(&moved).unwrap();
+        std::fs::write(moved.join("__init__.py"), "diff").unwrap();
+
+        // Control: a real project whose runs/ must not be touched.
+        let ctrl = training_root(&data).join("ctrl_00000000");
+        std::fs::create_dir_all(ctrl.join("rvc").join("runs").join("r0041a9726c54")).unwrap();
+        std::fs::write(ctrl.join(PROJECT_META), r#"{"id":"ctrl_00000000"}"#).unwrap();
+        std::fs::write(
+            ctrl.join("rvc").join("runs").join("r0041a9726c54").join("run.json"),
+            "{}",
+        )
+        .unwrap();
+
+        unfold_reserved_dirs(&data);
+        assert!(
+            code.join("sovits").join("diffusion").join("__init__.py").is_file(),
+            "diffusion must move back to the slot root"
+        );
+        assert!(!code.join("sovits").join("runs").exists(), "the emptied fold container must go");
+        assert!(!code.join(PROJECT_META).exists(), "the phantom stamp must go");
+        for fam in FAMILIES {
+            assert!(!code.join(fam).join("slot.json").exists(), "{fam} slot.json must go");
+        }
+        assert!(
+            ctrl.join("rvc").join("runs").join("r0041a9726c54").join("run.json").is_file(),
+            "a real project's runs/ must be untouched"
+        );
+
+        // Idempotent: a second pass changes nothing and panics on nothing.
+        unfold_reserved_dirs(&data);
+        assert!(code.join("sovits").join("diffusion").join("__init__.py").is_file());
+
+        // Target-exists arm: the canonical file is back — the stale folded copy is removed,
+        // never allowed to overwrite it.
+        let moved2 = code.join("sovits").join("runs").join("rdeadbeef0000").join("diffusion");
+        std::fs::create_dir_all(&moved2).unwrap();
+        std::fs::write(moved2.join("__init__.py"), "stale").unwrap();
+        unfold_reserved_dirs(&data);
+        assert_eq!(
+            std::fs::read(code.join("sovits").join("diffusion").join("__init__.py")).unwrap(),
+            b"diff",
+            "the canonical copy must win over the stale folded one"
+        );
+        assert!(!code.join("sovits").join("runs").exists());
+
+        // Name-squatter control (reviewed S168): a REAL project hand-renamed to a reserved
+        // name shows none of the bundled signature content — the repair must not dismantle
+        // it (it stays invisible to the scanners, but its bytes stay intact).
+        let squat = training_root(&data).join("packs");
+        std::fs::create_dir_all(squat.join("rvc").join("runs").join("r1")).unwrap();
+        std::fs::write(squat.join(PROJECT_META), r#"{"id":"packs"}"#).unwrap();
+        std::fs::write(squat.join("rvc").join("runs").join("r1").join("G_1.pth"), "w").unwrap();
+        unfold_reserved_dirs(&data);
+        assert!(squat.join(PROJECT_META).is_file(), "a name-squatter keeps its stamp");
+        assert!(
+            squat.join("rvc").join("runs").join("r1").join("G_1.pth").is_file(),
+            "a name-squatter's runs/ must not be unfolded"
+        );
     }
 
     #[test]

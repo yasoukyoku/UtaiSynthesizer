@@ -210,6 +210,13 @@ pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<Stora
                     training_bytes += dir_size(&p);
                     continue;
                 }
+                // S168: the bundled code dirs (utai_train/assets, present when the data root
+                // is the install root) are app code, not workspaces — no row, no delete
+                // button, and their few MB are not training data. This enumerator never keyed
+                // on project.json, which is exactly how the phantom row got its delete button.
+                if crate::training::tproject::is_reserved_training_dir(&id) {
+                    continue;
+                }
                 let bytes = dir_size(&p);
                 training_bytes += bytes;
                 // S76: one row per PROJECT. Display name comes from project.json (the only

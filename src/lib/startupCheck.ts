@@ -8,7 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import i18n from "../i18n";
 import { loadSetting, saveSetting } from "./settings";
-import { hfBaseForMirror } from "./models/msst-catalog";
+import { ghTrustedRoutes, hfBaseForMirror } from "./models/msst-catalog";
 import { useAppStore } from "../store/app";
 import { useMsstModelStore } from "../store/msst-models";
 
@@ -127,7 +127,18 @@ export async function runStartupComponentCheck(): Promise<void> {
           candidates.find((e) => e.variant === rec) ??
           candidates.find((e) => !e.experimental) ??
           candidates[0];
-        if (pick) await invoke("download_runtime_pack", { id: pick.id });
+        if (pick) {
+          // S168: the startup auto-download was the ONE caller still invoking the pack
+          // installer with no mirror information (reviewed — a dead verifier nearly buried
+          // this). Same trusted-routes rule as Settings: explicit choice + direct only,
+          // because the manifest is the pack's unsigned integrity root.
+          const ms = useMsstModelStore.getState();
+          await invoke("download_runtime_pack", {
+            id: pick.id,
+            hfBase,
+            ghRoutes: ghTrustedRoutes(ms.ghMirror, ms.ghPresets),
+          });
+        }
       } catch {
         /* surfaced in the Settings runtime section */
       }

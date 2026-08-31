@@ -22,6 +22,7 @@ use tauri::Emitter;
 
 use crate::{Result, UtaiError};
 
+pub mod bundled_code;
 pub mod diagnostics;
 pub mod dsmanifest;
 pub mod resume_lock;
@@ -54,6 +55,12 @@ pub mod trun;
 /// python 的 v2 公式」(`tpool::identity_version`)。排到前面去 = 先告诉 python 盘上是 v2 文本,
 /// 再让另外两个迁移器去搬那些还写着 v1 文本的字节。
 pub fn migrate_layouts(root: &Path) {
+    // S168: FIRST, undo any stamp/fold an earlier boot left inside the bundled code dirs
+    // (`RESERVED_TRAINING_DIRS`). Every walk below now skips those names, but a damaged
+    // install needs the artifacts gone before the trainer imports cleanly again. Deliberately
+    // NOT named `*::migrate_*` — the boot-chain ratchet counts those and this is a repair,
+    // not a layout step.
+    tproject::unfold_reserved_dirs(root);
     tproject::migrate_legacy_layout(root);
     tpool::migrate_all(root);
     trun::migrate_all(root);

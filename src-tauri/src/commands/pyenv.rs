@@ -121,7 +121,12 @@ pub fn get_runtime_env_info() -> Result<RuntimeEnvInfo, String> {
     // usable here" — one sentence, two consumers, no second rule to drift.
     let sig = crate::commands::settings::machine_sig();
     for p in &mut packs {
-        p.supported = crate::commands::settings::variant_supported(&p.meta.variant, &gpus, &nv_cc10);
+        // Variant-level first; for amd additionally by the INSTALLED pack's version — v1 on an
+        // RDNA3-dGPU-only box is installed-but-unusable and must say so (S168), while the same
+        // v1 on a 780M box stays supported.
+        p.supported = crate::commands::settings::variant_supported(&p.meta.variant, &gpus, &nv_cc10)
+            && (p.meta.variant != "amd"
+                || crate::commands::settings::amd_pack_version_supported(p.meta.version, &gpus));
         // Only an EXPLICIT disagreement is staleness — a report written before the stamp existed
         // carries no claim about its machine, so it keeps its verdict (see PackStatus).
         p.envtest_stale = p
@@ -140,7 +145,7 @@ pub fn get_runtime_env_info() -> Result<RuntimeEnvInfo, String> {
             download_bytes: e.download_bytes,
             disk_bytes: e.disk_bytes,
             experimental: e.experimental,
-            downloadable: !pyenv::manifest_url_candidates(e).is_empty(),
+            downloadable: !pyenv::manifest_url_candidates(e, None, None).is_empty(),
             // By ID, not variant: during a v1→v2 upgrade both coexist and the v2
             // catalog row must stay visible/downloadable while v1 is installed.
             installed: packs.iter().any(|p| p.meta.id == e.id),
@@ -182,6 +187,11 @@ pub async fn download_runtime_pack(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
     id: String,
+    // S168: the 下载源 (HF) choice and the GH proxy routes finally reach the ONE downloader
+    // in the app that ignored both — same param shapes as download_asset_pack / the GAME
+    // model download. Optional so a scripted/stale caller degrades to the built-in rotation.
+    hf_base: Option<String>,
+    gh_routes: Option<Vec<String>>,
 ) -> Result<(), String> {
     let entry = pyenv::CATALOG
         .iter()
@@ -223,7 +233,8 @@ pub async fn download_runtime_pack(
     }
     let (guard, cancel) = pyenv::InstallGuard::acquire().map_err(|e| e.to_string())?;
     let _task = state.begin_task("pyenv_install"); // close-flow in-progress listing
-    let result = do_download_and_install(&app, &state, entry, &cancel).await;
+    let result =
+        do_download_and_install(&app, &state, entry, hf_base.as_deref(), gh_routes.as_deref(), &cancel).await;
     // Terminal events fire AFTER the guard drops: the frontend's done-handler
     // refreshes get_runtime_env_info, and a still-held guard would report
     // installing=true and wedge the rebuilt busy state (audit S42-r2).
@@ -245,6 +256,8 @@ async fn do_download_and_install(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
     entry: &pyenv::CatalogEntry,
+    hf_base: Option<&str>,
+    gh_routes: Option<&[String]>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<DoneMsg, String> {
     let id = entry.id;
@@ -252,7 +265,7 @@ async fn do_download_and_install(
     let client = crate::download::client().map_err(|e| e.to_string())?;
 
     emit_progress(app, id, "manifest", 0.0, Some("STAGE_FETCH_MANIFEST"), vec![], "Fetching pack manifest...");
-    let candidates = pyenv::manifest_url_candidates(entry);
+    let candidates = pyenv::manifest_url_candidates(entry, hf_base, gh_routes);
     let (manifest, bases) = pyenv::fetch_manifest(&client, &candidates)
         .await
         .map_err(|e| e.to_string())?;
@@ -578,6 +591,12 @@ async fn run_envtest_inner(
         return Err(format!("PACK_NO_PYTHON: {}", python.display()));
     }
     let training_dir = state.app_dir.join("training");
+    if !training_dir.join("utai_train").join("envtest.py").exists() {
+        // S168: try the embedded heal once before failing — the boot-time heal covers the
+        // next launch, but the reporter hit this mid-session (the tree vanished between two
+        // installs) and a self-test that can repair its own script should.
+        crate::training::bundled_code::sync_bundled_training_code(&state.app_dir);
+    }
     if !training_dir.join("utai_train").join("envtest.py").exists() {
         return Err(format!(
             "ENVTEST_SCRIPT_MISSING: {}",
