@@ -1083,16 +1083,27 @@ function sanitizeExportName(name: string): string {
 // (Rust re-checks) before opening the native save dialog.
 function VoiceExportButton({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: VoiceType; lang: string }) {
   const [busy, setBusy] = useState(false);
-  const onExport = useCallback(async () => {
-    if (busy) return;
+  // S167: on Export the user picks the format inline (same pattern as the delete confirm):
+  // UTAI .zip (lossless re-importable package) vs community-standard files into a plain folder.
+  // The community choice is enabled only when the training-side source still exists — installed
+  // models are ONNX-only, so the `.pth` must come from the export ledger (has_community_source).
+  const [pick, setPick] = useState(false);
+  const [communityOk, setCommunityOk] = useState<boolean | null>(null);
+
+  const guardBusyModel = useCallback((): boolean => {
     const vm = useVoiceModelStore.getState();
     if (vm.rangeTesting[m.name] !== undefined || vm.auditionState?.name === m.name) {
       useAppStore.getState().showToast(
         t18({ zh: "该模型正在测试/试听中，稍后再导出", en: "This model is being tested/auditioned — export later", ja: "このモデルはテスト/試聴中です。後で書き出してください" }, lang),
         "info",
       );
-      return;
+      return false;
     }
+    return true;
+  }, [m.name, lang]);
+
+  const zipFlow = useCallback(async () => {
+    if (busy || !guardBusyModel()) return;
     const dest = await save({
       title: t18({ zh: "导出模型为 .zip", en: "Export model as .zip", ja: "モデルを .zip に書き出し" }, lang),
       defaultPath: `${sanitizeExportName(m.name)}.zip`,
@@ -1111,7 +1122,74 @@ function VoiceExportButton({ m, voiceType, lang }: { m: VoiceModelEntry; voiceTy
     } finally {
       setBusy(false);
     }
-  }, [busy, m.name, voiceType, lang]);
+  }, [busy, guardBusyModel, m.name, voiceType, lang]);
+
+  const communityFlow = useCallback(async () => {
+    if (busy || !guardBusyModel()) return;
+    // community format = plain files, no zip (user 2026-08-31) ⇒ a folder picker
+    const dest = await open({
+      directory: true,
+      title: t18({ zh: "选择社区格式的导出文件夹", en: "Pick a folder for the community-format files", ja: "コミュニティ形式の書き出し先フォルダーを選択" }, lang),
+    });
+    if (!dest || typeof dest !== "string") return;
+    setBusy(true);
+    try {
+      const files = await invoke<string[]>("export_model_community", { name: m.name, modelType: voiceType, destDir: dest });
+      useAppStore.getState().showToast(
+        t18({ zh: `已按社区格式导出 ${files.length} 个文件 · ${m.name}`, en: `Exported ${files.length} community-format file(s) · ${m.name}`, ja: `コミュニティ形式で ${files.length} 個のファイルを書き出し · ${m.name}` }, lang),
+        "success",
+      );
+    } catch (e) {
+      useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, guardBusyModel, m.name, voiceType, lang]);
+
+  const onExport = useCallback(async () => {
+    if (busy || !guardBusyModel()) return;
+    if (voiceType === "vocoder") {
+      // vocoders have no community-standard format — go straight to the .zip package
+      void zipFlow();
+      return;
+    }
+    let ok = false;
+    try {
+      ok = await invoke<boolean>("has_community_source", { name: m.name, modelType: voiceType });
+    } catch {
+      ok = false;
+    }
+    setCommunityOk(ok);
+    setPick(true);
+  }, [busy, guardBusyModel, m.name, voiceType, zipFlow]);
+
+  if (pick) {
+    return (
+      <div className="model-confirm-delete">
+        <button
+          className="model-export-btn"
+          disabled={busy}
+          onClick={() => { setPick(false); void zipFlow(); }}
+          title={t18({ zh: "UTAI 模型包，可在其它设备导入", en: "UTAI package — import on another device", ja: "UTAI パッケージ。他のデバイスで取り込めます" }, lang)}
+        >
+          {t18({ zh: "UTAI 包 (.zip)", en: "UTAI package (.zip)", ja: "UTAI パッケージ (.zip)" }, lang)}
+        </button>
+        <button
+          className="model-export-btn"
+          disabled={busy || communityOk !== true}
+          onClick={() => { setPick(false); void communityFlow(); }}
+          title={communityOk === true
+            ? t18({ zh: "导出社区通用格式到文件夹（不打包）", en: "Community-standard files into a plain folder (no zip)", ja: "コミュニティ標準形式でフォルダーに書き出し（zip なし）" }, lang)
+            : t18({ zh: "找不到训练侧来源：已安装模型只有 ONNX，社区 .pth 需要它的训练工程仍然在", en: "No training-side source: installed models are ONNX-only; the community .pth needs its original training project", ja: "学習側ソースがありません：インストール済みモデルは ONNX のみ。コミュニティ .pth には元の学習プロジェクトが必要です" }, lang)}
+        >
+          {t18({ zh: "社区格式（文件夹）", en: "Community format (folder)", ja: "コミュニティ形式（フォルダー）" }, lang)}
+        </button>
+        <button className="model-export-btn" disabled={busy} onClick={() => setPick(false)}>
+          {t18({ zh: "取消", en: "Cancel", ja: "キャンセル" }, lang)}
+        </button>
+      </div>
+    );
+  }
 
   return (
     <button

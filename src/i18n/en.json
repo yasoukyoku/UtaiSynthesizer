@@ -926,6 +926,7 @@
     "EXPORT_COMMUNITY_INDEX_COPY": "Community export: writing the .index file failed",
     "EXPORT_COMMUNITY_TASK": "Community export: the export task crashed",
     "EXPORT_COMMUNITY_UNSUPPORTED": "Community export: this architecture has no community-standard format",
+    "EXPORT_COMMUNITY_NO_SOURCE": "Community export: no training-side source found for this model (installed models are ONNX-only; the community checkpoint needs its original training project)",
     "PACKAGE_INVALID": "Not a valid Utai model package (missing manifest or core files)",
     "PACKAGE_EXTRACT_FAILED": "Failed to read the model package",
     "MODEL_NOT_LOADED": "The model is not loaded yet",

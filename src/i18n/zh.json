@@ -926,6 +926,7 @@
     "EXPORT_COMMUNITY_INDEX_COPY": "社区格式导出：写出 .index 文件失败",
     "EXPORT_COMMUNITY_TASK": "社区格式导出：导出任务异常终止",
     "EXPORT_COMMUNITY_UNSUPPORTED": "社区格式导出：该架构没有社区通用格式",
+    "EXPORT_COMMUNITY_NO_SOURCE": "社区格式导出：找不到该模型的训练侧来源（已安装模型只有 ONNX；社区 .pth 需要它原本的训练工程仍然在）",
     "PACKAGE_INVALID": "这不是有效的 Utai 模型包（缺少清单或核心文件）",
     "PACKAGE_EXTRACT_FAILED": "读取模型包失败",
     "MODEL_NOT_LOADED": "模型尚未加载",

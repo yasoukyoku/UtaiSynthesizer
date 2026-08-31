@@ -24,7 +24,7 @@ fn opt_run_id(s: &str) -> Option<&str> {
     Some(s.trim()).filter(|s| !s.is_empty())
 }
 
-fn data_root(state: &AppState) -> PathBuf {
+pub(crate) fn data_root(state: &AppState) -> PathBuf {
     // data root = parent of the models dir (data/models -> data/)
     state
         .models
@@ -932,7 +932,25 @@ pub async fn export_community_ckpt(
     }
     let app_dir = state.app_dir.clone();
     let cache_dir = state.cache_dir.clone();
-    match family.as_str() {
+    // S167: the family dispatch is shared with the resource manager's community export
+    // (`models::export_model_community`) — ONE source of truth for the file-set contract.
+    let _convert = state.acquire_convert_slot()?;
+    community_export_files(app_dir, cache_dir, &family, ckpt_canon, &name, dest).await
+}
+
+/// S167: community file-set builder shared by the training page (`export_community_ckpt`) and
+/// the resource manager (`models::export_model_community`). The CALLER holds the convert slot —
+/// the faiss index build runs under the converter role, same interlock as every converter user.
+pub(crate) async fn community_export_files(
+    app_dir: std::path::PathBuf,
+    cache_dir: std::path::PathBuf,
+    family: &str,
+    ckpt_canon: std::path::PathBuf,
+    name: &str,
+    dest: std::path::PathBuf,
+) -> Result<Vec<String>, String> {
+    let name = name.to_string();
+    match family {
         "rvc" => {
             // weights/<slug>*.pth → the run root (total_fea.npy's home) is two levels up
             let run_dir = ckpt_canon
@@ -952,7 +970,6 @@ pub async fn export_community_ckpt(
                 Some(768) => "v2",
                 other => return Err(format!("EXPORT_COMMUNITY_BAD_FEATURES: dim {other:?}")),
             };
-            let _convert = state.acquire_convert_slot()?;
             let out_pth = dest.join(format!("{name}.pth"));
             tauri::async_runtime::spawn_blocking(move || -> Result<Vec<String>, String> {
                 std::fs::copy(&ckpt_canon, &out_pth)

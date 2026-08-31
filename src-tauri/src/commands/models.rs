@@ -328,6 +328,151 @@ pub async fn export_model(
     .map_err(|e| format!("EXPORT_FAILED: task join: {e}"))?
 }
 
+/// S167: resolve an INSTALLED model back to a live training checkpoint through the projects'
+/// export ledgers. The registry keeps no provenance — installed voices are ONNX, and the
+/// community `.pth` cannot be reconstructed from them — so the ledger row
+/// (`ExportedModel { name, model_type, from_ckpt_rel, .. }`) is the only honest bridge.
+/// Newest matching live row whose checkpoint still exists wins. Returns the checkpoint path and
+/// the row's backend string (the family carrier — a "sovits_v2" row installs as SoVits but its
+/// family dispatch differs from "rvc").
+fn resolve_community_source(
+    data_dir: &Path,
+    name: &str,
+    model_type: &str,
+) -> Option<(PathBuf, String)> {
+    let want = parse_voice_type(model_type)?;
+    let mut best: Option<(u64, PathBuf, String)> = None;
+    for meta in crate::training::tproject::list_projects(data_dir) {
+        let proj = crate::training::tproject::project_dir(data_dir, &meta.id);
+        for row in &meta.exported {
+            if row.name != name || !row.source_live() {
+                continue;
+            }
+            if parse_voice_type(&row.model_type) != Some(want.clone()) {
+                continue;
+            }
+            let ckpt = proj.join(&row.from_ckpt_rel);
+            if !ckpt.is_file() {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(at, _, _)| row.at_ms > *at) {
+                best = Some((row.at_ms, ckpt, row.model_type.clone()));
+            }
+        }
+    }
+    best.map(|(_, p, mt)| (p, mt))
+}
+
+/// S167: does an installed model have a live training-side source for community export?
+/// Drives the enabled/disabled state of the「community format」choice in the manager's
+/// export flow — the honest answer is often "no" (imported packages carry no `.pth`).
+#[tauri::command]
+pub async fn has_community_source(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    model_type: String,
+) -> Result<bool, String> {
+    if model_type == "vocoder" || parse_voice_type(&model_type).is_none() {
+        return Ok(false);
+    }
+    let data_dir = crate::commands::training::data_root(&state);
+    Ok(resolve_community_source(&data_dir, &name, &model_type).is_some())
+}
+
+/// S167: export an INSTALLED model in the COMMUNITY-standard format — plain files into a
+/// user-picked folder, no zip (user 2026-08-31). The `.pth` is resolved through the training
+/// export ledger (see [`resolve_community_source`]); the file set itself comes from the same
+/// shared builder as the training page (`training::community_export_files` — ONE contract).
+/// Vocoder rows are refused: our fine-tuned NSF-HiFiGAN snapshots have no community standard.
+#[tauri::command]
+pub async fn export_model_community(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    model_type: String,
+    dest_dir: String,
+) -> Result<Vec<String>, String> {
+    if model_type == "vocoder" {
+        return Err("EXPORT_COMMUNITY_UNSUPPORTED".to_string());
+    }
+    let mt = parse_voice_type(&model_type)
+        .ok_or_else(|| "EXPORT_COMMUNITY_UNSUPPORTED".to_string())?;
+    if crate::commands::audition::AUDITION_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("MODEL_BUSY_AUDITION".to_string());
+    }
+    // per-row button in the manager ⇒ the registry entry must exist
+    state
+        .models
+        .get_by_type(&name, &mt)
+        .ok_or_else(|| "EXPORT_MODEL_NOT_FOUND".to_string())?;
+    let dest = PathBuf::from(&dest_dir);
+    if !dest.is_dir() {
+        return Err("EXPORT_COMMUNITY_DEST_MISSING".to_string());
+    }
+    let data_dir = crate::commands::training::data_root(&state);
+    let (ckpt, backend) = resolve_community_source(&data_dir, &name, &model_type)
+        .ok_or_else(|| "EXPORT_COMMUNITY_NO_SOURCE".to_string())?;
+    let ckpt = ckpt
+        .canonicalize()
+        .map_err(|e| format!("EXPORT_COMMUNITY_CKPT_MISSING: {e}"))?;
+    let family = crate::training::backend_family(&backend).to_string();
+    let out_name = crate::models::sanitize_file_stem(name.trim());
+    if out_name.is_empty() {
+        return Err("TRAINING_NAME_EMPTY".to_string());
+    }
+    // Same interlock as export_model: the faiss index build runs under the converter role, and
+    // holding the slot keeps a concurrent delete/REPLACE from pulling files mid-export.
+    let _convert = state.acquire_convert_slot()?;
+    crate::commands::training::community_export_files(
+        state.app_dir.clone(),
+        state.cache_dir.clone(),
+        &family,
+        ckpt,
+        &out_name,
+        dest,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod community_source_tests {
+    use super::*;
+
+    /// The resolver's four gates, each proven on a real on-disk ledger: name+type match,
+    /// `source_live`, the checkpoint file existing, and newest-at_ms-wins.
+    #[test]
+    fn resolver_finds_only_live_matching_rows_with_existing_ckpts() {
+        let root = std::env::temp_dir().join(format!("utai_commsrc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let proj = root.join("training").join("p1_aaaabbbb");
+        std::fs::create_dir_all(proj.join("rvc").join("weights")).unwrap();
+        std::fs::write(proj.join("rvc").join("weights").join("m_e14_s147.pth"), b"x").unwrap();
+        std::fs::write(proj.join("rvc").join("weights").join("m_e20_s200.pth"), b"y").unwrap();
+        std::fs::write(
+            proj.join("project.json"),
+            r#"{"id":"p1_aaaabbbb","name":"p","exported":[
+                {"name":"m","model_type":"rvc","from_ckpt_rel":"rvc/weights/m_e14_s147.pth","at_ms":9},
+                {"name":"m","model_type":"rvc","from_ckpt_rel":"rvc/weights/m_e20_s200.pth","at_ms":20},
+                {"name":"m","model_type":"rvc","from_ckpt_rel":"rvc/weights/gone.pth","at_ms":99},
+                {"name":"dead","model_type":"rvc","from_ckpt_rel":"rvc/weights/m_e14_s147.pth","at_ms":5,"source_deleted_ms":7},
+                {"name":"m","model_type":"sovits","from_ckpt_rel":"rvc/weights/m_e14_s147.pth","at_ms":50}
+            ]}"#,
+        )
+        .unwrap();
+
+        // newest LIVE row whose file exists wins — at_ms 99 points at a missing file and must lose
+        let got = resolve_community_source(&root, "m", "rvc").expect("live rvc row");
+        assert!(got.0.ends_with("m_e20_s200.pth"), "newest existing wins, got {:?}", got.0);
+        assert_eq!(got.1, "rvc");
+        // the sovits row for "m" resolves through the type table, not the raw string
+        assert!(resolve_community_source(&root, "m", "sovits").is_some());
+        // a tombstoned row must not resolve
+        assert!(resolve_community_source(&root, "dead", "rvc").is_none());
+        // vocoder / unknown types never resolve
+        assert!(resolve_community_source(&root, "m", "vocoder").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 /// S78 batch 7: re-import a `.zip` model package produced by `export_model` — the lossless
 /// counterpart. Extracts (zip-slip guarded) to a temp dir under the cache, reads the manifest for
 /// the display name / registry type / stem, then materializes the whole family under a fresh local

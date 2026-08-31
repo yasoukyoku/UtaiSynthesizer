@@ -926,6 +926,7 @@
     "EXPORT_COMMUNITY_INDEX_COPY": "コミュニティ形式書き出し：.index ファイルの書き出しに失敗しました",
     "EXPORT_COMMUNITY_TASK": "コミュニティ形式書き出し：書き出しタスクが異常終了しました",
     "EXPORT_COMMUNITY_UNSUPPORTED": "コミュニティ形式書き出し：このアーキテクチャにはコミュニティ標準形式がありません",
+    "EXPORT_COMMUNITY_NO_SOURCE": "コミュニティ形式書き出し：このモデルの学習側ソースが見つかりません（インストール済みモデルは ONNX のみ。コミュニティ .pth には元の学習プロジェクトが必要です）",
     "PACKAGE_INVALID": "有効な Utai モデルパッケージではありません（マニフェストまたはコアファイルがありません）",
     "PACKAGE_EXTRACT_FAILED": "モデルパッケージの読み込みに失敗しました",
     "MODEL_NOT_LOADED": "モデルがまだ読み込まれていません",

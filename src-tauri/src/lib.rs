@@ -1334,6 +1334,8 @@ pub fn run() {
             commands::models::list_models,
             commands::models::import_model,
             commands::models::export_model,
+            commands::models::export_model_community,
+            commands::models::has_community_source,
             commands::models::import_model_package,
             commands::models::delete_model,
             commands::models::check_model_exists,
