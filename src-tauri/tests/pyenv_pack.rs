@@ -111,12 +111,20 @@ fn run_chain(root: std::path::PathBuf) {
     let device = std::env::var("UTAI_PACK_DEVICE")
         .unwrap_or_else(|_| utai_lib::pyenv::envtest_device_for_variant(&meta.variant).to_string());
     println!("envtest tier: variant {:?} -> --device {device}", meta.variant);
-    let status = utai_lib::util::python_command(&py)
-        .current_dir(&training)
+    let mut cmd = utai_lib::util::python_command(&py);
+    cmd.current_dir(&training)
         .args(["-m", "utai_train.envtest", "--device", &device, "--out"])
-        .arg(&report_path)
-        .status()
-        .unwrap();
+        .arg(&report_path);
+    // S169: same single source as the app (see envtest_gfx_targets_for's doc) — an AMD
+    // pack re-verified here must pick its GPU by arch exactly like the badge run did,
+    // or the two answer about different silicon.
+    if let Some(targets) =
+        utai_lib::pyenv::envtest_gfx_targets_for(&meta.variant, meta.version)
+    {
+        println!("envtest gfx targets: {targets}");
+        cmd.args(["--gfx-targets", &targets]);
+    }
+    let status = cmd.status().unwrap();
     let text = std::fs::read_to_string(&report_path).expect("envtest.json written");
     let report: serde_json::Value = serde_json::from_str(&text).unwrap();
     for item in report["items"].as_array().unwrap() {

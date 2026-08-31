@@ -1842,10 +1842,10 @@ impl TrainingManager {
         // the moment the button is pressed; deciding it in run_worker would burn the workspace
         // and the whole dataset copy first. `req.gpu` is the UI id, re-derived against a freshly
         // built list (never trusted): id → entry → (variant, mask).
-        let (gpu_mask, want_variant) = if req.force_cpu {
-            ("-1".to_string(), None)
+        let (gpu_mask, want_variant, mut gpu_gfx_target, gpu_label) = if req.force_cpu {
+            ("-1".to_string(), None, None, None)
         } else if req.gpu.is_empty() {
-            (String::new(), None)
+            (String::new(), None, None, None)
         } else {
             let g = crate::commands::settings::training_gpu_by_id(&self.app_dir, &req.gpu)
                 .ok_or_else(|| {
@@ -1856,7 +1856,7 @@ impl TrainingManager {
                     g.reason.unwrap_or_else(|| "TRAINING_GPU_UNSUPPORTED".to_string()),
                 ));
             }
-            (g.value, g.variant)
+            (g.value, g.variant, g.gfx_target, Some(g.label))
         };
         let crate::pyenv::TrainingInterpreter { python, device_backend, variant: runtime_variant } =
             crate::pyenv::training_interpreter_for(
@@ -1876,6 +1876,29 @@ impl TrainingManager {
             tracing::warn!(
                 "Training runtime is the CPU variant: this run will train on CPU (slow). For GPU training install the runtime pack matching your GPU in Settings → Training Environment."
             );
+        }
+        // S169, auto lane: no GPU was picked but the resolver settled on the ROCm pack. An
+        // unmasked HIP process defaults to device 0, which on mixed-arch laptops can be an
+        // uncovered iGPU (the exact wrong-silicon shape the arch mask exists to prevent) — so
+        // derive the target from the first selectable AMD adapter, same source the UI default
+        // would have offered. Explicitly-picked GPUs already carried theirs from the entry.
+        if gpu_gfx_target.is_none()
+            && !req.force_cpu
+            && runtime_variant.as_deref() == Some("amd")
+        {
+            gpu_gfx_target =
+                crate::commands::settings::amd_first_selectable_gfx_target(&self.app_dir);
+            // ⛔ Fail CLOSED when no adapter qualifies (S169 adversarial review): "amd
+            // resolved but nothing selectable" means the installed pack drives none of this
+            // machine's dies (typically v1-only + RDNA3 dGPU — the S168 population). Letting
+            // the run proceed UNMASKED here would re-open the exact burn-the-workspace-then-
+            // hipErrorInvalidImage path this whole lane exists to close, on precisely those
+            // boxes. Same CODE the dropdown shows for the same condition; same remedy.
+            if gpu_gfx_target.is_none() {
+                return Err(UtaiError::Training(
+                    "TRAINING_GPU_NEEDS_PACK_UPDATE".to_string(),
+                ));
+            }
         }
 
         // READ-ONLY view of the target project, for the pre-flight checks below. Deliberately
@@ -2611,6 +2634,8 @@ impl TrainingManager {
             device_backend,
             runtime_variant,
             gpu_mask,
+            gpu_gfx_target,
+            gpu_label,
             project_id: project.id.clone(),
             speakers: eff_speakers,
         };
@@ -2741,6 +2766,16 @@ struct RunCtx {
     /// "" when no device was chosen. Resolved from the picked entry's `value` — NOT from the
     /// request, whose `gpu` field carries the UI id.
     gpu_mask: String,
+    /// S169, AMD lane only (None elsewhere → key omitted from run.json → device.py behaves
+    /// byte-identically to pre-0.12.2): the picked adapter's gfx arch ("gfx1102").
+    /// device.py::apply_amd_arch_mask re-keys the visibility mask from `gpu_mask` (a DXGI
+    /// vendor-relative index — HIP's ordinal space is NOT DXGI's) to the HIP ordinal that
+    /// actually carries this arch. Resolved at PREFLIGHT from the picked entry (auto lane:
+    /// from the first selectable AMD adapter), carried like everything else here.
+    gpu_gfx_target: Option<String>,
+    /// S169: the picked adapter's display name — a tiebreaker for device.py when several
+    /// HIP devices share the target arch, and log context. Never a selection key on its own.
+    gpu_label: Option<String>,
     /// S76: the resolved project. The dataset lives at the PROJECT level now, so the worker
     /// needs an identity the family slot path cannot give it. Decided in try_start (one
     /// resolution per run) — never re-derived here.
@@ -3320,6 +3355,17 @@ fn run_worker(
     if is_multi {
         run_config["speakers"] = serde_json::json!(run_speakers);
     }
+    // S169, AMD lane only: the picked adapter's gfx arch + name. device.py's
+    // apply_amd_arch_mask re-keys "gpu" (a DXGI vendor-relative index) to the HIP ordinal
+    // carrying this arch — the two orders differ on Windows and there is no LUID bridge on
+    // the AMD lane. Key OMITTED elsewhere (same absent-field convention as device_backend):
+    // NVIDIA/Intel/CPU runs and pre-0.12.2 run.json read byte-identically.
+    if let Some(t) = &ctx.gpu_gfx_target {
+        run_config["gpu_gfx_target"] = serde_json::json!(t);
+        if let Some(l) = &ctx.gpu_label {
+            run_config["gpu_label"] = serde_json::json!(l);
+        }
+    }
     let run_json = run.join("run.json");
     std::fs::write(&run_json, serde_json::to_vec_pretty(&run_config)?)?;
 
@@ -3727,6 +3773,119 @@ mod tests {
                  train() no test can drive it, which is exactly how the S117 regression shipped"
             );
         }
+    }
+
+    /// ★S169 — the same cross-language contract for the AMD arch-keyed device pick's two
+    /// refusals. They fire at start-up on exactly the community machines the lane was widened
+    /// for (mixed-arch AMD laptops), so a raw English CODE there is the S67
+    /// `TRAINING_GPU_UNAVAILABLE` failure again. Two DISTINCT codes on purpose (the closed-gate
+    /// iron rule): "the enum probe could not run" and "it ran and no device carries the arch"
+    /// demand different next steps, and a shared red would get shrugged past the second time.
+    /// ⚠ Both CODEs are parsed OUT of the python sources, never retyped here.
+    #[test]
+    fn s169_amd_device_pick_codes_are_wired_across_python_rust_and_all_three_locales() {
+        static HIPENUM_PY: &str = include_str!("../../../training/utai_train/hipenum.py");
+        static DEVICE_PY: &str = include_str!("../../../training/utai_train/device.py");
+        static ENVTEST_PY: &str = include_str!("../../../training/utai_train/envtest.py");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+
+        let parse = |src: &str, file: &str, name: &str| -> String {
+            src.lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("{name} = ")))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .unwrap_or_else(|| {
+                    panic!("{file} must keep `{name} = \"...\"` as a plain top-level literal — this gate parses it as the single source")
+                })
+        };
+        let codes = [
+            parse(HIPENUM_PY, "hipenum.py", "ENUM_FAILED_CODE"),
+            parse(DEVICE_PY, "device.py", "AMD_GPU_NOT_FOUND_CODE"),
+            // The envtest-side third red (the S169 adversarial review caught it shipping
+            // unmapped: the self-test panel would have shown raw English to zh/ja users).
+            parse(ENVTEST_PY, "envtest.py", "NO_COVERED_GPU_CODE"),
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            for b in codes.iter().skip(i + 1) {
+                assert_ne!(a, b, "the refusals must stay distinguishable to the user");
+            }
+        }
+
+        for code in &codes {
+            assert!(
+                (code.starts_with("TRAINING_") || code.starts_with("ENVTEST_"))
+                    && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "the CODE crosses a process boundary and lands in json keys: {code:?}"
+            );
+            assert!(
+                BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\"")),
+                "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+            );
+            for (lang, raw) in [
+                ("zh", include_str!("../../../src/i18n/zh.json")),
+                ("en", include_str!("../../../src/i18n/en.json")),
+                ("ja", include_str!("../../../src/i18n/ja.json")),
+            ] {
+                let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let msg = v
+                    .pointer(&format!("/backend/{code}"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
+                assert!(
+                    msg.chars().count() >= 30,
+                    "backend.{code} in {lang}.json is {} chars — too short to be the real message: {msg:?}",
+                    msg.chars().count()
+                );
+            }
+        }
+
+        // ★The wiring half a text gate CAN check, on COMMENT-STRIPPED sources (S169 review:
+        // a needle that also matches commented-out code lets the mechanism be disabled by
+        // commenting while the test stays green — the ipcParity "挖空注释" rule). Needles
+        // split with concat! so this test's own source can never satisfy them (S127).
+        let strip_py = |src: &str| -> String {
+            // Good enough for these needles: none of them can appear inside a string literal.
+            src.lines()
+                .map(|l| l.split('#').next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let runner = strip_py(include_str!("../../../training/utai_train/runner.py"));
+        // Order is LOAD-BEARING twice over (both pinned): setup_visibility seeds the legacy
+        // mask that apply_amd_arch_mask then re-keys — reversed, setup would overwrite the
+        // arch-keyed mask with the DXGI ordinal and silently reintroduce the S169 field bug;
+        // and the mask must precede require_wanted_accelerator, which probes visibility.
+        let setup_call = runner
+            .find(concat!("setup_visibility", "(cfg)"))
+            .expect("runner.py no longer calls setup_visibility");
+        let mask_call = runner
+            .find(concat!("apply_amd_arch_mask", "(cfg)"))
+            .expect("runner.py no longer applies the AMD arch mask");
+        let guard_call = runner
+            .find(concat!("require_wanted_accelerator", "(cfg)"))
+            .expect("runner.py lost the loud-degradation guard");
+        assert!(
+            setup_call < mask_call,
+            "runner.py: setup_visibility must run BEFORE apply_amd_arch_mask — reversed, the \
+             legacy DXGI-ordinal mask overwrites the arch-keyed one and the S169 wrong-silicon \
+             bug returns with every gate still green"
+        );
+        assert!(
+            mask_call < guard_call,
+            "runner.py: the arch mask must run before require_wanted_accelerator, or the guard \
+             passes/fails on the WRONG device's visibility"
+        );
+        // The emitting side: run_worker writes the trigger key run.json-side (this file),
+        // in CODE, not in a comment.
+        let me: String = include_str!("mod.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            me.contains(concat!("run_config[\"gpu_gfx", "_target\"]")),
+            "run_worker no longer emits gpu_gfx_target — device.py's AMD lane would never trigger \
+             and every mixed-arch AMD laptop silently regresses to the DXGI-ordinal mask"
+        );
     }
 
     /// ★S117 §F2⒜ — the「从最佳存档继续」button is gated on a COMPLETE snapshot.

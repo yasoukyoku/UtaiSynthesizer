@@ -87,6 +87,14 @@ pub struct TrainingGpu {
     pub selectable: bool,
     /// Stable CODE for why not (frontend maps via backendError.ts).
     pub reason: Option<String>,
+    /// S169, AMD rows only (None elsewhere): the adapter's gfx arch from its PCI id
+    /// ("gfx1102"). Written into run.json as `gpu_gfx_target` so device.py can re-key the
+    /// visibility mask from `value` (a DXGI vendor-relative index) to the RAW HIP ordinal
+    /// that actually carries this arch — on Windows the two orders differ (field case:
+    /// HIP put an unsupported gfx1035 iGPU at 0, the picked RX 7700S/gfx1102 at 1, so the
+    /// DXGI-derived mask trained the wrong silicon into hipErrorInvalidImage). The arch is
+    /// the only cross-API key the AMD lane has (no LUID/UUID bridge like NVIDIA's).
+    pub gfx_target: Option<String>,
 }
 
 /// One NVIDIA card as nvidia-smi sees it — identity AND capability from a SINGLE query, so the
@@ -323,6 +331,7 @@ fn training_gpu_list(
                 variant: Some("nv-cu130".to_string()),
                 selectable,
                 reason,
+                gfx_target: None,
             });
         }
     } else {
@@ -337,18 +346,24 @@ fn training_gpu_list(
                 variant: Some("nv-cu130".to_string()),
                 selectable,
                 reason,
+                gfx_target: None,
             });
         }
     }
 
-    // AMD / Intel — vendor-relative index (HIP / ZE_AFFINITY_MASK ordinals). The index must be
-    // counted WITHIN the vendor, exactly as before; it is what device.py masks with.
+    // AMD / Intel — vendor-relative index, counted WITHIN the vendor exactly as before.
+    // Intel: it is the ZE_AFFINITY_MASK ordinal device.py masks with, verbatim. AMD (S169):
+    // it is only the FALLBACK mask — HIP's ordinal space is not DXGI's, so device.py re-keys
+    // the mask to the HIP ordinal carrying `gfx_target` whenever run.json supplies one.
     for (vendor, variant, capable) in [
         ("amd", "amd", &amd_adapter_is_rocm_capable as &dyn Fn(&GpuAdapter) -> bool),
         ("intel", "xpu", &intel_adapter_is_xpu_capable as &dyn Fn(&GpuAdapter) -> bool),
     ] {
         for (i, g) in gpus.iter().filter(|g| g.vendor == vendor).enumerate() {
             let (mut selectable, mut reason) = judge(variant, capable(g), false);
+            // S169: resolved once here so every AMD row carries its arch (the run.json /
+            // device.py mask re-keying needs it — see TrainingGpu.gfx_target).
+            let gfx_target = if variant == "amd" { amd_adapter_gfx_target(g) } else { None };
             // S168: `judge` proves "SOME offerable pack can run this die" + "the variant is
             // installed" — but the resolver spawns the highest INSTALLED pack, whose kernel
             // inventory may be older than the catalog's (amd v1 = gfx1103 only). Selectable
@@ -356,7 +371,7 @@ fn training_gpu_list(
             // dies in HIP (hipErrorInvalidImage — the first community report on v0.12.0,
             // RX 7700S + leftover v1). The reason CODE is actionable: install the newer pack.
             if selectable && variant == "amd" {
-                let covered = amd_adapter_gfx_target(g).is_some_and(|t| {
+                let covered = gfx_target.is_some_and(|t| {
                     amd_installed_version
                         .map(amd_pack_targets_for_version)
                         .is_some_and(|ts| ts.contains(&t))
@@ -373,6 +388,7 @@ fn training_gpu_list(
                 variant: Some(variant.to_string()),
                 selectable,
                 reason,
+                gfx_target: gfx_target.map(str::to_string),
             });
         }
     }
@@ -391,6 +407,7 @@ fn training_gpu_list(
             variant: None,
             selectable: false,
             reason: Some("TRAINING_GPU_NO_RUNTIME".to_string()),
+            gfx_target: None,
         });
     }
     debug_assert!(
@@ -424,6 +441,26 @@ pub(crate) fn training_gpu_by_id(app_dir: &std::path::Path, id: &str) -> Option<
     )
     .into_iter()
     .find(|g| g.id == id)
+}
+
+/// S169, the auto lane's arch source: the gfx target of the first SELECTABLE AMD adapter —
+/// the adapter the UI default would have offered. try_start calls this when no GPU was
+/// picked but the resolver settled on the ROCm pack: an unmasked HIP process defaults to
+/// device 0, which on mixed-arch laptops can be an uncovered iGPU, so the run must still
+/// carry an arch for device.py to mask to. Selectable (not merely rocm-capable) on purpose:
+/// it folds in the installed pack's kernel coverage, same verdict the dropdown shows.
+pub(crate) fn amd_first_selectable_gfx_target(app_dir: &std::path::Path) -> Option<String> {
+    let gpus = query_gpu_adapters();
+    let available = crate::pyenv::available_training_variants(app_dir);
+    training_gpu_list(
+        &gpus,
+        nvidia_gpu_uuids(),
+        &available,
+        crate::pyenv::max_installed_version("amd"),
+    )
+    .into_iter()
+    .find(|g| g.selectable && g.variant.as_deref() == Some("amd"))
+    .and_then(|g| g.gfx_target)
 }
 
 /// NVIDIA cards as (name, UUID) via nvidia-smi — the only enumeration whose identity
@@ -831,7 +868,8 @@ fn amd_adapter_gfx_target(g: &GpuAdapter) -> Option<&'static str> {
 /// highest INSTALLED pack — an RX 7700S (gfx1102) box still holding only v1 was declared
 /// selectable, got backend=cuda, and crashed in HIP with hipErrorInvalidImage. The
 /// selectable verdict must be about the pack that would actually be spawned.
-fn amd_pack_targets_for_version(version: u32) -> &'static [&'static str] {
+// pub(crate) since S169: pyenv::envtest_gfx_targets_for hands the list to envtest.py.
+pub(crate) fn amd_pack_targets_for_version(version: u32) -> &'static [&'static str] {
     if version >= 2 {
         AMD_PACK_GFX_TARGETS
     } else {
@@ -3774,6 +3812,47 @@ mod tests {
         let igpu =
             training_gpu_list(&[gpu("AMD Radeon 780M Graphics", "amd")], vec![], &["amd"], Some(1));
         assert!(igpu[0].selectable, "{:?}", igpu[0].reason);
+    }
+
+    /// S169 — the second community report, same box, v2 INSTALLED and correctly resolved: HIP
+    /// enumerated an unsupported gfx1035 iGPU at ordinal 0 and the picked RX 7700S at 1, while
+    /// our mask fed device.py the DXGI vendor-relative "0" — training never touched the 7700S.
+    /// The fix keys the mask by ARCH: every AMD row must carry its gfx target for run.json,
+    /// and `value` stays the plain vendor-relative index (python re-keys it, Rust does not).
+    #[test]
+    fn s169_amd_rows_carry_their_gfx_target_for_the_arch_keyed_mask() {
+        let dgpu = GpuAdapter {
+            name: "AMD Radeon RX 7700S".to_string(),
+            vendor: "amd".to_string(),
+            pci_dev: Some(0x7480), // Navi 33 → gfx1102
+        };
+        // The reporter's iGPU: Rembrandt-class, NOT in the PCI table and no 780m-class name
+        // token → arch unknown → unselectable, and its row must not invent a target.
+        let igpu = GpuAdapter {
+            name: "AMD Radeon(TM) Graphics".to_string(),
+            vendor: "amd".to_string(),
+            pci_dev: Some(0x1681),
+        };
+        let list = training_gpu_list(&[dgpu, igpu], vec![], &["amd", "cpu"], Some(2));
+
+        let d = find(&list, "AMD Radeon RX 7700S");
+        assert!(d.selectable, "{:?}", d.reason);
+        assert_eq!(d.gfx_target.as_deref(), Some("gfx1102"));
+        assert_eq!(d.value, "0", "value stays the DXGI vendor-relative index — the arch rides its own field");
+
+        let i = find(&list, "AMD Radeon(TM) Graphics");
+        assert!(!i.selectable);
+        assert_eq!(i.gfx_target, None, "unknown die must not fabricate an arch for the mask");
+
+        // Non-AMD rows never carry one: the field is the AMD lane's discriminator inside
+        // device.py, so a stray value on an NVIDIA row would switch lanes there.
+        let nvl = training_gpu_list(
+            &[gpu("NVIDIA GeForce RTX 3080 Ti", "nvidia")],
+            vec![nv("RTX 3080 Ti", "GPU-x", Some(crate::gpu::CUDA_CC10_FLOOR))],
+            &["nv-cu130"],
+            None,
+        );
+        assert_eq!(nvl[0].gfx_target, None);
     }
 
     /// Below the shared CUDA_CC10_FLOOR = unsupported; an unreadable cap is its OWN verdict

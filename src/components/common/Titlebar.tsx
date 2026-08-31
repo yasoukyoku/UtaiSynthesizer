@@ -25,8 +25,19 @@ const HELP_LINKS = {
   repo: "https://github.com/yasoukyoku/UtaiSynthesizer",
 } as const;
 
+// S169 — the User Guide is per-locale (three separate documents, not one translated page).
+// Same GitHub blob targets the website's own guide buttons point at; i18n.language is exactly
+// "zh" | "en" | "ja" (src/i18n/index.ts), en is the fallback for anything unexpected.
+const GUIDE_URLS = {
+  zh: "https://github.com/yasoukyoku/UtaiSynthesizer/blob/main/docs/user-guide.zh-CN.md",
+  en: "https://github.com/yasoukyoku/UtaiSynthesizer/blob/main/docs/user-guide.en.md",
+  ja: "https://github.com/yasoukyoku/UtaiSynthesizer/blob/main/docs/user-guide.ja.md",
+} as const;
+const guideUrl = (lang: string): string =>
+  lang === "zh" || lang === "ja" ? GUIDE_URLS[lang] : GUIDE_URLS.en;
+
 export function Titlebar() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { name, dirty } = useProjectStore();
   const trackCount = useProjectStore((s) => s.tracks.length);
   const { toggleTrainingPage, trainingPageOpen, toggleModelManager, modelManagerOpen, toggleLogViewer, logViewerOpen, toggleSettings, settingsOpen } = useAppStore();
@@ -42,12 +53,15 @@ export function Titlebar() {
   const [appVersion, setAppVersion] = useState("");
   useEffect(() => { void getVersion().then(setAppVersion).catch(() => {}); }, []);
 
+  // S169 order (user-decided): guide, homepage, Score2ConVec, QQ, Discord — the version row
+  // stays the permanent first entry.
   const helpItems: MenuItem[] = [
     { label: `UtaiSynthesizer ${appVersion ? `v${appVersion}` : ""}`.trim(), disabled: true, onClick: () => {} },
+    { label: t("help.guide"), onClick: () => void openUrl(guideUrl(i18n.language)).catch(() => {}) },
+    { label: t("help.repo"), onClick: () => void openUrl(HELP_LINKS.repo).catch(() => {}) },
+    { label: t("help.score2convec"), onClick: () => void openUrl(HELP_LINKS.score2convec).catch(() => {}) },
     { label: t("help.qq"), onClick: () => void openUrl(HELP_LINKS.qq).catch(() => {}) },
     { label: t("help.discord"), onClick: () => void openUrl(HELP_LINKS.discord).catch(() => {}) },
-    { label: t("help.score2convec"), onClick: () => void openUrl(HELP_LINKS.score2convec).catch(() => {}) },
-    { label: t("help.repo"), onClick: () => void openUrl(HELP_LINKS.repo).catch(() => {}) },
   ];
 
   const isTraining = isRunningState(trainingState);

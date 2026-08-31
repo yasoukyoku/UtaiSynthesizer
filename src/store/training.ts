@@ -42,6 +42,9 @@ export interface TrainingGpu {
   selectable: boolean;
   /** Stable CODE (backendError.ts) explaining an unselectable entry. */
   reason: string | null;
+  /** S169, AMD rows only (null elsewhere): the adapter's gfx arch ("gfx1102"). Purely
+   *  informational here — the backend re-derives it at preflight and never trusts the UI. */
+  gfx_target: string | null;
 }
 
 export interface DatasetFile {

@@ -165,7 +165,7 @@ At the top of the window (just below the system title bar) sits the app's own me
 | "Resources" | Opens the resource manager panel: separation models, voice models, tool models (see [Chapter 7](#7-resource-management)) |
 | "Settings" | Opens the settings panel (see [Chapter 9](#9-settings)) |
 | "Log" | Opens the log viewer (for troubleshooting, see [Chapter 13](#13-faq-and-troubleshooting)) |
-| "Help & Community" | Shows the current version plus QQ group / Discord / GitHub links |
+| "Help & Community" | Shows the current version plus user guide / GitHub / QQ group / Discord links |
 
 The center of the title bar shows the current project name ("Untitled Project" when unnamed); a small dot next to the name means there are unsaved changes. At the far right is the "Training" button; while training is running, a pulsing "Training" indicator appears next to it.
 
@@ -175,7 +175,7 @@ The center of the title bar shows the current project name ("Untitled Project" w
 
 **The "Log" viewer**: clicking "Log" opens a draggable floating panel streaming the app's backend log in real time. The top toolbar filters by "All" "Error" "Warning" "Info" "Debug", has a search box (matches message text or module name), and a "COPY" button that copies every currently filtered line to the clipboard. The list auto-scrolls to the newest entry; scrolling up pauses auto-scroll, scrolling back to the bottom resumes it. The footer shows "filtered/total" counts and the log file's path on disk. It is your best friend when reporting bugs (see [Chapter 13](#13-faq-and-troubleshooting)).
 
-**The "Help & Community" menu**: the first row shows the current version (e.g. UtaiSynthesizer v0.1.4); below it, four links open in your system browser: "QQ Group", "Discord Community", "Score2ConVec (GitHub)", "Project Home (GitHub)".
+**The "Help & Community" menu**: the first row shows the current version (e.g. UtaiSynthesizer v0.1.4); below it, five links open in your system browser: "User Guide (GitHub)" (opens this manual in the interface language), "Project Home (GitHub)", "Score2ConVec (GitHub)", "QQ Group", "Discord Community".
 
 ### 3.2 The transport toolbar
 

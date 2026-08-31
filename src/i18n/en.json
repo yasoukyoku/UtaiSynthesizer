@@ -636,6 +636,7 @@
   },
   "help": {
     "title": "Help & Community",
+    "guide": "User Guide (GitHub)",
     "qq": "QQ Group",
     "discord": "Discord Community",
     "score2convec": "Score2ConVec (GitHub)",
@@ -1006,6 +1007,9 @@
     "TRAINING_GPU_UNSUPPORTED": "The available training runtime packs cannot drive this GPU",
     "TRAINING_RUNTIME_VARIANT_MISSING": "The training runtime pack for the selected GPU disappeared before the run started — aborted; reinstall it under Settings → Training Runtime",
     "TRAINING_GPU_UNAVAILABLE": "Training could not access the selected GPU — the run was aborted. Check the GPU driver and try again; if this machine's GPU does not support accelerated training, enable \"Force CPU training\" in the parameters step to proceed",
+    "TRAINING_AMD_ENUM_FAILED": "Enumerating AMD GPUs failed — the training runtime's probe process could not list the HIP devices, so the run was aborted. Run the pack's self-test under Settings → Training Runtime; if it keeps failing, report it with the log",
+    "TRAINING_AMD_GPU_NOT_FOUND": "No HIP device matches the selected GPU's architecture — the run was aborted rather than risk training on different silicon. Make sure the GPU driver is healthy and the card is not disabled, then try again",
+    "ENVTEST_AMD_NO_COVERED_GPU": "This training runtime pack carries kernels for none of this machine's GPUs — the self-test stopped. For a newer card, install a newer pack version (e.g. runtime-amd-v2) under Settings → Training Runtime and retry; if the GPU is unsupported, the training GPU list states why",
     "TRAINING_RUNTIME_CPU_ONLY": "A GPU was detected, but only the CPU training runtime pack is installed — the run was aborted instead of silently training on CPU. Install the runtime pack matching your GPU in Settings → Training Runtime; if you really mean to train on CPU, enable \"Force CPU training\" in the parameters step to proceed",
     "TRAINING_HOST_MEMORY_EXHAUSTED": "The system ran out of committed memory (virtual memory) — a data-loading worker could not get memory, and training has most likely stalled. ⚠ It will not report this itself and it will not stop on its own. What helps: raise the Windows pagefile, close anything rendering or otherwise using memory at the same time, or lower the batch size",
     "TRAINING_NO_PROGRESS": "Training has reported nothing for a long time — it may be stuck. ⚠ It may also be normal: some AMD integrated GPUs spend several minutes compiling their first convolution kernel. If it does not recover, stop the run and check the log",

@@ -362,6 +362,14 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   TRAINING_GPU_UNKNOWN: { key: "backend.TRAINING_GPU_UNKNOWN" },
   TRAINING_GPU_UNSUPPORTED: { key: "backend.TRAINING_GPU_UNSUPPORTED" },
   TRAINING_RUNTIME_VARIANT_MISSING: { key: "backend.TRAINING_RUNTIME_VARIANT_MISSING" },
+  // S169 AMD arch-keyed device pick (device.py::apply_amd_arch_mask): two DISTINCT reds by
+  // design — "the enum probe could not run" vs "it ran and no HIP device carries the arch".
+  TRAINING_AMD_ENUM_FAILED: { key: "backend.TRAINING_AMD_ENUM_FAILED" },
+  TRAINING_AMD_GPU_NOT_FOUND: { key: "backend.TRAINING_AMD_GPU_NOT_FOUND" },
+  // …and the envtest-side third red (the self-test panel renders it): the installed pack
+  // carries kernels for none of this machine's GPUs — the remedy is a NEWER pack, not a
+  // reinstall, so it must not fall to the generic "reinstall this pack" fallback lane.
+  ENVTEST_AMD_NO_COVERED_GPU: { key: "backend.ENVTEST_AMD_NO_COVERED_GPU" },
   // S68b loud-degradation guard (training/mod.rs try_start): GPU present but only the
   // CPU runtime pack installed — refuse instead of the old log-file-only warn.
   TRAINING_RUNTIME_CPU_ONLY: { key: "backend.TRAINING_RUNTIME_CPU_ONLY" },

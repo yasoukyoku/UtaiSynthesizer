@@ -572,7 +572,18 @@ pub async fn run_pack_envtest(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<serde_json::Value, String> {
-    run_envtest_inner(&app, &state, &id, None).await
+    let res = run_envtest_inner(&app, &state, &id, None).await;
+    // S169: the manual self-test's verdict used to reach ONLY the frontend — the S169
+    // field log showed the envtest stderr crash-stack and then silence, and attribution
+    // nearly broke on it. Mirror the post-install wrapper (install_pack) so every
+    // outcome lands in the log; the ENVTEST_FAILED per-check details are still logged
+    // inside run_envtest_inner, this covers the pre-verdict and crash/contradiction
+    // branches too.
+    match &res {
+        Ok(_) => tracing::info!("manual envtest passed for {id}"),
+        Err(e) => tracing::warn!("manual envtest failed for {id}: {e}"),
+    }
+    res
 }
 
 async fn run_envtest_inner(
@@ -625,6 +636,11 @@ async fn run_envtest_inner(
         .arg(device)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // S169: AMD packs get the arch list their version carries kernels for, so envtest's
+    // amd_device_pick masks to a covered GPU instead of touching HIP device 0 blind.
+    if let Some(targets) = pyenv::envtest_gfx_targets_for(&pack.meta.variant, pack.meta.version) {
+        cmd.arg("--gfx-targets").arg(targets);
+    }
     if device == "xpu" {
         // Design §4.1: must be set before torch import — missing operators become
         // loud-but-diagnosable CPU fallbacks (reported by envtest) instead of aborts.
@@ -719,6 +735,20 @@ async fn run_envtest_inner(
             if overall == "pass" && !status.success() {
                 // Belt-and-suspenders with the stale-report deletion above: a pass
                 // report must AGREE with the exit code (envtest exits 0 iff no fails).
+                //
+                // S169: and the file we just refused to trust must not stay on disk —
+                // list_packs reads exactly it for the badge, so leaving it would show a
+                // green badge from a run this very branch declared a lie (the machine
+                // stamp above even defeats the staleness detector). Same posture as the
+                // pre-spawn deletion; the Err below carries the evidence.
+                if let Err(e) = std::fs::remove_file(&report_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            "could not remove the contradicted envtest report {}: {e}",
+                            report_path.display()
+                        );
+                    }
+                }
                 return Err(format!(
                     "ENVTEST_REPORT_CONTRADICTION: overall=pass but exit code {:?}. stderr tail:\n{}",
                     status.code(),

@@ -133,7 +133,9 @@ mod tests {
     fn embedded_tree_holds_the_load_bearing_files_and_no_bytecode() {
         assert!(UTAI_TRAIN_FILES.len() >= 100, "only {} files embedded", UTAI_TRAIN_FILES.len());
         for probe in
-            ["envtest.py", "runner.py", "__init__.py", "sovits/diffusion/__init__.py", "rvc/train.py"]
+            // hipenum.py: S169 — every AMD run's device pick imports it; a healed tree
+            // without it turns the whole AMD lane into TRAINING_AMD_ENUM_FAILED.
+            ["envtest.py", "runner.py", "__init__.py", "sovits/diffusion/__init__.py", "rvc/train.py", "hipenum.py"]
         {
             assert!(
                 UTAI_TRAIN_FILES.iter().any(|(r, _)| *r == probe),

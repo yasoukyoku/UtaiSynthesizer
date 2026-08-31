@@ -31,6 +31,11 @@ import os
 
 BACKENDS = ("cuda", "xpu", "cpu")
 
+# S169 "ran fine, no such device" — a plain top-level literal on purpose: the Rust
+# cross-language gate parses it as the single source (ckpt_guard.py's CODE contract).
+# Its sibling ("the probe could not run") lives in hipenum.py as ENUM_FAILED_CODE.
+AMD_GPU_NOT_FOUND_CODE = "TRAINING_AMD_GPU_NOT_FOUND"
+
 
 def _device_type(backend):
     """Accept a bare backend ('cuda'/'xpu'/'cpu') OR a device string carrying an
@@ -64,6 +69,68 @@ def setup_visibility(cfg):
     else:
         # cuda AND rocm/hip both honour CUDA_VISIBLE_DEVICES; "-1" hides all GPUs.
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+
+
+def apply_amd_arch_mask(cfg):
+    """AMD lane only (S169): re-key the visibility mask from the app's DXGI
+    vendor-relative index to the RAW HIP ordinal of the adapter the user picked.
+
+    Why: HIP's device order is not DXGI's (S169 field case: HIP put an unsupported
+    gfx1035 iGPU at index 0, the picked RX 7700S/gfx1102 at index 1 — the DXGI-derived
+    mask "0" trained the wrong silicon into hipErrorInvalidImage). The arch is the
+    only cross-API key, so Rust writes the picked adapter's gfx target into run.json
+    and we look up which HIP ordinal carries it.
+
+    `cfg["gpu_gfx_target"]` is BOTH the trigger and the key: absent → no-op, so the
+    NVIDIA/Intel/CPU lanes and every pre-0.12.2 run.json behave byte-identically to
+    setup_visibility alone (device_backend collapses amd→"cuda", so this key is the
+    only AMD discriminator the sidecar has). Must run BEFORE any torch import (the
+    mask is read once at HIP init) and is called from INSIDE runner.py's try block so
+    a failure flows through the protocol error channel as a mappable CODE.
+
+    Failure CODEs are distinct on purpose (closed-gate iron rule): the enum helper
+    raises TRAINING_AMD_ENUM_FAILED ("tool could not run"); this function raises
+    TRAINING_AMD_GPU_NOT_FOUND ("ran fine, no such device").
+    """
+    target = cfg.get("gpu_gfx_target")
+    if not target:
+        return
+    backend = cfg.get("device_backend", "cuda")
+    gpu = str(cfg.get("gpu") or "")
+    if backend != "cuda" or gpu == "-1":
+        # Explicit CPU keeps its semantics; xpu has its own mask var. An EMPTY gpu
+        # ("auto") still gets the arch mask: unmasked HIP would default to device 0,
+        # which is exactly the wrong-silicon shape this function exists to prevent.
+        return
+    import sys
+
+    from .hipenum import (
+        VISIBILITY_VARS,
+        describe_devices,
+        enumerate_hip_devices,
+        pick_hip_index,
+    )
+
+    devices = enumerate_hip_devices()
+    idx = pick_hip_index(devices, target, prefer_name=cfg.get("gpu_label"))
+    if idx is None:
+        raise RuntimeError(
+            "%s: no HIP device with arch %s; visible: %s"
+            % (AMD_GPU_NOT_FOUND_CODE, target, describe_devices(devices))
+        )
+    for k in VISIBILITY_VARS:
+        # We own device selection on this lane; a stale user-level override (e.g. the
+        # S169 stopgap HIP_VISIBLE_DEVICES=1) composing with our mask would be
+        # ambiguous across HIP builds. Delete (never blank: on Windows empty == unset).
+        os.environ.pop(k, None)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(idx)
+    picked = next((d for d in devices if int(d.get("index", -1)) == idx), {})
+    print(
+        "[device] amd arch-pick: gfx=%s -> hip_index=%d name=%r (devices: %s)"
+        % (target, idx, picked.get("name", "?"), describe_devices(devices)),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def require_wanted_accelerator(cfg):

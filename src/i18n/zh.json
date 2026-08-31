@@ -636,6 +636,7 @@
   },
   "help": {
     "title": "帮助与社区",
+    "guide": "用户指南（GitHub）",
     "qq": "QQ 群",
     "discord": "Discord 社区",
     "score2convec": "Score2ConVec（GitHub）",
@@ -1006,6 +1007,9 @@
     "TRAINING_GPU_UNSUPPORTED": "现有训练环境包跑不了这块显卡",
     "TRAINING_RUNTIME_VARIANT_MISSING": "所选显卡对应的训练环境包在启动前消失了——已中止运行,请到 设置 → 训练环境 重新安装",
     "TRAINING_GPU_UNAVAILABLE": "训练无法访问所选显卡——已中止运行。请检查显卡驱动后重试;若此机器的显卡不支持训练加速,请在参数页勾选「强制 CPU 训练」继续",
+    "TRAINING_AMD_ENUM_FAILED": "枚举 AMD 显卡失败——训练环境包的探针进程没能列出 HIP 设备,已中止运行。请到 设置 → 训练环境 对该环境包跑一次自检;若仍失败请附日志反馈",
+    "TRAINING_AMD_GPU_NOT_FOUND": "HIP 设备里没有与所选显卡架构匹配的 GPU——已中止运行,而不是冒险训到别的芯片上。请确认显卡驱动正常、显卡未被系统禁用后重试",
+    "ENVTEST_AMD_NO_COVERED_GPU": "这个训练环境包没有本机任何显卡的 kernel——自检已中止。若显卡较新,请到 设置 → 训练环境 安装更新版本的环境包(如 runtime-amd-v2)后重试;若显卡不受支持,训练显卡列表会标出原因",
     "TRAINING_RUNTIME_CPU_ONLY": "检测到显卡,但当前只安装了 CPU 训练环境包——已中止运行,而不是静默改用 CPU 慢速训练。请到 设置 → 训练环境 安装与显卡匹配的环境包;若确实要用 CPU 训练,请在参数页勾选「强制 CPU 训练」继续",
     "TRAINING_HOST_MEMORY_EXHAUSTED": "系统提交内存(虚拟内存)不够了——数据加载进程拿不到内存,训练很可能已经卡住不动。⚠ 它不会自己报错、也不会自己停。处理办法:调大 Windows 虚拟内存(页面文件)、关掉同时在跑的渲染/其它占显存内存的程序、或者把批大小调小",
     "TRAINING_NO_PROGRESS": "训练已经很久没有任何进展了——可能卡住了。⚠ 也可能是正常的:某些 A 卡核显第一次编译卷积内核要好几分钟。如果长时间没有恢复,请停止后查看日志",

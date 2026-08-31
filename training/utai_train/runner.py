@@ -36,12 +36,18 @@ def main():
     stop = StopFlag(cfg["stop_file"])
     rc = 0
     try:
+        # S169 AMD lane: re-key the mask from the DXGI index to the HIP ordinal of
+        # the picked arch (no-op unless run.json carries gpu_gfx_target). Inside the
+        # try block so its CODEs reach the protocol error channel, and still before
+        # any torch import so the mask precedes HIP init.
+        from .device import apply_amd_arch_mask, require_wanted_accelerator, resolve_backend
+
+        apply_amd_arch_mask(cfg)
+
         # S67 loud-degradation guard: the user asked for a GPU — a masked visibility
         # env / broken driver must FAIL the run with a mappable CODE, never silently
         # train on CPU. Also states the effective device once so the log always
         # answers "what did this run actually train on".
-        from .device import require_wanted_accelerator, resolve_backend
-
         require_wanted_accelerator(cfg)
         print(
             "[device] backend=%s gpu=%r -> effective=%s"

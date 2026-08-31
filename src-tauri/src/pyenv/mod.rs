@@ -813,6 +813,24 @@ pub fn envtest_device_for_variant(variant: &str) -> &'static str {
     }
 }
 
+/// S169, the companion of the mapping above: the `--gfx-targets` value for envtest.py —
+/// the arch list the INSTALLED amd pack under test carries kernels for, as a comma list.
+/// envtest's `amd_device_pick` uses it to choose the GPU by arch instead of trusting HIP
+/// device 0 (which on mixed-arch laptops can be an iGPU the pack cannot drive — the S169
+/// field failure was a native 0xC0000005 on exactly that touch). `None` for every other
+/// variant → the flag is omitted → envtest behaves as before.
+///
+/// ⛔ Same single-source rule as `envtest_device_for_variant`, and for the same reason:
+/// `tests/pyenv_pack.rs` must hand envtest the SAME list the app would, or the harness
+/// re-verifies a pack under a different device pick than the badge did.
+pub fn envtest_gfx_targets_for(variant: &str, version: u32) -> Option<String> {
+    if variant == "amd" {
+        Some(crate::commands::settings::amd_pack_targets_for_version(version).join(","))
+    } else {
+        None
+    }
+}
+
 /// Validate everything a REMOTE manifest feeds into filesystem paths — one gate,
 /// called right after fetch (covers the download flow; local installs derive part
 /// paths from a real directory listing and extract_and_commit re-validates the id).
@@ -1311,6 +1329,24 @@ mod tests {
         // assertion over a table needs a second one that only the table can fail).
         assert_eq!(CATALOG.len(), 4, "catalog size changed — re-read the loop above");
         assert_eq!(CATALOG.iter().filter(|e| e.variant != "cpu").count(), 3);
+    }
+
+    /// S169 — the tier mapping's companion: the arch list envtest's `amd_device_pick`
+    /// masks with must follow the INSTALLED pack's version (v1 = gfx1103 only, v2 = the
+    /// RDNA3 superset), and only the amd variant gets one at all — a stray list on the
+    /// nv/xpu lanes would flip envtest into the AMD device pick on the wrong runtime.
+    #[test]
+    fn s169_envtest_gfx_targets_follow_the_installed_pack_version() {
+        assert_eq!(
+            envtest_gfx_targets_for("amd", 2).as_deref(),
+            Some("gfx1100,gfx1101,gfx1102,gfx1103")
+        );
+        // v0 = pack.json predating the version field; reads as the v1 inventory.
+        assert_eq!(envtest_gfx_targets_for("amd", 0).as_deref(), Some("gfx1103"));
+        assert_eq!(envtest_gfx_targets_for("amd", 1).as_deref(), Some("gfx1103"));
+        for v in ["nv-cu130", "xpu", "cpu"] {
+            assert_eq!(envtest_gfx_targets_for(v, 2), None, "{v} must not get a gfx list");
+        }
     }
 
     /// S168 — the candidate builder: user HF base first, HF rows in catalog order, the GH

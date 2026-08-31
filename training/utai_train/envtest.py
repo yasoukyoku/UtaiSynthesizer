@@ -205,6 +205,66 @@ def check_cuda_driver(ctx):
     return "driver %d (>= 580)" % drv
 
 
+# S169 "probe ran; no device this pack can drive" — a plain top-level literal on
+# purpose: the Rust cross-language gate parses it as the single source (the same
+# contract as device.py's AMD_GPU_NOT_FOUND_CODE / ckpt_guard.py's CODE).
+NO_COVERED_GPU_CODE = "ENVTEST_AMD_NO_COVERED_GPU"
+
+
+def check_amd_device_pick(ctx):
+    """S169: on the cuda tier of a ROCm pack, pick the GPU by kernel arch instead of
+    trusting HIP device 0. HIP's device order is not the app's DXGI order, and on a
+    mixed-arch laptop device 0 can be an iGPU the pack carries no kernels for (field
+    case: gfx1035 iGPU first, the supported RX 7700S/gfx1102 second — every default-
+    device touch died, one of them as a native 0xC0000005).
+
+    Skips on non-cuda tiers and when the caller passed no --gfx-targets (NVIDIA
+    packs, pre-0.12.2 callers) — behaviour is then byte-identical to before.
+
+    Placement is load-bearing: AFTER cuda_driver, BEFORE torch_backend. torch.cuda
+    is first touched in check_torch_backend and torch imports are lazy inside every
+    check, so setting the visibility env here still precedes HIP init. A FAIL
+    short-circuits the remaining checks exactly like cuda_driver's (main() break):
+    they would touch the uncovered device 0 and can crash natively — one decisive
+    fail + a clean report beats a 0xC0000005 with no report.
+
+    Two distinct reds by design (closed-gate rule): the enum helper raises
+    TRAINING_AMD_ENUM_FAILED ("the probe could not run"), this check raises
+    ENVTEST_AMD_NO_COVERED_GPU ("probe ran; no device this pack can drive")."""
+    targets = ctx.get("gfx_targets") or []
+    if ctx["device"] != "cuda" or not targets:
+        return None
+    from .hipenum import (
+        VISIBILITY_VARS,
+        base_arch,
+        describe_devices,
+        enumerate_hip_devices,
+        pick_hip_index,
+    )
+
+    devices = enumerate_hip_devices()
+    idx = None
+    for t in targets:
+        idx = pick_hip_index(devices, t)
+        if idx is not None:
+            break
+    if idx is None:
+        raise RuntimeError(
+            "%s: pack kernels cover [%s]; visible: %s"
+            % (NO_COVERED_GPU_CODE, ",".join(targets), describe_devices(devices))
+        )
+    for k in VISIBILITY_VARS:
+        os.environ.pop(k, None)  # delete, never blank: on Windows empty == unset
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(idx)
+    picked = next((d for d in devices if int(d.get("index", -1)) == idx), {})
+    return "picked hip_index=%d name=%s arch=%s (devices: %s)" % (
+        idx,
+        picked.get("name", "?"),
+        base_arch(picked.get("arch", "?")),
+        describe_devices(devices),
+    )
+
+
 def check_torch_backend(ctx):
     import torch
 
@@ -691,6 +751,10 @@ CHECKS = [
     ("python_info", check_python_info),
     ("imports", check_imports),
     ("cuda_driver", check_cuda_driver),
+    # S169: must sit between cuda_driver and torch_backend — the first torch.cuda
+    # touch is in check_torch_backend, so the arch-picked mask set here still
+    # precedes HIP init. Its FAIL short-circuits like cuda_driver's (see main()).
+    ("amd_device_pick", check_amd_device_pick),
     ("torch_backend", check_torch_backend),
     ("stft_roundtrip", check_stft_roundtrip),
     ("resample", check_resample),
@@ -723,6 +787,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="report json path (pack_dir/envtest.json)")
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda", "xpu"])
+    # S169: comma list of gfx archs the pack under test carries kernels for (AMD
+    # packs only; Rust derives it from the pack's version). Empty = no arch-keyed
+    # device pick, byte-identical to the pre-0.12.2 behaviour.
+    ap.add_argument("--gfx-targets", default="", help="comma list, e.g. gfx1100,gfx1101,gfx1102,gfx1103")
     args = ap.parse_args()
 
     # Design §4.1/§4.5: enable the xpu CPU-fallback net + its debug logging BEFORE any
@@ -740,7 +808,11 @@ def main():
     out_dir = os.path.dirname(os.path.abspath(args.out))
     tmp_dir = os.path.join(out_dir, "envtest_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
-    ctx = {"device": args.device, "tmp_dir": tmp_dir}
+    ctx = {
+        "device": args.device,
+        "tmp_dir": tmp_dir,
+        "gfx_targets": [t for t in args.gfx_targets.split(",") if t],
+    }
 
     items = []
     started = datetime.datetime.now().isoformat(timespec="seconds")
@@ -779,9 +851,10 @@ def main():
         item = {"name": name, "status": status, "detail": str(detail), "ms": ms}
         items.append(item)
         _emit({"type": "item", **item})
-        if name == "cuda_driver" and status == "fail":
-            # S68f: every later GPU check would touch torch.cuda — on a below-floor
-            # driver that can crash the interpreter outright (see check_cuda_driver).
+        if name in ("cuda_driver", "amd_device_pick") and status == "fail":
+            # S68f / S169: every later GPU check would touch torch.cuda — on a
+            # below-floor driver, or with no arch-covered HIP device to mask to,
+            # that can crash the interpreter outright (see the two checks' docs).
             # One decisive fail + a clean report beats a 0xC0000005 with no report.
             break
 
