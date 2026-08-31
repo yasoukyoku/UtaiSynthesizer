@@ -86,3 +86,52 @@ describe("phoneme lane — the cache key and the IPC payload come from ONE input
     expect(off.args.score).toEqual(on.args.score);
   });
 });
+
+import { boundaryDraggableAfter, redistributeConserving } from "./phonemeLane";
+
+describe("S167c: redistributeConserving is a faithful mirror of Rust redistribute_conserving", () => {
+  it("★ the SHARED vectors (score2cv.rs::redistribute_conserving_floors_sums_and_is_deterministic)", () => {
+    // ⛔ 改这里必须同步 Rust 侧同名测试的向量 —— 两份向量一致是「预览 == 提交」的承重判据。
+    expect(redistributeConserving(10, [6, 8])).toEqual([4, 6]);
+    expect(redistributeConserving(3, [100, 1, 1])).toEqual([1, 1, 1]); // spare 0 → floor 1 each
+    expect(redistributeConserving(7, [0, 0])).toEqual([1, 6]); // degenerate weights fail safe
+    for (const w of [[1, 1, 1], [5, 1, 1], [0.1, 0.1, 9]]) {
+      const out = redistributeConserving(17, w);
+      expect(out.reduce((a, b) => a + b, 0)).toBe(17);
+      expect(out.every((d) => d >= 1)).toBe(true);
+    }
+  });
+  it("documents the old snap-back: a pair dragged to (1,11) commits as (2,10) — preview must show (2,10)", () => {
+    // base [6,6], drag left to 1 frame ⇒ scales (1/6, 11/6) ⇒ weights (6×0.167, 6×1.833)
+    const w = [6 * Math.max(0.1, Math.round((1 / 6) * 1000) / 1000), 6 * Math.round((11 / 6) * 1000) / 1000];
+    expect(redistributeConserving(12, w)).toEqual([2, 10]);
+  });
+  it("deterministic tie-break follows ascending index (Rust: .then(a.cmp(&b)))", () => {
+    expect(redistributeConserving(5, [1, 1, 1])).toEqual([2, 2, 1]);
+  });
+});
+
+describe("S167c: boundaryDraggableAfter — hit-test and painted handles share ONE predicate", () => {
+  const ids: { [evt: number]: string | undefined } = { 0: "n0", 1: "n1", 2: undefined };
+  it("a same-note junction is draggable", () => {
+    const spans = [{ evt: 0, frames: 4 }, { evt: 0, frames: 3 }];
+    expect(boundaryDraggableAfter(spans, ids, 0)).toBe(true);
+  });
+  it("a note edge is NOT draggable (Rust conserves per-note totals)", () => {
+    const spans = [{ evt: 0, frames: 4 }, { evt: 1, frames: 3 }];
+    expect(boundaryDraggableAfter(spans, ids, 0)).toBe(false);
+  });
+  it("a dropped zero-width marker between two phones of one note must not hide their boundary", () => {
+    const spans = [{ evt: 0, frames: 4 }, { evt: 0, frames: 0 }, { evt: 0, frames: 3 }];
+    expect(boundaryDraggableAfter(spans, ids, 0)).toBe(true);
+    expect(boundaryDraggableAfter(spans, ids, 1)).toBe(false); // the marker itself is no handle
+  });
+  it("a trailing dropped marker with no real phone after it is NOT draggable", () => {
+    const spans = [{ evt: 0, frames: 4 }, { evt: 0, frames: 0 }, { evt: 1, frames: 3 }];
+    expect(boundaryDraggableAfter(spans, ids, 0)).toBe(false);
+  });
+  it("a gap rest (no tripleNoteId) is never editable", () => {
+    const spans = [{ evt: 2, frames: 4 }, { evt: 2, frames: 3 }];
+    expect(boundaryDraggableAfter(spans, ids, 0)).toBe(false);
+  });
+});

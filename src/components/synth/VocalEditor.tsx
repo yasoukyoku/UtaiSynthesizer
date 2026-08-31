@@ -18,7 +18,7 @@ import { resolveOverlaps, DEFAULT_TRANSITION, isSilentLyric, splitLyricTokens, v
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels, renderFrameTicks } from "../../lib/vocal/vocalRender";
-import { phonemeLaneRequest, phonemeLaneSig } from "../../lib/vocal/phonemeLane";
+import { boundaryDraggableAfter, PHONE_SCALE_MAX, PHONE_SCALE_MIN, phonemeLaneRequest, phonemeLaneSig, redistributeConserving } from "../../lib/vocal/phonemeLane";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { logToBackend } from "../../lib/log";
 import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
@@ -118,6 +118,9 @@ interface DragState {
   phoneLeft?: number; // phone-dur: span index of the LEFT phone at the grabbed boundary
   phoneSpan?: number; // phone-gain: span index being adjusted
   phoneWork?: { frames: Map<number, number>; gain: Map<number, number> }; // working values by span index
+  /** S167c phone-dur: the dragged pair's INTENT scales (vs base_frames, 3-dec, pre-clamp) — the
+   *  commit sends THESE, so Rust's redistribution reproduces the preview bit-for-bit. */
+  phoneScale?: Map<number, number>;
   previewNotes?: () => Note[]; // off-ref draw source during the gesture (attached by withPreview)
 }
 
@@ -463,6 +466,12 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   //    store churn (a fader drag on another track) must not re-stringify every note (review #9). ──
   const phonemeLaneRef = useRef<{ spans: PhonemeSpan[]; tripleNoteIds: (string | null)[]; ticksPerFrame: number; sig: string } | null>(null);
   const phonemeSigRef = useRef("");
+  // S167c: the just-committed lane working values, painted (and hit-tested) until the lane's
+  // debounced refetch lands — without it the release flashed the stale pre-edit split for
+  // ~300 ms, and a quick second gesture inside that window operated on pre-edit geometry
+  // (review findings). Cleared by the very next lane answer; keyed to the sig it was
+  // committed against so it can never dress up foreign data.
+  const phoneCommitOverlayRef = useRef<{ sig: string; frames: Map<number, number>; gain: Map<number, number> } | null>(null);
   const phonemeSeqRef = useRef(0);
   const phonemePrevOnRef = useRef(false);
   const phonemeLaneOn = laneOpen && laneParam === "phoneme";
@@ -505,6 +514,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         const spans = await invoke<PhonemeSpan[]>("preview_vocal_phonemes", args);
         if (seq !== phonemeSeqRef.current) return; // superseded by a newer request
         phonemeLaneRef.current = { spans, tripleNoteIds, ticksPerFrame, sig };
+        phoneCommitOverlayRef.current = null; // S167c: any fresh answer supersedes the commit overlay
       } catch {
         if (seq !== phonemeSeqRef.current) return;
         phonemeLaneRef.current = null;
@@ -801,6 +811,12 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         const pd = phonemeLaneRef.current;
         // S167: during a lane gesture, paint the WORKING split/gain instead of the cached answer.
         const drP = dragRef.current;
+        // S167c: after a commit, the lane's answer arrives via a 250 ms debounce + IPC — keep
+        // painting the just-committed working values until it lands, or the release flashes the
+        // stale pre-edit split and reads as yet another snap-back (review finding). The overlay
+        // is cleared by the very next lane answer (and only ever applies to the sig it was
+        // committed against).
+        const ovP = phoneCommitOverlayRef.current;
         const spansEff =
           pd && drP && (drP.kind === "phone-dur" || drP.kind === "phone-gain") && drP.phoneWork
             ? pd.spans.map((s, i) => ({
@@ -808,17 +824,20 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
                 frames: drP.phoneWork!.frames.get(i) ?? s.frames,
                 gain_db: drP.phoneWork!.gain.get(i) ?? s.gain_db,
               }))
-            : pd?.spans;
+            : pd && ovP && ovP.sig === pd.sig
+              ? pd.spans.map((s, i) => ({
+                  ...s,
+                  frames: ovP.frames.get(i) ?? s.frames,
+                  gain_db: ovP.gain.get(i) ?? s.gain_db,
+                }))
+              : pd?.spans;
         const bandY = laneTop + 14;
         const bandH = LANE_H - 20;
         if (pd && spansEff) {
-          // note-onset reference lines first (under the blocks): the beat each vowel should sit on.
-          ctx.strokeStyle = "rgba(226,232,244,0.4)"; ctx.lineWidth = 1;
-          for (const n of notesRef.current) {
-            const nx = noteAreaX + noteTickToX(n.tick, start, v);
-            if (nx < noteAreaX || nx > w) continue;
-            ctx.beginPath(); ctx.moveTo(Math.round(nx) + 0.5, laneTop + 1); ctx.lineTo(Math.round(nx) + 0.5, h); ctx.stroke();
-          }
+          // S167c: note-onset reference lines REMOVED (user, matching SV): they were white
+          // verticals fighting the draggable-boundary handles for attention — and the note grid
+          // is already visible in the piano roll directly above (a pre-rolled consonant still
+          // reads as "left of its note block"). The lane's only bright verticals are handles.
           // S167b: the 0 dB STRENGTH reference — the per-phone level lines below read against it
           // (mid = 0, top = +12, bottom = −12; same mapping the plain-drag gesture uses).
           ctx.strokeStyle = "rgba(226,232,244,0.12)"; ctx.lineWidth = 1; ctx.setLineDash([2, 3]);
@@ -879,6 +898,28 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             if (x1 - x0 >= 14) {
               ctx.fillStyle = s.nucleus ? (col("--text-primary") || "#e2e8f4") : (col("--text-muted") || "#8896b4");
               ctx.fillText(s.phone, (Math.max(x0, noteAreaX) + Math.min(x1, w)) / 2, bandY + bandH / 2);
+            }
+          }
+          // S167c: DRAGGABLE boundary handles, drawn from the SAME predicate the hit-test uses —
+          // a bright vertical is never painted where a drag would not work (the S167b shape:
+          // block outlines and note-onset reference lines read as handles, yet only same-note
+          // junctions respond — the user hovered "boundary lines" and found them dead). The
+          // grabbed boundary highlights in accent while dragging.
+          {
+            let hb = 0;
+            for (let i = 0; i < spansEff.length; i++) {
+              hb += spansEff[i]!.frames;
+              if (!boundaryDraggableAfter(pd.spans, pd.tripleNoteIds, i)) continue;
+              const hx = noteAreaX + noteTickToX(hb * pd.ticksPerFrame, start, v);
+              if (hx < noteAreaX || hx > w) continue;
+              const active = drP && (drP.kind === "phone-dur") && drP.phoneLeft === i;
+              ctx.strokeStyle = active ? (col("--accent-primary") || "#39c5bb") : "rgba(226,232,244,0.7)";
+              ctx.lineWidth = active ? 2 : 1;
+              ctx.beginPath();
+              ctx.moveTo(Math.round(hx) + 0.5, bandY - 2);
+              ctx.lineTo(Math.round(hx) + 0.5, bandY + bandH + 2);
+              ctx.stroke();
+              ctx.lineWidth = 1;
             }
           }
           // hover readout (top-right of the band): the phone under the cursor + its true length + the
@@ -1104,31 +1145,38 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // uses). A BOUNDARY between two adjacent same-note phones = a timing handle (drag to re-split);
   // a phone body = a strength handle (Alt+drag). Returns null when nothing editable is under x.
   const PHONE_BOUNDARY_HIT = 5;
-  // S167b (user-tuned): returns BOTH halves and lets the caller pick by modifier — a plain drag
-  // on a phone body is the STRENGTH handle (the frequent edit, no modifier), Alt near a same-note
-  // junction is the TIMING handle (the rare one). A dropped zero-width marker between two phones
-  // of one note must not hide their boundary, hence the look-ahead.
+  // S167c (user-tuned twice): returns BOTH halves; the CALLER prioritizes boundary over body —
+  // within ±5 px of a draggable junction = the TIMING handle (col-resize), anywhere else on a
+  // phone body = the STRENGTH handle (ns-resize). No modifier key (Alt dropped — user 2026-08-31:
+  // 「按现在这种操控甚至不需要 alt 了」). Draggability comes from the ONE shared predicate
+  // `boundaryDraggableAfter` — the painter draws its bright handles from the same predicate, so
+  // feedback, handles and hit-testing can never disagree (the S167b drift: outlines/reference
+  // lines read as handles yet only same-note junctions respond).
   const phoneLaneHitAt = (clientX: number): { boundary?: number; span?: number } => {
     const pd = phonemeLaneRef.current;
     if (!pd) return {};
     const cx = localXY(clientX, 0).x;
     const v = viewRef.current, start = startRef.current;
+    // S167c (review): hit-test in the frames the user is LOOKING at — after a commit the lane's
+    // cached spans lag by debounce+IPC, and the overlay is what the painter shows meanwhile.
+    const ovH = phoneCommitOverlayRef.current;
+    const effF = (i: number) =>
+      (ovH && ovH.sig === pd.sig ? ovH.frames.get(i) : undefined) ?? pd.spans[i]!.frames;
     let f = 0;
     const out: { boundary?: number; span?: number } = {};
     for (let i = 0; i < pd.spans.length; i++) {
       const s = pd.spans[i]!;
       const x0 = KEY_COL_W + noteTickToX(f * pd.ticksPerFrame, start, v);
-      f += s.frames;
+      f += effF(i);
       const x1 = KEY_COL_W + noteTickToX(f * pd.ticksPerFrame, start, v);
       if (s.frames <= 0) continue; // dropped markers are indicators, not handles
+      if (out.boundary === undefined && Math.abs(cx - x1) <= PHONE_BOUNDARY_HIT
+          // S167c (review): only junctions whose HANDLE is actually painted — the painter clips
+          // at the view edges, and an invisible handle must never answer col-resize.
+          && x1 >= KEY_COL_W && x1 <= sizeRef.current.w
+          && boundaryDraggableAfter(pd.spans, pd.tripleNoteIds, i)) out.boundary = i;
       if (!pd.tripleNoteIds[s.evt]) continue; // a gap rest is not editable
       if (out.span === undefined && cx >= x0 && cx < x1) out.span = i;
-      if (out.boundary === undefined && Math.abs(cx - x1) <= PHONE_BOUNDARY_HIT) {
-        let j = i + 1;
-        while (j < pd.spans.length && pd.spans[j]!.frames <= 0 && pd.spans[j]!.evt === s.evt) j++;
-        const next = pd.spans[j];
-        if (next && next.evt === s.evt && next.frames > 0) out.boundary = i;
-      }
     }
     return out;
   };
@@ -1268,22 +1316,35 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     // right-click a point → delete (onContextMenu). Commits ONCE on pointerup (one undo step).
     if (laneOpenRef.current && y >= noteBottom() && x >= KEY_COL_W) {
       if (laneParamRef.current === "phoneme") {
-        // S167b (user-tuned): PLAIN drag on a phone = strength (the frequent edit, SV-style — the
-        // level line follows the cursor); Alt near a same-note boundary = re-split timing (the
-        // note's total length never moves — Rust conserves it). Anything else stays gesture-free,
-        // and the hover cursor only lights up where a drag would actually work.
+        // S167c (user-tuned twice): no modifier key — the ±5 px boundary zone IS the timing
+        // handle (it wins over the body), anywhere else on a phone body is the strength handle.
+        // The note's total length never moves (Rust conserves it); anything else stays
+        // gesture-free, and the hover cursor only lights up where a drag would actually work.
         const pd = phonemeLaneRef.current;
         if (!pd) return;
         const hit = phoneLaneHitAt(e.clientX);
-        if (e.altKey && hit.boundary !== undefined) {
+        if (hit.boundary !== undefined) {
           const s = pd.spans[hit.boundary]!;
+          // S167c (review): seed the intent map with the note's STORED scales — an untouched
+          // phone must commit exactly what it already had. Re-deriving from previewed frames
+          // drifts ±1 per regrab, and inside the post-commit debounce window the cached spans
+          // are still pre-edit (the quick-second-drag would silently wipe the first edit).
+          const seeded = new Map<number, number>();
+          const noteId0 = pd.tripleNoteIds[s.evt];
+          const pt0 = noteId0 ? part?.notes.find((n) => n.id === noteId0)?.phoneTiming : undefined;
+          if (pt0) {
+            const nIdxs: number[] = [];
+            pd.spans.forEach((sp, i) => { if (sp.evt === s.evt && sp.frames > 0) nIdxs.push(i); });
+            if (pt0.scale.length === nIdxs.length) nIdxs.forEach((i, k) => seeded.set(i, pt0.scale[k]!));
+          }
           dragRef.current = withPreview({
             kind: "phone-dur", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
             activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive: false,
             phoneEvt: s.evt, phoneLeft: hit.boundary, phoneWork: { frames: new Map(), gain: new Map() },
+            phoneScale: seeded,
           });
           requestRedraw();
-        } else if (!e.altKey && hit.span !== undefined) {
+        } else if (hit.span !== undefined) {
           const s = pd.spans[hit.span]!;
           dragRef.current = withPreview({
             kind: "phone-gain", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
@@ -1425,10 +1486,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         if (p.y < RULER_H && p.x >= KEY_COL_W) cv.style.cursor = "col-resize"; // ② ruler = seek the playhead
         else if (laneOpenRef.current && p.y >= noteBottom() && p.x >= KEY_COL_W)
           cv.style.cursor = laneParamRef.current === "phoneme"
-            ? (() => { // S167b: feedback only where a drag would WORK — plain hover on a phone =
-                //         strength (ns-resize); Alt near a boundary = timing (col-resize); else none.
+            ? (() => { // S167c: feedback only where a drag would WORK — the ±5 px boundary zone
+                //         wins (col-resize = timing), a phone body is strength (ns-resize).
                 const h = phoneLaneHitAt(e.clientX);
-                if (e.altKey) return h.boundary !== undefined ? "col-resize" : "default";
+                if (h.boundary !== undefined) return "col-resize";
                 return h.span !== undefined ? "ns-resize" : "default";
               })()
             : laneParamPointAt(e.clientX, e.clientY) >= 0 ? "grab" : "crosshair"; // ② over a point vs insert
@@ -1475,18 +1536,73 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         c.xs[i] = Math.min(hi, Math.max(lo, rel));
         c.ys[i] = Math.round(yToParam(localXY(e.clientX, e.clientY).y, cfg.min, cfg.max, noteBottom(), LANE_H) * 10) / 10;
       } else if (d.kind === "phone-dur" && d.phoneWork && d.phoneLeft !== undefined) {
-        // S167: move the boundary between the pair; each side keeps ≥1 frame, the pair total is fixed.
+        // S167c: the preview runs the COMMIT's own math — scale-vs-base with the 0.1..10 clamp,
+        // then the whole-note largest-remainder redistribution (`redistributeConserving`, a
+        // pinned mirror of Rust's `redistribute_conserving`) — so the painted split IS the split
+        // that sticks. The old pair-local ≥1-frame preview allowed frames the commit would floor
+        // or round away, and the release "snapped back" (user 2026-08-31: 「压的时候音素被压得很
+        // 短,松手之后又回弹」). The dragged pair's INTENT scales live on d.phoneScale, and
+        // pointerup sends exactly those — preview inputs ≡ wire payload ≡ Rust's inputs.
         const pd = phonemeLaneRef.current;
         if (pd) {
-          const li = d.phoneLeft, ri = li + 1;
-          const L = pd.spans[li]!, R = pd.spans[ri]!;
-          const total = L.frames + R.frames;
-          let f0 = 0;
-          for (let i = 0; i < li; i++) f0 += pd.spans[i]!.frames;
-          const bf = Math.round(Math.max(0, relTickAt(e.clientX)) / pd.ticksPerFrame) - f0;
-          const left = Math.min(total - 1, Math.max(1, bf));
-          d.phoneWork.frames.set(li, left);
-          d.phoneWork.frames.set(ri, total - left);
+          const li = d.phoneLeft;
+          const L = pd.spans[li]!;
+          // the boundary's RIGHT phone: skip same-note dropped markers (same look-ahead as the
+          // predicate — the old code grabbed spans[li+1] and could land on a zero-width marker).
+          let ri = li + 1;
+          while (ri < pd.spans.length && pd.spans[ri]!.frames <= 0 && pd.spans[ri]!.evt === L.evt) ri++;
+          const R = pd.spans[ri];
+          if (R && R.evt === L.evt && R.frames > 0) {
+            const idxs: number[] = [];
+            pd.spans.forEach((s, i) => { if (s.evt === L.evt && s.frames > 0) idxs.push(i); });
+            const total = idxs.reduce((a, i) => a + pd.spans[i]!.frames, 0);
+            if (total >= idxs.length) { // the commit's own degenerate-note guard
+              // eff = the frames the user is LOOKING at: working values, else the post-commit
+              // overlay (the lane's answer lags a commit by debounce+IPC), else the cached spans.
+              const ovM = phoneCommitOverlayRef.current;
+              const eff = (i: number) =>
+                d.phoneWork!.frames.get(i)
+                ?? (ovM && ovM.sig === pd.sig ? ovM.frames.get(i) : undefined)
+                ?? pd.spans[i]!.frames;
+              // cursor → wanted boundary frame in the CURRENT preview geometry
+              let f0 = 0;
+              for (let i = 0; i < li; i++) f0 += eff(i);
+              const pairTotal = eff(li) + eff(ri);
+              const bf = Math.round(Math.max(0, relTickAt(e.clientX)) / pd.ticksPerFrame) - f0;
+              const wantL = Math.min(pairTotal - 1, Math.max(1, bf));
+              // S167c (review): a grab + jitter that never crosses a frame must not touch
+              // anything — the first write used to re-derive intent from the previewed frames and
+              // the boundary hopped ±1 with the cursor stationary. Engage only once the wanted
+              // split actually differs (afterwards a still cursor is stable by determinism).
+              const engaged = d.phoneWork!.frames.size > 0;
+              if (engaged || wantL !== eff(li)) {
+                const round3 = (x: number) => Math.round(x * 1000) / 1000;
+                d.phoneScale?.set(li, round3(wantL / Math.max(1, L.base_frames)));
+                d.phoneScale?.set(ri, round3((pairTotal - wantL) / Math.max(1, R.base_frames)));
+                const scaleOf = (i: number) =>
+                  d.phoneScale?.get(i)
+                  ?? round3(pd.spans[i]!.frames / Math.max(1, pd.spans[i]!.base_frames));
+                const allOne = idxs.every((i) => scaleOf(i) === 1);
+                if (allOne) {
+                  // Identity point: the release CLEARS the edit and the render is the allocator's
+                  // own split — paint exactly that. (Redistribution is NOT identity at all-1
+                  // scales — floor-1 + largest remainder skews any uneven split — and Rust skips
+                  // it for all-1 edits for the same reason; review finding.)
+                  idxs.forEach((i) => d.phoneWork!.frames.set(i, pd.spans[i]!.base_frames));
+                } else {
+                  // ⚠ f32 fidelity: the wire's scale is f32 and Rust clamps in f32 BEFORE
+                  // widening to f64 (`s.clamp(0.1,10.0)` on f32, then `f64::from`). Math.fround
+                  // mirrors both narrowings — without it a near-tie largest-remainder can split
+                  // differently and leave a ±1-frame ghost of the snap-back this preview kills.
+                  const w = idxs.map((i) =>
+                    Math.max(1, pd.spans[i]!.base_frames)
+                    * Math.fround(Math.min(PHONE_SCALE_MAX, Math.max(Math.fround(PHONE_SCALE_MIN), Math.fround(scaleOf(i))))));
+                  const frames = redistributeConserving(total, w);
+                  idxs.forEach((i, k) => d.phoneWork!.frames.set(i, frames[k]!));
+                }
+              }
+            }
+          }
         }
       } else if (d.kind === "phone-gain" && d.phoneWork && d.phoneSpan !== undefined) {
         // S167b: ABSOLUTE placement — the strength line lands where the cursor is (mid = 0 dB,
@@ -1570,8 +1686,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
           const phones = idxs.map((i) => pd.spans[i]!.phone);
           const scale = idxs.map((i) => {
             const s = pd.spans[i]!;
-            const frames = d.phoneWork!.frames.get(i) ?? s.frames;
-            return Math.round((frames / Math.max(1, s.base_frames)) * 1000) / 1000;
+            // S167c: the dragged pair commits its INTENT scale (what the preview redistributed
+            // FROM); untouched phones commit their STANDING frames (pd.spans, not the preview
+            // map — the preview redistributes ALL phones by ±1 rounding, and echoing those back
+            // would perturb the very inputs the mirror assumed). This keeps the wire payload
+            // identical to the preview's inputs, so Rust reproduces the painted frames exactly.
+            const sc = d.phoneScale?.get(i);
+            if (sc !== undefined) return sc;
+            return Math.round((s.frames / Math.max(1, s.base_frames)) * 1000) / 1000;
           });
           const gainDb = idxs.map((i) => d.phoneWork!.gain.get(i) ?? pd.spans[i]!.gain_db);
           const anyGain = gainDb.some((g) => g !== 0);
@@ -1581,6 +1703,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             update: { [note.id]: { phoneTiming: any ? { phones, scale, ...(anyGain ? { gainDb } : {}) } : undefined } },
             remove: [],
           });
+          // S167c: keep painting the committed working values until the lane's debounced
+          // refetch lands (see phoneCommitOverlayRef). At the identity point the working
+          // frames already hold the allocator split, matching the cleared edit.
+          phoneCommitOverlayRef.current = {
+            sig: pd.sig,
+            frames: new Map(d.phoneWork.frames),
+            gain: new Map(d.phoneWork.gain),
+          };
         }
       }
       requestRedraw();
@@ -1612,6 +1742,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const { x, y } = localXY(e.clientX, e.clientY);
     if (y < noteBottom() || x < KEY_COL_W) return;
     if (laneParamRef.current === "phoneme") {
+      // S167c: never clear while a lane gesture is in flight — a chorded right-click mid-drag
+      // would clear the edit and then have pointerup re-commit it (two contradictory undo steps).
+      if (dragRef.current) return;
       // S167 (§E2): right-click a phone → clear this note's timing/strength edit (back to automatic).
       const pd = phonemeLaneRef.current;
       const h = pd ? phoneLaneHitAt(e.clientX) : null;

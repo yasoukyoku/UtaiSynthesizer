@@ -2479,7 +2479,12 @@ fn apply_phone_edits(
             continue;
         }
         let total: i64 = idx.iter().map(|&i| pdur[i]).sum();
-        if total >= idx.len() as i64 && !idx.is_empty() {
+        // ⛔ S167c —— **scale 全 1 ⇒ 时长一个字节不动**(纯强度编辑走这条)。
+        //    redistribute 在 scale 全 1 时**不是恒等**:floor-1-each + 最大余数偏向小权重,
+        //    [1,9] 会被"恒等"重排成 [2,8] —— 改个响度把时长动了(S167c 审查抓出,判据
+        //    `gain_only_edit_never_moves_timing` 钉死)。前端预览镜像同一条跳过。
+        let all_one = edit.scale.iter().all(|&s| s == 1.0);
+        if !all_one && total >= idx.len() as i64 && !idx.is_empty() {
             let w: Vec<f64> = idx
                 .iter()
                 .zip(edit.scale.iter())
@@ -4738,6 +4743,45 @@ mod phone_edit_tests {
         assert_eq!(arr.edit_stale, vec![0], "the stale edit is REPORTED");
         assert_eq!(arr.phone_dur, arr.phone_base_dur, "…and IGNORED: the split is the allocator's own");
         assert!(arr.phone_gain_db.iter().all(|&g| g == 0.0), "…gains included");
+    }
+
+    /// S167c —— **纯强度编辑(scale 全 1)不许动时长**。redistribute 在全 1 时不是恒等
+    /// (floor-1-each + 最大余数偏向小权重:[1,9] 会被「恒等」重排成 [2,8])⇒ apply 必须整段
+    /// 跳过时长分支。没有这条判据,「改个响度把时序动了」会静默溜过去(S167c 审查抓出)。
+    #[test]
+    fn gain_only_edit_never_moves_timing() {
+        static EDIT2: std::sync::OnceLock<PhoneEdit> = std::sync::OnceLock::new();
+        let edit2 = EDIT2.get_or_init(|| PhoneEdit {
+            phones: vec!["t".into(), "a".into()],
+            scale: vec![1.0, 1.0],
+            gain_db: vec![0.0, 3.0],
+        });
+        static EDIT4: std::sync::OnceLock<PhoneEdit> = std::sync::OnceLock::new();
+        let edit4 = EDIT4.get_or_init(|| PhoneEdit {
+            phones: vec!["f".into(), "aɪ".into(), "n".into(), "d".into()],
+            scale: vec![1.0, 1.0, 1.0, 1.0],
+            gain_db: vec![0.0, -2.0, 0.0, 0.0],
+        });
+        // 扫一段帧数:任何一个不均匀的分配都能暴露「全 1 重排」;等式必须全体成立。
+        for frames in 6..=14 {
+            let base = build_arrays_daw(&[evt("t a", frames, None)], &NoDicts, ArticulationTiming::Auto).unwrap();
+            let arr =
+                build_arrays_daw(&[evt("t a", frames, Some(edit2))], &NoDicts, ArticulationTiming::Auto).unwrap();
+            assert_eq!(arr.phone_dur, base.phone_dur, "t a @{frames}: scale 全 1 ⇒ 时长逐帧不变");
+            assert!(arr.edit_stale.is_empty());
+        }
+        for frames in 8..=16 {
+            let base =
+                build_arrays_daw(&[evt("f aɪ n d", frames, None)], &NoDicts, ArticulationTiming::Auto).unwrap();
+            let arr = build_arrays_daw(&[evt("f aɪ n d", frames, Some(edit4))], &NoDicts, ArticulationTiming::Auto)
+                .unwrap();
+            if arr.edit_stale.is_empty() {
+                // (短帧数下 codas 可能被丢 ⇒ 音素集对不上会 stale —— 那不是本判据的对象)
+                assert_eq!(arr.phone_dur, base.phone_dur, "f aɪ n d @{frames}: scale 全 1 ⇒ 时长逐帧不变");
+                let gi = arr.phon.iter().position(|&p| p == "aɪ").unwrap();
+                assert_eq!(arr.phone_gain_db[gi], -2.0, "增益照常落位");
+            }
+        }
     }
 
     #[test]
