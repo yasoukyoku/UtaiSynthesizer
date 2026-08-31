@@ -2,8 +2,6 @@
 
 **English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-**Website**: https://utaisynthesizer.net
-
 [![Release](https://img.shields.io/github/v/release/yasoukyoku/UtaiSynthesizer)](https://github.com/yasoukyoku/UtaiSynthesizer/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-informational)
