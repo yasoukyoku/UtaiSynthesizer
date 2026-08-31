@@ -679,8 +679,8 @@ Next to the editor's title are the "Loudness", "Formant" and "Phonemes" buttons;
 
 **Phoneme duration and strength are hand-editable** (v0.12) — when the algorithm gets one wrong, you have the last word:
 
-- **Drag the boundary between two phones of the same note** to change their split. The note's total length never moves (one side grows at the other's expense, and every phone keeps at least one frame), so an edit can never push other notes around.
-- **Alt + drag a phone block vertically** to adjust that phone's strength (±12 dB in 0.5 dB steps; the hover readout shows `+N dB`).
+- **Drag a phone block vertically** to adjust that phone's **strength** (±12 dB in 0.5 dB steps). Every block carries a horizontal strength line (middle = 0 dB, top = +12, bottom = −12, with a dashed 0 dB reference across the band); the line follows the cursor while you drag, and the hover readout shows `+N dB`.
+- **Alt + drag the boundary between two phones of the same note** to change their **duration** split. The note's total length never moves (one side grows at the other's expense, and every phone keeps at least one frame), so an edit can never push other notes around. The left-right resize cursor only appears near a boundary while Alt is held — feedback only where a drag would work.
 - **Right-click a phone block** to clear all manual edits on that note and return to automatic.
 - Edited blocks carry a highlighted underline. Changing the note's lyric / language / phoneme override invalidates the old edit (a dashed outline = a stale edit the render is ignoring) and drops it.
 - **A thin red marker = a dropped phone**: on a note too short to fund every consonant, the allocator drops the least load-bearing one — that used to happen silently; now it is drawn in the lane (to rescue it: lengthen the note, or drag a boundary to give it time).

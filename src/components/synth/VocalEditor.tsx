@@ -819,6 +819,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             if (nx < noteAreaX || nx > w) continue;
             ctx.beginPath(); ctx.moveTo(Math.round(nx) + 0.5, laneTop + 1); ctx.lineTo(Math.round(nx) + 0.5, h); ctx.stroke();
           }
+          // S167b: the 0 dB STRENGTH reference — the per-phone level lines below read against it
+          // (mid = 0, top = +12, bottom = −12; same mapping the plain-drag gesture uses).
+          ctx.strokeStyle = "rgba(226,232,244,0.12)"; ctx.lineWidth = 1; ctx.setLineDash([2, 3]);
+          const zeroY = Math.round(bandY + bandH * 0.5) + 0.5;
+          ctx.beginPath(); ctx.moveTo(noteAreaX, zeroY); ctx.lineTo(w, zeroY); ctx.stroke(); ctx.setLineDash([]);
           ctx.font = "9px Consolas, monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
           let f = 0;
           for (const s of spansEff) {
@@ -854,8 +859,19 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
               if (s.stale) ctx.setLineDash([3, 2]); // S167: this note's edit no longer matches — visibly dead
               ctx.strokeRect(Math.round(bx0) + 0.5, Math.round(bandY) + 0.5, Math.max(1, Math.round(bw) - 1), bandH - 1);
               ctx.setLineDash([]);
-              if (s.frames !== s.base_frames || s.gain_db !== 0) {
-                // S167: an ACTIVE edit — accent underline (timing and/or strength moved off automatic)
+              // S167b (SV-style): the phone's STRENGTH as a level line inside its block — faint at
+              // 0 dB so the default reads as a continuous mid-line, bold once edited. A plain
+              // vertical drag moves exactly this line (absolute placement, same mapping).
+              {
+                const gy = Math.round(bandY + bandH * (1 - (s.gain_db + 12) / 24)) + 0.5;
+                ctx.strokeStyle = col("--accent-primary") || "#39c5bb";
+                ctx.globalAlpha = s.gain_db !== 0 ? 0.95 : 0.3;
+                ctx.lineWidth = s.gain_db !== 0 ? 2 : 1;
+                ctx.beginPath(); ctx.moveTo(bx0 + 1, gy); ctx.lineTo(bx0 + Math.max(2, bw) - 1, gy); ctx.stroke();
+                ctx.globalAlpha = 1; ctx.lineWidth = 1;
+              }
+              if (s.frames !== s.base_frames) {
+                // S167: an ACTIVE timing edit — accent underline (strength has its own line above)
                 ctx.fillStyle = col("--accent-primary") || "#39c5bb";
                 ctx.fillRect(bx0, bandY + bandH - 2, bw, 2);
               }
@@ -1088,12 +1104,17 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // uses). A BOUNDARY between two adjacent same-note phones = a timing handle (drag to re-split);
   // a phone body = a strength handle (Alt+drag). Returns null when nothing editable is under x.
   const PHONE_BOUNDARY_HIT = 5;
-  const phoneLaneHitAt = (clientX: number): { boundary?: number; span?: number } | null => {
+  // S167b (user-tuned): returns BOTH halves and lets the caller pick by modifier — a plain drag
+  // on a phone body is the STRENGTH handle (the frequent edit, no modifier), Alt near a same-note
+  // junction is the TIMING handle (the rare one). A dropped zero-width marker between two phones
+  // of one note must not hide their boundary, hence the look-ahead.
+  const phoneLaneHitAt = (clientX: number): { boundary?: number; span?: number } => {
     const pd = phonemeLaneRef.current;
-    if (!pd) return null;
+    if (!pd) return {};
     const cx = localXY(clientX, 0).x;
     const v = viewRef.current, start = startRef.current;
     let f = 0;
+    const out: { boundary?: number; span?: number } = {};
     for (let i = 0; i < pd.spans.length; i++) {
       const s = pd.spans[i]!;
       const x0 = KEY_COL_W + noteTickToX(f * pd.ticksPerFrame, start, v);
@@ -1101,16 +1122,15 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       const x1 = KEY_COL_W + noteTickToX(f * pd.ticksPerFrame, start, v);
       if (s.frames <= 0) continue; // dropped markers are indicators, not handles
       if (!pd.tripleNoteIds[s.evt]) continue; // a gap rest is not editable
-      const next = pd.spans[i + 1];
-      if (
-        Math.abs(cx - x1) <= PHONE_BOUNDARY_HIT &&
-        next && next.evt === s.evt && next.frames > 0
-      ) {
-        return { boundary: i };
+      if (out.span === undefined && cx >= x0 && cx < x1) out.span = i;
+      if (out.boundary === undefined && Math.abs(cx - x1) <= PHONE_BOUNDARY_HIT) {
+        let j = i + 1;
+        while (j < pd.spans.length && pd.spans[j]!.frames <= 0 && pd.spans[j]!.evt === s.evt) j++;
+        const next = pd.spans[j];
+        if (next && next.evt === s.evt && next.frames > 0) out.boundary = i;
       }
-      if (cx >= x0 && cx < x1) return { span: i };
     }
-    return null;
+    return out;
   };
 
   // ② index of the lane control-point under the cursor (within LANE_PT_HIT px), or -1. Uses the CURRENTLY
@@ -1248,13 +1268,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     // right-click a point → delete (onContextMenu). Commits ONCE on pointerup (one undo step).
     if (laneOpenRef.current && y >= noteBottom() && x >= KEY_COL_W) {
       if (laneParamRef.current === "phoneme") {
-        // S167 (§E2): the lane is EDITABLE now — drag a boundary between two phones of one note to
-        // re-split its timing (the note's total length never moves — Rust conserves it); Alt+drag a
-        // phone body to adjust its strength (dB). Anything else in the band stays gesture-free.
+        // S167b (user-tuned): PLAIN drag on a phone = strength (the frequent edit, SV-style — the
+        // level line follows the cursor); Alt near a same-note boundary = re-split timing (the
+        // note's total length never moves — Rust conserves it). Anything else stays gesture-free,
+        // and the hover cursor only lights up where a drag would actually work.
         const pd = phonemeLaneRef.current;
-        const hit = pd ? phoneLaneHitAt(e.clientX) : null;
-        if (!pd || !hit) return;
-        if (hit.boundary !== undefined) {
+        if (!pd) return;
+        const hit = phoneLaneHitAt(e.clientX);
+        if (e.altKey && hit.boundary !== undefined) {
           const s = pd.spans[hit.boundary]!;
           dragRef.current = withPreview({
             kind: "phone-dur", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
@@ -1262,7 +1283,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             phoneEvt: s.evt, phoneLeft: hit.boundary, phoneWork: { frames: new Map(), gain: new Map() },
           });
           requestRedraw();
-        } else if (hit.span !== undefined && e.altKey) {
+        } else if (!e.altKey && hit.span !== undefined) {
           const s = pd.spans[hit.span]!;
           dragRef.current = withPreview({
             kind: "phone-gain", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
@@ -1404,9 +1425,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         if (p.y < RULER_H && p.x >= KEY_COL_W) cv.style.cursor = "col-resize"; // ② ruler = seek the playhead
         else if (laneOpenRef.current && p.y >= noteBottom() && p.x >= KEY_COL_W)
           cv.style.cursor = laneParamRef.current === "phoneme"
-            ? (() => { // S167: timing handle (boundary) vs strength handle (Alt over a phone) vs nothing
+            ? (() => { // S167b: feedback only where a drag would WORK — plain hover on a phone =
+                //         strength (ns-resize); Alt near a boundary = timing (col-resize); else none.
                 const h = phoneLaneHitAt(e.clientX);
-                return h?.boundary !== undefined ? "col-resize" : h?.span !== undefined && e.altKey ? "ns-resize" : "default";
+                if (e.altKey) return h.boundary !== undefined ? "col-resize" : "default";
+                return h.span !== undefined ? "ns-resize" : "default";
               })()
             : laneParamPointAt(e.clientX, e.clientY) >= 0 ? "grab" : "crosshair"; // ② over a point vs insert
         else if (toolRef.current === "delete") cv.style.cursor = "";
@@ -1466,11 +1489,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
           d.phoneWork.frames.set(ri, total - left);
         }
       } else if (d.kind === "phone-gain" && d.phoneWork && d.phoneSpan !== undefined) {
-        // S167: vertical drag = dB, quantized to 0.5 (6 px per dB feels precise without jitter).
+        // S167b: ABSOLUTE placement — the strength line lands where the cursor is (mid = 0 dB,
+        // top = +12, bottom = −12; 0.5 dB quantize). Grab-and-place, like dragging the line itself.
         const pd = phonemeLaneRef.current;
         if (pd) {
-          const s0 = pd.spans[d.phoneSpan]!;
-          const g = Math.max(-12, Math.min(12, Math.round((s0.gain_db - (e.clientY - d.clientY0) / 6) * 2) / 2));
+          const bandY = noteBottom() + 14;
+          const bandH = LANE_H - 20;
+          const y = localXY(e.clientX, e.clientY).y;
+          const g = Math.max(-12, Math.min(12, Math.round(((1 - (y - bandY) / bandH) * 24 - 12) * 2) / 2));
           d.phoneWork.gain.set(d.phoneSpan, g);
         }
       } else if (d.kind === "ruler-seek") {
