@@ -7883,6 +7883,30 @@ fn splice_kept(
             if !tied_here(t) {
                 continue;
             }
+            // ⛔⛔ S167 —— **左窗要硬写到 t,所以 t 必须仍在左窗 donor 片段的覆盖里。**
+            // 这个配对循环原来没有任何间隙上限:鹅妈妈原 key 上四对「同一长音」窗相隔
+            // **77 帧**(donor 片段只到 job+25 帧)照样被配对 ⇒ 写入在 `escapes its donor
+            // segment` 处被夹紧,而 `hard_end` 又把淡出关了 ⇒ 夹紧点留下一条**无淡化的
+            // donor→base 硬切** = 全频贯穿竖线(用户 2026-08-31 报的那批:akiko/yachiyo ×
+            // 鹅妈妈原 key 各 4/6 处,渲染产物 vocal.wav 上单样本 step 0.30-0.61,坐标
+            // 与四条 clamp 警告的 seg end **逐样本相等**)。
+            // 覆盖够不着 ⇒ 这一对根本接不上(中间隔着一段没被救援的 base,那段 base 本来
+            // 就唱得动)⇒ 不配对,让两窗各自走普通的 10 ms 淡化。
+            // ⚠ 另外两个 join 源不用这道闸:`join_rests` 的打分经 `rms_db` 读不到覆盖外
+            // 就跳过,`defer_dead_handover` 的 `lvl` 越界返回 NEG_INFINITY ⇒ 都自带守卫。
+            let l_covers_t = kept
+                .iter()
+                .find(|(i, _, _)| *i == l as i64)
+                .is_some_and(|(_, lo, buf)| t <= lo + buf.len());
+            if !l_covers_t {
+                tracing::info!(
+                    "range: tied seam at {:.3}s NOT joined — join target beyond the left \
+                     window's donor coverage (gap {} frames)",
+                    t as f64 / f64::from(sample_rate),
+                    jobs[r].start - jobs[l].end,
+                );
+                continue;
+            }
             join.insert(oi, t);
             xf_at.insert(oi + 1, tied_xf);
         }
@@ -8026,8 +8050,18 @@ fn splice_kept(
                     "range-extend(dead-only): window {a}..{b} escapes its donor segment {sa}..{sb} — clamped"
                 );
             }
+            let b_wanted = b;
             let a = a.max(sa);
             let b = b.min(sb);
+            // ⛔ S167 保底(与上面 tied 配对的覆盖闸成对):join/handover 把 `b` 推出
+            //    donor 覆盖被夹紧时,「右窗会从 t 淡入我们的 donor」这个 `hard_end` 前提
+            //    已经不成立(我们根本写不到 t)⇒ 夹紧点必须像普通窗尾一样淡出,
+            //    绝不许留无淡化的 donor→base 硬切(S167 的全频竖线 = 正是这条硬切)。
+            //    ⚠ 修完源头闸之后,今天的三个 join 源都到不了这里(tied 有覆盖闸;
+            //    `join_rests` 的 `rms_db` / `defer` 的 `lvl` 读不到覆盖外就放弃)
+            //    ⇒ 这一行今天是**纯保底**,保的是下一把把窗边推出覆盖的刀;
+            //    行为判据钉在源头闸上:`tied_join_beyond_donor_coverage_is_skipped`。
+            let hard_end = hard_end && b == b_wanted;
             // ⭐⭐ S163 —— 淡入宽度逐窗给(长音延续处拉长,见 [`tied_xfade_ms`]);
             // 淡出永远是 10 ms —— 被拉长的那一侧一定是 `hard_end`(左窗硬写到交接点),
             // 所以它根本不淡出。
@@ -11707,6 +11741,70 @@ mod tests {
                        &[0, 1], xf, true).is_empty(),
             "两条 donor 都补不上那个洞时必须放弃"
         );
+    }
+
+    /// ⛔⛔ S167 —— 用户报的「全频贯穿竖线」的判据(鹅妈妈原 key,akiko 4 处 / yachiyo 6 处)。
+    ///
+    /// 根因:tied-xfade 配对循环没有间隙上限 —— 相隔 77 帧的两个窗(donor 片段只到
+    /// job+25 帧)照样被配成「同一长音的接缝」,左窗被硬写到右窗起点,写入在
+    /// `escapes its donor segment` 处被夹紧,而 `hard_end` 把淡出关了
+    /// ⇒ 夹紧点留下无淡化的 donor→base 硬切(渲染产物上单样本 step 0.30-0.61,
+    /// 坐标与 clamp 警告的 seg end 逐样本相等)。
+    ///
+    /// 两个方向都钉住:
+    /// * 大间隙(77 帧 > 覆盖)⇒ **不配对**:间隙里仍是 base,且全曲无硬边;
+    /// * 小间隙(20 帧 ≤ 覆盖)⇒ **照常硬接**(回归守卫):间隙里是左 donor,同样无硬边。
+    #[test]
+    fn tied_join_beyond_donor_coverage_is_skipped() {
+        let sr = 48_000u32;
+        let total = 400i64;
+        let n = 400 * 480usize;
+        let spf = spf_of(n, total);
+        let xf = (sr as usize / 100).max(2); // 10 ms
+        let tied_xf = sr as usize * 120 / 1000; // 120 ms
+        // 一个横跨两窗的长音(肚子判定;不需要 tied 标志)。
+        let notes = [NoteSpan { start: 10, frames: 280, sung: true, hz: 440.0, tied: false }];
+        let margin = MERGE_BRIDGE_FRAMES; // 25 帧 —— 与 donor_read_span 同一余量
+        let cut = |j: &DeadJob| -> (i64, usize, Vec<f32>) {
+            let lo = ((j.start - margin).max(0) as f64 * spf) as usize;
+            let hi = (((j.end + margin) as f64 * spf) as usize).min(n);
+            (0, lo, vec![-0.4f32; hi - lo])
+        };
+        let run = |r_start: i64| -> Vec<f32> {
+            let jobs = [
+                DeadJob { shift: -5, start: 20, end: 120 },
+                DeadJob { shift: -4, start: r_start, end: r_start + 83 },
+            ];
+            let kept: Vec<(i64, usize, Vec<f32>)> = jobs
+                .iter()
+                .enumerate()
+                .map(|(i, j)| {
+                    let (_, lo, buf) = cut(j);
+                    (i as i64, lo, buf)
+                })
+                .collect();
+            let mut audio = vec![0.4f32; n];
+            splice_kept(
+                &mut audio, sr, spf, &jobs, &kept, xf, false, 0, 0.0, &notes, tied_xf, 0.0,
+                false, 0.0, 0, false, false,
+            )
+            .unwrap();
+            audio
+        };
+
+        // ⓐ 大间隙:120 → 197 = 77 帧,覆盖只到 120+25 ⇒ 不许配对。
+        let a = run(197);
+        let mid = (160.0 * spf) as usize; // 间隙正中
+        assert!((a[mid] - 0.4).abs() < 1e-6, "大间隙必须留 base(没被救的那段唱得动),得到 {}", a[mid]);
+        let worst = a.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.05, "大间隙臂不许有硬边(最大单样本 step {worst:.3},竖线阈在 ~0.3)");
+
+        // ⓑ 回归守卫:小间隙(120 → 140 = 20 帧 ≤ 25)照常硬接,间隙里是左 donor。
+        let b = run(140);
+        let mid2 = (130.0 * spf) as usize;
+        assert!((b[mid2] + 0.4).abs() < 1e-6, "小间隙必须仍被左 donor 硬写满(tied 接缝的既有行为),得到 {}", b[mid2]);
+        let worst2 = b.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst2 < 0.05, "小间隙臂同样不许有硬边(最大单样本 step {worst2:.3})");
     }
 
     #[test]

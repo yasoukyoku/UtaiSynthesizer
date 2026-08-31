@@ -46,6 +46,16 @@
    "observed_bad": "1.85 dB / **28.7%**(翻默认前);S159i 之后 1.11 dB / 28.5%",
    "negative": "可用范围抬到 F5 ⇒ **0.91 dB / 4.2%**;base↔base 交界地板 p50 0.9 dB / 8%",
    "notes": "⭐ 谱心那一半是 donor 渲染自己的,不是 PSOLA;电平那一半 S159i 已修掉。"
+  },
+  {
+   "id": "s167_unfaded_tied_join_hard_cut",
+   "reported": "2026-08-31 用户:『MIDI 轨渲染怎么又开始有那个全频域的贯穿竖线了,而且跨模型都有』(鹅妈妈原 key;akiko 1:53.256/3:45.682/3:54.325/4:02.984,yachiyo 1:45.276/1:53.237/3:37.713/3:45.676;⚠ 导出坐标 = 渲染内坐标 + 0.6757 s 的轨道时间轴偏移,别再追那个常数)",
+   "detector": "unfaded_splice_hard_edge",
+   "material": "鹅妈妈原 key × akiko(sovits 44.1k)与 yachiyo_runami(rvc 48k)· 装机 f0(autotune 常开)",
+   "expect": "渲染产物上该判据 0 处,且日志 0 条『escapes its donor segment』",
+   "observed_bad": "拼接产物 vocal.wav:akiko 112.563/225.006/233.646/242.306 s 读 0.31/0.13/0.61/0.32(×13-×29),yachiyo 104.600/112.560/217.040/225.000/233.640/242.300 —— 坐标与 clamp 警告的 seg end **逐样本相等**;同渲染的拼接前 base.f32 同坐标干净 ⇒ 拼接层",
+   "negative": "修后(vocal_range.rs tied 覆盖闸,S167)同素材双模型:该判据 0 处、escapes 0 条、『NOT joined』4+6 条精确落位、10 处硬边全回自然斜率 0.075-0.126",
+   "notes": "根因:tied-xfade 配对循环无间隙上限(43/77 帧照样配对),左窗被硬写到下一窗起点越过 donor 覆盖(job+25 帧)被 clamp,而 hard_end 把淡出关了 ⇒ 无淡化 donor→base 硬切。单测 `tied_join_beyond_donor_coverage_is_skipped` 钉死两个方向。⚠ 同扫描顺带发现一族**修前就有**的独立残留(akiko 161.673 / yachiyo 8.640·188.072;拼接前 base 里就有,跨 EP/跨 run 逐样本确定 ⇒ 渲染层)——未定性、用户未报,登记别混案。"
   }
  ]
 }

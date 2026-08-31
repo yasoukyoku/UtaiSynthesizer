@@ -62,6 +62,17 @@ SHAPES = [
                     "同族即 S157b 修过的「基频附近的合唱感」。",
     },
     {
+        "id": "unfaded_splice_hard_edge",
+        "what": "单样本内容硬切(|Δx| > 0.05 且 > 8×邻域 ±10 ms 的 |Δx| 中位)—— 两侧都是平滑波形、"
+                "RMS 不变 ⇒ 两段不同内容无淡化对接 = 全频贯穿竖线",
+        "evidence": "S167:用户报『MIDI 轨渲染又开始有全频竖线,跨模型』(鹅妈妈原 key)。"
+                    "拼接产物 vocal.wav 上 akiko 4 处 / yachiyo 6 处,坐标与"
+                    "『escapes its donor segment』clamp 警告的 seg end **逐样本相等**"
+                    "(tied-xfade 配对无间隙上限 ⇒ 左窗硬写越过 donor 覆盖被截断,hard_end 又关了淡出)。"
+                    "阴性:修后同素材双模型 0 处;拼接前 base.f32 同坐标干净。"
+                    "⚠ hard_level_step(5 ms 包络)在这一族上**读 0**——单样本相位跳变不改包络。",
+    },
+    {
         "id": "hard_level_step",
         "what": "5 ms 包络上的硬台阶(>12 dB),且不是正常起音(前后都在唱)",
         "evidence": "S159t:yachiyo +7 上 4 处(50.45 / 128.75 / 175.21 / 188.25 s),akiko 0 处。"
@@ -152,6 +163,31 @@ def find_sub_fundamental(y, sr, win=0.150, hop=0.075):
     return out
 
 
+def find_hard_edges(y, sr):
+    """S167:单样本内容硬切。返回 (时刻, |Δx|, 相对邻域中位的倍数),5 ms 内聚簇取最大。
+    ⛔ 绝对门限 0.05 + 相对门限 8× 缺一不可:只用绝对门限会把响段的正常斜率报上来,
+    只用相对门限会把数字静音边上的一切报上来。在 S167 病例上:坏臂读 0.31/0.61(×13-×29),
+    修后臂 0 处;正常响段最陡自然斜率 ~0.12。"""
+    d = np.abs(np.diff(y))
+    w = int(sr * 0.010)
+    idx = np.argsort(d)[-400:][::-1]
+    out = []
+    for i in idx:
+        lo, hi = max(0, int(i) - w), min(len(d), int(i) + w)
+        ctx = np.median(d[lo:hi]) + 1e-9
+        if d[i] > 8 * ctx and d[i] > 0.05:
+            out.append((int(i), float(d[i]), float(d[i] / ctx)))
+    out.sort()
+    merged = []
+    for i, v, r in out:
+        if merged and i - merged[-1][0] < sr * 0.005:
+            if v > merged[-1][1]:
+                merged[-1] = (i, v, r)
+        else:
+            merged.append((i, v, r))
+    return [((i + 1) / sr, v, r) for i, v, r in merged]
+
+
 def find_level_steps(y, sr, thr=12.0):
     h = int(sr * 0.005)
     K = len(y) // h
@@ -212,6 +248,7 @@ def main() -> int:
 
     sil = find_digital_silence(y, sr, notes, off)
     steps = find_level_steps(y, sr)
+    edges = find_hard_edges(y, sr)
     sub = find_sub_fundamental(y, sr)
     subv = np.array([s[1] for s in sub]) if sub else np.array([])
 
@@ -223,12 +260,15 @@ def main() -> int:
         print(f"    {t0-off:8.3f}s  {(t1-t0)*1000:5.0f} ms  {tag}")
     print(f"hard_level_step         : **{len(steps)}** 处;前几个 " +
           " ".join(f"{t-off:.2f}s({d:+.0f}dB)" for t, d in steps[:8]))
+    print(f"unfaded_splice_hard_edge: **{len(edges)}** 处;前几个 " +
+          " ".join(f"{t-off:.3f}s({v:.2f},x{r:.0f})" for t, v, r in edges[:8]))
     if len(subv):
         print(f"sub_fundamental_sheet   : p50 {np.median(subv):.1f} dB · p90 {np.percentile(subv,90):.1f} · max {subv.max():.1f}")
         worst = sorted(sub, key=lambda s: -s[1])[:a.top]
         print("    最高的几处:" + " ".join(f"{t-off:.2f}s({v:.0f}dB,f0={f:.0f})" for t, v, f in worst[:8]))
 
-    spots = [(t0, tag) for t0, t1, tag in sil[:a.top]]
+    spots = [(t, f"硬切 {v:.2f}(x{r:.0f})") for t, v, r in edges[:a.top]]
+    spots += [(t0, tag) for t0, t1, tag in sil[:max(0, a.top - len(spots))]]
     for t, v, f in sorted(sub, key=lambda s: -s[1])[:max(0, a.top - len(spots))]:
         spots.append((t, f"基频以下 {v:.0f} dB"))
     p1 = contact_sheet(os.path.join(out_dir, "sheet_wide.png"), arms, spots,

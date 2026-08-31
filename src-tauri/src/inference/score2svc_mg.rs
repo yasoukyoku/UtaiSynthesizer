@@ -58,6 +58,16 @@ fn mg_device() -> DeviceConfig {
     }
 }
 
+/// S167 —— CUDA 探针要加载**CUDA build 的** ORT(一 build 一 EP;⛔ 顶层 DML build 混载
+/// `cuda/onnxruntime_providers_cuda.dll` 是 settings.rs 记过的 API-24/API-20 死锁陷阱,不许走)。
+/// `UTAI_MG_ORT_DLL=<绝对路径>` 覆盖(配合把 `runtime\cuda` 加进 PATH 供 cudnn/cublas);
+/// 不设 = 今天的 `runtime/ort/onnxruntime.dll`,逐位不变。
+fn mg_ort_dll(root: &Path) -> std::path::PathBuf {
+    std::env::var_os("UTAI_MG_ORT_DLL")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.join(concat!("../runtime/ort/", "onnxruntime.dll")))
+}
+
 fn mg_out_dir() -> std::path::PathBuf {
     let p = match std::env::var("UTAI_MG_OUTDIR") {
         Ok(s) if !s.trim().is_empty() => {
@@ -765,7 +775,7 @@ fn mg_cv_cond_grid() {
     assert_eq!(cls.len(), total_t, "frame class map vs Σ phone_dur");
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    let dll = mg_ort_dll(root);
     assert!(dll.exists(), "ORT dll missing at {}", dll.display());
     if let Ok(bld) = ort::init_from(&dll) {
         let _ = bld.commit();
@@ -939,7 +949,7 @@ fn mg_render_rvc() {
     let vf0 = VocalF0 { cents, voiced };
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    let dll = mg_ort_dll(root);
     assert!(dll.exists(), "ORT dll missing at {}", dll.display());
     if let Ok(bld) = ort::init_from(&dll) {
         let _ = bld.commit();
@@ -1115,7 +1125,7 @@ impl MgSovitsRig {
         let mtag = if stem.contains("东雪莲") { "dxl41".to_string() } else { stem };
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let dll = root.join("../runtime/ort/onnxruntime.dll");
+        let dll = mg_ort_dll(root);
         assert!(dll.exists(), "ORT dll missing at {}", dll.display());
         if let Ok(bld) = ort::init_from(&dll) {
             let _ = bld.commit();
@@ -1486,7 +1496,7 @@ impl MgRvcRig {
         let noise_channels = sc["noise_channels"].as_u64().unwrap_or(192) as usize;
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let dll = root.join("../runtime/ort/onnxruntime.dll");
+        let dll = mg_ort_dll(root);
         assert!(dll.exists(), "ORT dll missing at {}", dll.display());
         if let Ok(bld) = ort::init_from(&dll) {
             let _ = bld.commit();
@@ -2373,7 +2383,7 @@ fn mg_render_rvc_oversampled() {
     });
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    let dll = mg_ort_dll(root);
     assert!(dll.exists());
     if let Ok(bld) = ort::init_from(&dll) {
         let _ = bld.commit();
@@ -2585,7 +2595,7 @@ fn mg_cover_range_replay() {
     let r = super::super::vocal_range::speaker_range(&cfg, 0).expect("no vocal_range record");
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    let dll = mg_ort_dll(root);
     assert!(dll.exists());
     if let Ok(bld) = ort::init_from(&dll) {
         let _ = bld.commit();
@@ -2656,7 +2666,7 @@ fn mg_cover_deadonly_smoke() {
     let src = crate::audio::AudioBuffer { samples: mono, sample_rate: full.sample_rate, channels: 1 };
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    let dll = mg_ort_dll(root);
     assert!(dll.exists(), "ORT dll missing at {}", dll.display());
     if let Ok(bld) = ort::init_from(&dll) {
         let _ = bld.commit();
@@ -2763,7 +2773,7 @@ fn mg_render_cover() {
     let src = crate::audio::AudioBuffer { samples: mono, sample_rate: full.sample_rate, channels: 1 };
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    let dll = mg_ort_dll(root);
     assert!(dll.exists(), "ORT dll missing at {}", dll.display());
     if let Ok(bld) = ort::init_from(&dll) {
         let _ = bld.commit();
