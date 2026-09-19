@@ -117,6 +117,24 @@ describe("splitLyricTokens — whole-phrase distribution", () => {
     expect(splitLyricTokens("", "あ")).toEqual(["あ"]);
   });
 
+  // ⛔ S170 — the NFD half. `が` has two legal spellings (U+304C, or か + U+3099) and they must
+  // distribute identically; before this, the combining mark became its OWN note, guaranteed OOV.
+  // Rust composes them in `kana_tokenize`, so the splitter has to keep them attached or the two
+  // halves of §9.5's single classifier disagree about what one note even is.
+  it("★ a combining dakuten rides on its base kana — NFD must split exactly like NFC", () => {
+    const nfc = "がっこう";
+    const nfd = nfc.normalize("NFD");
+    expect(nfd).not.toEqual(nfc); // guard: this test is vacuous if the two strings are equal
+    // the splitter GROUPS, it does not normalise — so compare the grouping, not the bytes
+    expect(splitLyricTokens(nfd, "あ").map((t) => t.normalize("NFC"))).toEqual(splitLyricTokens(nfc, "あ"));
+    expect(splitLyricTokens(nfc, "あ")).toEqual(["がっ", "こ", "う"]); // っ rides on its base too
+    // the defect itself: the mark must not become a note of its own
+    expect(splitLyricTokens(nfd, "あ")).toHaveLength(3);
+    // handakuten too (ぱ = は + U+309A), and the 鼻濁音 spelling that has NO precomposed form
+    expect(splitLyricTokens("ぱぴ".normalize("NFD"), "あ")).toHaveLength(2);
+    expect(splitLyricTokens("か゚き゚", "あ")).toHaveLength(2);
+  });
+
   it("★ a phonetic hint stays ONE token — it contains spaces but belongs to a single note", () => {
     // Without this, typing what a UST file imports (`[dh ae dh]`) scattered `[dh` / `ae` / `dh]` across
     // three notes and painted all three OOV-red, while the identical text arriving through import

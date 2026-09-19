@@ -395,11 +395,17 @@ fn targets(
 ) -> (Position, i64, i64) {
     let (onset_end, nuc) = syllable_split(ph);
     if i < onset_end {
-        let measured = onset_target_frames(ph[i], note_frames);
+        // ⛔ S170 — must be the CONTEXT-AWARE target, the same one the allocator spends against.
+        // `onset_target_frames` alone reads the pooled `w` row (made of post-vowel /w/), so every
+        // cluster /w/ of the くぁ族 came back 582× STARVED against a target production never asked
+        // for. That is an instrument that is permanently red for a reason that is not the defect —
+        // the exact shape this repo's first iron rule exists to forbid.
+        let measured = onset_target_in_cluster(ph, i, note_frames);
         let effective = if onset_capped_to_2 { measured.min(2) } else { measured };
         (Position::Onset, effective, measured)
     } else if i < nuc {
-        let measured = if is_nucleus_phone(ph[i]) { in_note[i] } else { onset_target_frames(ph[i], note_frames) };
+        let measured =
+            if is_nucleus_phone(ph[i]) { in_note[i] } else { onset_target_in_cluster(ph, i, note_frames) };
         (Position::Medial, in_note[i], measured)
     } else if i == nuc {
         // 核在音符内的分配额(信息列)。它**不是**判据 —— 判据走借帧账本,见 `audit()`。

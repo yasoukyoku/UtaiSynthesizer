@@ -162,7 +162,7 @@ fn lyric_to_phones(lyr: &str) -> Lyric {
 /// ALL-OR-NOTHING: any position that cannot be consumed returns None (→ the caller's romaji chain,
 /// and ultimately a LOUD `Unknown`). A partial parse is precisely the silent truncation this replaces.
 fn kana_tokenize(s: &str) -> Option<Vec<&'static str>> {
-    let chars: Vec<char> = s.chars().collect();
+    let chars: Vec<char> = compose_kana_marks(s);
     let (kana, r2ipa) = (kana_map(), r2ipa_map());
     let mut out: Vec<&'static str> = Vec::new();
     let mut i = 0usize;
@@ -198,6 +198,16 @@ fn kana_tokenize(s: &str) -> Option<Vec<&'static str>> {
                     break;
                 }
             }
+            // S170 FOURTH branch — 鼻濁音 written as か行 + COMBINING HANDAKUTEN (か゚). Same silent
+            // truncation shape as the third branch, one column further out. See `nasal_g_kana_phones`
+            // for why it resolves to the が row and not to [ŋ].
+            if w == 2 {
+                if let Some(v) = nasal_g_kana_phones(&slice) {
+                    out.extend(v);
+                    took = w;
+                    break;
+                }
+            }
         }
         if took == 0 {
             match chars[i] {
@@ -221,14 +231,129 @@ fn kana_tokenize(s: &str) -> Option<Vec<&'static str>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// ⛔⛔ S170 — 濁点/半濁点 as COMBINING marks (U+3099 / U+309A), i.e. the NFD form of が/ぱ/ゔ.
+///
+/// `が` has two perfectly legal Unicode spellings: precomposed U+304C, or **か + U+3099**. Both are
+/// the same character to a reader, and NFD is what macOS filesystems, several text pipelines and
+/// some UST/MIDI importers hand you. Until this function existed, `kana_tokenize` consumed the base
+/// kana, hit the combining mark, and fell into its `_ => break` — so the mark was silently dropped:
+///   が(NFD) sang **[k a]**  — the か row, i.e. the VOICING was flipped with no OOV and no red mark;
+///   ば(NFD) → [h a] · ぱ(NFD) → [h a] · ざ(NFD) → [s a] · だ(NFD) → [t a] · ゔ(NFD) → [ɯ] …
+/// and because `_ => break` KEEPS what it already consumed, a whole NFD lyric was truncated at its
+/// first voiced mora: 「がっこうへいこう」 rendered as **[k a]** and nothing else. Measured, not
+/// reasoned — the probe transcript is in the S170 scratchpad.
+///
+/// Composing here (rather than NFC-normalising the whole lyric) keeps it to zero new dependencies
+/// and puts the fix in the one function that had the bug. The table is the complete hiragana
+/// dakuten/handakuten inventory; katakana has already been folded onto hiragana upstream by
+/// `g2p::fold_katakana`, so ヴ arrives as う + U+3099.
+/// ⚠ か行 + U+309A is deliberately NOT composed — it is 鼻濁音 and has no precomposed form;
+/// `nasal_g_kana_phones` owns it and needs the two characters intact.
+/// ⚠ A lone U+3099/U+309A stays unresolved, which is what `s102_ja_kana_block_coverage` pins.
+const KANA_COMBINING_MARKS: &[(char, char, char)] = &[
+    // (base, mark, composed) — 濁点 U+3099
+    ('か', '\u{3099}', 'が'), ('き', '\u{3099}', 'ぎ'), ('く', '\u{3099}', 'ぐ'),
+    ('け', '\u{3099}', 'げ'), ('こ', '\u{3099}', 'ご'),
+    ('さ', '\u{3099}', 'ざ'), ('し', '\u{3099}', 'じ'), ('す', '\u{3099}', 'ず'),
+    ('せ', '\u{3099}', 'ぜ'), ('そ', '\u{3099}', 'ぞ'),
+    ('た', '\u{3099}', 'だ'), ('ち', '\u{3099}', 'ぢ'), ('つ', '\u{3099}', 'づ'),
+    ('て', '\u{3099}', 'で'), ('と', '\u{3099}', 'ど'),
+    ('は', '\u{3099}', 'ば'), ('ひ', '\u{3099}', 'び'), ('ふ', '\u{3099}', 'ぶ'),
+    ('へ', '\u{3099}', 'べ'), ('ほ', '\u{3099}', 'ぼ'),
+    ('う', '\u{3099}', 'ゔ'), ('ゝ', '\u{3099}', 'ゞ'),
+    // 半濁点 U+309A — は行 only (か行 is 鼻濁音, see above)
+    ('は', '\u{309A}', 'ぱ'), ('ひ', '\u{309A}', 'ぴ'), ('ふ', '\u{309A}', 'ぷ'),
+    ('へ', '\u{309A}', 'ぺ'), ('ほ', '\u{309A}', 'ぽ'),
+];
+
+/// Fold every `base + combining dakuten/handakuten` pair onto its precomposed kana — see the table.
+fn compose_kana_marks(s: &str) -> Vec<char> {
+    let raw: Vec<char> = s.chars().collect();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0usize;
+    while i < raw.len() {
+        let composed = (i + 1 < raw.len())
+            .then(|| {
+                KANA_COMBINING_MARKS
+                    .iter()
+                    .find(|&&(b, m, _)| b == raw[i] && m == raw[i + 1])
+                    .map(|&(_, _, c)| c)
+            })
+            .flatten();
+        match composed {
+            Some(c) => {
+                out.push(c);
+                i += 2;
+            }
+            None => {
+                out.push(raw[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Small-vowel kana → the vowel IPA it substitutes (外来拗音 second element).
 const SMALL_VOWEL_IPA: &[(char, &'static str)] = &[('ぁ', "a"), ('ぃ', "i"), ('ぅ', "ɯ"), ('ぇ', "e"), ('ぉ', "o")];
 
-/// Vowel-onset foreign rows the generic vowel-swap can't derive (う/い have no consonant onset):
-/// the UTAU convention reads them as w-/y-glide syllables. ゔ行 is NOT here — base ゔ ([v ɯ], S58
-/// KANA_EXTRA) goes through the generic rule like any consonant kana.
-const FOREIGN_KANA_EXPLICIT: &[(&str, &[&'static str])] =
-    &[("うぃ", &["w", "i"]), ("うぇ", &["w", "e"]), ("うぉ", &["w", "o"]), ("いぇ", &["j", "e"])];
+/// Rows where the GENERIC vowel-swap structurally deletes a glide, so they must be spelled out.
+///
+/// ⛔ S170 — the criterion this table used to document ("う/い have no consonant onset") was the
+/// WRONG QUESTION, and it cost us the whole く/ぐ family. The generic rule in `foreign_kana_phones`
+/// takes the base mora's IPA, throws its LAST phone away as "the nucleus being swapped", and keeps
+/// the head as the onset. That is sound only when the discarded phone really is just a nucleus:
+///   * う (=[ɯ]) / い (=[i]) — the discarded phone IS the whole mora, so the glide the UTAU
+///     convention asks for (うぉ = /wo/, いぇ = /je/) has nothing left to come from;
+///   * く (=[k ɯ]) / ぐ (=[ɡ ɯ]) — the discarded [ɯ] is the SOURCE of the labial glide
+///     (くぁ = /kʷa/), so the generic rule emitted [k a], i.e. **exactly か**, phone for phone.
+///     Reported by a community user rendering a UTAU extended reclist (S170): 56 notes of his sheet
+///     came out as the plain か/が row with no OOV and no red mark, so nothing in the editor could
+///     tell him. ⇒ the real criterion is "does this base's nucleus carry a glide?", never
+///     "does it have an onset?".
+///
+/// The く/ぐ spelling is `k`/`ɡ` + `w`, NOT the single token `kʷ`: `kʷ` IS in the 210-token vocab
+/// but `score2cv_dur_priors.rs` measures it at onset n=0 / coda n=0 — the S99 dead end. `k w` is
+/// what the TRAINING LABELS themselves use: the OFUTON/ONIKU `.lab` files (the same extended
+/// reclist, hand-annotated by the corpus author) write `k w a` / `g w o` with real time boundaries,
+/// and the final training set (44947 clips = splits/train_final + val_final, NOT the 163729-line
+/// manifest) has ja bigrams `k`+`w` = 61 and `ɡ`+`w` = 58, all five vowels present.
+/// ⚠ The DURATION half of this fix is not optional — see `CLUSTER_GLIDE_ONSET_FRAMES`.
+///
+/// ゔ行 is NOT here — base ゔ ([v ɯ]) has an ordinary nucleus and goes through the generic rule.
+/// くゎ/ぐゎ (the historical /kwa/ spelling; katakana クヮ/グヮ folds onto them) are here because
+/// small ゎ is in NO other table: `kana_tokenize` consumed just く and then hit its `_ => break`,
+/// singing [k ɯ] with no OOV — the S86/S99 silent-truncation family, in the one column nobody
+/// covered. ⚠ ゎ must NOT become singable on its own: `s102_ja_kana_block_coverage` pins it in the
+/// unresolved list, and that pin is what keeps a bare small kana from being sung as a mora.
+///
+/// ⚠ The う/い rows below are DERIVED FROM THE SAME PRINCIPLE, not corpus-attested: only うぃ/うぇ/
+/// うぉ/いぇ appear in the training reclist. うぁ/いぁ/いぅ/いぉ are spelled out so the family cannot
+/// keep half a rule — today they silently drop the glide and sing a bare vowel (うぁ → [a] = あ).
+const FOREIGN_KANA_EXPLICIT: &[(&str, &[&'static str])] = &[
+    // う行 = /w/ · い行 = /j/  (うぅ/いぃ are the identity case — the generic rule owns those)
+    ("うぁ", &["w", "a"]),
+    ("うぃ", &["w", "i"]),
+    ("うぇ", &["w", "e"]),
+    ("うぉ", &["w", "o"]),
+    ("いぁ", &["j", "a"]),
+    ("いぅ", &["j", "ɯ"]),
+    ("いぇ", &["j", "e"]),
+    ("いぉ", &["j", "o"]),
+    // く行/ぐ行 = labialised /kʷ/ /ɡʷ/, written as the two attested tokens
+    ("くぁ", &["k", "w", "a"]),
+    ("くぃ", &["k", "w", "i"]),
+    ("くぅ", &["k", "w", "ɯ"]),
+    ("くぇ", &["k", "w", "e"]),
+    ("くぉ", &["k", "w", "o"]),
+    ("くゎ", &["k", "w", "a"]),
+    ("ぐぁ", &["ɡ", "w", "a"]),
+    ("ぐぃ", &["ɡ", "w", "i"]),
+    ("ぐぅ", &["ɡ", "w", "ɯ"]),
+    ("ぐぇ", &["ɡ", "w", "e"]),
+    ("ぐぉ", &["ɡ", "w", "o"]),
+    ("ぐゎ", &["ɡ", "w", "a"]),
+];
 
 /// UTAI EXTENSION (S69): resolve a UTAU-convention foreign-sound kana (外来拗音) lyric, or None to
 /// fall through to the legacy chain. Generic rule: 「base kana + small vowel ぁぃぅぇぉ」 = the
@@ -276,6 +401,40 @@ fn foreign_kana_phones(s0: &str) -> Option<Vec<&'static str>> {
     Some(v)
 }
 
+/// UTAI EXTENSION (S170) — 鼻濁音 written the STANDARD way: か行 + COMBINING HANDAKUTEN U+309A
+/// (か゚き゚く゚け゚こ゚; the katakana forms arrive here already folded by `g2p::fold_katakana`).
+///
+/// It resolves to the **が row**, and that is a loss we are choosing knowingly:
+///   * the phonetically right answer is [ŋ]. `ŋ` IS in the 210-token vocab, but its **ja training
+///     exposure is 0** — all 3597 occurrences come from de/en/es/fr and are overwhelmingly codas
+///     (onset 142 vs coda 2165) — and every ja `ŋ`+vowel bigram is 0 (pooled, only `ŋ a` = 1).
+///     Emitting it is the move S99 killed for `tʲ`, with an extra position mismatch on top.
+///   * the training side declined the rule on purpose: `MBS2H/src/preprocessing/dict_fixes.py`
+///     marks the ja が-row [ŋ] allophone "speaker/dialect-dependent, not text-derivable ⇒ SKIPPED",
+///     so there is no label to align to either.
+/// ⇒ 鼻濁音 is a capability we do not have, and no G2P edit can create it. What this function fixes
+/// is narrower and unambiguous: か゚ used to fall through `kana_tokenize`'s `_ => break` and sing
+/// **[k a]** — the か row — so the VOICING came out wrong on top of the nasality, silently. Reading
+/// it as が keeps voicing and place, and matches how the katakana ガ spelling of the same reclist
+/// convention already renders.
+fn nasal_g_kana_phones(s0: &str) -> Option<Vec<&'static str>> {
+    let mut it = s0.chars();
+    let (base, mark) = (it.next()?, it.next()?);
+    if mark != '\u{309A}' || it.next().is_some() {
+        return None;
+    }
+    let voiced = match base {
+        'か' => "が",
+        'き' => "ぎ",
+        'く' => "ぐ",
+        'け' => "げ",
+        'こ' => "ご",
+        _ => return None,
+    };
+    let romaji = kana_map().get(voiced)?;
+    r2ipa_map().get(*romaji).map(|s| s.to_vec())
+}
+
 /// The onset a base kana wears on its 拗音 row (き→きゃ→[c a] ⇒ `[c]`), or None if it has no such row.
 /// Derived from the SAME generated tables as everything else — the palatal counterparts are never
 /// spelled out by hand here.
@@ -288,6 +447,40 @@ fn yoon_onset(base: &str) -> Option<Vec<&'static str>> {
 
 /// Small palatal-glide kana → the romaji key of the standalone ya-row mora it stands for.
 const SMALL_YA_ROMAJI: &[(char, &str)] = &[('ゃ', "ya"), ('ゅ', "yu"), ('ょ', "yo")];
+
+/// ⛔ S170 — the two 拗音 rows whose TRAINING LABEL is a single palatal token, which the generic
+/// `base onset + [j V]` derivation below cannot produce.
+///
+/// This corrects S99's own choice, on S99's own criterion. S99 picked `t j ɯ` over the single token
+/// `tʲ` because `tʲ` measures onset n=0 — right call — and justified the replacement with the TOKEN
+/// exposure of the pieces (`j` n=4868, `t` n=16602). But the piece exposure is pooled across all
+/// seven languages, and what the model is actually asked for is the BIGRAM. Measured on the real
+/// training set (44947 clips): **ja `t`+`j` = 0 and ja `d`+`j` = 0** (pooled 550 / 273, every one of
+/// them English or Spanish). So the shipped spelling was itself a zero-exposure sequence in the only
+/// language that uses it — the very thing the rule exists to forbid, one level up.
+///
+/// The labels say what to use instead. Aligning the ofuton/oniku UST lyric columns against their
+/// `mono_label` phone strings gives てゃ→`ty a`(n=24) てゅ→`ty u`(9) てょ→`ty o`(10) でゃ→`dy a`(19)
+/// でゅ→`dy u`(10) でょ→`dy o`(9), and `phoneme_vocab.py::JA_ROMAJI_TO_IPA` maps `ty`→`c`, `dy`→`ɟ`
+/// — the SAME tokens the ordinary きゃ/ぎゃ rows already ship. ja bigrams: `c`+a/ɯ/o = 64/78/82,
+/// `ɟ`+a/ɯ/o = 51/32/46. ⇒ this swaps a ja=0 sequence for a ja=32..82 one AND drops the mora from
+/// three phones to two (its onset stops costing `t`+`j` = 10 frames on a long note).
+///
+/// ⚠ でぇ is deliberately NOT here even though the corpus has it as `dy e` (n=9). In that reclist it
+/// is the ぇ column of the dy row, but in ordinary lyrics 「でぇ」 is a stylistic lengthening of で —
+/// and the identity short-circuit in `foreign_kana_phones` exists for exactly that reading
+/// (にぃ/てぇ/ふぅ). One corpus using a spelling one way does not outrank ordinary Japanese; the
+/// ambiguity is real and is recorded rather than resolved by fiat.
+/// ⚠ ふゅ/ゔゅ stay on the derived path: they are absent from the corpus, so there is no label to
+/// align to, and inventing one would be the thing this comment is complaining about.
+const SMALL_YA_EXPLICIT: &[(&str, &[&'static str])] = &[
+    ("てゃ", &["c", "a"]),
+    ("てゅ", &["c", "ɯ"]),
+    ("てょ", &["c", "o"]),
+    ("でゃ", &["ɟ", "a"]),
+    ("でゅ", &["ɟ", "ɯ"]),
+    ("でょ", &["ɟ", "o"]),
+];
 
 /// UTAI EXTENSION (S99, S86#8-3): 「base kana + small ゃゅょ」 that the generated kana table does NOT
 /// contain — てゅ/でゅ/ふゅ/ゔゅ and the ゃ/ょ members of those rows. Before this, TWO gaps stacked into a
@@ -316,6 +509,11 @@ const SMALL_YA_ROMAJI: &[(char, &str)] = &[('ゃ', "ya"), ('ゅ', "yu"), ('ょ',
 fn small_ya_kana_phones(s0: &str) -> Option<Vec<&'static str>> {
     if kana_map().contains_key(s0) {
         return None; // the generated table owns the real 拗音 rows — see ORDER TRAP above
+    }
+    // S170: the ty/dy rows the training labels spell as ONE palatal token — must win over the
+    // generic `base onset + [j V]` derivation below. See `SMALL_YA_EXPLICIT`.
+    if let Some(&(_, seq)) = SMALL_YA_EXPLICIT.iter().find(|&&(k, _)| k == s0) {
+        return Some(seq.to_vec());
     }
     let chars: Vec<char> = s0.chars().collect();
     let last = *chars.last()?;
@@ -688,15 +886,16 @@ pub(crate) fn onset_want_frames(
     short_cap: bool,
     enabled: bool,
 ) -> i64 {
-    ph[..onset_end]
-        .iter()
-        .map(|&p| {
+    (0..onset_end)
+        .map(|i| {
             let t = {
-                let t = onset_target_frames(p, fr);
+                // S170: indexed, not by-value — the cluster /w/ needs its LEFT neighbour to be
+                // costed correctly (`onset_target_in_cluster`).
+                let t = onset_target_in_cluster(ph, i, fr);
                 if short_cap { t.min(2) } else { t }
             };
             match rest_fr {
-                Some(rf) if enabled => t.min(onset_target_frames(p, rf)),
+                Some(rf) if enabled => t.min(onset_target_in_cluster(ph, i, rf)),
                 _ => t,
             }
         })
@@ -748,6 +947,44 @@ pub(crate) fn parse_rest_bucket_target(v: Option<&str>) -> bool {
 
 fn onset_target_frames(p: &str, fr: i64) -> i64 {
     dur_prior(p).map(|(o, _, _)| o[dur_bucket(fr)]).unwrap_or(ONSET_TARGET_FALLBACK)
+}
+
+/// ⛔ S170 — the /w/ of a LABIALISED onset cluster (`k w V` / `ɡ w V`, i.e. the くぁ族/ぐぁ族 that
+/// `FOREIGN_KANA_EXPLICIT` now spells out) is NOT the same segment as the /w/ of わ, and giving it
+/// the pooled `w` row is what makes the otherwise-correct spelling regress.
+///
+/// Measured on the training npz (the 6 ja corpora, 88606 ja phones — not the alignment layer):
+///   `w` after `k`  n=61 → 56/61 = 91.8% are ONE frame
+///   `w` after `ɡ`  n=58 → 48/58 = 82.8% are ONE frame      (together 104/119 = 87.4%, median 1)
+///   `w` after a vowel (o 439 / i 338 / a 333 / e 164 / ɯ 147) → only 3.2–10.2% are one frame,
+///   median 3 — and THAT group is what the pooled `PHONE_DUR_PRIORS` row `("w", [3, 3, 4], …)`
+///   is made of. Handing it to a cluster /w/ asks for 3–4× the length the model was trained on.
+///
+/// Measured cost of getting it wrong (`mg_audit` over note lengths 4..50 on the reporter's own
+/// reclist kw/gw rows; arms differ ONLY in `phonemeInput`, one binary):
+///   today (glide deleted)     bad findings: 0 at ≥12 frames, 157 over the whole sweep
+///   `k w V` with the pooled w                24 at ≥16 frames, 48 at ≥12, 508 over the sweep
+///   `k w V` with this cap                     0 at ≥12 frames, 316 over the sweep
+/// i.e. the cap is what keeps the fix from buying a correct phone with starved neighbours. What is
+/// left below 12 frames is arithmetic, not policy: three phones do not fit in a 4–6 frame note.
+///
+/// ⚠ What actually LANDS is 2 frames, not 1: the allocator floors every surviving onset at
+/// `CODA_MIN_FRAMES` and drops anything below it ("a 1-frame phone is categorically OOD"). So this
+/// constant asks for the trained median and the floor rounds it to the nearest legal value — 40 ms
+/// against the pooled row's 80 ms. Measured on the reporter's own score (150 BPM quarter notes =
+/// 20 frames): every くぁ族 onset comes out `k`6 + `w`2 / `ɡ`4 + `w`2.
+///
+/// ⚠ Deliberately NOT a general mechanism. The repo has no per-language and no per-left-context
+/// duration table, and inventing one off a single measured pair would be exactly the "one rule to
+/// rescue one family" move S161 判负. This is one measured constant for one measured context.
+const CLUSTER_GLIDE_ONSET_FRAMES: i64 = 1;
+
+/// `onset_target_frames` plus the one context the pooled table gets wrong — see the const above.
+fn onset_target_in_cluster(ph: &[&str], i: usize, fr: i64) -> i64 {
+    if ph[i] == "w" && i > 0 && matches!(ph[i - 1], "k" | "ɡ") {
+        return CLUSTER_GLIDE_ONSET_FRAMES;
+    }
+    onset_target_frames(ph[i], fr)
 }
 fn coda_target_frames(p: &str, fr: i64) -> i64 {
     dur_prior(p).map(|(_, c, _)| c[dur_bucket(fr)]).unwrap_or(CODA_TARGET_FALLBACK)
@@ -1233,23 +1470,248 @@ mod foreign_kana_tests {
 
     /// S99 (S86#8-3): 「base + small ゃゅょ」 rows the generated chart has no romaji for. Before this
     /// they were SILENTLY TRUNCATED to the base mora — てゅ sang [t e] with no OOV and no red mark.
+    ///
+    /// ⛔ S170 CORRECTED THE ty/dy HALF OF THIS. S99 pinned てゅ = `[t j ɯ]`, reasoning from the
+    /// TOKEN exposure of the pieces (`j` n=4868, `t` n=16602) after correctly refusing the
+    /// zero-exposure single token `tʲ`. But the model is asked for the BIGRAM, and on the real
+    /// training set (44947 clips) **ja `t`+`j` = 0 and ja `d`+`j` = 0** — the shipped spelling was
+    /// itself a zero-exposure sequence in the only language that uses it. The labels give the
+    /// answer: てゅ is annotated `ty u` → `c ɯ` (ja `c`+`ɯ` = 78). See `SMALL_YA_EXPLICIT`.
+    /// ⇒ the ty/dy rows now assert the LABEL spelling; ふ/ゔ keep the derived one (no label exists
+    /// for them, and inventing one is the move this whole comment is against).
     #[test]
     fn small_ya_kana_rows_sing_in_full() {
         for (k, want) in [
-            ("てゅ", vec!["t", "j", "ɯ"]), ("てゃ", vec!["t", "j", "a"]), ("てょ", vec!["t", "j", "o"]),
-            ("でゅ", vec!["d", "j", "ɯ"]),
+            // ty/dy: the training label's single palatal token (S170)
+            ("てゅ", vec!["c", "ɯ"]), ("てゃ", vec!["c", "a"]), ("てょ", vec!["c", "o"]),
+            ("でゅ", vec!["ɟ", "ɯ"]), ("でゃ", vec!["ɟ", "a"]), ("でょ", vec!["ɟ", "o"]),
+            // no label to align to ⇒ still the derived `base onset + [j V]`
             ("ふゅ", vec!["ɸ", "j", "ɯ"]), ("ふゃ", vec!["ɸ", "j", "a"]), ("ふょ", vec!["ɸ", "j", "o"]),
             ("ゔゅ", vec!["v", "j", "ɯ"]),
         ] {
             assert_eq!(phones(k), want, "{k}");
         }
+        // ⛔ the thing S170 actually fixed: the shipped spelling used a sequence the model has never
+        // seen in Japanese. Keep it as an explicit NE so a "tidy-up" back to the compositional form
+        // has to delete this line and read why.
+        assert_ne!(phones("てゅ"), vec!["t", "j", "ɯ"], "ja `t`+`j` bigram exposure is 0");
+        assert_ne!(phones("でゅ"), vec!["d", "j", "ɯ"], "ja `d`+`j` bigram exposure is 0");
         // katakana arrives folded upstream, same as the small-vowel family
-        assert_eq!(phones(&super::super::g2p::fold_katakana("テュ")), vec!["t", "j", "ɯ"]);
+        assert_eq!(phones(&super::super::g2p::fold_katakana("テュ")), vec!["c", "ɯ"]);
         // inside a multi-mora string, and with a 長音符 that must add no phone
-        assert_eq!(phones("てゅーん"), vec!["t", "j", "ɯ", "ɴ"]);
+        assert_eq!(phones("てゅーん"), vec!["c", "ɯ", "ɴ"]);
         // a sustain after it must carry the SWAPPED vowel (ɯ), not the base's e
         let arr = build_arrays(&[("てゅ", 60, 80), ("ー", 60, 80)]).unwrap();
-        assert_eq!(arr.phon, vec!["t", "j", "ɯ", "ɯ"], "sustain re-emits the small-ya vowel");
+        assert_eq!(arr.phon, vec!["c", "ɯ", "ɯ"], "sustain re-emits the small-ya vowel");
+    }
+
+    /// ⛔ S170 — くぁ族/ぐぁ族 keep their /w/. The reported bug: the generic vowel-swap threw away the
+    /// base's [ɯ], which for く/ぐ IS the glide, so every one of these sang the plain か/が row.
+    ///
+    /// The `assert_ne!`s are the load-bearing half. "くぁ resolves and its phones are in the vocab"
+    /// was TRUE all along — that is exactly why every existing test stayed green — so a gate that
+    /// only checks resolution is vacuous here. What was never asserted is that くぁ ≠ か.
+    #[test]
+    fn s170_labialised_kana_keep_their_glide() {
+        for (k, want) in [
+            ("くぁ", vec!["k", "w", "a"]), ("くぃ", vec!["k", "w", "i"]), ("くぅ", vec!["k", "w", "ɯ"]),
+            ("くぇ", vec!["k", "w", "e"]), ("くぉ", vec!["k", "w", "o"]), ("くゎ", vec!["k", "w", "a"]),
+            ("ぐぁ", vec!["ɡ", "w", "a"]), ("ぐぃ", vec!["ɡ", "w", "i"]), ("ぐぅ", vec!["ɡ", "w", "ɯ"]),
+            ("ぐぇ", vec!["ɡ", "w", "e"]), ("ぐぉ", vec!["ɡ", "w", "o"]), ("ぐゎ", vec!["ɡ", "w", "a"]),
+        ] {
+            assert_eq!(phones(k), want, "{k}");
+        }
+        // the defect itself, stated as the inequality nobody was asserting
+        for (bad, same_as) in [
+            ("くぁ", "か"), ("くぃ", "き"), ("くぇ", "け"), ("くぉ", "こ"), ("くぅ", "く"), ("くゎ", "く"),
+            ("ぐぁ", "が"), ("ぐぃ", "ぎ"), ("ぐぇ", "げ"), ("ぐぉ", "ご"), ("ぐぅ", "ぐ"), ("ぐゎ", "ぐ"),
+        ] {
+            assert_ne!(phones(bad), phones(same_as), "{bad} collapsed onto {same_as}");
+        }
+        // katakana クヮ/グヮ arrive folded (S58 `fold_katakana`), so they must land on the same rows
+        for (kata, hira) in [("クヮ", "くゎ"), ("グヮ", "ぐゎ")] {
+            assert_eq!(phones(&super::super::g2p::fold_katakana(kata)), phones(hira), "{kata}");
+        }
+        // ⚠ small ゎ must NOT become singable alone — `s102_ja_kana_block_coverage` pins it unresolved,
+        // and that pin is what stops a bare small kana from being sung as a mora.
+        assert!(matches!(classify_lyric("ゎ"), LyricClass::Unknown { .. }), "bare ゎ must stay OOV");
+    }
+
+    /// S170 — the DURATION half of the labialised-cluster fix, and it is not optional. Emitting
+    /// `k w a` with the pooled `w` row ([3,3,4], which is made of POST-VOWEL /w/ — わ, うぉ) asks for
+    /// 3–4× the length the model was trained on after a stop. `mg_audit` over note lengths 4..50 on
+    /// the reporter's own kw/gw rows, all three arms from one binary:
+    ///   today (glide deleted)      bad findings 0 at ≥12 frames
+    ///   `k w V`, pooled `w`                    48 at ≥12 frames (STARVED 24 @16fr, 24 @12fr)
+    ///   `k w V` + this cap                      0 at ≥12 frames  ← back to parity, glide kept
+    /// What is left below 12 frames is arithmetic (three phones do not fit in a 4–6 frame note),
+    /// not policy, and it is the same shape every 3-phone mora already has.
+    #[test]
+    fn s170_cluster_glide_gets_its_measured_frame() {
+        for fr in [8, 16, 20, 40] {
+            // same phone, two left contexts — this is the whole point
+            assert_eq!(onset_target_in_cluster(&["k", "w", "a"], 1, fr), CLUSTER_GLIDE_ONSET_FRAMES);
+            assert_eq!(onset_target_in_cluster(&["ɡ", "w", "a"], 1, fr), CLUSTER_GLIDE_ONSET_FRAMES);
+            // post-vowel /w/ (わ / うぉ) must keep the pooled row — that half must NOT change
+            assert_eq!(onset_target_in_cluster(&["w", "a"], 0, fr), onset_target_frames("w", fr));
+            assert!(
+                onset_target_frames("w", fr) > CLUSTER_GLIDE_ONSET_FRAMES,
+                "vacuous at fr={fr}: the pooled row already equals the cap"
+            );
+        }
+        // …and it reaches the real allocation. ⚠ `build_arrays` is the Phase-1c PARITY port
+        // (legacy `split_dur`, not frame-conserving) and never consults these targets at all — the
+        // DAW assembly is the one that does, so a duration assertion has to go through it.
+        // 2, not 1: the allocator floors a surviving onset at CODA_MIN_FRAMES (a 1-frame phone is
+        // categorically OOD), so the trained median rounds up to the nearest legal value — still
+        // half of what the pooled row would have taken.
+        let evts: Vec<g2p::ScoreEvt> =
+            [("くぁ", 60, 20), ("わ", 60, 20)].iter().map(g2p::ScoreEvt::ja).collect();
+        let arr = build_arrays_daw(&evts, &NoDicts, ArticulationTiming::InNote).unwrap();
+        let cluster_w = arr.phon.iter().position(|p| *p == "w").expect("the glide is emitted");
+        let bare_w = arr.phon.iter().rposition(|p| *p == "w").expect("わ's own /w/");
+        assert_ne!(cluster_w, bare_w, "vacuous: the two /w/ are the same phone slot");
+        assert_eq!(arr.phone_dur[cluster_w], CODA_MIN_FRAMES, "cluster /w/ took the pooled length");
+        assert!(
+            arr.phone_dur[bare_w] > arr.phone_dur[cluster_w],
+            "わ's /w/ must stay longer than the cluster's ({} vs {})",
+            arr.phone_dur[bare_w],
+            arr.phone_dur[cluster_w]
+        );
+    }
+
+    /// S170 — the う/い rows, same root cause one column over: their nucleus IS the glide, so the
+    /// generic swap left a bare vowel (うぁ → [a] = あ). うぃ/うぇ/うぉ/いぇ were already spelled out
+    /// by S69; the other four were not, and nothing noticed.
+    #[test]
+    fn s170_vowel_onset_rows_keep_their_glide() {
+        for (k, want) in [
+            ("うぁ", vec!["w", "a"]), ("いぁ", vec!["j", "a"]),
+            ("いぅ", vec!["j", "ɯ"]), ("いぉ", vec!["j", "o"]),
+        ] {
+            assert_eq!(phones(k), want, "{k}");
+        }
+        // same sound as わ/や/ゆ/よ is CORRECT here (they are the same syllable, two spellings) —
+        // what must not hold is the bare-vowel answer the generic rule used to give.
+        for (k, bare) in [("うぁ", "あ"), ("いぁ", "あ"), ("いぅ", "う"), ("いぉ", "お")] {
+            assert_ne!(phones(k), phones(bare), "{k} lost its glide and sang {bare}");
+        }
+        // the identity column stays the base mora (S99: 「にぃ」「てぇ」「ふぅ」 are lengthenings)
+        assert_eq!(phones("うぅ"), phones("う"));
+        assert_eq!(phones("いぃ"), phones("い"));
+    }
+
+    /// ⛔⛔ S170 — 濁点/半濁点 as COMBINING marks (the NFD form). This is the widest of the batch:
+    /// it is not an exotic reclist column, it is ordinary Japanese arriving from macOS, from several
+    /// text pipelines and from some importers. `kana_tokenize` used to drop the mark AND truncate the
+    /// rest of the lyric at it, so 「がっこうへいこう」 in NFD sang `[k a]` and stopped.
+    ///
+    /// The assertion is judgement-free: the two legal spellings of the same character must produce
+    /// the same phones. No pinned expectations to drift.
+    #[test]
+    fn s170_combining_dakuten_is_not_silently_dropped() {
+        for &(base, mark, composed) in KANA_COMBINING_MARKS {
+            let decomposed = format!("{base}{mark}");
+            let pre = composed.to_string();
+            if matches!(classify_lyric(&pre), LyricClass::Unknown { .. }) {
+                continue; // ゞ and friends are not singable either way — nothing to compare
+            }
+            assert_eq!(phones(&decomposed), phones(&pre), "NFD {composed} ≠ precomposed {composed}");
+            assert_ne!(
+                phones(&decomposed),
+                phones(&base.to_string()),
+                "{composed} in NFD sang the UNVOICED base {base} — the mark vanished"
+            );
+        }
+        // the truncation half: the mark must not end the kana run
+        assert_eq!(phones("か\u{3099}っこうへいこう"), phones("がっこうへいこう"));
+        assert!(phones("か\u{3099}っこうへいこう").len() > 2, "NFD lyric was truncated at the mark");
+        // a lone combining mark stays unresolved — `s102_ja_kana_block_coverage` pins both
+        for m in ["\u{3099}", "\u{309A}"] {
+            assert!(matches!(classify_lyric(m), LyricClass::Unknown { .. }), "bare {m:?} must stay OOV");
+        }
+    }
+
+    /// S170 — 鼻濁音 written the standard way (か行 + U+309A). We cannot sing [ŋ] (ja exposure 0, and
+    /// the training side declined the rule on purpose — see `nasal_g_kana_phones`), so this reads as
+    /// the が row. The bug being fixed is narrower and not arguable: it used to sing the か row, i.e.
+    /// it lost the VOICING too.
+    #[test]
+    fn s170_nasal_g_orthography_reads_as_the_ga_row() {
+        for (nasal, voiced, unvoiced) in [
+            ("か\u{309A}", "が", "か"), ("き\u{309A}", "ぎ", "き"), ("く\u{309A}", "ぐ", "く"),
+            ("け\u{309A}", "げ", "け"), ("こ\u{309A}", "ご", "こ"),
+        ] {
+            assert_eq!(phones(nasal), phones(voiced), "{nasal} should read as {voiced}");
+            assert_ne!(phones(nasal), phones(unvoiced), "{nasal} lost its voicing");
+        }
+        // katakana カ゚ folds onto か゚ and must agree
+        assert_eq!(phones(&super::super::g2p::fold_katakana("カ\u{309A}")), phones("が"));
+        // ⛔ and it must NOT reach for [ŋ]: ja training exposure is 0 and every ja `ŋ`+vowel bigram
+        // is 0 — that is the S99 forbidden move, harder than the `tʲ` case S99 killed.
+        assert!(!phones("か\u{309A}").contains(&"ŋ"), "ŋ has zero ja training exposure");
+    }
+
+    /// ⛔ S170 — THE GATE `s102_ja_kana_block_coverage` STRUCTURALLY COULD NOT BE.
+    ///
+    /// That gate walks the Unicode blocks one CODE POINT at a time and asserts each either resolves
+    /// or is pinned unresolved. Every defect in this batch was invisible to it for two independent
+    /// reasons: ① they are TWO-character spellings, which a per-code-point walk never forms; and
+    /// ② they all RESOLVED, to in-vocab phones — くぁ gave `[k a]`, か゚ gave `[k a]`, が(NFD) gave
+    /// `[k a]`. "Resolves, and every phone is in the 210-token vocab" was true the whole time, on
+    /// all 448 green tests.
+    ///
+    /// What nothing asserted is that **adding a modifier changes something**. That is this test, and
+    /// it is judgement-free: it sweeps only the combinations that are REAL spellings, and for each
+    /// one requires the result to differ from the bare base. The identity column (にぃ/てぇ/ふぅ —
+    /// where the small vowel IS the base's own nucleus) is excluded by construction, not by a list,
+    /// because there the base's own answer is by definition the right one.
+    #[test]
+    fn s170_a_real_modified_spelling_never_leaves_the_phones_unchanged() {
+        let small_v = [('ぁ', "a"), ('ぃ', "i"), ('ぅ', "ɯ"), ('ぇ', "e"), ('ぉ', "o")];
+        let mut checked = 0usize;
+        for (base, _) in tbl::KANA.iter().chain(super::super::g2p_tables::KANA_EXTRA) {
+            if base.chars().count() != 1 {
+                continue; // the 拗音 rows are their own spellings, not base+modifier
+            }
+            let b = phones(base);
+            for (sv, ipa) in small_v {
+                if b.last() == Some(&ipa) {
+                    continue; // identity column — by design the base's own row (S99)
+                }
+                let s = format!("{base}{sv}");
+                checked += 1;
+                assert_ne!(phones(&s), b, "{s}: the small vowel vanished — it sings exactly {base}");
+            }
+            if b.last() == Some(&"i") {
+                for sy in ['ゃ', 'ゅ', 'ょ'] {
+                    let s = format!("{base}{sy}");
+                    checked += 1;
+                    assert_ne!(phones(&s), b, "{s}: the small ゃゅょ vanished");
+                }
+            }
+        }
+        // the ゎ column: only く/ぐ carry it (historical /kwa/ /gwa/ — かゎ etc. are not spellings)
+        for base in ["く", "ぐ"] {
+            let s = format!("{base}ゎ");
+            checked += 1;
+            assert_ne!(phones(&s), phones(base), "{s}: small ゎ vanished");
+        }
+        // the combining marks, including the 鼻濁音 column that has no precomposed form
+        for &(base, mark, _) in KANA_COMBINING_MARKS {
+            let s = format!("{base}{mark}");
+            if matches!(classify_lyric(&s), LyricClass::Unknown { .. }) {
+                continue;
+            }
+            checked += 1;
+            assert_ne!(phones(&s), phones(&base.to_string()), "{s}: the combining mark vanished");
+        }
+        for base in ["か", "き", "く", "け", "こ"] {
+            let s = format!("{base}\u{309A}");
+            checked += 1;
+            assert_ne!(phones(&s), phones(base), "{s}: the 半濁点 vanished");
+        }
+        assert!(checked >= 300, "the sweep must actually cover the family (got {checked})");
     }
 
     /// ★ THE order trap this rule could most easily cause (S86 and S98 both flagged it in advance):
@@ -1655,8 +2117,10 @@ fn assemble_arrays(
                             r.is_sustain
                                 && matches!(&r.kind, g2p::ResolvedKind::Phones(np) if np.first() == Some(&ph[nuc]))
                         });
-                    let target = |p: &'static str| {
-                        let t = onset_target_frames(p, fr);
+                    // S170: keyed by INDEX, not by phone — the cluster /w/ is costed from its left
+                    // neighbour (`onset_target_in_cluster`), which a by-value closure cannot see.
+                    let target = |i: usize| {
+                        let t = onset_target_in_cluster(ph, i, fr);
                         if fr <= 5 && !nucleus_held_by_next {
                             t.min(2)
                         } else {
@@ -1686,14 +2150,14 @@ fn assemble_arrays(
                     let mut onset_durs = vec![0i64; n];
                     if onset_end > 0 && timing == ArticulationTiming::InNote {
                         let avail = (fr - SUNG_KEEP_MIN).max(0).min((fr + 1) / 2);
-                        let want: i64 = ph[..onset_end].iter().map(|&p| target(p)).sum();
+                        let want: i64 = (0..onset_end).map(target).sum();
                         let mut left = want.min(avail);
                         reserved = left;
                         // LAST-first, exactly as the pre-roll arm: the consonant touching the vowel
                         // carries the syllable's identity, so a starved cluster sheds its OUTERMOST
                         // member first.
                         for i in (0..onset_end).rev() {
-                            let give = left.min(target(ph[i]));
+                            let give = left.min(target(i));
                             onset_durs[i] = give;
                             left -= give;
                         }
@@ -1738,7 +2202,7 @@ fn assemble_arrays(
                     // never starve a word-initial consonant.
                     let onset_allowance = if timing == ArticulationTiming::Auto && onset_end > 0 {
                         let floors = CODA_MIN_FRAMES * onset_end as i64;
-                        let want: i64 = ph[..onset_end].iter().map(|&p| target(p)).sum();
+                        let want: i64 = (0..onset_end).map(target).sum();
                         want.max(floors).min((fr - SUNG_KEEP_MIN).max(0).min((fr + 1) / 2))
                     } else {
                         0
@@ -1935,7 +2399,7 @@ fn assemble_arrays(
                         // syllable identity — a starved cluster sheds its outermost member first),
                         // each capped at its own measured, note-length-bucketed target.
                         for i in (0..onset_end).rev() {
-                            let give = left.min(target(ph[i]));
+                            let give = left.min(target(i));
                             durs[i] = give;
                             left -= give;
                         }
@@ -2005,7 +2469,7 @@ fn assemble_arrays(
                             let floor_takes = nuc_before_supplement - durs[nuc];
                             let mut allow = (cap - floor_takes).max(0);
                             for i in (0..onset_end).rev() {
-                                let t = target(ph[i]);
+                                let t = target(i);
                                 if allow == 0 || durs[i] == 0 || durs[i] >= t {
                                     continue;
                                 }

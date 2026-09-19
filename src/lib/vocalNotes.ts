@@ -332,7 +332,16 @@ export function isSilentLyric(lyric: string, tokens: VocalTokens): boolean {
   return isRestLyric(lyric, tokens.rest) || isBreathLyric(lyric, tokens.breath);
 }
 
-const SMALL_KANA = new Set([..."ぁぃぅぇぉゃゅょゎっゕゖァィゥェォャュョヮッ"]);
+// ⛔ S170 — U+3099 / U+309A (COMBINING 濁点/半濁点) belong here for exactly the reason every other
+// member does: they are legal ONLY after a base kana, so they ride on the token before them. They are
+// not exotic — they are the NFD spelling of が/ぱ/ゔ, which is what macOS, several text pipelines and
+// some importers hand you. Without them an NFD phrase was scattered one combining mark per note, each
+// painted OOV-red, while the identical text in NFC distributed correctly: two spellings of the same
+// lyric, two behaviours, no error message. (Rust's `kana_tokenize` composes them — `compose_kana_marks`
+// in score2cv.rs — so the split has to keep them attached for the two halves to agree.)
+// ⚠ the two marks are written as escapes on purpose: a combining character inside a string literal
+// visually glues itself to whatever precedes it, so the next reader cannot see how many there are.
+const SMALL_KANA = new Set([..."ぁぃぅぇぉゃゅょゎっゕゖァィゥェォャュョヮッ", "゙", "゚"]);
 
 /** Split a typed lyric phrase into per-note tokens (§9.2 auto-distribute). Whitespace-separated first;
  *  else an all-kana run splits per mora (a base kana + trailing small kana); an all-Han run splits per

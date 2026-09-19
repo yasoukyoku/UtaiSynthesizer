@@ -859,8 +859,21 @@ export const RANGE_ALGO_VERSION = "s166e";
  *  from (d) because s113 shipped one commit earlier and a bake stamped s113 renders (d) but not (e).
  *  Blast radius over 180 real Japanese scores on disk: ONE note. Truth surface = the shipped
  *  GTSinger annotation, where a `ɴ` held across two notes inside one word occurs 87 times and a
- *  `ɴ` re-opening to a vowel inside one word occurs 0. */
-export const G2P_ALGO_VERSION = "s113b";
+ *  `ɴ` re-opening to a vowel inside one word occurs 0.
+ *  (f) s170 — five JA readings changed, and every one of them used to be a SILENT SUCCESS, which is
+ *  precisely the case S99 established requires a bump ("the criterion is whether the old behaviour
+ *  was an error or a silent success, not how big the change is"): a user can be holding a
+ *  signature-clean bake of the WRONG audio.
+ *    · くぁくぃくぅくぇくぉ / ぐぁ… / くゎ・クヮ — the /w/ was deleted, so they rendered as the plain
+ *      か/が row, phone for phone (community report: 56 notes of one reclist);
+ *    · うぁ・いぁ・いぅ・いぉ — same shape one column over, they rendered as a bare vowel;
+ *    · てゃてゅてょ・でゃでゅでょ — were `[t j V]`/`[d j V]`, whose ja bigram exposure is 0; the
+ *      training labels spell them `ty`/`dy` → `[c V]`/`[ɟ V]` (ja 32..82);
+ *    · か゚き゚く゚け゚こ゚ (鼻濁音, U+309A) — the mark was dropped and they sang the UNVOICED か row;
+ *    · ⛔ any NFD lyric — a combining U+3099/U+309A was dropped AND truncated the rest of the
+ *      phrase, so 「がっこうへいこう」 in NFD rendered as `[k a]` and stopped. This one is not an
+ *      exotic column: NFD is what macOS and several importers hand you. */
+export const G2P_ALGO_VERSION = "s170";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a
