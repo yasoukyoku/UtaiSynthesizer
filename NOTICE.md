@@ -51,7 +51,7 @@ Both were trained on the same corpus set (44,947 clips; `train_final` / `val_fin
 | M4Singer (Chinese) | 44.5% | **CC BY-NC-SA 4.0** — https://github.com/M4Singer/M4Singer |
 | Tohoku Kiritan singing DB (東北きりたん歌唱データベース) / Tohoku Itako singing DB (東北イタコ歌唱データベース) — SSS LLC, Meiji University (Masanori Morise) | 1.2% / 1.1% | Non-commercial use under SSS LLC's usage agreement; models built with the data may be incorporated into public software/services only with SSS LLC's prior approval (agreement §3-6); https://zunko.jp/ |
 | Natsume Yuuri male singing DB (夏目悠李/男性歌声データベース) — ATSUYA | 1.0% | Non-commercial; distributing models built with the DB requires prior notice to ATSUYA and bundling「夏目悠李の出力音声に関する利用規約」 |
-| Ofuton P singing DB (おふとんP歌唱DB) | 1.0% | Non-commercial; distributing voice models built with the DB requires prior inquiry |
+| Ofuton P singing DB (おふとんP歌声データベース) | 1.0% | Non-commercial; distributing voice models built with the DB requires prior inquiry |
 | Oniku Kurumi singing DB (御丹宮くるみ歌声データべース) | 1.4% | Credit required; commercial use requires prior inquiry |
 | PJS: Phoneme-balanced Japanese Singing-voice corpus (Koguchi & Takamichi); lyrics from the Voice Actor Statistics Corpus (声優統計コーパス, 日本声優統計学会) | 0.4% | **CC BY-SA 4.0** (commercial use permitted) |
 
