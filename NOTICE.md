@@ -62,8 +62,9 @@ Credits required by the Japanese corpora's terms (verbatim):
 tuning is output of models trained on the corpora above, so their terms follow it:
 - It is the 「出力音声」 (output voice) of the Natsume Yuuri DB and falls under
   「夏目悠李の出力音声に関する利用規約」, published by ATSUYA at
-  https://ksdcm1ng.wixsite.com/njksofficial/%E8%A6%8F%E7%B4%84-rules and shipped unmodified
-  beside the model files (`NATSUME_OUTPUT_VOICE_TERMS.txt`). In particular: commercial use needs
+  https://ksdcm1ng.wixsite.com/njksofficial/%E8%A6%8F%E7%B4%84-rules; an unmodified copy is published
+  beside the model files on the download mirror (`huggingface.co/datasets/yasoukyoku/utai-runtimes`,
+  `models/auxiliary/NATSUME_OUTPUT_VOICE_TERMS.txt`). In particular: commercial use needs
   separate permission, and **generated audio must not be used to build acoustic/pitch models**
   (禁止事項 (8)) — this includes using it as training data in Utai's own training feature.
 - Commercial use of the generated singing is not permitted under the corpora's terms.
