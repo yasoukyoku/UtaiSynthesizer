@@ -820,7 +820,7 @@ Say you dragged in a full song and want to swap the vocals to your own model, wi
 | --- | --- |
 | Model dropdown | The installed models of this category |
 | "Overlap" | 2–8; higher = finer and slower (absent on the VR architecture) |
-| "Precision" | fp32 / fp16 — shown only when both are converted; fp16 is about twice as fast with half the VRAM, and the quality difference is inaudible |
+| "Precision" | fp32 / fp16 — shown only when both are converted; fp16 is about twice as fast with half the VRAM, and the quality difference is inaudible. With the inference device set to CPU, fp16 brings no benefit: the fp32 variant is used if it is installed, and if only fp16 is installed you are asked to convert fp32 (since v0.12.3) |
 | "Batch" | 1–16; lower it if VRAM runs short |
 | "Normalize" | Normalization toggle for spectrogram architectures |
 | "TTA" | Test-time augmentation: ~3× slower for a marginal quality gain |
@@ -1520,6 +1520,14 @@ Go to "Settings" → "Download Source / Network" and switch mirrors: mainland Ch
 - Out of VRAM: lower the separation node's "Batch"; download/use fp16 models; close other VRAM-hungry programs; leave "GPU extraction" unchecked on RVC/SoVITS nodes.
 - Training out of VRAM: lower "Batch size", turn on "Half precision (fp16)".
 
+**Q: Separation/inference fails with "the display driver timed out and was reset" (DirectML device lost)**
+
+The graphics driver timed out during a GPU operation and Windows reset it (the log shows a code such as `0x887A0006`). This is **not** an out-of-VRAM problem. To work around it, set "Settings" → "Hardware" → "Inference Device" to CPU and try again (much slower, but independent of the display driver); on an NVIDIA GPU, installing the CUDA runtime (see 2.4) is usually faster and more stable; updating the display driver may also help. The full technical error is written to the log — attach the log when reporting.
+
+**Q: My settings (inference device, data folder, …) suddenly went back to defaults**
+
+`config.json` in the installation folder could not be read at startup (for example it was damaged). Since v0.12.3 an unreadable file is no longer overwritten with defaults: it is kept next to it as `config.json.corrupt-1` (`-2` the next time, and so on) and a notice appears at startup. The data-folder location is stored in that file too — if your models seem to have "disappeared", first point Settings back to your original data folder. Please attach the backup file when reporting. Also, configs saved by Notepad or PowerShell as "UTF-8 with BOM" are now read normally.
+
 **Q: Rendering is slow**
 
 Check whether "Inference Device" fell back to CPU (see the previous entry). The log records the execution device actually used. On NVIDIA cards the CUDA runtime is usually faster than DirectML. Also, the wait on first playing a large project is the "Loading audio…" decode preparation, not slow rendering.
@@ -1537,6 +1545,8 @@ Check in order:
 **Q: "A separation job is already running" / "A render is already in progress"**
 
 Separation runs one at a time globally; vocal rendering runs one at a time. Wait for the current task, or Stop it and start the new one. A just-cancelled render has a brief "winding down" period; queued jobs start automatically.
+
+⚠ Before v0.12.3 there was a bug: right after a separation finished, the workflow's next separation node could be refused with this message and the whole run failed (the finished result went unused). Fixed in v0.12.3 — if you still see it afterwards, a separation really is still running.
 
 **Q: The workflow finished with "Run finished but produced no track output"**
 
