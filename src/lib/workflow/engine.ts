@@ -606,7 +606,9 @@ async function executeNode(
         // run emitting a same-labeled stem would overwrite each other inside the shared run dir. Rust
         // create_dir_all's the output dir before writing.
         outputDir: `${cacheDir}/${nodeId}`,
-        device: (params.device as string) ?? "cpu",
+        // NO `device` key: this config never carried the EP. Rust picks it from the GLOBAL
+        // OnnxEngine preference (Settings), and its SeparationConfig.device field — which nothing
+        // ever read — was removed in S170. Sending it again would re-create the lie, not the feature.
         normalize: (params.normalize as boolean) ?? false,
         useTta: (params.useTta as boolean) ?? false,
         shifts: (params.shifts as number) ?? 0,

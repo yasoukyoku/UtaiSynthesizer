@@ -261,12 +261,96 @@ fn is_cuda_kernel_failure(msg: &str) -> bool {
     // failure now surfaces as an ordinary inference error, which is what it is.
 }
 
+/// S170: the DXGI HRESULT of a "the graphics device is gone" failure, normalized to text WE own
+/// (`0xXXXXXXXX`) — or None when this is not one. ORT surfaces these as a raw C++ exception string
+/// from `DmlCommandRecorder.cpp` with the bare hex inside it:
+///   `… onnxruntime.dll!00007FFC…: (caller: …) Exception(1) tid(132ec) 887A0006 GPU …`
+/// (community log `utai.log.2026-09-09`, 22:14:45.828493, RTX 2060 + DirectML build, 0.12.2).
+///
+/// FOUR HRESULTs, not one. They all mean the same thing for us — this D3D12 device is dead and the
+/// session on it can never run again — and all four arrive through the same ORT path, so a
+/// classifier that knew only the one we happened to observe would be wrong the next time:
+///   887A0005 DXGI_ERROR_DEVICE_REMOVED · 887A0006 DXGI_ERROR_DEVICE_HUNG
+///   887A0007 DXGI_ERROR_DEVICE_RESET   · 887A0020 DXGI_ERROR_DRIVER_INTERNAL_ERROR
+///
+/// ⛔ NOT an out-of-memory condition and must never be reported as one: in the community log the
+/// VRAM and commit stamps AT FAILURE are identical to the successful run's (`vram GPU0 3320/5186
+/// MB` on both), which is why this arm sits BEFORE nothing and beside `is_alloc_failure` rather
+/// than inside it.
+/// ⛔ The CAUSE is deliberately NOT claimed anywhere in this file. Windows did record a TDR
+/// (4101 / nvlddmkm) 8.66 s before we threw, but the same log has 125 consecutive ~1.99 s runs that
+/// tripped nothing — so "it sat on the 2 s watchdog" is a hypothesis, not a finding. We classify
+/// the HRESULT; we do not diagnose the driver.
+///
+/// Returns `&'static str` on purpose: the detail that rides on a user-visible CODE must be text we
+/// wrote, so no build-machine path and no lossily-decoded OS string can ride along with it.
+fn device_lost_hresult(msg: &str) -> Option<&'static str> {
+    // (lowercase needle, what we print). Matched as a substring because the hex sits inside a
+    // ~400-character C++ message; lowercased because ORT has printed the hex in both cases.
+    const CODES: [(&str, &str); 4] = [
+        ("887a0005", "0x887A0005"),
+        ("887a0006", "0x887A0006"),
+        ("887a0007", "0x887A0007"),
+        ("887a0020", "0x887A0020"),
+    ];
+    let m = msg.to_ascii_lowercase();
+    CODES.iter().find(|(needle, _)| m.contains(needle)).map(|&(_, shown)| shown)
+}
+
+/// S170: THE run-failure taxonomy — raw backend error + the EP that produced it → the stable CODE
+/// the frontend localizes, or None to pass the raw error through unchanged.
+///
+/// Extracted from `run_typed`'s error arm (the CUDA and low-memory arms are byte-for-byte what they
+/// were; the DirectML arm is the new part) because that arm needs a GPU, a model file AND a live
+/// ORT session to reach — which is why this taxonomy had ZERO test coverage and why a whole DXGI
+/// HRESULT family fell through it from S67c until the 2026-09-09 community log, as a raw C++ string
+/// printed straight into the user's node banner.
+///
+/// `device` is `LoadedSession::actual_device`; the EP gate is load-bearing (see `is_alloc_failure`:
+/// a CUDA "allocation failed" is a VRAM/arena condition, not system-memory exhaustion).
+/// `stamp` is appended to INFERENCE_LOW_MEMORY ONLY — it is the evidence for THAT claim and noise
+/// on any other.
+///
+/// ⚠ S170 SCOPE, stated so nobody reads more into this than it does: the Auto lane's transparent
+/// degrade (Auto-DirectML dies → poison the tier → rebuild on CPU → re-run) was specified in the
+/// same round and deliberately NOT landed. It would have had zero executions — the observed box
+/// had picked DirectML explicitly, there is no DML simulation hook, and the CUDA one cannot be
+/// reused — i.e. five patches of never-run error branch in the hot path. What ships here is the
+/// part the 2026-09-09 log actually needed and that a unit test can reach: the HRESULT gets a
+/// CODE, and the raw ORT text stops reaching the user.
+pub(crate) fn error_code_for(msg: &str, device: &str, stamp: &str) -> Option<String> {
+    let is_cuda = device.starts_with("CUDA");
+    let is_dml = device.starts_with("DirectML");
+    if is_cuda && is_cuda_kernel_failure(msg) {
+        // S74: the GPU can't run our CUDA build's kernels (no kernel image / broken Blackwell
+        // PTX-JIT) → an actionable "switch to DirectML" modal, not raw ORT text.
+        return Some(format!("CUDA_UNSUPPORTED_GPU: {msg}"));
+    }
+    if is_dml {
+        if let Some(hr) = device_lost_hresult(msg) {
+            // S170: the HRESULT alone. ⛔ NOT `{msg}` like its two neighbours — this message is the
+            // ~400-character ORT C++ exception carrying the BUILD MACHINE's path
+            // (`E:\_work\1\s\onnxruntime\…`) and an OS string ort decoded lossily (U+FFFD), and the
+            // error VALUE is what the workflow node banner renders verbatim. i18n hard rule: no
+            // raw backend prose in front of the user. The full original is logged by the caller.
+            return Some(format!("DML_DEVICE_HUNG: {hr}"));
+        }
+    }
+    if !is_cuda && is_alloc_failure(msg) {
+        // S67c: CPU bad_alloc family / a DML E_OUTOFMEMORY that surfaced as an error instead of an
+        // OS kill → the same trilingual modal as the pre-run floor.
+        return Some(format!("INFERENCE_LOW_MEMORY: {msg} ({stamp})"));
+    }
+    None
+}
+
 /// S74: process-wide "Auto must not pick CUDA" flag, set the first time an AUTO-selected CUDA
 /// session dies with a kernel-image / cuDNN-exec failure (an in-window card that still can't run
 /// CUDA, or a leaked/old CUDA install the cc-window gate missed). build_session_auto then routes
 /// Auto straight to DirectML for the rest of the process so the render isn't blocked. Never reset
 /// this session (a machine that fails CUDA once keeps failing it) — a restart re-probes.
 static AUTO_CUDA_POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 
 /// S74b: Auto degraded away from CUDA on a machine where CUDA was EXPECTED to work — i.e. the
 /// CUDA ORT build is the one we loaded, which only happens when `cuda_pkg_supported()` said this
@@ -900,11 +984,19 @@ impl OnnxEngine {
         // #3) otherwise keeps `session` borrowed through BOTH match arms of run's Result,
         // and the failed-run arm below needs the guards released.
         let failed_dml_build = loaded.dml.as_ref().map(|_| loaded.build_id);
-        // S67c: the INFERENCE_LOW_MEMORY rewrite below must not claim "system memory is
-        // low" for CUDA VRAM/arena failures (S66 user-set arena cap fails with exactly
-        // "allocation failed" while system RAM is plentiful) — copied out here because the
-        // `loaded` borrow is gone by the error arm.
-        let failed_is_cuda = loaded.actual_device.starts_with("CUDA");
+        // S67c/S170: the EP that actually ran, copied out because the `loaded` borrow is gone by
+        // the error arm. The taxonomy gates on it twice and for two different reasons:
+        //   · the INFERENCE_LOW_MEMORY rewrite must not claim "system memory is low" for CUDA
+        //     VRAM/arena failures (the S66 user-set arena cap fails with exactly "allocation
+        //     failed" while system RAM is plentiful);
+        //   · the DML_DEVICE_HUNG rewrite must not fire for a non-DirectML session.
+        let failed_device = loaded.actual_device.clone();
+        // ⚠ S170 — still needed by the input-clone predicate below (the S74 CUDA retry arm).
+        // The spec that introduced `failed_device` also rewrote that predicate to ask
+        // `auto_tier(..)` instead; that patch belongs to the Auto-degrade lane, which is NOT
+        // landing this round (see `error_code_for`'s SCOPE note), so the CUDA-only predicate
+        // stays exactly as it was.
+        let failed_is_cuda = failed_device.starts_with("CUDA");
         // S74b: this incarnation's id, so the Auto-CUDA retry below can tear the dead session down
         // through drop_session_incarnation (revalidated + dropped OUTSIDE the write lock) instead
         // of a raw remove. Same reason failed_dml_build exists — copied out before the borrow ends.
@@ -967,8 +1059,15 @@ impl OnnxEngine {
                 drop(sessions);
                 if let Some(build_id) = failed_dml_build {
                     if self.drop_session_incarnation(session_id, build_id) {
+                        // S170: this line used to read "(fresh rebuild on retry)", which a reader of
+                        // the 2026-09-09 community log takes as "we retried". We did not: dropping
+                        // the incarnation only means the NEXT run of this session id rebuilds it.
+                        // Nothing follows it today: an EXPLICIT DirectML pick is answered with a
+                        // loud failure by design, and the Auto-tier degrade was specified this
+                        // round and deliberately not landed (see error_code_for's SCOPE note).
+                        // Say only what happened.
                         tracing::info!(
-                            "Dropped DirectML session after a failed run (fresh rebuild on retry): {}",
+                            "Dropped the DirectML session incarnation after a failed run (the next run of this session rebuilds it): {}",
                             session_id
                         );
                     }
@@ -998,24 +1097,32 @@ impl OnnxEngine {
                     notify_cuda_degraded_once();
                     return self.run_typed(session_id, ri);
                 }
-                // S67c: allocation-exhaustion failures (CPU bad_alloc family / DML
-                // E_OUTOFMEMORY that surfaced as an error instead of an OS kill) get the
-                // INFERENCE_LOW_MEMORY code so the frontend's trilingual modal catches
-                // them; and EVERY inference failure leaves an English forensic line in
-                // the file log (command errors otherwise go straight to the UI and the
-                // backend log stays empty at the exact moment we need it). CUDA sessions
-                // pass through unchanged — their allocation failures are VRAM/arena-cap
-                // conditions, not system-memory exhaustion (see is_alloc_failure).
-                let e = if failed_is_cuda && is_cuda_kernel_failure(&e.to_string()) {
-                    // S74: a CUDA run failure meaning the GPU can't run our CUDA build's kernels
-                    // (no kernel image / broken Blackwell PTX-JIT / cuDNN exec failure) → an
-                    // actionable "switch to DirectML" modal, not raw ORT text. The cc-window gate
-                    // pre-empts the known cases; this catches in-window-but-fails + leaked installs.
-                    UtaiError::Inference(format!("CUDA_UNSUPPORTED_GPU: {e}"))
-                } else if !failed_is_cuda && is_alloc_failure(&e.to_string()) {
-                    UtaiError::Inference(format!("INFERENCE_LOW_MEMORY: {e} ({stamp_at_failure})"))
-                } else {
-                    e
+                // S67c/S74/S170: the failure taxonomy lives in `error_code_for` so it can be
+                // exercised without a GPU (see its doc for why that matters). EVERY inference
+                // failure also leaves an English forensic line in the file log — command errors
+                // otherwise go straight to the UI and the backend log stays empty at the exact
+                // moment we need it.
+                let raw = e.to_string();
+                let e = match error_code_for(&raw, &failed_device, &stamp_at_failure) {
+                    Some(code) => {
+                        // ⛔ i18n hard rule + FORENSICS, both at once. CUDA_UNSUPPORTED_GPU and
+                        // INFERENCE_LOW_MEMORY EMBED the raw message, so the log line below already
+                        // carries it. DML_DEVICE_HUNG deliberately REPLACES it (the raw text is the
+                        // ORT C++ exception with the build machine's `E:\_work\1\s\onnxruntime\…`
+                        // path and lossily-decoded OS bytes in it, and the error VALUE is what the
+                        // workflow node banner renders verbatim). Dropping it from the user's view
+                        // must not drop it from the log — that is the only copy a community bug
+                        // report can send us.
+                        if !code.contains(&raw) {
+                            tracing::error!(
+                                "Inference run failed ({}) — raw backend error, NOT shown to the user: {}",
+                                session_id,
+                                raw
+                            );
+                        }
+                        UtaiError::Inference(code)
+                    }
+                    None => e,
                 };
                 tracing::error!("Inference run failed ({}): {} [{stamp_at_failure}]", session_id, e);
                 return Err(e);
@@ -1506,4 +1613,108 @@ fn build_session_auto(path: &Path, mem_pattern: bool, auto_gpu: Option<u32>) -> 
     let session = commit(builder, path)?;
     tracing::info!("ONNX device=Auto → using CPU");
     Ok((session, "CPU (Auto)".to_string()))
+}
+
+#[cfg(test)]
+mod run_failure_taxonomy_tests {
+    use super::*;
+
+    /// VERBATIM from the community log (`D:\\MyDev\\TESTING\\bug-report\\20260918\\utai.log.2026-09-09`,
+    /// 22:14:45.828493 — RTX 2060, DirectML ORT build, 0.12.2), truncated at the localized tail:
+    /// that tail is mojibake IN THE LOG FILE ITSELF (ort's `to_string_lossy` over a GBK OS string —
+    /// NOT our encoding, see S170), and nothing in the classifier reads past the HRESULT.
+    /// ⚠ Keeping the build-machine path `E:\\_work\\1\\s\\…` in the fixture is the POINT: the
+    /// assertions below are the only thing standing between it and a user's node error banner.
+    const DEVICE_HUNG: &str = r"Inference error: Inference failed: E:\_work\1\s\onnxruntime\core\providers\dml\DmlExecutionProvider\src\DmlCommandRecorder.cpp(371)\onnxruntime.dll!00007FFC2620B693: (caller: 00007FFC2617E184) Exception(1) tid(132ec) 887A0006 GPU ";
+
+    const KERNEL_IMAGE: &str =
+        "Inference error: Inference failed: CUDA error cudaErrorNoKernelImageForDevice";
+    const BAD_ALLOC: &str = "Inference error: Inference failed: std::bad_alloc";
+    /// The real stamp from the same failure — note it is IDENTICAL to the successful run's
+    /// (`vram GPU0 3320/5186 MB` at 22:10:11 too), which is the whole reason this must never be
+    /// classified as an out-of-memory condition.
+    const STAMP: &str = "commit=5913 MB, sys avail=8752 MB; vram GPU0 3320/5186 MB";
+
+    /// T1
+    #[test]
+    fn a_dxgi_device_hung_is_classified_and_never_ships_the_raw_ort_text_to_the_ui() {
+        let code = error_code_for(DEVICE_HUNG, "DirectML (GPU 0)", STAMP)
+            .expect("0x887A0006 must map to a stable CODE, not pass through raw");
+        assert_eq!(code, "DML_DEVICE_HUNG: 0x887A0006");
+
+        // i18n hard rule: what the workflow node banner renders carries NO backend prose, no
+        // build-machine path, and no lossily-decoded bytes. (The original is logged instead —
+        // see run_typed's error arm.)
+        assert!(!code.contains(r"E:\_work"), "build-machine path leaked into the CODE: {code}");
+        assert!(!code.contains("onnxruntime"), "ORT internals leaked into the CODE: {code}");
+        assert!(!code.contains('\u{FFFD}'), "lossy-decoded bytes leaked into the CODE: {code}");
+
+        // ── ATTRIBUTION CONTROLS: this red must not be reachable by "the fixture is wrong".
+        // Same string, CPU session → not a DirectML condition, stays raw.
+        assert_eq!(error_code_for(DEVICE_HUNG, "CPU (Auto)", STAMP), None);
+        // …and it is NOT memory exhaustion. The stamps at failure equal the successful run's, so
+        // INFERENCE_LOW_MEMORY would be a lie told with a straight face.
+        assert!(!code.starts_with("INFERENCE_LOW_MEMORY"));
+        assert!(!is_alloc_failure(DEVICE_HUNG));
+    }
+
+    /// T2 — the "the gate can run" control. GREEN before AND after the fix.
+    #[test]
+    fn the_pre_existing_cuda_and_low_memory_arms_are_unchanged() {
+        // These three WERE the whole taxonomy before S170 (S74 / S67c). The extraction must answer
+        // byte-for-byte as the inline chain did, otherwise this refactor changed behaviour behind
+        // a comment that says it doesn't.
+        assert_eq!(
+            error_code_for(KERNEL_IMAGE, "CUDA (GPU 0)", STAMP),
+            Some(format!("CUDA_UNSUPPORTED_GPU: {KERNEL_IMAGE}"))
+        );
+        assert_eq!(
+            error_code_for(BAD_ALLOC, "DirectML (GPU 0)", STAMP),
+            Some(format!("INFERENCE_LOW_MEMORY: {BAD_ALLOC} ({STAMP})"))
+        );
+        // CUDA allocation failures are VRAM/arena conditions (the S66 user-set arena cap fails with
+        // exactly this text while system RAM is plentiful) — never system-memory exhaustion.
+        assert_eq!(
+            error_code_for("Inference error: failed to allocate", "CUDA (GPU 0)", STAMP),
+            None
+        );
+        // An ordinary failure carries no code at all.
+        assert_eq!(
+            error_code_for("Inference error: Output 0: unsupported tensor dtype", "CPU", STAMP),
+            None
+        );
+    }
+
+    // WARNING S170 - T3 (only_auto_sessions_degrade_and_an_explicit_pick_fails_loudly) is NOT
+    // here. It exercised the two Auto-tier helpers, which belong to the Auto-degrade lane that
+    // was specified in the same round and deliberately not landed (see error_code_for's SCOPE
+    // note). Shipping a gate with nothing behind it is worse than no gate; the test comes back
+    // with the lane it tests.
+
+    /// T4
+    #[test]
+    fn the_whole_dxgi_device_lost_family_is_covered_not_just_the_hresult_we_happened_to_see() {
+        // 0x887A0006 is what the community log carried. The other three mean the same thing (the
+        // D3D12 device is gone) and reach us through the same ORT path, so a classifier that knows
+        // only the one we saw is a classifier that will be wrong the next time.
+        for (raw, want) in [
+            ("Exception(1) tid(1) 887A0005 x", "0x887A0005"),
+            ("Exception(1) tid(1) 887A0006 x", "0x887A0006"),
+            ("Exception(1) tid(1) 887A0007 x", "0x887A0007"),
+            ("Exception(1) tid(1) 887A0020 x", "0x887A0020"),
+            ("Exception(1) tid(1) 887a0006 x", "0x887A0006"), // ORT prints the hex in both cases
+        ] {
+            assert_eq!(
+                error_code_for(raw, "DirectML (GPU 0)", STAMP),
+                Some(format!("DML_DEVICE_HUNG: {want}")),
+                "unclassified DXGI device-lost HRESULT in {raw}"
+            );
+        }
+        // …and a neighbouring DXGI code that is NOT device-loss must not be swept in
+        // (887A0001 = DXGI_ERROR_INVALID_CALL — our bug, not the driver's).
+        assert_eq!(
+            error_code_for("Exception(1) tid(1) 887A0001 x", "DirectML (GPU 0)", STAMP),
+            None
+        );
+    }
 }

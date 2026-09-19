@@ -42,6 +42,10 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // Separation single-slot guard (separation/mod.rs) — the TOCTOU backstop behind the pre-flight.
   SEPARATION_BUSY: { key: "workflow.separationBusy", busy: true },
   MSST_MODEL_NOT_CONVERTED: { key: "workflow.errSeparationNotConverted" },
+  // S170: the device preference is CPU and only the fp16 variant of the model is installed. The CPU
+  // provider has no fp16 kernels (it casts every op back to fp32), so separation/mod.rs refuses
+  // instead of starting a run that is pure downside — on 2026-09-09 such a run died silently.
+  MSST_FP16_ON_CPU: { key: "backend.MSST_FP16_ON_CPU" },
   // Transpose node (utai-stretch wrapper) codes.
   TRANSPOSE_INPUT_MISSING: { key: "workflow.errTransposeInput" },
   TRANSPOSE_RANGE: { key: "workflow.errTransposeRange" },
@@ -69,12 +73,27 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // process that loaded the CUDA build (registering the DML EP there access-violates), so the
   // engine refuses instead of probing. Blocking (explicit pick) → modal.
   DML_NEEDS_RESTART: { key: "backend.DML_NEEDS_RESTART", modal: true },
+  // S170: the graphics device was lost mid-run (DXGI 0x887A0005/6/7/20 — hung, removed, reset,
+  // driver internal error). Modal: the remedy is user action outside the app (change the inference
+  // device, or install the CUDA runtime), and the text is too long for a toast. The detail the
+  // Rust side attaches is ONLY the HRESULT — the raw ORT C++ exception (build-machine path +
+  // lossily-decoded OS bytes) is deliberately kept out of the user's view and logged instead.
+  // ⚠ S170: this reaches the user on EVERY device pick, Auto included — the transparent Auto
+  // degrade was specified in the same round and deliberately not landed (it would have had zero
+  // executions). The 2026-09-09 community box had picked DirectML explicitly, so it is that box's
+  // message either way.
+  DML_DEVICE_HUNG: { key: "backend.DML_DEVICE_HUNG", modal: true },
   // S66 poisoned-proxy guard (download.rs): a GH proxy answered a download with an HTML page.
   DOWNLOAD_HTML_RESPONSE: { key: "backend.DOWNLOAD_HTML_RESPONSE" },
   // S66 CUDA local-file install (settings.rs install_cuda_runtime_local).
   CUDA_LOCAL_NO_FILES: { key: "backend.CUDA_LOCAL_NO_FILES" },
   CUDA_LOCAL_UNRECOGNIZED: { key: "backend.CUDA_LOCAL_UNRECOGNIZED" },
   CUDA_LOCAL_BAD_FILE: { key: "backend.CUDA_LOCAL_BAD_FILE" },
+  // ⛔S170 config.json integrity (commands/settings.rs). QUARANTINED is a startup fact (App.tsx
+  // toasts it from get_config_issue); LOCKED also rides out of `save_config` through every settings
+  // command, and is a modal because its remedy is outside the app — move the file by hand, restart.
+  CONFIG_UNREADABLE_QUARANTINED: { key: "backend.CONFIG_UNREADABLE_QUARANTINED" },
+  CONFIG_UNREADABLE_LOCKED: { key: "backend.CONFIG_UNREADABLE_LOCKED", modal: true },
   // S66 conversion single-flight + heavy-job interlock (lib.rs acquire_convert_slot).
   CONVERT_BUSY: { key: "backend.CONVERT_BUSY", busy: true },
   CONVERT_RENDER_BUSY: { key: "backend.CONVERT_RENDER_BUSY", busy: true },

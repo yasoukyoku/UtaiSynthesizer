@@ -1385,6 +1385,7 @@ pub fn run() {
             commands::settings::get_device_preference,
             commands::settings::get_data_dir,
             commands::settings::get_data_dir_issue,
+            commands::settings::get_config_issue,
             commands::settings::migrate_data_dir,
             commands::settings::is_cuda_runtime_ready,
             commands::settings::download_cuda_runtime,

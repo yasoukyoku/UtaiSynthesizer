@@ -188,6 +188,21 @@ export function App() {
       .catch(() => {});
   }, []);
 
+  // ⛔S170: config.json could not be read at startup — the bytes were moved aside and this session
+  // is running on defaults. NOT the same as "no config": the device preference AND `data_dir` live
+  // in that file, so an install whose data root was moved looks EMPTY until it is restored. The
+  // backup path rides along as the detail. Localized through the ONE backend-error table (Rust
+  // ships a CODE, never a sentence) rather than a second startup.* string saying the same thing.
+  useEffect(() => {
+    void invoke<{ code: string; backup: string; detail: string } | null>("get_config_issue")
+      .then((issue) => {
+        if (!issue) return;
+        const msg = backendErrorMessage(`${issue.code}: ${issue.backup || issue.detail}`);
+        if (msg) useAppStore.getState().showToast(msg, "error");
+      })
+      .catch(() => {});
+  }, []);
+
   // S101: pull the dictionary-content fingerprint into the bake signature as early as possible.
   // Rust has already refreshed the data root's dictionaries synchronously in setup(), so this reads
   // a settled value. `ensureDictionarySig` is idempotent and never rejects; until it resolves,
