@@ -69,11 +69,15 @@ tuning is output of models trained on the corpora above, so their terms follow i
   (禁止事項 (8)) — this includes using it as training data in Utai's own training feature.
 - Commercial use of the generated singing is not permitted under the corpora's terms.
 
-**Consequence:** 93.96% of the training set is NonCommercial-licensed, so these two models are
-distributed for **non-commercial use only**, with attribution to the corpora above and under
-ShareAlike terms inherited from the CC BY-NC-SA sets. This is the same pattern as the NSF-HiFiGAN
-weights below. The application source (see `LICENSE`, AGPL-3.0) is a separate matter and does not
-grant any rights over these weights, nor do these corpus terms restrict the source code.
+**Licence position.** We take the position — consistent with Creative Commons' guidance that in many
+cases an AI model is not an adaptation of the works it was trained on
+(https://creativecommons.org/using-cc-licensed-works-for-ai-training/) — that these trained weights
+are not Adapted Material of the CC-licensed corpora above, so the ShareAlike conditions of GTSinger /
+M4Singer (CC BY-NC-SA 4.0) and PJS (CC BY-SA 4.0) do not attach to them. The weights are nevertheless
+distributed **for non-commercial use only**, with the attribution above: several Japanese corpora's
+usage agreements require it, and we respect the NonCommercial terms of the corpora that make up
+93.96% of the training set. The application source (see `LICENSE`, AGPL-3.0) is a separate matter
+and does not grant any rights over these weights, nor do these corpus terms restrict the source code.
 
 Corpora that appear in intermediate data but are **not** in the shipped models' training set
 (`ace_opencpop`, `PopCS`, `CSD`, `NUS-48E`) are listed here only to record that they were excluded.
