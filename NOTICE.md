@@ -58,6 +58,16 @@ Both were trained on the same corpus set (44,947 clips; `train_final` / `val_fin
 Credits required by the Japanese corpora's terms (verbatim):
 『©SSS』 · 『歌声DB制作:アマノケイ 音声提供者: 霧野蒼太』 · 『DB制作:おふとんP』 · 『御丹宮くるみ歌声データべース』.
 
+**Audio you generate with these models.** Singing rendered through ScoreToCV / automatic pitch
+tuning is output of models trained on the corpora above, so their terms follow it:
+- It is the 「出力音声」 (output voice) of the Natsume Yuuri DB and falls under
+  「夏目悠李の出力音声に関する利用規約」, published by ATSUYA at
+  https://ksdcm1ng.wixsite.com/njksofficial/%E8%A6%8F%E7%B4%84-rules and shipped unmodified
+  beside the model files (`NATSUME_OUTPUT_VOICE_TERMS.txt`). In particular: commercial use needs
+  separate permission, and **generated audio must not be used to build acoustic/pitch models**
+  (禁止事項 (8)) — this includes using it as training data in Utai's own training feature.
+- Commercial use of the generated singing is not permitted under the corpora's terms.
+
 **Consequence:** 93.96% of the training set is NonCommercial-licensed, so these two models are
 distributed for **non-commercial use only**, with attribution to the corpora above and under
 ShareAlike terms inherited from the CC BY-NC-SA sets. This is the same pattern as the NSF-HiFiGAN
