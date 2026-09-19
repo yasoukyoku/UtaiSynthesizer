@@ -49,9 +49,14 @@ Both were trained on the same corpus set (44,947 clips; `train_final` / `val_fin
 |---|---|---|
 | GTSinger (English direct; French/German/Italian/Spanish re-aligned) | 49.5% | **CC BY-NC-SA 4.0** — https://github.com/AaronZ345/GTSinger |
 | M4Singer (Chinese) | 44.5% | **CC BY-NC-SA 4.0** — https://github.com/M4Singer/M4Singer |
-| Namine Ritsu "Kiritan" song DB / Tohoku Itako song DB (SSS LLC) | 1.2% / 1.1% | Non-commercial use permitted; https://zunko.jp/ |
-| Natsume Yuuri song DB (ATSUYA) · Ofuton P song DB · Oniku Kurumi "Utagoe" DB | 1.0% / 1.0% / 1.4% | Non-commercial; redistribution of derived voice models requires prior permission from each author |
-| PJS: Phoneme-balanced Japanese Singing-voice corpus | 0.4% | **CC BY-SA 4.0** (commercial use permitted) |
+| Tohoku Kiritan singing DB (東北きりたん歌唱データベース) / Tohoku Itako singing DB (東北イタコ歌唱データベース) — SSS LLC, Meiji University (Masanori Morise) | 1.2% / 1.1% | Non-commercial use under SSS LLC's usage agreement; models built with the data may be incorporated into public software/services only with SSS LLC's prior approval (agreement §3-6); https://zunko.jp/ |
+| Natsume Yuuri male singing DB (夏目悠李/男性歌声データベース) — ATSUYA | 1.0% | Non-commercial; distributing models built with the DB requires prior notice to ATSUYA and bundling「夏目悠李の出力音声に関する利用規約」 |
+| Ofuton P singing DB (おふとんP歌唱DB) | 1.0% | Non-commercial; distributing voice models built with the DB requires prior inquiry |
+| Oniku Kurumi singing DB (御丹宮くるみ歌声データべース) | 1.4% | Credit required; commercial use requires prior inquiry |
+| PJS: Phoneme-balanced Japanese Singing-voice corpus (Koguchi & Takamichi); lyrics from the Voice Actor Statistics Corpus (声優統計コーパス, 日本声優統計学会) | 0.4% | **CC BY-SA 4.0** (commercial use permitted) |
+
+Credits required by the Japanese corpora's terms (verbatim):
+『©SSS』 · 『歌声DB制作:アマノケイ 音声提供者: 霧野蒼太』 · 『DB制作:おふとんP』 · 『御丹宮くるみ歌声データべース』.
 
 **Consequence:** 93.96% of the training set is NonCommercial-licensed, so these two models are
 distributed for **non-commercial use only**, with attribution to the corpora above and under
@@ -96,6 +101,16 @@ never the third-party weights it fetches.
 
 ## Bundled dictionary data (`data/dictionaries/`)
 
-Compiled pronunciation dictionaries derived from: CMUdict (BSD-2-Clause), Montreal Forced
-Aligner community dictionaries (CC BY 4.0), pinyin-data / phrase-pinyin-data (MIT / CC),
-opencpop-extension (Apache-2.0). Detailed per-file attribution ships with the full documentation.
+Compiled pronunciation dictionaries, one upstream per file:
+
+| File | Upstream | License / attribution |
+|---|---|---|
+| `en.tsv` | CMUdict (Carnegie Mellon University) | BSD-2-Clause-style; CMU copyright notice retained |
+| `de.tsv` · `fr.tsv` · `es.tsv` | Montreal Forced Aligner dictionaries (German/French MFA v3.0.0, Spanish MFA v2.0.0a; McAuliffe & Sonderegger) | declared CC BY 4.0; built largely from WikiPron-scraped Wiktionary transcriptions, so treated as **CC BY-SA 4.0** with attribution to MFA and the Wiktionary contributors |
+| `it.tsv` | MFA Italian CV dictionary v2.0.0 (VoxCommunis; Ahn & Chodroff 2022, via Epitran) | CC BY 4.0 (upstream metadata; the model card says CC0) |
+| `zh_chars.tsv` · `zh_phrases.tsv` · `zh_syllables.tsv` | pinyin-data v0.15.0 / phrase-pinyin-data (mozillazg), incl. Unicode Unihan `kMandarin` | MIT; Unicode License V3 for the Unihan-derived data |
+
+The build is reproducible from these sources (URLs, sizes and sha256 in the generator's
+`dict_sources_manifest.json`); the generator's own deliberate rewrites (merges and primary-reading
+overrides that keep the dictionaries consistent with the trained model) are changes to the upstream
+data in the sense of CC BY 4.0 / CC BY-SA 4.0.
