@@ -80,6 +80,8 @@
       ],
       "headline": "你在动 python 训练侧的生产代码。",
       "must_read": [
+        "project_v2_amd_log_triage_handoff.md",
+        "project_v2_s172_amd_miopen_cxx_headers.md",
         "reference_training_workspace_layout.md",
         "project_v2_session75.md",
         "project_v2_session76.md",
@@ -90,7 +92,13 @@
         "⛔ additive-then-flip:会让 N 个调用点同时失效的改动,**删除留到最后一笔**(S121 血训)。",
         "⛔ 改了阶段函数的签名 ⇒ 仓内**和仓外**的驱动都要跟上。跑 `gate_driver_arity.py` 核一遍(S134 那七个调用点漂了四个月;S135 又在仓外抓到两个)。",
         "⛔⛔⭐⭐⭐ **A 卡包 —— 别重推，去读 `project_v2_pending_cleanups` 的「AMD 训练包支持面过窄（S74b）」+ 它下面的 S115 新起点。**（路由用的一句话：`runtime-amd-v1` 里**只有 gfx1103 的 kernel** ⇒ 只有 780M/760M/740M 能用；`amd-torch-device-gfx110x` 是**无 kernel 的家族 dist-info**；而 S115 实测**库侧 gfx110x 全带 1100/1101/1102/1103**；止血已做（`amd_is_rocm_capable`+单测）；**真正要做的 = 补发 device kernel 包，谓词同 commit 放宽**。）⭐ 用户 2026-08-31：**这条线要做的事就是扩大适用面**，核显独显都要、**搞长期主义**。⛔⛔ **而这一条本身就是一个活例子**：S166e 收工时我没查旧记录就另开了一份 A 卡文档，**写出了一条错的结论**（「Windows 上走 DirectML」，实际训练侧走的是 TheRock ROCm） ⇒ **开工前先 grep 旧记录，别凭当场推导写文档。**",
-        "⛔⛔⛔ **训练环境至今是【死的】**（2026-08-31 实测）：`data/runtimes/` **不存在**；`data/training/*` 也仍缺（★S103 更正：**10 个项目 ≈39.8 GB**，不是四个）。⭐ 恢复源可能还在：`training` 下的 `packs/build/dist` 四个 pack（tar.zst + manifest）。⇒ **这是训练侧任何工作的前置，不是内容** —— 开工先跑 `py -3.10 scripts/audit_repo_assets_vs_logs.py`（秒级）把缺口摄出来。⚠ `data/models/*` 按用户口径**先不管**（live 在 TESTING 下的 UtaiSynth2）。"
+        "⛔⛔⛔ **训练环境至今是【死的】**（2026-08-31 实测）：`data/runtimes/` **不存在**；`data/training/*` 也仍缺（★S103 更正：**10 个项目 ≈39.8 GB**，不是四个）。⭐ 恢复源可能还在：`training` 下的 `packs/build/dist` 四个 pack（tar.zst + manifest）。⇒ **这是训练侧任何工作的前置，不是内容** —— 开工先跑 `py -3.10 scripts/audit_repo_assets_vs_logs.py`（秒级）把缺口摄出来。⚠ `data/models/*` 按用户口径**先不管**（live 在 TESTING 下的 UtaiSynth2）。",
+        "⛔★★★ **用户可见的通道不只有 `raise`（S172 血训）**：还有 **`reporter.stage(message=)`**（进度文字 —— 每场训练从头看到尾，**比 raise 更常被看到**）与 **`reporter.warn()`**。三条都经 `backendErrorMessage` 解析 CODE。⇒ **永远不要传裸串，任何语言都不行**；先去 `config_codes.py` / `prep_codes.py` / `stage_codes.py` 加常量，再加 `backendError.ts` 的 CODE_KEYS 与 `src/i18n/{zh,en,ja}.json` 的 `backend.*` 三语。⚠ 详情跟在 CODE 后面用 `CODE: <英文机器可读详情>`，前端会把它括号附在译文后。⛔ **数硬编码串时先把【所有能到达用户的通道】列出来再数** —— S172 我只数了 raise，漏掉 17 处进度文字，而那部分才是用户一直在看的。",
+        "⛔★★ **CODE 先查再铸（S172）**：`src-tauri/src/training/mod.rs` 已经为好几个**逐字相同的判据**发着 CODE（`TRAINING_BACKEND_UNSUPPORTED` / `TRAINING_BAD_SAMPLE_RATE` / `TRAINING_BAD_SOVITS_VERSION` / `TRAINING_ASSET_MISSING`），python 这边是纵深防御 ⇒ **复用同一个 CODE，不要铸近义词**（一个条件两个名字 = 两份会漂移的文案）。先 `grep` 一遍 `src/lib/backendError.ts` 的 CODE_KEYS。",
+        "⛔★★ **兑现必须诚实（S172）**：写 i18n 文案前先问「用户在界面上真的够得到这个开关吗」。未知后端 / 未知编码器 / 未知 f0 方式 / 资产路径为空 —— 这些都是**界面上根本到不了的内部不变式**，写「请检查你的设置」等于让人去找一个不存在的控件。一个诚实的死胡同（「这是 Utai 自己的问题，把日志发给开发者」）好过一个听上去有用的。⭐ 提到控件时把名字**逐字核对三个语言的目录**，别自己编一个译名。",
+        "⛔★★ **预处理房规（S41 定、S172 把 RVC 补齐）**：**base 切片失败 = 致命，第一个就炸**；`_aug` 失败 = 容忍但**响亮报数**；源文件失败 = 容忍但响亮。原因：`rvc/filelist.py` 用**四路集合交集**建训练集 ⇒ 369/370 失败也会照常训练并报 `completed`，**一个静默用了 1/370 数据的模型比一次死掉的训练更糟**。同族：任何「质检/闸」全部失败时，那是**闸自己没跑起来**，必须炸，不允许被读成「每一份都是坏的」而静默删掉 100% 的产物（vocoder aug 闸就是这么坏的）。",
+        "⭐⭐⭐ **想问反馈者一件事的时候，先去 `envfingerprint.py` 加一行（S172 用户立的规矩）**。它每场训练打一块，由 **sidecar 自己**打 —— 记录这个进程**实际收到**的东西，而不是父进程打算发什么（S169 的 bug 就活在这道缝里）。已有：torch/HIP 版本 · 设备名与 gfx 架构 · 头文件计数 · 実主机有无 C++ 工具链 · 七个环境变量。⚠ 还没有：**A 卡驱动版本**（若又因为它回头问了两次，就该加了）。⛔ 别写探针让用户跑 —— 探针是给我用的，日志是给所有人用的。",
+        "⚠ **新加 .py 文件时两件事**：① `build.rs` 只靠 `rerun-if-changed` 逐文件跟踪，**只新增而不动任何旧文件时嵌入集看不到它**（要 `cargo clean -p utai` 或随便改一个旧文件）；② 若它是**模块级导入**的（缺了就全线死在 import），必须加进 `src-tauri/src/training/bundled_code.rs` 的探针清单。"
       ]
     },
     {
@@ -100,6 +108,8 @@
       ],
       "headline": "你在动 Rust 训练侧(槽 / run / 池 / 锁表 / 导出账本)。",
       "must_read": [
+        "project_v2_amd_log_triage_handoff.md",
+        "project_v2_s172_amd_miopen_cxx_headers.md",
         "reference_training_workspace_layout.md",
         "project_v2_session133.md",
         "project_v2_session132.md",
@@ -116,7 +126,14 @@
         "✅ 训练环境已在 S167 重建(四个 pack 经真安装器装回 `data/runtimes`,envtest 全 pass;S168 又实测过一遍在)。⚠ 旧钩子那句「训练环境是死的」已过期,别再照它排前置;开工怀疑资产缺口时照旧先跑 `py -3.10 scripts/audit_repo_assets_vs_logs.py`。",
         "⛔⛔⭐⭐⭐ **S168 保留目录铁律**:`training_root` 下的 `utai_train`/`assets`/`packs` 是随包代码,**永远不是工程** —— `has_family_slot(utai_train)` 由构造为真,0.10-0.12 因此把它盖章成幻影工程、0.12 的 trun 折叠还把 `sovits/diffusion` 搬进 runs/(删幻影工程=删训练器=社区首例 ENVTEST_SCRIPT_MISSING)。**凡新写一个枚举 training root 孩子的扫描,必须过 `tproject::is_reserved_training_dir`**;开机修复=`unfold_reserved_dirs`(先内容签名探针再动手);**要往 training/ 下新增随包目录,先加进 `RESERVED_TRAINING_DIRS` + 那条 reserved 测试**。",
         "⭐⭐ **S168 训练器代码有内嵌自愈**:build.rs 把 `training/utai_train/*.py` 嵌进二进制,`training::bundled_code::sync_bundled_training_code` 开机(migrate_layouts 之前)+ envtest 缺脚本时校验/回写;dev checkout(training/.venv 在)自动禁用。⚠ 只治 .py:往 utai_train 塞非 .py 文件它不管;**新增全新 .py 后要 `cargo clean -p utai` 或碰一下旧文件**(有意不给目录级 rerun-if-changed —— __pycache__ 会把整 crate 打脏)。",
-        "⛔⭐⭐ **S168 包镜像信任契约**:pack manifest **未签名**,它自己的 sha256 表就是全部完整性 ⇒ manifest 的抓取路线只许「内建两 HF + github 直连 + 用户显式选的 gh 代理」(前端 `ghTrustedRoutes`),**社区代理 preset 尾巴永远不上 manifest**(哈希/签名消费者才许全链,S66 规则上移一层)。GH 镜像 = release tag `packs-v1`(⛔ 必须 --prerelease --latest=false,否则劫持 releases/latest 的更新链);发布走 `scripts/publish_packs.ps1`(逐件 sha 对拍+远端逐 URL 验)。"
+        "⛔⭐⭐ **S168 包镜像信任契约**:pack manifest **未签名**,它自己的 sha256 表就是全部完整性 ⇒ manifest 的抓取路线只许「内建两 HF + github 直连 + 用户显式选的 gh 代理」(前端 `ghTrustedRoutes`),**社区代理 preset 尾巴永远不上 manifest**(哈希/签名消费者才许全链,S66 规则上移一层)。GH 镜像 = release tag `packs-v1`(⛔ 必须 --prerelease --latest=false,否则劫持 releases/latest 的更新链);发布走 `scripts/publish_packs.ps1`(逐件 sha 对拍+远端逐 URL 验)。",
+        "⛔★★★ **`-idirafter` 指向不存在的目录会被【静默忽略】（S172）** —— 没有警告、没有报错、任何流上都没有。所以 `util.rs::log_hiprtc_cxx_provenance` 那一行是承重的：没有它，「这台机器没拿到修复」与「拿到了但别的地方坏了」会产生**逐字相同**的用户日志。⇒ 动它的时候：① **计数必须递归**（libc++ 不是平的：`v1` 顶层 15 / 递归 189）——我第一版不递归，**每一次健康运行都会打红字说头文件缺失**；② 用 `DirEntry::file_type()` **不要** `Path::is_file()`（后者跟随 reparse point，**S96 炸仓的起因就是安装目录里的自建 junction**）+ 深度上限；③ **行里必须带 `cwd=`** —— 注入的是相对路径，哪天 spawn 的 cwd 被挪走，目录还在、计数还对、这行还是绿的，而每个 kernel 都编译不了。⭐ **一条永远红的判据 = 一条空判据；总在喊狼的诊断比没有更糟。**",
+        "⛔★★ **永远用 `-idirafter`，不要 `-I`（S172实测）**：`-I` 把我们的头排在実主机前面 ⇒ 一台本来正常的机器会拿到**半我们半 MSVC 的混合标准库**（实测炸在 `MSVC\\...\\utility:111:60: no template named '_Is_swappable'`，即「修复弄坏了本来好的机器」）。补全载荷能让那个探针重新通过，但那恰恰说明 `-I` 是错的工具。⚠ 同理永远不要写 `-idirafter=<dir>`（那个形式被静默忽略），且路径**必须相对**（该环境变量按空白切分且不认引号，绝对路径遇到带空格的安装目录会被切碎），**`v1` 必须排在 `clangres` 前面**（libc++ 靠 `#include_next` 去拿 C 头）。",
+        "⛔★ **`MIOPEN_LOG_LEVEL` 钉在 4，不要回 3 也不要上 5（S172）**：当初为降噪钉死的 3 恰好删掉了**唯一能说出根因的那一行**（编译器诊断），这就是这个 bug 拖了三份反馈的原因。实测：健康跑只多 1 行、失败的 kernel 每个多 7 行；**5 会涌出 1888 行**。",
+        "⛔★★ **`classify_stderr_line` 是纯函数，加匹配器必须同时加正例与反例（S172）**。它以前写在 `thread::spawn` 闭包里 ⇒ **结构上没有任何测试能到达**，1455 那条从 S114 起**一次都没被执行过**。⭐ 反例里那条是真的：`utai.log(1)(3).2026-07-24` 的普通 loss 行 `1.8825397491455078` **字面包含 1455** ⇒ 匹配器若放松成裸 `1455`，会对一个完全健康的训练弹警告。",
+        "⭐⭐ **日志要能被一个不熟悉代码的人读懂（S172）**：三个固定 grep 靶 —— `hipRTC C++ headers`（载荷凭据，每次 spawn）· `[env]`（环境指纹，由 sidecar 打）· `training VERDICT`（**五个出口全覆盖**：done / error / crashed / force-stopped / aborted-pre-spawn）。⛔ **加新出口时必须一并加 `log_run_verdict`** —— `abort_finish` 与强停都返回 Ok，错误行根本不跑，我当时就把出口数成了两个。⭐ `warnings=[]` 那一格是重点：一次被 MIOpen 兜底救回来的**降级**训练以前只记一句 `completed`。",
+        "⚠ **往 `RESERVED_TRAINING_DIRS` 加名字时，必须同时去 `tproject.rs` 的 `looks_bundled` 加一个臂（S172 现场犯）**：否则落到 `_ => false`，对 data_dir==安装根的用户（正是 S168 那批）**每次开机误报一条警告**。一条永远错的警告比没有更糟。",
+        "⚠ **`envtest` 通过时也要进日志（S172）**：以前是 `if overall == \"pass\" { Ok(rep) }`，逐项 detail 只走 stdout 给 UI ⇒ 唯一一句「这台机器的 kernel 编译器经实测是好的」**恰好在它成立的时候被丢掉**。同族：一份 `pass` 的报告仍可能带 `warn` 项。"
       ]
     },
     {
