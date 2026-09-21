@@ -15,6 +15,13 @@ import traceback
 import numpy as np
 import soundfile as sf
 
+from ..augment import is_aug_name
+from ..prep_codes import (
+    AUG_SLICES_DROPPED_CODE,
+    FULL_TRACEBACKS,
+    SLICE_PREP_FAILED_CODE,
+)
+
 logger = logging.getLogger(__name__)
 
 # ContentVec conv frontend needs at least 400 samples @16k (S35 aux contract)
@@ -58,11 +65,27 @@ def extract_features(pool_dir, version, contentvec_onnx, reporter, stop):
             if np.isnan(feats).sum() == 0:
                 np.save(out_path, feats.astype(np.float32), allow_pickle=False)
             else:
-                failed += 1
-                logger.warning("%s contains nan feature, skipped", name)
-        except Exception:
+                # a NaN feature is a FAILURE, not a skip: the slice reaches the filelist
+                # intersection without a product exactly like a raised one would.
+                raise ValueError("ContentVec returned NaN features")
+        except Exception as exc:
             failed += 1
-            logger.error("feature failed for %s\n%s", name, traceback.format_exc())
+            if failed <= FULL_TRACEBACKS:
+                logger.error("feature failed for %s\n%s", name, traceback.format_exc())
+            else:
+                logger.error("feature failed for %s: %s: %s", name, type(exc).__name__, exc)
+            # S172, house policy (prep_codes.py) — same as extract_f0: a base slice is fatal
+            # on the first one, because filelist.py's 4-way intersection would otherwise drop
+            # it in silence and train on a quietly smaller dataset.
+            if not is_aug_name(name):
+                raise RuntimeError(
+                    "%s: ContentVec feature extraction failed for %s (%s: %s)"
+                    % (SLICE_PREP_FAILED_CODE, name, type(exc).__name__, exc)
+                )
     reporter.stage("feature", done=len(names), total=len(names))
-    if names and failed == len(names):
-        raise RuntimeError("所有切片的特征提取均失败（详见日志）")
+    if failed:
+        logger.error(
+            "feature: %d augmented slice(s) of %d failed and will be dropped from training",
+            failed, len(names),
+        )
+        reporter.warn(AUG_SLICES_DROPPED_CODE)

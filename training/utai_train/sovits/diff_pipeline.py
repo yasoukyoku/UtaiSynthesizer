@@ -74,6 +74,8 @@ from .pipeline import (
 )
 from .preprocess import slice_and_resample
 from . import utils as sovits_utils
+from .. import stage_codes
+from .. import config_codes
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +141,14 @@ def run(cfg, reporter, stop):
     assets = cfg["assets"]
     version = cfg["version"]
     if version not in VERSION_ENCODER:
-        raise RuntimeError("非法 SoVITS 版本: %s（可选 4.1/4.0）" % version)
+        raise RuntimeError(
+            "%s: sovits_diff version=%s expected=%s"
+            % (
+                config_codes.BAD_SOVITS_VERSION_CODE,
+                version,
+                "|".join(sorted(VERSION_ENCODER)),
+            )
+        )
     encoder = VERSION_ENCODER[version]
     dim = ENCODER_DIMS[encoder]
     seed = int(cfg.get("seed", 1234))
@@ -153,7 +162,10 @@ def run(cfg, reporter, stop):
     # model's dual-config split isn't wired here. Refuse BEFORE any cache/slice
     # op so a multi-speaker workspace's shared caches are never touched.
     if len(cfg.get("speakers") or []) > 1:
-        raise RuntimeError("浅扩散暂不支持多说话人模型（请先训练单说话人扩散）")
+        raise RuntimeError(
+            "%s: sovits_diff run.json speakers=%d"
+            % (config_codes.DIFF_MULTI_SPEAKER_CODE, len(cfg.get("speakers") or []))
+        )
     _existing_cfg = os.path.join(run_dir, "config.json")
     if os.path.exists(_existing_cfg):
         try:
@@ -163,7 +175,10 @@ def run(cfg, reporter, stop):
         except Exception:
             _probe_n = 1
         if _probe_n > 1:
-            raise RuntimeError("浅扩散暂不支持多说话人模型（该工作区主模型为多说话人）")
+            raise RuntimeError(
+                "%s: sovits_diff config.json n_speakers=%d path=%s"
+                % (config_codes.DIFF_MULTI_SPEAKER_CODE, _probe_n, _existing_cfg)
+            )
 
     # same cache identity as the sovits main pipeline (single source — a
     # format drift here would wipe the shared caches on every backend switch).
@@ -279,7 +294,7 @@ def run(cfg, reporter, stop):
     build_filelists(run_dir, slug, dataset_44k, seed, reporter)
 
     stop.check()
-    reporter.stage("diff_prep", message="准备扩散配置与底模")
+    reporter.stage("diff_prep", message=stage_codes.DIFF_PREP)
     expdir = os.path.join(run_dir, "diffusion")
     os.makedirs(expdir, exist_ok=True)
     duration = _write_diffusion_yaml(cfg, run_dir, expdir, encoder, dim)
@@ -287,7 +302,7 @@ def run(cfg, reporter, stop):
     _seed_base_model(expdir, assets.get("diffusion_pretrain") or "", reporter)
 
     stop.check()
-    reporter.stage("train_prep", message="加载扩散模型与数据，训练即将开始")
+    reporter.stage("train_prep", message=stage_codes.DIFF_LOADING)
     summary = _train_diff(cfg, run_dir, pool_dir, reporter, stop)
 
     if summary["steps_this_run"] == 0 and not summary["stopped"]:
@@ -486,13 +501,16 @@ def _seed_base_model(expdir, pretrain_path, reporter):
         logger.warning("no diffusion base model — training from scratch")
         # force past the Reporter throttle — this notice follows the stage's
         # opening message within the throttle window and must not be swallowed
-        reporter.stage("diff_prep", message="无扩散底模，将从零训练", force=True)
+        reporter.stage("diff_prep", message=stage_codes.DIFF_NO_PRETRAIN, force=True)
         return
     dst = os.path.join(expdir, "model_0.pt")
     tmp = dst + ".tmp"
     ckpt = torch.load(pretrain_path, map_location="cpu", weights_only=False)
     if not isinstance(ckpt, dict) or "model" not in ckpt:
-        raise RuntimeError("扩散底模格式不符（缺少 'model' 键）: %s" % pretrain_path)
+        raise RuntimeError(
+            "%s: diffusion base model has no 'model' key: %s"
+            % (config_codes.DIFF_BASE_FORMAT_CODE, pretrain_path)
+        )
     if int(ckpt.get("global_step") or 0) == 0 and "optimizer" not in ckpt:
         shutil.copyfile(pretrain_path, tmp)
     else:
@@ -718,7 +736,7 @@ def _train_diff(cfg, run_dir, pool_dir, reporter, stop):
     # not wait for the training loop to notice)
     def progress(done, total):
         stop.check()
-        reporter.stage("train_prep", done=done, total=total, message="缓存训练数据")
+        reporter.stage("train_prep", done=done, total=total, message=stage_codes.CACHING)
 
     loader_train, loader_valid = get_data_loaders(args, whole_audio=False, progress=progress)
 

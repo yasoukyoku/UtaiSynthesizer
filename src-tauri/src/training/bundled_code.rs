@@ -135,7 +135,32 @@ mod tests {
         for probe in
             // hipenum.py: S169 — every AMD run's device pick imports it; a healed tree
             // without it turns the whole AMD lane into TRAINING_AMD_ENUM_FAILED.
-            ["envtest.py", "runner.py", "__init__.py", "sovits/diffusion/__init__.py", "rvc/train.py", "hipenum.py"]
+            // miopen_guard.py: S172, same shape and worse — BOTH vendored rmvpe copies import
+            // it at module scope now, so a healed tree without it is an ImportError on every
+            // training run of every chain, not just the AMD ones.
+            [
+                "envtest.py",
+                "runner.py",
+                "__init__.py",
+                "sovits/diffusion/__init__.py",
+                "rvc/train.py",
+                "hipenum.py",
+                "miopen_guard.py",
+                // prep_codes.py: S172 — all three RVC prep stages import it at module scope
+                // for their CODEs and the traceback cap; without it the RVC lane is an
+                // ImportError before the first slice.
+                "prep_codes.py",
+                // stage_codes.py: S172 — ten modules across all five lanes import it at module
+                // scope for their progress messages. Missing it means every lane dies at import,
+                // so it belongs in the same load-bearing set as the two above.
+                "stage_codes.py",
+                // envfingerprint.py: S172 — runner.py imports it at run start. Missing it kills
+                // every run before the first stage, so it is load-bearing like the three above.
+                "envfingerprint.py",
+                // config_codes.py: S172 — imported at module scope by runner.py and
+                // every lane that validates its run config. Load-bearing like the rest.
+                "config_codes.py",
+            ]
         {
             assert!(
                 UTAI_TRAIN_FILES.iter().any(|(r, _)| *r == probe),

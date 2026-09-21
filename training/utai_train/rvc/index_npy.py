@@ -14,6 +14,8 @@ import traceback
 import numpy as np
 
 from ..augment import is_aug_name
+from .. import stage_codes
+from .. import prep_codes
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,7 @@ def build_index(exp_dir, pool_dir, version, seed, reporter, n_cpu=None):
     # copy left at the slot root while the probe looks in the run would install a model with no
     # retrieval asset, no error and no log line. `trun::RUN_ENTRIES` states the same in Rust, and
     # `commands::training::get_slot_export_context` is the probe.
-    reporter.stage("index", message="构建检索特征库")
+    reporter.stage("index", message=stage_codes.BUILD_INDEX)
     feature_dir = os.path.join(
         pool_dir, "3_feature256" if version == "v1" else "3_feature768"
     )
@@ -36,7 +38,14 @@ def build_index(exp_dir, pool_dir, version, seed, reporter, n_cpu=None):
     # non-augmented run (also immunizes against stale aug orphans; design B3)
     names = sorted(n for n in os.listdir(feature_dir) if not is_aug_name(n))
     if not names:
-        raise RuntimeError("特征目录为空，无法构建检索库")
+        raise RuntimeError(
+            "%s: %s: 0 non-aug feature files (%d entries total)"
+            % (
+                prep_codes.FEATURE_DIR_EMPTY_CODE,
+                feature_dir,
+                len(os.listdir(feature_dir)),
+            )
+        )
     npys = []
     for name in names:
         npys.append(np.load(os.path.join(feature_dir, name)))

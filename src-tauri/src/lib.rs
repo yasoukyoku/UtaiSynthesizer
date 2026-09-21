@@ -930,6 +930,13 @@ pub fn run() {
     let tz_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
     let mut file_appender =
         logging::LocalDailyFile::new(log_dir.clone(), logging::LOG_PREFIX, tz_offset);
+    // S172: rolled logs had no retention at all — the writer appends forever and nothing
+    // ever removed one. AFTER the current file is opened, so today's is never a candidate.
+    logging::prune_old_logs(
+        &log_dir,
+        logging::LOG_PREFIX,
+        time::OffsetDateTime::now_utc().to_offset(tz_offset).date(),
+    );
     // S67c: process-start divider, FILE ONLY. Same-day launches APPEND to one file, so a
     // crashed process's last line and the next launch's first line were visually
     // indistinguishable (the 07-16 community log interleaves six runs across three app

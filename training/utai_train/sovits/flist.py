@@ -29,6 +29,8 @@ import wave
 
 from ..augment import is_aug_name
 from ..pool import SOLE_SPEAKER_DIR, identity_version
+from .. import stage_codes
+from .. import config_codes
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +152,7 @@ def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter, speakers=None
     falls back to the single `spk` slug and skips the cross-speaker shuffle —
     BYTE-IDENTICAL to the pre-①c output."""
     # stage name "filelist" matches the RVC trainer's — the UI label is shared
-    reporter.stage("filelist", message="生成训练清单与配置")
+    reporter.stage("filelist", message=stage_codes.FILELIST)
 
     if speakers is None:
         speakers = [{"slug": spk}]
@@ -202,7 +204,14 @@ def build_config(
     while the filelists must be (re)built AFTER the aug quality gate — the
     pre-S41 build_flist_and_config coupling made that ordering impossible."""
     if encoder not in ENCODER_DIMS:
-        raise RuntimeError("未知语音编码器: %s" % encoder)
+        raise RuntimeError(
+            "%s: encoder=%s expected=%s"
+            % (
+                config_codes.UNKNOWN_SPEECH_ENCODER_CODE,
+                encoder,
+                "|".join(sorted(ENCODER_DIMS)),
+            )
+        )
 
     flist_dir = os.path.join(exp_dir, "filelists")
     train_list = os.path.join(flist_dir, "train.txt")

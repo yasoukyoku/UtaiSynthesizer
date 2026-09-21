@@ -40,6 +40,8 @@ from .filelist import build_filelist_and_config
 from .index_npy import build_index
 from .preprocess import preprocess_trainset, _wipe_slice_dirs
 from .train import train
+from .. import stage_codes
+from .. import config_codes
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,10 @@ def run(cfg, reporter, stop):
     assets = cfg["assets"]
     sr_str = cfg["sample_rate"]
     if sr_str not in SR_MAP:
-        raise RuntimeError("非法采样率: %s（可选 32k/40k/48k）" % sr_str)
+        raise RuntimeError(
+            "%s: rvc: sample_rate=%r not in 32k|40k|48k"
+            % (config_codes.BAD_SAMPLE_RATE_CODE, sr_str)
+        )
     version = cfg["version"]
     seed = int(cfg.get("seed", 1234))
     fp16 = bool(cfg.get("fp16", True)) and backend == "cuda"
@@ -167,7 +172,7 @@ def run(cfg, reporter, stop):
     )
 
     stop.check()
-    reporter.stage("train_prep", message="加载模型与数据，训练即将开始")
+    reporter.stage("train_prep", message=stage_codes.LOADING)
     summary = train(cfg, run_dir, pool_dir, reporter, stop)
 
     if summary["final_weight"] is None and not summary["stopped"]:

@@ -14,6 +14,7 @@ from .modules import modules
 from . import utils
 from .modules.commons import get_padding
 from .utils import f0_to_coarse
+from .. import config_codes
 
 
 class ResidualCouplingBlock(nn.Module):
@@ -431,7 +432,10 @@ class SynthesizerTrn(nn.Module):
             from .vdecoder.hifigan.models import Generator
             self.dec = Generator(h=hps)
         elif vocoder_name == "nsf-snake-hifigan":
-            raise RuntimeError("nsf-snake-hifigan 声码器未内置（训练模板固定 nsf-hifigan）")
+            raise RuntimeError(
+                "%s: vocoder_name=nsf-snake-hifigan not bundled; template pins nsf-hifigan"
+                % config_codes.VOCODER_NOT_BUNDLED_CODE
+            )
         else:
             print("[?] Unkown vocoder: use default(nsf-hifigan)")
             from .vdecoder.hifigan.models import Generator

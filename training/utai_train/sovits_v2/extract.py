@@ -34,6 +34,7 @@ from ..augment import is_aug_name
 from ..sovits.f0.RMVPEF0Predictor import RMVPEF0Predictor
 from .modules import audio
 from . import utils
+from .. import config_codes
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,10 @@ def extract_all(
             model_path=rmvpe_pt,
         )
     elif f0_method != "dio":
-        raise RuntimeError("未知 f0 提取器: %s" % f0_method)
+        raise RuntimeError(
+            "%s: f0_method=%s expected=rmvpe|dio"
+            % (config_codes.UNKNOWN_F0_METHOD_CODE, f0_method)
+        )
 
     filenames = []
     for spk in sorted(os.listdir(dataset_44k_dir)):
@@ -98,7 +102,8 @@ def extract_all(
                 failed_aug.append(filename)
                 continue
             raise RuntimeError(
-                "切片 %s 特征提取失败（详见日志）" % os.path.basename(filename)
+                "%s: feature extraction failed for %s"
+                % (SLICE_PREP_FAILED_CODE, os.path.basename(filename))
             )
     reporter.stage("extract", done=len(filenames), total=len(filenames))
     return failed_aug
@@ -123,12 +128,16 @@ def _process_one(filename, sess, f0_predictor, sampling_rate, hop_length, hps, f
     if not os.path.exists(soft_path):
         wav16k = librosa.resample(wav, orig_sr=sampling_rate, target_sr=16000)
         if len(wav16k) < MIN_SAMPLES_16K:
-            raise RuntimeError("切片过短（<400 采样点 @16k），无法提取特征")
+            # No CODE here: the wrapper in extract_all re-raises with SLICE_PREP_FAILED_CODE.
+            raise RuntimeError(
+                "slice too short for ContentVec: %d samples @16k, minimum %d"
+                % (len(wav16k), MIN_SAMPLES_16K)
+            )
         feats = sess.run(
             ["features"], {"waveform": wav16k.astype(np.float32)[None, :]}
         )[0][0]  # [T, dim]
         if np.isnan(feats).sum() > 0:
-            raise RuntimeError("ContentVec 特征包含 NaN")
+            raise RuntimeError("ContentVec returned NaN features")
         # upstream layout: [1, dim, T] cpu tensor
         c = torch.from_numpy(np.ascontiguousarray(feats.T))[None, :, :].float()
         _atomic_torch_save(c, soft_path)

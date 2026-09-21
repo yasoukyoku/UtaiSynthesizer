@@ -50,6 +50,8 @@ from . import utils
 from .extract import extract_all
 from .flist import build_config
 from .train import train
+from .. import stage_codes
+from .. import config_codes
 
 import numpy as np
 
@@ -74,7 +76,10 @@ def run(cfg, reporter, stop):
     assets = cfg["assets"]
     version = cfg["version"]
     if version != VERSION:
-        raise RuntimeError("非法 SoVITS 4.0-v2 版本: %s（仅支持 %s）" % (version, VERSION))
+        raise RuntimeError(
+            "%s: sovits_v2 version=%s expected=%s"
+            % (config_codes.BAD_SOVITS_VERSION_CODE, version, VERSION)
+        )
     seed = int(cfg.get("seed", 1234))
     loudnorm = bool(cfg.get("loudnorm", False))
     ffmpeg = assets["ffmpeg"]
@@ -206,7 +211,7 @@ def run(cfg, reporter, stop):
             index_rows += rows
 
     stop.check()
-    reporter.stage("train_prep", message="加载模型与数据，训练即将开始")
+    reporter.stage("train_prep", message=stage_codes.LOADING)
     _seed_base_checkpoints(run_dir, cfg)
     summary = train(cfg, run_dir, pool_dir, reporter, stop)
 

@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "UtaiSynthesizer",
   "mainBinaryName": "UtaiSynthesizer",
-  "version": "0.12.3",
+  "version": "0.12.4",
   "identifier": "com.utaisynthesizer.app",
   "build": {
     "frontendDist": "../dist",
@@ -16,13 +16,18 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/**", "$APPLOCALDATA/**"]
+        "scope": [
+          "$APPDATA/**",
+          "$APPLOCALDATA/**"
+        ]
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "createUpdaterArtifacts": true,
     "licenseFile": "../LICENSE",
     "icon": [
@@ -54,7 +59,8 @@
       "../converter/export_index.py": "converter/export_index.py",
       "../converter/architectures/": "converter/architectures/",
       "../training/utai_train/": "training/utai_train/",
-      "../training/assets/": "training/assets/"
+      "../training/assets/": "training/assets/",
+      "../training/rocm_cxx_headers/": "training/rocm_cxx_headers/"
     },
     "windows": {
       "nsis": {
@@ -63,7 +69,11 @@
         "installerIcon": "icons/icon.ico",
         "headerImage": "installer/header.bmp",
         "sidebarImage": "installer/sidebar.bmp",
-        "languages": ["English", "SimpChinese", "Japanese"],
+        "languages": [
+          "English",
+          "SimpChinese",
+          "Japanese"
+        ],
         "displayLanguageSelector": true,
         "compression": "lzma"
       }

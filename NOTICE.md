@@ -113,6 +113,14 @@ never the third-party weights it fetches.
   binary is a **BtbN** win64 GPL build (currently `n8.1.2-34-g9b6c8969e0-20260801`, configured with
   `--enable-gpl --enable-version3` ⇒ **GPL-3.0**). Source: https://ffmpeg.org / builds:
   https://github.com/BtbN/FFmpeg-Builds.
+- **LLVM libc++ headers + clang builtin headers** (LLVM Project, **Apache-2.0 WITH
+  LLVM-exception**) — `training/rocm_cxx_headers/{v1,clangres}`, 200 header files, headers only
+  (no library code, nothing linked). Taken from the ROCm fork of llvm-project at the same commit
+  our AMD runtime pack pins, and reduced to the minimal set the compiler actually asks for (resolved empirically: compile, copy the header it names, repeat), cross-checked against upstream's own
+  `amd/comgr/cmake/trace_headers.py`. The Apache-2.0 WITH LLVM-exception licence text ships beside them as `training/rocm_cxx_headers/LICENSE.TXT`.
+  They exist because AMD's `comgr` is supposed to embed these headers for its run-time kernel
+  compiler and our pinned nightly ships the payload empty (upstream fix: ROCm/llvm-project#4241),
+  which makes every MIOpen kernel build fail on a machine without Microsoft's MSVC headers.
 
 ## Bundled dictionary data (`data/dictionaries/`)
 

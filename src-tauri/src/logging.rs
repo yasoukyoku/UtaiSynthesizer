@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -35,6 +35,94 @@ pub const LINE_TIME_FORMAT: &[time::format_description::BorrowedFormatItem<'stat
 /// same file the logging worker writes.
 pub fn log_file_name(prefix: &str, date: time::Date) -> String {
     format!("{}.{:04}-{:02}-{:02}", prefix, date.year(), u8::from(date.month()), date.day())
+}
+
+/// How long a rolled log file is kept, and how much of them we keep in total.
+///
+/// S172: there was NO retention of any kind — the writer rolls by date and appends forever,
+/// and nothing in the codebase ever removed a `utai.log.*`. That is fine until a failure
+/// loop writes a traceback per item: one community report produced a 2.2 MB file in 3.5
+/// minutes, 99.65% of it the same 39 lines. A user who leaves that running has no ceiling.
+///
+/// The numbers are deliberately generous, because this DELETES the user's files: a month of
+/// history covers any realistic "can you send me the log from when it broke", and the size
+/// cap only bites when something pathological happened.
+const LOG_KEEP_DAYS: i64 = 30;
+const LOG_KEEP_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Prune old rolled log files. Called once at startup, AFTER the current file is opened.
+///
+/// ⛔ Deliberately conservative and fail-open, in that order:
+///   * only files whose name is EXACTLY `<prefix>.<YYYY-MM-DD>` are candidates — anything
+///     else in the log directory (crash dumps, a user's own notes) is never touched;
+///   * today's file is never a candidate, whatever the caller passes;
+///   * age first, then size, oldest-first, and it stops as soon as it is under the cap;
+///   * every error is swallowed. This is housekeeping; it must never delay or fail a boot.
+///
+/// It LOGS what it removed. That is not decoration: a later report whose log "starts in the
+/// middle" must be explainable, and S172 was nearly misattributed precisely because
+/// something had quietly removed the evidence.
+pub fn prune_old_logs(dir: &Path, prefix: &str, today: time::Date) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(time::Date, u64, PathBuf)> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix(prefix).and_then(|r| r.strip_prefix('.')) else {
+            continue;
+        };
+        // exactly YYYY-MM-DD, nothing appended — a `.1` or `.bak` suffix is not ours
+        let p: Vec<&str> = rest.split('-').collect();
+        if p.len() != 3 || rest.len() != 10 {
+            continue;
+        }
+        let (Ok(y), Ok(m), Ok(d)) = (
+            p[0].parse::<i32>(),
+            p[1].parse::<u8>(),
+            p[2].parse::<u8>(),
+        ) else {
+            continue;
+        };
+        let Ok(month) = time::Month::try_from(m) else { continue };
+        let Ok(date) = time::Date::from_calendar_date(y, month, d) else { continue };
+        if date >= today {
+            continue; // never the file we are writing into (nor a clock-skewed future one)
+        }
+        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+        files.push((date, size, e.path()));
+    }
+    if files.is_empty() {
+        return;
+    }
+    files.sort_by_key(|(d, _, _)| *d); // oldest first
+    let mut removed: Vec<String> = Vec::new();
+    let mut freed: u64 = 0;
+    let mut total: u64 = files.iter().map(|(_, s, _)| *s).sum();
+    for (date, size, path) in &files {
+        let too_old = (today - *date).whole_days() > LOG_KEEP_DAYS;
+        if !(too_old || total > LOG_KEEP_TOTAL_BYTES) {
+            break; // sorted oldest-first: nothing after this can be older either
+        }
+        if std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(*size);
+            freed += *size;
+            if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
+                removed.push(n.to_string());
+            }
+        }
+    }
+    if !removed.is_empty() {
+        let shown = removed.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+        tracing::info!(
+            "log retention: removed {} old log file(s), {:.1} MiB ({}{}) — keeping {} days / {} MiB",
+            removed.len(),
+            freed as f64 / (1024.0 * 1024.0),
+            shown,
+            if removed.len() > 6 { ", …" } else { "" },
+            LOG_KEEP_DAYS,
+            LOG_KEEP_TOTAL_BYTES / (1024 * 1024)
+        );
+    }
 }
 
 /// Daily-rolling log file writer whose file-name DATE and roll boundary follow the
@@ -389,6 +477,90 @@ pub(crate) fn foreign_live_session_in(dir: &PathBuf) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// S172. The three things that matter, all in one place because a retention bug is a
+    /// data-loss bug: it removes what it should, KEEPS what it should (a pruner that
+    /// deletes everything would also pass a "did it delete?" test), and does not touch a
+    /// single file that is not ours.
+    #[test]
+    fn prune_removes_only_our_own_stale_logs_and_keeps_the_rest() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("utai_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let today = time::Date::from_calendar_date(2026, time::Month::September, 21).unwrap();
+
+        let write = |name: &str, bytes: usize| {
+            let mut f = std::fs::File::create(dir.join(name)).unwrap();
+            f.write_all(&vec![b'x'; bytes]).unwrap();
+        };
+        // ours, too old (>30 days)
+        write("utai.log.2026-01-01", 10);
+        write("utai.log.2026-08-01", 10);
+        // ours, inside the window
+        write("utai.log.2026-09-01", 10);
+        write("utai.log.2026-09-20", 10);
+        // ours, TODAY — never a candidate even though the caller passes the same date
+        write("utai.log.2026-09-21", 10);
+        // ours-looking but NOT ours: suffixed, malformed, a different prefix, a crash dump
+        write("utai.log.2026-09-01.bak", 10);
+        write("utai.log.2026-9-1", 10);
+        write("utai.log.not-a-date", 10);
+        write("other.log.2026-01-01", 10);
+        write("crash_20260101.dmp", 10);
+
+        super::prune_old_logs(&dir, super::LOG_PREFIX, today);
+
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for gone in ["utai.log.2026-01-01", "utai.log.2026-08-01"] {
+            assert!(!left.contains(gone), "should have pruned {gone}: {left:?}");
+        }
+        for kept in [
+            "utai.log.2026-09-01",
+            "utai.log.2026-09-20",
+            "utai.log.2026-09-21",
+            "utai.log.2026-09-01.bak",
+            "utai.log.2026-9-1",
+            "utai.log.not-a-date",
+            "other.log.2026-01-01",
+            "crash_20260101.dmp",
+        ] {
+            assert!(left.contains(kept), "should have KEPT {kept}: {left:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The size cap is the other half, and it must not fire while we are under it — a cap
+    /// that always prunes is indistinguishable from no cap at all.
+    #[test]
+    fn prune_size_cap_takes_the_oldest_first_and_stops_at_the_limit() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("utai_prunesz_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let today = time::Date::from_calendar_date(2026, time::Month::September, 21).unwrap();
+        // all INSIDE the age window, so only the size rule can act here
+        for (day, mb) in [(18u8, 300usize), (19, 300), (20, 10)] {
+            let name = format!("utai.log.2026-09-{:02}", day);
+            let mut f = std::fs::File::create(dir.join(&name)).unwrap();
+            f.write_all(&vec![b'x'; mb * 1024 * 1024]).unwrap();
+        }
+        super::prune_old_logs(&dir, super::LOG_PREFIX, today);
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        // 610 MiB > 512 MiB cap: the oldest goes, and then it STOPS (310 MiB is under).
+        assert!(!left.contains("utai.log.2026-09-18"), "oldest not pruned: {left:?}");
+        assert!(left.contains("utai.log.2026-09-19"), "pruned past the cap: {left:?}");
+        assert!(left.contains("utai.log.2026-09-20"), "pruned past the cap: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
     use std::io::Write as _;
 

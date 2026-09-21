@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import traceback
+from . import config_codes
 
 
 def main():
@@ -55,6 +56,21 @@ def main():
             file=sys.stderr,
             flush=True,
         )
+        # S172: one fingerprint block per run. Each of the last three community reports needed
+        # a follow-up question the app could have answered here -- data dir (S168), which GPU
+        # ordinal really got used (S169), whether the machine had its own C++ headers (S172).
+        # Printed from the CHILD so it records what this process RECEIVED, not what the parent
+        # meant to send: the S169 bug lived exactly in that gap.
+        from . import envfingerprint
+
+        envfingerprint.emit()
+        # S172: give the MIOpen-RNN backstop this run's reporter, so a degrade is announced
+        # through the normal warning channel instead of only reaching the log. Here, and not
+        # inside the lanes, because all five reach rmvpe's BiGRU and the latch is per-run.
+        from . import miopen_guard
+
+        miopen_guard.install(reporter)
+
         backend = cfg.get("backend")
         if backend == "rvc":
             from .rvc import pipeline
@@ -77,7 +93,10 @@ def main():
 
             pipeline.run(cfg, reporter, stop)
         else:
-            raise RuntimeError("未知训练后端: %s" % backend)
+            raise RuntimeError(
+                "%s: runner: backend=%r not in rvc|sovits|sovits_v2|sovits_diff|vocoder"
+                % (config_codes.BACKEND_UNSUPPORTED_CODE, backend)
+            )
     except StopRequested:
         # stop observed during a preprocessing stage — nothing was trained
         reporter.done("stopped", {"phase": "preprocess"})

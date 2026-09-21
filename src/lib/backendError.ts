@@ -389,6 +389,57 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // carries kernels for none of this machine's GPUs — the remedy is a NEWER pack, not a
   // reinstall, so it must not fall to the generic "reinstall this pack" fallback lane.
   ENVTEST_AMD_NO_COVERED_GPU: { key: "backend.ENVTEST_AMD_NO_COVERED_GPU" },
+  // S172 self-test items for the AMD kernel-compiler hole. Each has a DIFFERENT
+  // remedy, and none of them is the generic "reinstall this pack" the unmapped
+  // lane would have shown: headers missing -> update Utai; payload incomplete ->
+  // our packaging bug, send us the report; probe could not start -> reinstall the
+  // pack; RNN broken -> read the headers item first.
+  ENVTEST_HIPRTC_CXX_HEADERS_MISSING: { key: "backend.ENVTEST_HIPRTC_CXX_HEADERS_MISSING" },
+  ENVTEST_HIPRTC_CXX_HEADERS_NOT_SHIPPED: { key: "backend.ENVTEST_HIPRTC_CXX_HEADERS_NOT_SHIPPED" },
+  ENVTEST_HIPRTC_PROBE_FAILED: { key: "backend.ENVTEST_HIPRTC_PROBE_FAILED" },
+  ENVTEST_GPU_RNN_BROKEN: { key: "backend.ENVTEST_GPU_RNN_BROKEN" },
+  // S172 sweep: the last two trainer CODEs that had no mapping. Both are
+  // internal invariants from the S120 pool layout that should be unreachable
+  // — which is why they were missed, and why their remedy is "send us the
+  // log" rather than anything the user could usefully do to their install.
+  // training/utai_train is 25/25 with these.
+  POOL_IDENTITY_EMPTY: { key: "backend.POOL_IDENTITY_EMPTY" },
+  POOL_ID_EXHAUSTED: { key: "backend.POOL_ID_EXHAUSTED" },
+  // S172: training PROGRESS messages. Not errors -- TrainingPage renders the stage
+  // message through this same table, and until now it had only Chinese literals to
+  // render, so every non-Chinese user watched Chinese text for the whole run.
+  // Defined in training/utai_train/stage_codes.py; two carry a ": <count>" detail.
+  TRAINING_STAGE_NO_AUGMENT: { key: "backend.TRAINING_STAGE_NO_AUGMENT" },
+  TRAINING_STAGE_FILELIST: { key: "backend.TRAINING_STAGE_FILELIST" },
+  TRAINING_STAGE_BUILD_INDEX: { key: "backend.TRAINING_STAGE_BUILD_INDEX" },
+  TRAINING_STAGE_LOADING: { key: "backend.TRAINING_STAGE_LOADING" },
+  TRAINING_STAGE_KMEANS: { key: "backend.TRAINING_STAGE_KMEANS" },
+  TRAINING_STAGE_DIFF_PREP: { key: "backend.TRAINING_STAGE_DIFF_PREP" },
+  TRAINING_STAGE_DIFF_LOADING: { key: "backend.TRAINING_STAGE_DIFF_LOADING" },
+  TRAINING_STAGE_DIFF_NO_PRETRAIN: { key: "backend.TRAINING_STAGE_DIFF_NO_PRETRAIN" },
+  TRAINING_STAGE_CACHING: { key: "backend.TRAINING_STAGE_CACHING" },
+  TRAINING_STAGE_VOCODER_LOADING: { key: "backend.TRAINING_STAGE_VOCODER_LOADING" },
+  TRAINING_STAGE_DROPPED_AUG: { key: "backend.TRAINING_STAGE_DROPPED_AUG" },
+  TRAINING_STAGE_SPLIT: { key: "backend.TRAINING_STAGE_SPLIT" },
+  TRAINING_STAGE_DROPPED_SHORT: { key: "backend.TRAINING_STAGE_DROPPED_SHORT" },
+  // S172: the trainer's config- and material-refusals. These used to raise hardcoded
+  // Chinese, so a non-Chinese user met a Chinese sentence at the moment their run died.
+  // Defined in training/utai_train/{config_codes,prep_codes}.py. Four more codes that
+  // those modules emit are NOT listed again here -- TRAINING_BACKEND_UNSUPPORTED,
+  // TRAINING_BAD_SAMPLE_RATE, TRAINING_BAD_SOVITS_VERSION and TRAINING_ASSET_MISSING
+  // are already in this table because Rust emits them for the same predicate.
+  TRAINING_PSOLA_OUTPUT_INVALID: { key: "backend.TRAINING_PSOLA_OUTPUT_INVALID" },
+  TRAINING_PREP_PRODUCTS_MISMATCH: { key: "backend.TRAINING_PREP_PRODUCTS_MISMATCH" },
+  TRAINING_FEATURE_DIR_EMPTY: { key: "backend.TRAINING_FEATURE_DIR_EMPTY" },
+  TRAINING_ASSET_PATH_UNSET: { key: "backend.TRAINING_ASSET_PATH_UNSET" },
+  TRAINING_UNKNOWN_SPEECH_ENCODER: { key: "backend.TRAINING_UNKNOWN_SPEECH_ENCODER" },
+  TRAINING_UNKNOWN_F0_METHOD: { key: "backend.TRAINING_UNKNOWN_F0_METHOD" },
+  TRAINING_VOCODER_NOT_BUNDLED: { key: "backend.TRAINING_VOCODER_NOT_BUNDLED" },
+  TRAINING_DIFF_MULTI_SPEAKER: { key: "backend.TRAINING_DIFF_MULTI_SPEAKER" },
+  TRAINING_DIFF_BASE_FORMAT: { key: "backend.TRAINING_DIFF_BASE_FORMAT" },
+  TRAINING_NO_USABLE_SLICES: { key: "backend.TRAINING_NO_USABLE_SLICES" },
+  TRAINING_SOURCE_FILES_ALL_FAILED: { key: "backend.TRAINING_SOURCE_FILES_ALL_FAILED" },
+  TRAINING_SOURCE_SR_TOO_LOW: { key: "backend.TRAINING_SOURCE_SR_TOO_LOW" },
   // S68b loud-degradation guard (training/mod.rs try_start): GPU present but only the
   // CPU runtime pack installed — refuse instead of the old log-file-only warn.
   TRAINING_RUNTIME_CPU_ONLY: { key: "backend.TRAINING_RUNTIME_CPU_ONLY" },
@@ -414,6 +465,27 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // waits forever, so these two are the only thing the UI can say.
   TRAINING_HOST_MEMORY_EXHAUSTED: { key: "backend.TRAINING_HOST_MEMORY_EXHAUSTED" },
   TRAINING_NO_PROGRESS: { key: "backend.TRAINING_NO_PROGRESS" },
+  // S172 AMD lane: MIOpen could not BUILD its RNN kernel (the pack ships no C++ standard
+  // library, so hipRTC cannot resolve <type_traits> on a machine without MSVC headers), and
+  // the run continued on a MIOpen-free path that is still on the GPU. Raised by
+  // training/utai_train/miopen_guard.py — a warning, not an error: the run succeeds.
+  TRAINING_MIOPEN_KERNEL_BYPASSED: { key: "backend.TRAINING_MIOPEN_KERNEL_BYPASSED" },
+  // S172 RVC preprocessing policy (training/utai_train/prep_codes.py). All three stages used
+  // to swallow per-item failures and raise only when EVERY item failed, while filelist.py
+  // builds the training set as a 4-way set INTERSECTION — so 369 of 370 f0 slices failing
+  // trained on the remainder and reported "completed". Now: a BASE slice is fatal on the
+  // first one, an _aug copy is dropped loudly, and a source file that yields no slices at
+  // all is skipped loudly.
+  TRAINING_SLICE_PREP_FAILED: { key: "backend.TRAINING_SLICE_PREP_FAILED" },
+  TRAINING_AUG_SLICES_DROPPED: { key: "backend.TRAINING_AUG_SLICES_DROPPED" },
+  // …and the one that must NOT be a warning: the gate itself could not run, so its
+  // "reject" verdict would delete 100%% of the augmentation on no evidence at all.
+  TRAINING_AUG_GATE_UNUSABLE: { key: "backend.TRAINING_AUG_GATE_UNUSABLE" },
+  TRAINING_SOURCE_FILES_SKIPPED: { key: "backend.TRAINING_SOURCE_FILES_SKIPPED" },
+  // S172 classifier over the sidecar's stderr: MIOpen could not BUILD a kernel (hipRTC
+  // returned HIPRTC_ERROR_COMPILATION). The reason only ever appears on stderr, never in
+  // the exception, so mod.rs sniffs for it the way it already does for the 1455 hang.
+  TRAINING_ROCM_KERNEL_BUILD_FAILED: { key: "backend.TRAINING_ROCM_KERNEL_BUILD_FAILED" },
   TRAINING_NAME_EMPTY: { key: "backend.TRAINING_NAME_EMPTY" },
   // ★S143 §E2E-M25 笔 5 —— 同槽两个 run 同名 ⇒ 同 slug ⇒ `plan_cleanup` 会把另一个 run 的
   // 快照永久保留。改名那条路此前前后端都只判空,而「再训一个」那条早有闸。

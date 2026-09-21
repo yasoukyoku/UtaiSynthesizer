@@ -209,6 +209,13 @@ KNOWN_BASES = {
     "weights_dir", "flist_dir", "configs_dir", "cluster_dir", "meta_dir",
     "slices_dir", "slice_dir", "out_dir", "out_spk_dir", "tmp",
     "self.gt_wavs_dir", "self.wavs16k_dir",
+    # S172: NOT part of the pool/run hierarchy at all. envfingerprint.py probes the
+    # Program Files root to answer "does this machine have its own C++ headers" -- the
+    # question S172 had to ASK a reporter instead of reading from their log. Declared here
+    # rather than renamed out of sight, because this set is held to EXACT equality on
+    # purpose: a new base is meant to stop a human and make them say which kind it is.
+    # This one is neither a pool nor a run directory, so checks (1)-(3) correctly skip it.
+    "pf_root",
 }
 #: marker for a name this gate could not resolve to a literal (a `%`-format or an f-string).
 #: Plain ASCII on purpose — this repo has five separate incidents of a NUL byte written into a

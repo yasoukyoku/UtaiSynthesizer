@@ -18,6 +18,8 @@ except Exception:  # pylint: disable=broad-exception-caught
 import torch.nn as nn
 import torch.nn.functional as F
 from librosa.util import normalize, pad_center, tiny
+
+from .. import miopen_guard
 from scipy.signal import get_window
 
 import logging
@@ -170,7 +172,13 @@ class BiGRU(nn.Module):
         )
 
     def forward(self, x):
-        return self.gru(x)[0]
+        # S172 deviation from upstream: the call goes through the MIOpen-RNN backstop.
+        # On every non-ROCm runtime that is one boolean test and a direct call, so the
+        # NVIDIA / Intel / CPU lanes are byte-identical to upstream. On ROCm it catches
+        # MIOpen failing to BUILD its RNN kernel (the pack ships no C++ standard library,
+        # so hipRTC cannot resolve <type_traits> on a machine without MSVC headers) and
+        # retries once without MIOpen, still on the GPU. See utai_train/miopen_guard.py.
+        return miopen_guard.run(lambda: self.gru(x)[0])
 
 
 class ConvBlockRes(nn.Module):
@@ -546,7 +554,12 @@ class RMVPE:
                 )[0]
             else:
                 mel = mel.half() if self.is_half else mel.float()
-                hidden = self.model(mel)
+                # S172 deviation: guard the WHOLE network forward, not just the BiGRU inside
+                # it. This lane happens to run fp16 (pipeline.py passes backend=="cuda" as
+                # is_half), and in fp16 torch does not hand BatchNorm to MIOpen — so the RNN
+                # is merely the FIRST kernel that fails here, not the only one. Forcing this
+                # same code to fp32 makes it die in `self.bn(x)` instead (measured).
+                hidden = miopen_guard.run(lambda: self.model(mel))
             return hidden[:, :n_frames]
 
     def decode(self, hidden, thred=0.03):
