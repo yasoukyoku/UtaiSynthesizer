@@ -11,8 +11,6 @@ import logging
 import os
 import random
 import shutil
-from .. import stage_codes
-from .. import prep_codes
 
 logger = logging.getLogger(__name__)
 
@@ -62,33 +60,21 @@ def build_filelist_and_config(
     # artifacts WRITTEN (filelist.txt, config.json) stay at the slot root — the filelist is
     # rewritten in full by every run and holds absolute paths INTO the pool, so pooling it would
     # only duplicate it, and config.json is per-run by design (fp16_run follows the run's toggle).
-    reporter.stage("filelist", message=stage_codes.FILELIST)
+    reporter.stage("filelist", message="生成训练清单与配置")
     gt_wavs_dir = os.path.join(pool_dir, "0_gt_wavs")
     fea_dim = 256 if version == "v1" else 768
     feature_dir = os.path.join(pool_dir, "3_feature%s" % fea_dim)
     f0_dir = os.path.join(pool_dir, "2a_f0")
     f0nsf_dir = os.path.join(pool_dir, "2b-f0nsf")
 
-    # S172: the four sets are bound before the intersection so the refusal can say HOW they
-    # disagree. "0 slices have all four products" is not actionable; "gt=370 feature=1 f0=370"
-    # names the stage that failed, and it is the only clue we get from a log.
-    gt_names = set(name.split(".")[0] for name in os.listdir(gt_wavs_dir))
-    fea_names = set(name.split(".")[0] for name in os.listdir(feature_dir))
-    f0_names = set(name.split(".")[0] for name in os.listdir(f0_dir))
-    f0nsf_names = set(name.split(".")[0] for name in os.listdir(f0nsf_dir))
-    names = gt_names & fea_names & f0_names & f0nsf_names
+    names = (
+        set([name.split(".")[0] for name in os.listdir(gt_wavs_dir)])
+        & set([name.split(".")[0] for name in os.listdir(feature_dir)])
+        & set([name.split(".")[0] for name in os.listdir(f0_dir)])
+        & set([name.split(".")[0] for name in os.listdir(f0nsf_dir)])
+    )
     if not names:
-        raise RuntimeError(
-            "%s: no slice has all 4 products: gt=%d feature%d=%d f0=%d f0nsf=%d"
-            % (
-                prep_codes.PREP_PRODUCTS_MISMATCH_CODE,
-                len(gt_names),
-                fea_dim,
-                len(fea_names),
-                len(f0_names),
-                len(f0nsf_names),
-            )
-        )
+        raise RuntimeError("预处理产物为空：没有任何切片同时具备音频/特征/f0")
 
     # sorted() before the seeded shuffle: set iteration order is per-process random
     # (str hash randomization), which would defeat the seed

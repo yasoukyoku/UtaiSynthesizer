@@ -1,11 +1,6 @@
 # Vendored verbatim from so-vits-svc 4.1-Stable (modules/F0Predictor/rmvpe/seq.py @ 730930d).
-# Changes vs upstream: package-relative imports only; S172 routes the RNN call through the
-# MIOpen-RNN backstop (utai_train/miopen_guard.py) — a no-op on every non-ROCm runtime, and on
-# ROCm it survives MIOpen failing to BUILD its RNN kernel, which is fatal for f0 extraction on
-# any machine whose hipRTC cannot resolve <type_traits> (the pack ships no C++ standard library).
+# Changes vs upstream: package-relative imports only.
 import torch.nn as nn
-
-from .... import miopen_guard
 
 
 class BiGRU(nn.Module):
@@ -14,7 +9,7 @@ class BiGRU(nn.Module):
         self.gru = nn.GRU(input_features, hidden_features, num_layers=num_layers, batch_first=True, bidirectional=True)
 
     def forward(self, x):
-        return miopen_guard.run(lambda: self.gru(x)[0])
+        return self.gru(x)[0]
 
 
 class BiLSTM(nn.Module):
@@ -23,4 +18,5 @@ class BiLSTM(nn.Module):
         self.lstm = nn.LSTM(input_features, hidden_features, num_layers=num_layers, batch_first=True, bidirectional=True)
 
     def forward(self, x):
-        return miopen_guard.run(lambda: self.lstm(x)[0])
+        return self.lstm(x)[0]
+

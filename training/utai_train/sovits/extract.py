@@ -45,7 +45,6 @@ from ..augment import is_aug_name
 from .f0.RMVPEF0Predictor import RMVPEF0Predictor
 from .modules.mel_processing import spectrogram_torch
 from .utils import Volume_Extractor
-from .. import config_codes
 
 logger = logging.getLogger(__name__)
 
@@ -89,10 +88,7 @@ def extract_all(
     aug_rng = None
     if diff_mode:
         if not nsf_hifigan_model:
-            raise RuntimeError(
-                "%s: run.json asset path empty: nsf_hifigan_model (diff_mode)"
-                % config_codes.ASSET_PATH_UNSET_CODE
-            )
+            raise RuntimeError("扩散预处理缺少 NSF-HiFiGAN 声码器资产路径")
         import random
 
         from .diffusion.vocoder import Vocoder
@@ -143,8 +139,7 @@ def extract_all(
                 failed_aug.append(filename)
                 continue
             raise RuntimeError(
-                "%s: feature extraction failed for %s"
-                % (SLICE_PREP_FAILED_CODE, os.path.basename(filename))
+                "切片 %s 特征提取失败（详见日志）" % os.path.basename(filename)
             )
     reporter.stage("extract", done=len(filenames), total=len(filenames))
     return failed_aug
@@ -174,18 +169,12 @@ def _process_one(filename, sess, f0_predictor, volume_extractor, sampling_rate, 
     if not os.path.exists(soft_path):
         wav16k = librosa.resample(wav, orig_sr=sampling_rate, target_sr=16000)
         if len(wav16k) < MIN_SAMPLES_16K:
-            # No CODE here on purpose: the wrapper in extract_all catches this and
-            # re-raises with SLICE_PREP_FAILED_CODE. Prefixing here would put two codes
-            # in one message and the frontend matches the first one it finds.
-            raise RuntimeError(
-                "slice too short for ContentVec: %d samples @16k, minimum %d"
-                % (len(wav16k), MIN_SAMPLES_16K)
-            )
+            raise RuntimeError("切片过短（<400 采样点 @16k），无法提取特征")
         feats = sess.run(
             ["features"], {"waveform": wav16k.astype(np.float32)[None, :]}
         )[0][0]  # [T, dim]
         if np.isnan(feats).sum() > 0:
-            raise RuntimeError("ContentVec returned NaN features")
+            raise RuntimeError("ContentVec 特征包含 NaN")
         # upstream layout: [1, dim, T] cpu tensor
         c = torch.from_numpy(np.ascontiguousarray(feats.T))[None, :, :].float()
         _atomic_torch_save(c, soft_path)

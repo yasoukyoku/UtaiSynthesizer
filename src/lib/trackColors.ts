@@ -19,6 +19,15 @@ export function trackRgb(type: TrackType): [number, number, number] {
   return TRACK_RGB[type] ?? TRACK_RGB.instrument;
 }
 
+/** 画布绘制用轨道色: 优先轨道头自定义色(track.color, 用户在色条上选的 hex),
+ *  保持「音轨块颜色 = 轨道头颜色」一致; 未自定义时回退到类型默认色。 */
+export function trackDrawRgb(track: Pick<Track, "color" | "trackType">): [number, number, number] {
+  if (track.color && track.color.startsWith("#")) {
+    return hexToRgb(track.color, trackRgb(track.trackType));
+  }
+  return trackRgb(track.trackType);
+}
+
 export function trackTypeCssVar(type: TrackType): string {
   return type === "vocal"
     ? "var(--track-vocal)"
@@ -38,8 +47,52 @@ export function rgba(c: readonly number[], a: number): string {
  *  `TRACK_RGB.vocal` by coincidence only — they are semantically distinct; keep them independent. */
 export const ACCENT_RGB: [number, number, number] = [57, 197, 187];
 
+/** Parse a 3/6-digit hex color ("#a78bfa") to an [r,g,b] tuple; on any parse failure return `fallback`
+ *  (default: the theme accent). Used by canvas draw loops that follow the active skin by reading
+ *  `--accent-primary` from computed styles (ChordTrack/TimelineRuler). */
+export function hexToRgb(hex: string, fallback: [number, number, number] = ACCENT_RGB): [number, number, number] {
+  const m = /^#?([\da-f]{3}|[\da-f]{6})$/i.exec(hex.trim());
+  if (!m) return fallback;
+  let s = m[1]!;
+  if (s.length === 3) s = s[0]! + s[0] + s[1]! + s[1] + s[2]! + s[2];
+  return [parseInt(s.slice(0, 2), 16), parseInt(s.slice(2, 4), 16), parseInt(s.slice(4, 6), 16)];
+}
+
 /** Theme accent as a canvas hex literal (= `rgba(ACCENT_RGB, 1)`) — used by the loading spinner etc. */
 export const ACCENT = "#39c5bb";
+
+/** Random color palette for new tracks (when no audio is added yet).
+ *  These colors are visually distinct and work well with the dark theme. */
+export const RANDOM_TRACK_COLORS = [
+  "#60A5FA", // blue
+  "#39C5BB", // teal
+  "#A78BFA", // purple
+  "#F59E0B", // amber
+  "#10B981", // emerald
+  "#F472B6", // pink
+  "#8B5CF6", // violet
+  "#EF4444", // red
+  "#14B8A6", // cyan
+  "#F97316", // orange
+];
+
+/** Get a random color from the track color palette */
+export function getRandomTrackColor(): string {
+  return RANDOM_TRACK_COLORS[Math.floor(Math.random() * RANDOM_TRACK_COLORS.length)]!;
+}
+
+/** 挑一个「未被现有轨道占用」的随机轨道色 —— 所有新建轨(音频/乐器/人声/粘贴)都走这里,
+ *  保证全局不出现相同颜色; 10 色用满后回退到使用次数最少的颜色。 */
+export function pickUniqueTrackColor(existing: { color?: string }[]): string {
+  const used = new Map<string, number>();
+  for (const t of existing) {
+    if (t.color && t.color.startsWith("#")) used.set(t.color, (used.get(t.color) ?? 0) + 1);
+  }
+  let min = Infinity;
+  for (const c of RANDOM_TRACK_COLORS) min = Math.min(min, used.get(c) ?? 0);
+  const least = RANDOM_TRACK_COLORS.filter((c) => (used.get(c) ?? 0) === min);
+  return least[Math.floor(Math.random() * least.length)]!;
+}
 
 /** Sub-lane GROUP palette ("r,g,b" strings for canvas rgba() + the header's `--lane-rgb` CSS var),
  *  cycled by the group-run index within a track (all rows of one 组 share the hue, so grouping reads

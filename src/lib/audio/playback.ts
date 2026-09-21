@@ -9,6 +9,7 @@ import { isLaneRowMuted, laneControlFor, segmentPlaysLanes } from "../trackLayou
 import { useProjectStore } from "../../store/project";
 import type { Track } from "../../types/project";
 import type { AudioTrackData } from "../../store/audio";
+import { connectTrackOutput, getFxBusConfig } from "./effectsBus";
 
 let audioCtx: AudioContext | null = null;
 const loadedBuffers = new Map<string, AudioBuffer>();
@@ -39,7 +40,7 @@ let scheduledSources: ScheduledSource[] = [];
 let playGeneration = 0;
 let scheduleTimeOrigin = 0;
 
-function getContext(): AudioContext {
+export function getContext(): AudioContext {
   if (!audioCtx || audioCtx.state === "closed") {
     audioCtx = new AudioContext();
   }
@@ -168,7 +169,10 @@ function prewarmScheduleSources(
       })().catch(() => {}),
     );
   };
-  for (const track of tracks) {
+  // 🎯 Solo 过滤: 任何轨 solo=true → 只听 solo 的轨
+  const soloActive = tracks.some((t) => t.solo);
+  const effectiveTracks = soloActive ? tracks.filter((t) => t.solo) : tracks;
+  for (const track of effectiveTracks) {
     for (const seg of track.segments) {
       // mirror the loop's own skip: a segment fully behind the playhead never schedules,
       // so warming it would decode dead weight (audit S60 — a play from the outro must not
@@ -239,7 +243,10 @@ export async function playAllTracks(
     return { t, audible: !t.muted && (!solo || t.solo) };
   };
 
-  for (const track of tracks) {
+  // 🎯 Solo 过滤: 任何轨 solo=true → 只听 solo 的轨
+  const soloActive = tracks.some((t) => t.solo);
+  const effectiveTracks = soloActive ? tracks.filter((t) => t.solo) : tracks;
+  for (const track of effectiveTracks) {
     const sorted = [...track.segments]
       // ② vocal render: a notes segment with a ready baked lane plays too (segmentPlaysLanes admits it —
       // the single source-selection predicate). audioClip is always admitted (it may play original audio).
@@ -376,7 +383,9 @@ export async function playAllTracks(
             source.buffer = buf;
             const envNode = loudnessEnvNode(ctx, seg, playheadTick, tempo, now, startDelay, playDuration, seg.laneLoudness?.[group]);
             const laneTail = source.connect(fadeInNode).connect(fadeOutNode);
-            (envNode ? laneTail.connect(envNode) : laneTail).connect(laneGainNode).connect(trackGainNode).connect(panner).connect(ctx.destination);
+            (envNode ? laneTail.connect(envNode) : laneTail).connect(laneGainNode).connect(trackGainNode).connect(panner);
+            // S12: dry → destination (unchanged) + per-track FX sends into the aux buses.
+            connectTrackOutput(ctx, panner, { reverb: lt.reverbSend, delay: lt.delaySend }, getFxBusConfig(), track.id);
             source.onended = () => { if (gen !== playGeneration) return; endedCount++; if (schedulingDone && endedCount >= totalScheduled) onAllEnded(); };
             source.start(now + startDelay, audioOffset, playDuration);
             scheduledSources.push({
@@ -491,7 +500,9 @@ export async function playAllTracks(
       source.buffer = buf;
       const envNode = loudnessEnvNode(ctx, seg, playheadTick, tempo, now, startDelay, playDuration);
       const origTail = source.connect(fadeInNode).connect(fadeOutNode);
-      (envNode ? origTail.connect(envNode) : origTail).connect(trackGainNode).connect(panner).connect(ctx.destination);
+      (envNode ? origTail.connect(envNode) : origTail).connect(trackGainNode).connect(panner);
+      // S12: dry → destination (unchanged) + per-track FX sends into the aux buses.
+      connectTrackOutput(ctx, panner, { reverb: lt.reverbSend, delay: lt.delaySend }, getFxBusConfig(), track.id);
 
       source.onended = () => {
         // Ignore end events from a superseded generation — stopPlayback() (called when a new

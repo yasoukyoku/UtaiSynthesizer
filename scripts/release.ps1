@@ -37,7 +37,6 @@ if ($lastTag) {
 
 # ── 3. bundle inputs exist + ffmpeg has the S63 encoder set ──
 foreach ($p in @(
-  "bin\ffmpeg.exe",
   "runtime\ort\onnxruntime.dll",
   "runtime\ort\onnxruntime_providers_shared.dll",
   "runtime\ort\DirectML.dll",
@@ -73,9 +72,18 @@ foreach ($name in $want.Keys) {
     Fail "dictionary identity: $name does not match $manifestPath (intentional regeneration? rerun verify_dictionaries.py, then ``py -3.10 scripts\dict_manifest.py --write``)"
   }
 }
-$enc = & bin\ffmpeg.exe -hide_banner -encoders 2>$null | Out-String
-foreach ($e in @("libmp3lame", "libvorbis", "libopus", " aac", " flac")) {
-  if ($enc -notmatch [regex]::Escape($e)) { Fail "bundled ffmpeg lacks encoder:$e" }
+# ffmpeg is resource-manager on-demand now (slim installer): not a bundle input. Keep the
+# encoder sanity gate against ANY local copy (dev bin\ or the resource-managed download);
+# when neither exists, skip — the catalog SHA256 pins the exact gyan essentials build.
+$ff = @("bin\ffmpeg.exe", "data\models\amt\ffmpeg\bin\ffmpeg.exe") |
+  Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($ff) {
+  $enc = & $ff -hide_banner -encoders 2>$null | Out-String
+  foreach ($e in @("libmp3lame", "libvorbis", "libopus", " aac", " flac")) {
+    if ($enc -notmatch [regex]::Escape($e)) { Fail "ffmpeg ($ff) lacks encoder:$e" }
+  }
+} else {
+  Write-Host "note: no local ffmpeg copy — encoder gate skipped (catalog SHA256 pins the build)" -ForegroundColor Yellow
 }
 
 # ── 4. purge python bytecode from bundled trees (resources copy directories verbatim) ──
@@ -111,8 +119,9 @@ $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
 Write-Host "building v$confVer ..." -ForegroundColor Cyan
 npm run tauri build; if ($LASTEXITCODE -ne 0) { Fail "tauri build" }
 
-# ── 7. artifacts + latest.json ──
-$setup = "src-tauri\target\release\bundle\nsis\UtaiSynthesizer_${confVer}_x64-setup.exe"
+# ── 7. artifacts + latest.json ── (Muno rebrand: bundle/asset names follow productName;
+# repo URL stays the project's real home. The signing key keeps its historical path.)
+$setup = "src-tauri\target\release\bundle\nsis\Muno_${confVer}_x64-setup.exe"
 $sig = "$setup.sig"
 if (-not (Test-Path $setup)) { Fail "setup exe not produced: $setup" }
 if (-not (Test-Path $sig)) { Fail ".sig not produced (signing key env not seen by the build?)" }
@@ -123,7 +132,7 @@ $latest = @{
   platforms = @{
     "windows-x86_64" = @{
       signature = (Get-Content $sig -Raw)
-      url = "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/v$confVer/UtaiSynthesizer_${confVer}_x64-setup.exe"
+      url = "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/v$confVer/Muno_${confVer}_x64-setup.exe"
     }
   }
 }
@@ -136,8 +145,8 @@ Write-Host "       $latestPath" -ForegroundColor Green
 # ── 8. publish (opt-in; the release must be a REAL release — prerelease/draft never becomes `latest`) ──
 if ($Publish) {
   Write-Host "publishing v$confVer to GitHub Releases..." -ForegroundColor Cyan
-  $relNotes = if ($Notes) { $Notes } else { "UtaiSynthesizer v$confVer" }
-  gh release create "v$confVer" $setup $latestPath --title "UtaiSynthesizer v$confVer" --notes $relNotes
+  $relNotes = if ($Notes) { $Notes } else { "Muno v$confVer" }
+  gh release create "v$confVer" $setup $latestPath --title "Muno v$confVer" --notes $relNotes
   if ($LASTEXITCODE -ne 0) { Fail "gh release create" }
   Write-Host "published: https://github.com/yasoukyoku/UtaiSynthesizer/releases/tag/v$confVer" -ForegroundColor Green
 }

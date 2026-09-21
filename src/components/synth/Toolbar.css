@@ -8,6 +8,46 @@
   gap: var(--space-md);
 }
 
+/* 三栏布局：左侧工具 + 中心播放控制 + 右侧信息 */
+.toolbar-left,
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  flex: 1;
+  min-width: 0;
+}
+
+.toolbar-left {
+  justify-content: flex-start;
+}
+
+.toolbar-right {
+  justify-content: flex-end;
+}
+
+/* 中心区域：播放控制 + 概览图（视觉焦点，固定宽度居中） */
+.toolbar-center {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  flex-shrink: 0;
+  max-width: 50%;
+}
+
+/* 概览图容器（频谱已内嵌到 OverviewMap 画布中，与波形同大小） */
+.toolbar-overlay {
+  position: relative;
+  width: 220px;
+  height: 40px;
+  flex-shrink: 0;
+}
+
+.toolbar-overlay .overview-map {
+  position: relative;
+  display: block;
+}
+
 .toolbar-section {
   display: flex;
   align-items: center;
@@ -39,6 +79,65 @@
   align-items: center;
   justify-content: center;
   padding: 0;
+}
+
+/* Play — 圆形大按钮：重新设计为非常漂亮的样式，使用渐变、阴影、动画 */
+.transport-btn-lg {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  position: relative;
+  background: linear-gradient(135deg, rgba(74, 222, 128, 0.15) 0%, rgba(34, 197, 94, 0.08) 100%);
+  box-shadow: 
+    0 2px 8px rgba(74, 222, 128, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.transport-btn-lg::before {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 50%;
+  padding: 2px;
+  background: linear-gradient(135deg, rgba(74, 222, 128, 0.4), rgba(34, 197, 94, 0.2));
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.transport-btn-lg:hover {
+  background: linear-gradient(135deg, rgba(74, 222, 128, 0.25) 0%, rgba(34, 197, 94, 0.15) 100%);
+  box-shadow: 
+    0 4px 16px rgba(74, 222, 128, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+  transform: translateY(-1px);
+}
+
+.transport-btn-lg:hover::before {
+  opacity: 1;
+}
+
+.transport-btn-lg:active {
+  transform: translateY(0);
+  box-shadow: 
+    0 2px 8px rgba(74, 222, 128, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.transport-btn-lg .icon-play {
+  border-width: 8px 0 8px 13px;
+  margin-left: 3px;
+  filter: drop-shadow(0 1px 2px rgba(74, 222, 128, 0.3));
+}
+.transport-btn-lg .icon-pause {
+  width: 14px;
+  height: 16px;
+  border-left-width: 4px;
+  border-right-width: 4px;
+  filter: drop-shadow(0 1px 2px rgba(74, 222, 128, 0.3));
 }
 
 /* Transport hover: a crisp INSET ring + subtle fill — NOT an outer glow. The old `box-shadow: 0 0 8px`
@@ -99,13 +198,28 @@
   border-color: var(--color-success);
 }
 
-.transport-btn.play:hover {
-  box-shadow: inset 0 0 0 1px rgba(74, 222, 128, 0.55); /* green inset ring only — no fill */
+.transport-btn.play.playing {
+  background: linear-gradient(135deg, rgba(74, 222, 128, 0.3) 0%, rgba(34, 197, 94, 0.2) 100%);
+  box-shadow: 
+    0 0 0 3px rgba(74, 222, 128, 0.2),
+    0 4px 16px rgba(74, 222, 128, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  animation: playPulse 2s ease-in-out infinite;
 }
 
-.transport-btn.play.playing {
-  background: rgba(74, 222, 128, 0.14);
-  box-shadow: inset 0 0 0 1px rgba(74, 222, 128, 0.7); /* stronger ring = distinct active state, still no glow */
+@keyframes playPulse {
+  0%, 100% {
+    box-shadow: 
+      0 0 0 3px rgba(74, 222, 128, 0.2),
+      0 4px 16px rgba(74, 222, 128, 0.4),
+      inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  }
+  50% {
+    box-shadow: 
+      0 0 0 3px rgba(74, 222, 128, 0.35),
+      0 6px 20px rgba(74, 222, 128, 0.5),
+      inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  }
 }
 
 /* ② Auto-render-on-Play: while the pre-play batch bakes the changed vocal tracks, the play button pulses
@@ -132,27 +246,51 @@
   margin: 0;
 }
 
-/* Editable time signature — two compact custom Dropdowns (square, house-styled) + a slash. Override the
-   shared Dropdown's default flex:1 so each stays a fixed narrow width inside the toolbar row, and tighten
-   the trigger padding to fit the 40px-tall toolbar. */
-.time-sig {
-  gap: 2px;
+.time-sig-clickable {
+  padding: 4px 10px;
+  cursor: pointer;
+  border-radius: var(--radius-md);
+  transition: all 0.2s ease;
+  background: var(--bg-secondary);
 }
 
-.time-sig .timesig-dd {
-  flex: none;
-  width: 46px;
+.time-sig-clickable:hover {
+  background: var(--bg-tertiary);
+  box-shadow: 0 0 0 1px var(--border-default);
 }
 
-.time-sig .timesig-dd .ut-dropdown-trigger {
-  padding: 3px 6px;
-  gap: 4px;
-}
-
-.time-sig-slash {
+.time-sig-display {
   font-size: var(--font-size-sm);
-  color: var(--text-secondary);
+  color: var(--text-primary);
+  user-select: none;
 }
+
+.key-selector {
+  padding: 6px 10px;
+  cursor: pointer;
+  border-radius: var(--radius-md);
+  transition: all 0.2s ease;
+  background: var(--bg-secondary);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  min-width: 60px;
+  justify-content: center;
+}
+
+.key-selector:hover {
+  background: var(--bg-tertiary);
+  box-shadow: 0 0 0 1px var(--border-default);
+}
+
+.key-selector svg {
+  display: block;
+  flex-shrink: 0;
+}
+
+/* 删除旧的工具栏左侧新建轨道按钮样式 */
 
 .position-display {
   font-size: var(--font-size-sm);
@@ -177,11 +315,27 @@
 .snap-toggle.active {
   color: var(--accent-primary);
   border-color: var(--accent-primary);
-  background: rgba(57, 197, 187, 0.12);
+  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
 }
 
 .snap-toggle svg {
   display: block;
+}
+
+/* ③ B8: 吸附步长下拉（紧跟在磁吸开关后，紧凑一行） */
+.snap-section .snap-grid-dropdown {
+  height: 24px;
+}
+.snap-section .snap-grid-dropdown .ut-dropdown-trigger {
+  height: 24px !important;
+  padding: 0 6px;
+  font-size: var(--font-size-xs);
+}
+.snap-section .snap-grid-dropdown .ut-dropdown-label {
+  min-width: 0;
+}
+.snap-section .snap-grid-dropdown .ut-dropdown-arrow {
+  margin-left: 3px;
 }
 
 .edit-section .toolbar-btn {
@@ -199,6 +353,36 @@
   padding: var(--space-sm) var(--space-md);
 }
 
+/* 图标按钮 (从标题栏搬来的撤销/快捷键/主题) */
+.toolbar-btn.icon-btn {
+  width: 28px;
+  height: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.toolbar-btn.icon-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-primary-dim);
+  color: var(--text-primary);
+}
+
+/* edit-section 内部小分隔 */
+.edit-section-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--border-subtle);
+  margin: 0 4px;
+  flex: none;
+}
+
 
 /* S60-3: request→sound window (stretch regeneration + buffer decode) — a faster, dimmer pulse
    than the render one so "loading audio" and "baking vocals" read as different activities. */
@@ -209,4 +393,240 @@
 @keyframes transport-prepare-pulse {
   0%, 100% { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text-muted) 30%, transparent); }
   50% { box-shadow: inset 0 0 0 1px var(--text-muted); }
+}
+
+/* 主题弹窗 (从 Titlebar 搬来, 改为 9 种风格: 黑夜/白天 × 6种皮肤, 共12项) */
+.skin-popover {
+  position: fixed;
+  z-index: var(--z-tooltip);
+  width: 240px;
+  padding: 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  animation: fadeUpIn 0.12s ease;
+}
+.skin-popover-title {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+/* 弹窗遮罩层 */
+.popover-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--z-tooltip) - 1);
+  background: rgba(0, 0, 0, 0.3);
+  animation: fadeIn 0.15s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* 通用弹窗标题 */
+.popover-title {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+/* 拍号编辑弹窗 */
+.time-sig-popover {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: var(--z-tooltip);
+  width: 320px;
+  padding: 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  animation: popoverSlideIn 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@keyframes popoverSlideIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -48%);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%);
+  }
+}
+
+.time-sig-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.time-sig-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.time-sig-row label {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.time-sig-options {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.time-sig-option {
+  padding: 8px;
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.time-sig-option:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--border-default);
+  transform: translateY(-1px);
+}
+
+.time-sig-option.active {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: white;
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3);
+}
+
+/* 调性选择器弹窗 */
+.key-popover {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: var(--z-tooltip);
+  width: 360px;
+  padding: 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  animation: popoverSlideIn 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.key-section {
+  margin-bottom: 16px;
+}
+
+.key-section:last-child {
+  margin-bottom: 0;
+}
+
+.key-section-title {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+
+.key-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 6px;
+}
+
+.key-option {
+  padding: 10px 4px;
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: center;
+}
+
+.key-option:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--border-default);
+  transform: translateY(-1px);
+}
+
+.key-option.active {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: white;
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3);
+}
+.theme-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.theme-item {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.theme-color-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.theme-item:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-default);
+}
+.theme-item.active {
+  border-color: var(--accent-primary);
+  background: var(--accent-primary-glow);
+}
+.theme-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  text-align: center;
+}
+.theme-item.active .theme-label {
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+
+@keyframes fadeUpIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }

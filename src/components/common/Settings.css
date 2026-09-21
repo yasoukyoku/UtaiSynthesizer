@@ -1,4 +1,4 @@
-.settings-panel {
+﻿.settings-panel {
   position: fixed;
   /* size is state-driven (useFloatingPanel inline style, S67 resizable panels) */
   min-width: 300px;
@@ -12,7 +12,7 @@
 }
 
 /* Header base styles were silently inherited from the (deleted) TrainingPanel.css
- * UNSCOPED .panel-header/.panel-title — restored here scoped, matching the
+ * UNSCOPED .panel-header/.panel-title 鈥?restored here scoped, matching the
  * LogViewer/MsstModelManager copies (values identical to the old global rule). */
 .settings-panel .panel-header {
   display: flex;
@@ -98,8 +98,8 @@
 }
 
 .settings-badge.ok {
-  color: #4ade80;
-  border-color: #4ade80;
+  color: var(--color-success);
+  border-color: var(--color-success);
 }
 
 .settings-badge.no {
@@ -107,12 +107,12 @@
   border-color: var(--border-subtle);
 }
 
-/* S75 — license line. The one pack whose weights carry their own terms (CC BY-NC-SA vocoder base)
+/* S75 鈥?license line. The one pack whose weights carry their own terms (CC BY-NC-SA vocoder base)
    states them on a row of ITS OWN, under the pack row. It deliberately does NOT live inside that
    row: `.settings-asset-actions` is `flex: 0 0 auto`, so a fourth chip there is paid for out of
    `.settings-asset-row > .settings-label`, which has no ellipsis and collapses to per-character
    wrapping (adversarial review measured ~9px labels in zh/ja and en overflowing into a horizontal
-   scrollbar at the default 340px panel width). The whole line is the attribution link — the credit
+   scrollbar at the default 340px panel width). The whole line is the attribution link 鈥?the credit
    stays one click from the thing it applies to. */
 .settings-asset-pack {
   display: flex;
@@ -157,11 +157,11 @@
   border-color: var(--border-subtle);
 }
 
-/* S74b — model-asset rows. They gained a Delete button, and the row's `space-between` then
+/* S74b 鈥?model-asset rows. They gained a Delete button, and the row's `space-between` then
    scattered the status badge into the middle of the row, so nothing lined up any more. Keep the
    label elastic and group badge+buttons at the right; the badge keeps its natural chip width
    (a min-width there would leave the text hugging one edge of the border), and the alignment
-   instead comes from a minimum width on the BUTTON column — that fixes the badge's right edge at
+   instead comes from a minimum width on the BUTTON column 鈥?that fixes the badge's right edge at
    a constant offset from the row edge, with a real gap so the two don't touch. */
 .settings-asset-row {
   justify-content: flex-start;
@@ -183,7 +183,7 @@
   justify-content: flex-end;
   gap: 6px;
   flex: 0 0 auto;
-  min-width: 58px; /* fits 删除 / Delete / 削除 — the common one-button case aligns */
+  min-width: 58px; /* fits 鍒犻櫎 / Delete / 鍓婇櫎 鈥?the common one-button case aligns */
 }
 
 .settings-field {
@@ -301,8 +301,7 @@
   color: var(--bg-base);
 }
 
-/* S42：该类首次被 disabled 属性使用（安装进行中）；无此规则时禁用态与可点态
-   外观完全相同（WebView2 里 :hover 对 disabled 按钮照样命中）。 */
+/* S42锛氳绫婚娆¤ disabled 灞炴€т娇鐢紙瀹夎杩涜涓級锛涙棤姝よ鍒欐椂绂佺敤鎬佷笌鍙偣鎬?   澶栬瀹屽叏鐩稿悓锛圵ebView2 閲?:hover 瀵?disabled 鎸夐挳鐓ф牱鍛戒腑锛夈€?*/
 .settings-download-btn:disabled {
   opacity: 0.5;
   cursor: default;
@@ -340,7 +339,7 @@
   word-break: break-all;
 }
 
-/* S42 训练环境（runtime pack）段 —— 组件语言与本面板一致：mono、细边框、方角 */
+/* S42 璁粌鐜锛坮untime pack锛夋 鈥斺€?缁勪欢璇█涓庢湰闈㈡澘涓€鑷达細mono銆佺粏杈规銆佹柟瑙?*/
 .settings-pack {
   display: flex;
   flex-direction: column;
@@ -385,7 +384,7 @@
 }
 
 /* S61 storage usage & cleanup rows: the label/name column stretches (ellipsized), the size
- * readout + action button hug the right — same angular chrome as the runtime-pack rows. */
+ * readout + action button hug the right 鈥?same angular chrome as the runtime-pack rows. */
 .settings-storage .settings-row {
   justify-content: flex-start;
   gap: 8px;
@@ -407,7 +406,7 @@
   flex-shrink: 0;
 }
 
-/* S76 batch 3b — training project detail rows. Deliberately NOT the training page's archive
+/* S76 batch 3b 鈥?training project detail rows. Deliberately NOT the training page's archive
    row shape: that one budgets 56px + 72px + 72px of fixed columns at 11px in a full-width
    page, which in this 340px panel (10px type, see .settings-row) would leave the name almost
    nothing. Here a detail row is name (flexible, ellipsised by the .settings-storage

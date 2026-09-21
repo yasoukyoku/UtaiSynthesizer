@@ -1,0 +1,443 @@
+/* 发送到轨道对话框样式 */
+
+.st-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.8);
+  backdrop-filter: blur(8px);
+  animation: fadeIn 0.2s ease-out;
+}
+
+.st-dialog {
+  width: min(540px, 90vw);
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(135deg, #0f0f17 0%, #1a1a28 100%);
+  border: 1px solid rgba(106, 139, 255, 0.2);
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8);
+  overflow: hidden;
+  animation: slideUpIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.st-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  background: rgba(30, 30, 40, 0.6);
+  border-bottom: 1px solid rgba(106, 139, 255, 0.15);
+  backdrop-filter: blur(10px);
+}
+
+.st-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #e6e6eb;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.st-title-icon {
+  font-size: 20px;
+}
+
+.st-close {
+  background: rgba(226, 88, 88, 0.1);
+  border: 1px solid rgba(226, 88, 88, 0.3);
+  color: #e25858;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 600;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.st-close:hover {
+  background: rgba(226, 88, 88, 0.2);
+  transform: scale(1.05);
+}
+
+.st-body {
+  padding: 24px;
+}
+
+/* 歌曲信息 */
+.st-song-info {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px;
+  background: rgba(20, 20, 28, 0.6);
+  border: 1px solid rgba(106, 139, 255, 0.15);
+  border-radius: 12px;
+  margin-bottom: 24px;
+}
+
+.st-song-icon {
+  width: 50px;
+  height: 50px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(106, 139, 255, 0.3), rgba(106, 139, 255, 0.1));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  flex-shrink: 0;
+  border: 2px solid rgba(106, 139, 255, 0.3);
+}
+
+.st-song-details {
+  flex: 1;
+  min-width: 0;
+}
+
+.st-song-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #e6e6eb;
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.st-song-meta {
+  font-size: 11px;
+  color: #9a9aa5;
+}
+
+/* 格式选择 */
+.st-formats {
+  margin-bottom: 20px;
+}
+
+.st-formats-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #9a9aa5;
+  margin-bottom: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.st-formats-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.st-format-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  background: rgba(20, 20, 28, 0.6);
+  border: 2px solid rgba(106, 139, 255, 0.15);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.st-format-card:hover:not(.disabled) {
+  border-color: rgba(106, 139, 255, 0.4);
+  background: rgba(20, 20, 28, 0.8);
+  transform: translateX(4px);
+}
+
+.st-format-card.selected {
+  border-color: #6a8bff;
+  background: rgba(106, 139, 255, 0.1);
+  box-shadow: 0 0 0 3px rgba(106, 139, 255, 0.1);
+}
+
+.st-format-card.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background: rgba(20, 20, 28, 0.3);
+}
+
+.st-format-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  background: rgba(106, 139, 255, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  flex-shrink: 0;
+  transition: all 0.3s;
+}
+
+.st-format-card:hover:not(.disabled) .st-format-icon {
+  background: rgba(106, 139, 255, 0.25);
+  transform: scale(1.1);
+}
+
+.st-format-card.selected .st-format-icon {
+  background: rgba(106, 139, 255, 0.3);
+}
+
+.st-format-card.disabled .st-format-icon {
+  background: rgba(154, 154, 165, 0.1);
+  opacity: 0.6;
+}
+
+.st-format-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.st-format-label {
+  font-size: 14px;
+  font-weight: 700;
+  color: #e6e6eb;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.st-format-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  background: rgba(226, 88, 88, 0.2);
+  border: 1px solid rgba(226, 88, 88, 0.4);
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #e25858;
+}
+
+.st-format-desc {
+  font-size: 12px;
+  color: #9a9aa5;
+  line-height: 1.4;
+}
+
+.st-format-radio {
+  font-size: 20px;
+  color: #6a8bff;
+  flex-shrink: 0;
+}
+
+.st-format-card.disabled .st-format-radio {
+  display: none;
+}
+
+/* 提示信息 */
+.st-hint {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  background: rgba(106, 139, 255, 0.08);
+  border: 1px solid rgba(106, 139, 255, 0.2);
+  border-radius: 8px;
+  font-size: 12px;
+  color: #9a9aa5;
+  margin-top: 10px;
+}
+
+.st-hint-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+/* 底部按钮 */
+.st-footer {
+  display: flex;
+  gap: 12px;
+  padding: 16px 24px;
+  background: rgba(10, 10, 15, 0.5);
+  border-top: 1px solid rgba(106, 139, 255, 0.15);
+}
+
+.st-btn {
+  flex: 1;
+  padding: 12px 20px;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.st-btn-cancel {
+  background: rgba(154, 154, 165, 0.1);
+  border: 1px solid rgba(154, 154, 165, 0.3);
+  color: #9a9aa5;
+}
+
+.st-btn-cancel:hover {
+  background: rgba(154, 154, 165, 0.2);
+  border-color: rgba(154, 154, 165, 0.5);
+}
+
+.st-btn-confirm {
+  background: linear-gradient(135deg, #6a8bff 0%, #8ba3ff 100%);
+  color: #fff;
+  box-shadow: 0 4px 16px rgba(106, 139, 255, 0.3);
+}
+
+.st-btn-confirm:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 24px rgba(106, 139, 255, 0.5);
+}
+
+.st-btn-confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* ── 现场分轨引擎 + 预览清单（规划 8.1/8.2） ─────────────────────────── */
+
+.st-engine-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.st-engine-chip {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+  background: var(--bg-secondary, rgba(255, 255, 255, 0.04));
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.st-engine-chip:hover {
+  border-color: var(--primary, #6a8bff);
+}
+
+.st-engine-chip.on {
+  border-color: var(--primary, #6a8bff);
+  background: rgba(106, 139, 255, 0.15);
+  color: var(--primary, #8ba3ff);
+}
+
+.st-preview {
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 4px;
+  background: var(--bg-secondary, rgba(255, 255, 255, 0.03));
+}
+
+.st-preview-title {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  opacity: 0.85;
+}
+
+.st-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  padding: 4px 0;
+  border-top: 1px dashed var(--border, rgba(255, 255, 255, 0.06));
+}
+
+.st-preview-row:first-of-type {
+  border-top: none;
+}
+
+.st-preview-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.st-preview-type {
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
+.st-preview-note {
+  flex-shrink: 0;
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 落点选项（规划 8.2） ─────────────────────────────────────────────── */
+
+.st-dest {
+  margin-bottom: 20px;
+}
+
+.st-dest-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.st-dest-select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+  background: var(--bg-secondary, rgba(255, 255, 255, 0.04));
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.st-dest-select:focus {
+  outline: none;
+  border-color: var(--primary, #6a8bff);
+}
+
+/* ── MIDI 工作台次级按钮（规划 8.2 双按钮） ──────────────────────────── */
+
+.st-btn-secondary {
+  background: transparent;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  color: var(--text-secondary, #9a9aa5);
+}
+
+.st-btn-secondary:hover {
+  border-color: var(--primary, #6a8bff);
+  color: var(--primary, #8ba3ff);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideUpIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}

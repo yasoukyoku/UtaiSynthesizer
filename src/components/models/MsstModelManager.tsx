@@ -4,6 +4,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { useMsstModelStore, setupDownloadListener } from "../../store/msst-models";
+import { useAmtModelStore, setupAmtDownloadListener } from "../../store/amt-models";
 import { useAppStore } from "../../store/app";
 import {
   MSST_CATALOG,
@@ -14,18 +15,29 @@ import {
   MSST_FP16_ARCHS,
   MSST_FP16_TIP,
   ghRouteOrder,
+  hfBaseForMirror,
+  urlNeedsVpn,
   t18,
   type MsstArchitecture,
   type MsstCatalogEntry,
   type MsstCategory,
   type MsstPrecision,
 } from "../../lib/models/msst-catalog";
+import { AMT_CATALOG, type AmtCatalogEntry } from "../../lib/models/amt-catalog";
 import { useFloatingPanel } from "../../lib/useFloatingPanel";
 import { PanelResizeHandles } from "../common/PanelResizeHandles";
 import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { logToBackend } from "../../lib/log";
 import { VOICE_STRINGS } from "../workflow/nodes/VoiceModelPicker";
+import { downloadSongModel, listSongModels, deleteSongModel, type SongModelFile } from "../../lib/backendSong";
+import {
+  SONG_MODEL_CATALOG,
+  SONG_FAMILY_LABELS,
+  getSongInstallStatus,
+  songModelTotalSize,
+  type SongModelFamily,
+} from "../../lib/models/song-catalog";
 import {
   useVoiceModelStore,
   voiceVersionBadge,
@@ -41,18 +53,163 @@ import { targetRange } from "../../lib/vocal/rangeBounds";
 import { preview } from "../common/previewPlayer";
 import { RangeBoundsEditor } from "../vocal/RangeBoundsEditor";
 import { readFile } from "@tauri-apps/plugin-fs";
+import { exportOneAudioFileToFolder, laneExportErrorMessage } from "../../lib/audio/exportLaneAudio";
 import "./MsstModelManager.css";
 
-type TopTab = "separation" | "voice" | "tools";
+type TopTab = "separation" | "amt" | "lyrics" | "runtime" | "voice";
+
+interface PyenvProgress {
+  id: string;
+  phase: string;
+  progress: number;
+  message: string;
+  code?: string;
+  params: string[];
+}
+
+function StatusIcon({ type, title, onClick }: { type: "installed" | "downloading" | "pending"; title?: string; onClick?: () => void }) {
+  if (type === "installed") {
+    return (
+      <span className="model-status-icon installed" title={title}>
+        <svg viewBox="0 0 24 24" width="16" height="16">
+          <path fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+        </svg>
+      </span>
+    );
+  }
+  if (type === "downloading") {
+    return (
+      <span className="model-status-icon downloading" title={title}>
+        <svg viewBox="0 0 24 24" width="16" height="16">
+          <path fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" d="M12 3a9 9 0 1 0 9 9" />
+        </svg>
+      </span>
+    );
+  }
+  return (
+    <button className="model-status-icon primary" onClick={onClick} title={title}>
+      <svg viewBox="0 0 24 24" width="14" height="14">
+        <path fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" d="M12 5v14M5 12l7 7 7-7" />
+      </svg>
+    </button>
+  );
+}
+
+function VpnBadge({ lang }: { lang: string }) {
+  const label = lang === "zh" ? "需魔法" : lang === "ja" ? "要VPN" : "VPN";
+  const tip = lang === "zh"
+    ? "该资源无镜像线路，需可访问外网（魔法）才能下载"
+    : lang === "ja"
+    ? "このリソースにはミラー経路がなく、外部ネットワークへのアクセスが必要です"
+    : "No mirror route — requires external network access to download";
+  return <span className="model-vpn-badge" title={tip}>{label}</span>;
+}
+
+/** Reusable AMT model card (转谱模型 / 歌词识别 / 运行环境 tabs share this — one look, one
+ *  download/delete flow). Renders the status icon, name + VPN/必备 badges, description, newbie
+ *  tip, size/rating/features, download progress (download / extract), and the installed delete row. */
+function AmtModelCard({
+  entry, lang, isInstalled, dl, onDownload,
+  confirming, onRequestDelete, onConfirmDelete, onCancelDelete,
+}: {
+  entry: AmtCatalogEntry;
+  lang: string;
+  isInstalled: boolean;
+  dl: { downloaded: number; total: number; stage: string } | undefined;
+  onDownload: () => void;
+  confirming: boolean;
+  onRequestDelete: () => void;
+  onConfirmDelete: () => void;
+  onCancelDelete: () => void;
+}) {
+  const isDownloading = !!dl;
+  return (
+    <div className={`msst-model-card-wrap ${isInstalled ? "installed" : ""}`}>
+      <div className="msst-model-card-status">
+        <StatusIcon
+          type={isInstalled ? "installed" : isDownloading ? "downloading" : "pending"}
+          title={isInstalled ? (lang === "zh" ? "已安装" : "Installed") : isDownloading ? (lang === "zh" ? "正在下载" : "Downloading") : (lang === "zh" ? "下载" : "Download")}
+          onClick={isInstalled || isDownloading ? undefined : onDownload}
+        />
+      </div>
+      <div className="msst-model-card">
+        <div className="model-card-header">
+          <span className="model-card-name">
+            {t18(entry.name, lang)}
+            {urlNeedsVpn(entry.downloadUrl) && <VpnBadge lang={lang} />}
+            {entry.isEssential && (
+              <span className="essential-badge">{lang === "zh" ? "必备" : "Required"}</span>
+            )}
+          </span>
+          <span className="model-card-arch">{entry.architecture.toUpperCase()}</span>
+        </div>
+        <p className="model-card-desc">{t18(entry.description, lang)}</p>
+        {entry.newbie_tip && (
+          <div className="model-newbie-tip">
+            <span className="tip-icon">💡</span>
+            {t18(entry.newbie_tip, lang)}
+          </div>
+        )}
+        <div className="model-card-meta">
+          <span className="model-card-size">{formatSize(entry.fileSize)}</span>
+          {entry.rating && (
+            <span className="model-rating">
+              {"★".repeat(entry.rating)}{"☆".repeat(5 - entry.rating)}
+            </span>
+          )}
+          {entry.ui_features && (
+            <span className="model-card-stems">
+              {entry.ui_features.map((f) => t18(f, lang)).join(" / ")}
+            </span>
+          )}
+        </div>
+        {isDownloading && (
+          <div className="model-download-progress">
+            {dl!.stage === "extract" ? (
+              <>
+                <div className="model-download-bar model-convert-bar" style={{ width: "100%" }} />
+                <span className="model-download-text">{lang === "zh" ? "正在解压安装..." : "Extracting..."}</span>
+              </>
+            ) : (
+              <>
+                <div className="model-download-bar" style={{ width: dl!.total > 0 ? `${(dl!.downloaded / dl!.total) * 100}%` : "0%" }} />
+                <span className="model-download-text">{formatSize(dl!.downloaded)} / {dl!.total > 0 ? formatSize(dl!.total) : "..."}</span>
+              </>
+            )}
+          </div>
+        )}
+        {isInstalled && (
+          <div className="model-card-actions">
+            <span className="model-status-installed">{lang === "zh" ? "已安装" : "Installed"}</span>
+            {confirming ? (
+              <div className="model-confirm-delete">
+                <button className="danger" onClick={onConfirmDelete}>{lang === "zh" ? "确认" : "OK"}</button>
+                <button onClick={onCancelDelete}>{lang === "zh" ? "取消" : "Cancel"}</button>
+              </div>
+            ) : (
+              <button className="model-delete-btn" onClick={onRequestDelete}>{lang === "zh" ? "删除" : "Delete"}</button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 export function MsstModelManager({ onClose }: { onClose: () => void }) {
-  const { i18n } = useTranslation();
+  const { t, i18n } = useTranslation();
   const lang = i18n.language;
+  const showToast = useAppStore((s) => s.showToast);
   const {
     installed, downloading, error,
     fetchInstalled, fetchModelsDir, modelsDir,
     clearError, deleteModel, downloadEntry, convertPrecision,
   } = useMsstModelStore();
+
+  const [pyenvProgress, setPyenvProgress] = useState<PyenvProgress | null>(null);
+  const [isInstallingPyenv, setIsInstallingPyenv] = useState(false);
+  const [sidecarInstalled, setSidecarInstalled] = useState<boolean | null>(null);
+  const [sidecarPath, setSidecarPath] = useState<string>("");
 
   const { style: panelStyle, startDrag, startResize } = useFloatingPanel({
     storageKey: "utai.msstManagerRect",
@@ -67,11 +224,171 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
   // Download-time precision choice per catalog entry (roformers only); absent = arch default.
   const [dlPrecision, setDlPrecision] = useState<Record<string, MsstPrecision>>({});
 
+  const {
+    installed: amtInstalled, downloading: amtDownloading,
+    fetchInstalled: fetchAmtInstalled, fetchModelsDir: fetchAmtModelsDir,
+    deleteModel: deleteAmtModel, downloadEntry: downloadAmtEntry,
+  } = useAmtModelStore();
+
   useEffect(() => {
     fetchModelsDir();
     fetchInstalled();
     setupDownloadListener();
-  }, [fetchModelsDir, fetchInstalled]);
+    fetchAmtModelsDir();
+    fetchAmtInstalled();
+    setupAmtDownloadListener();
+
+    invoke<boolean>("amt_sidecar_installed").then(setSidecarInstalled).catch(() => setSidecarInstalled(false));
+    invoke<string>("amt_sidecar_path").then(setSidecarPath).catch(() => {});
+  }, [fetchModelsDir, fetchInstalled, fetchAmtModelsDir, fetchAmtInstalled]);
+
+  useEffect(() => {
+    const unlisten = listen<PyenvProgress>("pyenv-progress", (event) => {
+      setPyenvProgress(event.payload);
+      if (event.payload.phase === "done") {
+        setSidecarInstalled(true);
+        setIsInstallingPyenv(false);
+        showToast(t("amt.envInstalled") || "AMT 运行环境安装成功", "success");
+        setTimeout(() => setPyenvProgress(null), 3000);
+      } else if (event.payload.phase === "error") {
+        setIsInstallingPyenv(false);
+        showToast(event.payload.message, "error");
+      }
+    });
+    return () => { void unlisten.then(fn => fn()); };
+  }, [t, showToast]);
+
+  const handleDownloadRuntime = useCallback(async () => {
+    if (isInstallingPyenv) return;
+    setIsInstallingPyenv(true);
+    setPyenvProgress({ id: "init", phase: "init", progress: 0, message: "正在初始化...", params: [] });
+
+    try {
+      const { mirror, ghMirror, ghPresets } = useMsstModelStore.getState();
+      const hf_base = hfBaseForMirror(mirror) || undefined;
+      const gh_routes = ghRouteOrder(ghMirror, ghPresets);
+
+      await invoke("download_runtime_pack", { 
+        id: "runtime-cpu-v1",
+        hf_base,
+        gh_routes
+      });
+    } catch (e) {
+      showToast(String(e), "error");
+      setIsInstallingPyenv(false);
+    }
+  }, [isInstallingPyenv, showToast]);
+
+  // ── §user 一键下载全部必备组件 ─────────────────────────────────────────────
+  // 必备 = AMT_CATALOG 里 isEssential 的条目（FFmpeg/FluidSynth/默认音源/默认转谱
+  // 模型/节拍模型/Whisper 歌词模型/MuseScore 乐谱运行时）+ AMT Python 推理引擎。
+  // 逐项串行下载（复用单条下载链路：镜像轮询、断点续传、SHA256、进度卡），
+  // 单项失败只弹 toast 不中断后续项。
+  const [bulkEssential, setBulkEssential] = useState<{ active: boolean; current: number; total: number; label: string }>(
+    { active: false, current: 0, total: 0, label: "" },
+  );
+
+  const missingEssentials = useMemo(
+    () => AMT_CATALOG.filter(
+      (e) => e.isEssential && !amtInstalled.find((m) => m.id === e.id)?.is_available,
+    ),
+    [amtInstalled],
+  );
+
+  const handleOneClickEssentials = useCallback(async () => {
+    if (bulkEssential.active) return;
+    // 实时读 store（列表可能滞后于最近一次下载完成）
+    const missing = AMT_CATALOG.filter(
+      (e) => e.isEssential && !useAmtModelStore.getState().installed.find((m) => m.id === e.id)?.is_available,
+    );
+    const needRuntime = sidecarInstalled === false;
+    if (missing.length === 0 && !needRuntime) {
+      showToast(t18({ zh: "所有必备组件都已就绪，无需下载", en: "All essential components are ready", ja: "必須コンポーネントはすべて揃っています" }, lang), "info");
+      return;
+    }
+    const total = missing.length + (needRuntime ? 1 : 0);
+    setBulkEssential({ active: true, current: 0, total, label: "" });
+    // §user「一键下载并行 2-3 线程」：小文件（<100MB，如 FluidSynth/FFmpeg/小模型）
+    // 最多 3 个并行；大文件（≥100MB，如音源/大模型/推理引擎）串行，大小队列同时
+    // 推进——总耗时约省 40%。单项失败只弹 toast（downloadAmtEntry 内部处理），
+    // 不中断其它项。
+    let done = 0;
+    const setLabel = (label: string) =>
+      setBulkEssential((b) => (b.active ? { ...b, current: done, label } : b));
+    const bump = () => {
+      done++;
+      setBulkEssential((b) => (b.active ? { ...b, current: done } : b));
+    };
+    try {
+      const SMALL_THRESHOLD = 100_000_000;
+      const small = missing.filter((e) => e.fileSize < SMALL_THRESHOLD);
+      const large = missing.filter((e) => e.fileSize >= SMALL_THRESHOLD);
+      const runtimeLabel = t18({ zh: "AMT 推理引擎（约 1.8 GB）", en: "AMT inference engine (~1.8 GB)", ja: "AMT 推論エンジン（約1.8GB）" }, lang);
+      // 小文件并行池（≤3 线程）。
+      const smallPool = (async () => {
+        let idx = 0;
+        const workers: Promise<void>[] = [];
+        for (let w = 0; w < Math.min(3, small.length); w++) {
+          workers.push((async () => {
+            while (idx < small.length) {
+              const entry = small[idx++]!;
+              setLabel(t18(entry.name, lang));
+              await downloadAmtEntry(entry);
+              bump();
+            }
+          })());
+        }
+        await Promise.all(workers);
+      })();
+      // 大文件 + 推理引擎串行队列（与小文件池并行推进）。
+      const largeQueue = (async () => {
+        if (needRuntime) {
+          setLabel(runtimeLabel);
+          await handleDownloadRuntime();
+          bump();
+        }
+        for (const entry of large) {
+          setLabel(t18(entry.name, lang));
+          await downloadAmtEntry(entry);
+          bump();
+        }
+      })();
+      await Promise.all([smallPool, largeQueue]);
+
+      // 完成统计按刷新后的实际可用性数（失败项不虚报）。
+      await useAmtModelStore.getState().fetchInstalled().catch(() => {});
+      const runtimeOk = await invoke<boolean>("amt_sidecar_installed").catch(() => false);
+      const okCount = AMT_CATALOG.filter(
+        (e) => e.isEssential && useAmtModelStore.getState().installed.find((m) => m.id === e.id)?.is_available,
+      ).length + (runtimeOk ? 1 : 0);
+      showToast(
+        t18(
+          {
+            zh: "必备组件下载完成（" + okCount + "/" + total + "）。失败项可稍后单独重试或更换镜像线路。",
+            en: "Essential components done (" + okCount + "/" + total + "). Failed items can be retried individually or via another mirror.",
+            ja: "必須コンポーネント完了（" + okCount + "/" + total + "）。失敗項目は個別に再試行できます。",
+          },
+          lang,
+        ),
+        okCount === total ? "success" : "info",
+      );
+      // §user「下载完成后自动弹『下一步做什么』提示」：新手零摸索。
+      void useAppStore.getState().showConfirm({
+        title: t18({ zh: "必备组件已就绪，下一步做什么？", en: "Essentials ready — what's next?", ja: "必須コンポーネント準備完了。次は？" }, lang),
+        body: t18(
+          {
+            zh: "① 转谱：关闭本面板 → 选择歌曲音频 → 选模型开始转换\n② 歌词：结果工作台会自动提取人声歌词（按音符铺词），双击音符即可改词\n③ 音源：工作台右上角音源下拉切换，切换后自动 2 秒预览试听",
+            en: "1) Transcribe: close this panel → pick a song → choose a model → start.\n2) Lyrics: the workbench auto-extracts per-note lyrics; double-click a note to edit.\n3) Soundfont: switch in the workbench header — a 2s preview plays automatically.",
+            ja: "① 採譜：このパネルを閉じ → 楽曲を選択 → モデル選択で開始\n② 歌詞：ワークベンチが自動で音符ごとの歌詞を抽出、音符ダブルクリックで編集\n③ 音源：ワークベンチ右上の音源セレクターで切替、2秒プレビューが自動再生",
+          },
+          lang,
+        ),
+        buttons: [{ id: "ok", label: t18({ zh: "知道了", en: "Got it", ja: "了解" }, lang), kind: "primary" }],
+      });
+    } finally {
+      setBulkEssential({ active: false, current: 0, total: 0, label: "" });
+    }
+  }, [bulkEssential.active, sidecarInstalled, downloadAmtEntry, handleDownloadRuntime, lang, showToast]);
 
   const installedFilenames = new Set(installed.map((m) => m.filename));
   const filtered = MSST_CATALOG.filter((m) => m.category === category);
@@ -108,17 +425,204 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
         <button className={topTab === "separation" ? "active" : ""} onClick={() => setTopTab("separation")}>
           {lang === "zh" ? "音频分离" : lang === "ja" ? "音声分離" : "Separation"}
         </button>
+        <button className={topTab === "amt" ? "active" : ""} onClick={() => setTopTab("amt")}>
+          {lang === "zh" ? "MIDI 模型" : lang === "ja" ? "MIDIモデル" : "MIDI Models"}
+        </button>
+        <button className={topTab === "lyrics" ? "active" : ""} onClick={() => setTopTab("lyrics")}>
+          {lang === "zh" ? "歌词识别" : lang === "ja" ? "歌詞認識" : "Lyrics"}
+        </button>
+        <button className={topTab === "runtime" ? "active" : ""} onClick={() => setTopTab("runtime")}>
+          {lang === "zh" ? "运行环境" : lang === "ja" ? "実行環境" : "Runtime"}
+        </button>
         <button className={topTab === "voice" ? "active" : ""} onClick={() => setTopTab("voice")}>
           {lang === "zh" ? "声音模型" : lang === "ja" ? "ボイスモデル" : "Voice Models"}
         </button>
-        <button className={topTab === "tools" ? "active" : ""} onClick={() => setTopTab("tools")}>
-          {lang === "zh" ? "工具模型" : lang === "ja" ? "ツールモデル" : "Tool Models"}
-        </button>
       </div>
+
+      <div className="rm-download-note">
+        {lang === "zh"
+          ? "下载说明：HuggingFace 与 GitHub 资源可在设置中切换镜像加速；标注「需魔法」的资源无镜像线路，需可访问外网。"
+          : lang === "ja"
+          ? "ダウンロード：HuggingFace / GitHub は設定でミラー加速に切替可能。「要VPN」はミラー経路がなく、外部アクセスが必要です。"
+          : "Download note: HuggingFace & GitHub assets can use mirror acceleration in Settings; assets marked “VPN” have no mirror route and need external network access."}
+      </div>
+
+      {topTab === "amt" && (
+        <div className="msst-model-list">
+          {/* §user 一键下载：所有必备组件（引擎+工具+核心模型）。小文件 ≤3 线程并行、大文件串行，完成后弹「下一步做什么」。 */}
+          <div className="amt-oneclick-bar">
+            <div className="amt-oneclick-info">
+              <span className="amt-oneclick-title">
+                {t18({ zh: "⚡ 一键下载必备组件", en: "⚡ One-click Essentials", ja: "⚡ 必須コンポーネント一括DL" }, lang)}
+              </span>
+              <span className="amt-oneclick-sub">
+                {bulkEssential.active
+                  ? t18({ zh: "已完成 " + bulkEssential.current + "/" + bulkEssential.total + " · 正在下载：" + bulkEssential.label + "（小文件并行）", en: "Done " + bulkEssential.current + "/" + bulkEssential.total + " · downloading: " + bulkEssential.label + " (small files in parallel)", ja: "完了 " + bulkEssential.current + "/" + bulkEssential.total + " ・ DL中：" + bulkEssential.label + "（小ファイル並列）" }, lang)
+                  : missingEssentials.length === 0 && sidecarInstalled === true
+                    ? t18({ zh: "全部必备组件已就绪 ✓", en: "All essentials ready ✓", ja: "すべて準備完了 ✓" }, lang)
+                    : t18(
+                        {
+                          zh: "待下载 " + missingEssentials.length + " 项（约 " + formatSize(missingEssentials.reduce((a, e) => a + e.fileSize, 0)) + (sidecarInstalled === false ? " + 推理引擎约 1.8 GB" : "") + "），含引擎/音源/默认模型/歌词模型",
+                          en: missingEssentials.length + " pending (~" + formatSize(missingEssentials.reduce((a, e) => a + e.fileSize, 0)) + (sidecarInstalled === false ? " + ~1.8 GB engine" : "") + ") — engine, soundfont, models, lyrics",
+                          ja: "未入手 " + missingEssentials.length + " 件（約 " + formatSize(missingEssentials.reduce((a, e) => a + e.fileSize, 0)) + "）",
+                        },
+                        lang,
+                      )}
+              </span>
+            </div>
+            <button
+              className="amt-oneclick-btn"
+              disabled={bulkEssential.active || (missingEssentials.length === 0 && sidecarInstalled === true)}
+              title={t18(
+                {
+                  zh: "依次下载所有必备组件：AMT 推理引擎、FFmpeg、FluidSynth、默认音源、默认转谱/节拍模型、Whisper 歌词模型、MuseScore 乐谱运行时。下载完即可使用全部核心功能。",
+                  en: "Download every essential component in order: AMT engine, FFmpeg, FluidSynth, default soundfont, default transcription/beat models, Whisper lyrics model, MuseScore runtime.",
+                  ja: "必須コンポーネントを順に一括ダウンロードします。",
+                },
+                lang,
+              )}
+              onClick={() => void handleOneClickEssentials()}
+            >
+              {bulkEssential.active
+                ? t18({ zh: "下载中…", en: "Downloading…", ja: "ダウンロード中…" }, lang)
+                : t18({ zh: "一键下载", en: "Download All", ja: "一括DL" }, lang)}
+            </button>
+          </div>
+
+          {/* 转谱引擎：独立 Python 推理引擎（所有音频→MIDI 功能的核心依赖） */}
+          <div className="amt-section-header" style={{ margin: "16px 8px 4px", color: "var(--text-secondary)", fontSize: "14px", fontWeight: "bold" }}>
+            {lang === "zh" ? "转谱引擎（核心运行时）" : lang === "ja" ? "転写エンジン（コア実行環境）" : "Transcription Engine (Core Runtime)"}
+          </div>
+          
+          {/* AMT Python Runtime Card */}
+          <div className={`msst-model-card-wrap ${sidecarInstalled ? "installed" : ""}`}>
+            <div className="msst-model-card-status">
+              <StatusIcon 
+                type={sidecarInstalled ? "installed" : isInstallingPyenv ? "downloading" : "pending"} 
+                title={sidecarInstalled ? (lang === "zh" ? "已安装" : "Installed") : isInstallingPyenv ? (lang === "zh" ? "正在安装" : "Installing") : (lang === "zh" ? "下载" : "Download")}
+                onClick={handleDownloadRuntime}
+              />
+            </div>
+            <div className="msst-model-card">
+              <div className="model-card-header">
+                <span className="model-card-name">
+                  AMT · {t18({ zh: "全轨音频转 MIDI 推理引擎", en: "Full-track Audio-to-MIDI Engine", ja: "全トラック音声→MIDI推論エンジン" }, lang)}
+                  <span className="essential-badge">
+                    {lang === "zh" ? "必备" : "Required"}
+                  </span>
+                </span>
+                <span className="model-card-arch">Python · Sidecar</span>
+              </div>
+              <p className="model-card-desc">
+                {t18({
+                  zh: "独立 Python 推理引擎，包含 PyTorch 与模型推理逻辑。支持 FP16/FP32 精度切换，是所有音乐转 MIDI 功能的核心依赖。",
+                  en: "Independent Python inference engine, including PyTorch and model logic. Core dependency for all music-to-midi features.",
+                  ja: "独立した Python 推論エンジン。PyTorch とモデル推論ロジックを含みます。すべての音声→MIDI機能のコア依存関係です。",
+                }, lang)}
+              </p>
+              <div className="model-card-meta">
+                <span className="model-card-size">~1.8 GB</span>
+                <span className="model-card-stems" style={{ fontSize: 10, opacity: 0.7, wordBreak: "break-all" }}>{sidecarPath || "..."}</span>
+              </div>
+              
+              {isInstallingPyenv && pyenvProgress && (
+                <div className="model-download-progress">
+                  <div 
+                    className={`model-download-bar ${pyenvProgress.phase !== "download" ? "model-convert-bar" : ""}`} 
+                    style={{ width: `${pyenvProgress.progress}%` }} 
+                  />
+                  <span className="model-download-text">
+                    {pyenvProgress.message} ({pyenvProgress.progress}%)
+                  </span>
+                </div>
+              )}
+
+              {sidecarInstalled && (
+                <div className="model-card-actions">
+                  <span className="model-status-installed">{lang === "zh" ? "环境已就绪" : "Environment Ready"}</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 转谱模型库：仅保留音频→MIDI 转谱模型（音源已并入「音源管理」；歌词识别在「歌词识别」标签；运行环境在「运行环境」标签） */}
+          <div className="amt-section-header" style={{ margin: "16px 8px 4px", color: "var(--text-secondary)", fontSize: "14px", fontWeight: "bold" }}>
+            {lang === "zh" ? "转谱模型库" : lang === "ja" ? "転写モデル" : "Transcription Models"}
+          </div>
+          {AMT_CATALOG.filter(e => !["fluidsynth", "soundfont", "musescore", "ffmpeg", "whisper", "bs_roformer", "polarformer"].includes(e.architecture)).map((entry) => {
+            const isInstalled = !!amtInstalled.find((m) => m.id === entry.id)?.is_available;
+            return (
+              <AmtModelCard
+                key={entry.id}
+                entry={entry}
+                lang={lang}
+                isInstalled={isInstalled}
+                dl={amtDownloading[entry.id]}
+                onDownload={() => downloadAmtEntry(entry)}
+                confirming={confirmDelete === entry.id}
+                onRequestDelete={() => setConfirmDelete(entry.id)}
+                onConfirmDelete={() => { deleteAmtModel(entry.filename); setConfirmDelete(null); }}
+                onCancelDelete={() => setConfirmDelete(null)}
+              />
+            );
+          })}
+        </div>
+      )}
+
+      {topTab === "lyrics" && (
+        <div className="msst-model-list">
+          <div className="amt-section-header" style={{ margin: "16px 8px 4px", color: "var(--text-secondary)", fontSize: "14px", fontWeight: "bold" }}>
+            {lang === "zh" ? "歌词识别模型" : lang === "ja" ? "歌詞認識モデル" : "Lyrics Recognition Models"}
+          </div>
+          {AMT_CATALOG.filter(e => e.architecture === "whisper").map((entry) => {
+            const isInstalled = !!amtInstalled.find((m) => m.id === entry.id)?.is_available;
+            return (
+              <AmtModelCard
+                key={entry.id}
+                entry={entry}
+                lang={lang}
+                isInstalled={isInstalled}
+                dl={amtDownloading[entry.id]}
+                onDownload={() => downloadAmtEntry(entry)}
+                confirming={confirmDelete === entry.id}
+                onRequestDelete={() => setConfirmDelete(entry.id)}
+                onConfirmDelete={() => { deleteAmtModel(entry.filename); setConfirmDelete(null); }}
+                onCancelDelete={() => setConfirmDelete(null)}
+              />
+            );
+          })}
+        </div>
+      )}
+
+      {topTab === "runtime" && (
+        <div className="msst-model-list">
+          <GameEngineTab lang={lang} />
+          <div className="amt-section-header" style={{ margin: "16px 8px 4px", color: "var(--text-secondary)", fontSize: "14px", fontWeight: "bold" }}>
+            {lang === "zh" ? "运行环境组件" : lang === "ja" ? "実行環境コンポーネント" : "Runtime Components"}
+          </div>
+          {AMT_CATALOG.filter(e => ["fluidsynth", "ffmpeg", "musescore"].includes(e.architecture)).map((entry) => {
+            const isInstalled = !!amtInstalled.find((m) => m.id === entry.id)?.is_available;
+            return (
+              <AmtModelCard
+                key={entry.id}
+                entry={entry}
+                lang={lang}
+                isInstalled={isInstalled}
+                dl={amtDownloading[entry.id]}
+                onDownload={() => downloadAmtEntry(entry)}
+                confirming={confirmDelete === entry.id}
+                onRequestDelete={() => setConfirmDelete(entry.id)}
+                onConfirmDelete={() => { deleteAmtModel(entry.filename); setConfirmDelete(null); }}
+                onCancelDelete={() => setConfirmDelete(null)}
+              />
+            );
+          })}
+        </div>
+      )}
 
       {topTab === "voice" && <VoiceModelsTab lang={lang} />}
 
-      {topTab === "tools" && <GameEngineTab lang={lang} />}
+      {/* former tools tab removed */}
 
       {topTab === "separation" && (
         <>
@@ -139,16 +643,19 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
               const chosenPrecision = dlPrecision[entry.id] ?? MSST_DEFAULT_PRECISION[entry.architecture];
               return (
                 <div key={entry.id} className={`msst-model-card-wrap ${isInstalled ? "installed" : ""}`}>
-                  {!isInstalled && !isDownloading && (
-                    <div className="msst-model-card-slide">
-                      <button className="primary" onClick={() => handleDownload(entry)} title={lang === "zh" ? "下载" : "Download"}>
-                        ↓
-                      </button>
-                    </div>
-                  )}
+                  <div className="msst-model-card-status">
+                    <StatusIcon 
+                      type={isInstalled ? "installed" : isDownloading ? "downloading" : "pending"} 
+                      title={isInstalled ? (lang === "zh" ? "已安装" : "Installed") : isDownloading ? (lang === "zh" ? "正在下载" : "Downloading") : (lang === "zh" ? "下载" : "Download")}
+                      onClick={() => handleDownload(entry)}
+                    />
+                  </div>
                   <div className="msst-model-card">
                     <div className="model-card-header">
-                      <span className="model-card-name">{t18(entry.name, lang)}</span>
+                      <span className="model-card-name">
+                        {t18(entry.name, lang)}
+                        {urlNeedsVpn(entry.downloadUrl) && <VpnBadge lang={lang} />}
+                      </span>
                       <span className="model-card-arch">
                         {ARCHITECTURE_LABELS[entry.architecture]}
                         {entry.source === "community" && <span className="model-card-community"> *</span>}
@@ -644,63 +1151,66 @@ function GameEngineTab({ lang }: { lang: string }) {
   };
 
   return (
-    <div className="msst-model-list">
-      <div className={`msst-model-card-wrap ${installed ? "installed" : ""}`}>
-        {installed === false && !busy && (
-          <div className="msst-model-card-slide">
-            <button className="primary" onClick={handleDownload} title={lang === "zh" ? "下载" : lang === "ja" ? "ダウンロード" : "Download"}>↓</button>
+    <div className={`msst-model-card-wrap ${installed ? "installed" : ""}`}>
+      <div className="msst-model-card-status">
+        <StatusIcon 
+          type={installed ? "installed" : busy ? "downloading" : "pending"} 
+          title={installed ? (lang === "zh" ? "已安装" : "Installed") : busy ? (lang === "zh" ? "正在安装" : "Installing") : (lang === "zh" ? "下载" : "Download")}
+          onClick={handleDownload}
+        />
+      </div>
+      <div className="msst-model-card">
+        <div className="model-card-header">
+          <span className="model-card-name">
+            GAME · {t18({ zh: "人声转 MIDI", en: "Vocal-to-MIDI", ja: "歌声→MIDI" }, lang)}
+            <span className="essential-badge">
+              {lang === "zh" ? "必备" : "Required"}
+            </span>
+          </span>
+          <span className="model-card-arch">openvpi · 1.0.3</span>
+        </div>
+        <p className="model-card-desc">
+          {t18({
+            zh: "从人声干声提取音符。模型权重由 openvpi 发布，需在此下载。",
+            en: "Extracts notes from vocal stems. Weights are released by openvpi and must be downloaded here.",
+            ja: "ボーカルステムからノートを抽出します。モデル重みは openvpi が公開しており、ここでダウンロードが必要です。",
+          }, lang)}
+        </p>
+        <div className="model-card-meta">
+          <span className="model-card-stems">en / ja / yue / zh</span>
+          <span className="model-card-size">{formatSize(179775226)}</span>
+        </div>
+        {busy && dl && (
+          <div className="model-download-progress">
+            <div
+              className={`model-download-bar ${dl.stage !== "download" ? "model-convert-bar" : ""}`}
+              style={{ width: dl.stage !== "download" ? "100%" : dl.total > 0 ? `${(dl.downloaded / dl.total) * 100}%` : "0%" }}
+            />
+            <span className="model-download-text">{stageText(dl)}</span>
           </div>
         )}
-        <div className="msst-model-card">
-          <div className="model-card-header">
-            <span className="model-card-name">GAME · {t18({ zh: "人声转 MIDI", en: "Vocal-to-MIDI", ja: "歌声→MIDI" }, lang)}</span>
-            <span className="model-card-arch">openvpi · 1.0.3 medium</span>
+        {installed && (
+          <div className="model-card-actions">
+            <span className="model-status-installed">{lang === "zh" ? "已安装" : lang === "ja" ? "インストール済み" : "Installed"}</span>
+            {confirmDelete ? (
+              <div className="model-confirm-delete">
+                <button className="danger" onClick={handleDelete}>{lang === "zh" ? "确认" : "OK"}</button>
+                <button onClick={() => setConfirmDelete(false)}>{lang === "zh" ? "取消" : lang === "ja" ? "キャンセル" : "Cancel"}</button>
+              </div>
+            ) : (
+              <button className="model-delete-btn" onClick={() => setConfirmDelete(true)}>{lang === "zh" ? "删除" : lang === "ja" ? "削除" : "Delete"}</button>
+            )}
           </div>
-          <p className="model-card-desc">
-            {t18({
-              zh: "从人声干声/分离声提取音符（右键子轨道 →「提取 MIDI」）。识别为无歌词音符，自动填入占位词供改词翻唱。",
-              en: "Transcribes vocal stems into notes (right-click a sub-lane → \"Extract MIDI\"). Notes carry no lyrics; placeholder lyrics are filled in for re-lyric covers.",
-              ja: "ボーカルステムからノートを抽出します（サブレーン右クリック →「MIDI 抽出」）。歌詞なしのノートとして認識され、置き換え用のプレースホルダー歌詞が入ります。",
-            }, lang)}
-          </p>
-          <div className="model-card-meta">
-            <span className="model-card-stems">en / ja / yue / zh</span>
-            <span className="model-card-size">{formatSize(179775226)}</span>
-          </div>
-          <p className="model-card-desc">
-            {t18({
-              zh: "模型权重按 CC BY-NC-SA 4.0 由 openvpi 发布（代码 MIT），因此不随本体分发、需在此下载。",
-              en: "Weights are released by openvpi under CC BY-NC-SA 4.0 (code MIT), so they are downloaded here instead of shipping with the app.",
-              ja: "モデル重みは openvpi が CC BY-NC-SA 4.0 で公開しています（コードは MIT）。そのためアプリには同梱されず、ここでダウンロードします。",
-            }, lang)}
-          </p>
-          {busy && dl && (
-            <div className="model-download-progress">
-              <div
-                className={`model-download-bar ${dl.stage !== "download" ? "model-convert-bar" : ""}`}
-                style={{ width: dl.stage !== "download" ? "100%" : dl.total > 0 ? `${(dl.downloaded / dl.total) * 100}%` : "0%" }}
-              />
-              <span className="model-download-text">{stageText(dl)}</span>
-            </div>
-          )}
-          {installed && (
-            <div className="model-card-actions">
-              <span className="model-status-installed">{lang === "zh" ? "已安装" : lang === "ja" ? "インストール済み" : "Installed"}</span>
-              {confirmDelete ? (
-                <div className="model-confirm-delete">
-                  <button className="danger" onClick={handleDelete}>{lang === "zh" ? "确认" : "OK"}</button>
-                  <button onClick={() => setConfirmDelete(false)}>{lang === "zh" ? "取消" : lang === "ja" ? "キャンセル" : "Cancel"}</button>
-                </div>
-              ) : (
-                <button className="model-delete-btn" onClick={() => setConfirmDelete(true)}>{lang === "zh" ? "删除" : lang === "ja" ? "削除" : "Delete"}</button>
-              )}
-            </div>
-          )}
-        </div>
+        )}
       </div>
     </div>
   );
 }
+
+// ─── AMT (music-to-midi) runtime card — multi-instrument audio→MIDI sidecar.
+// The Python engine + PyTorch + model weights are GB-sized and partly
+// CC BY-NC, so they are not bundled; the card reports whether the sidecar
+// was found at the expected data/amt/python path. ───
 
 function VoiceAvatar({ path, name, onSet }: { path: string | null; name: string; onSet: () => void }) {
   if (path) {
@@ -733,7 +1243,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
   // DIFFERENT singers = semantic drift + the crowding the user reported); the single selector
   // lives in the model meta line, replacing the static "N speakers" badge.
   const [voiceSpk, setVoiceSpk] = useState<Record<string, number>>({});
-  const [voiceType, setVoiceType] = useState<VoiceType>("rvc");
+  const [voiceType, setVoiceType] = useState<VoiceType | "song">("rvc");
   const [showImport, setShowImport] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   // S146f: 音域边界编辑器展开时,四条滑条会占满整行 —— 试听按钮与它挤在同一行里视觉重叠
@@ -743,11 +1253,22 @@ function VoiceModelsTab({ lang }: { lang: string }) {
   // range row / delete yield), same tab-level pattern as rangeEditing (S146f: 同排按钮要跟着让位).
   const [exportPick, setExportPick] = useState<string | null>(null);
   // Shared store — the SAME list the RVC/SoVITS workflow nodes read (one source of truth).
-  const models = useVoiceModelStore((s) => s.models[voiceType]);
+  const models = useVoiceModelStore((s) => s.models[voiceType === "song" ? "rvc" : voiceType]);
   const voiceError = useVoiceModelStore((s) => s.error);
   const { fetchModels, deleteModel, setAvatar, clearError } = useVoiceModelStore();
+  // Song models state
+  const [songModels, setSongModels] = useState<SongModelFile[]>([]);
+  const [songDownloading, setSongDownloading] = useState<{ id: string; downloaded: number; total: number; file: string } | null>(null);
+  const [songDeleteConfirm, setSongDeleteConfirm] = useState<string | null>(null);
   // built-in default vocoder facts — refetched on tab entry (cheap disk stat)
   const [defaultVoc, setDefaultVoc] = useState<DefaultVocoderInfo | null>(null);
+  
+  useEffect(() => {
+    if (voiceType === "song") {
+      void listSongModels().then(setSongModels);
+    }
+  }, [voiceType]);
+  
   useEffect(() => {
     if (voiceType !== "vocoder") return;
     void invoke<DefaultVocoderInfo>("get_default_vocoder_info")
@@ -773,6 +1294,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
   const handleDelete = useCallback(async (name: string) => {
     // S60 audit: a running range test writes this model's sidecar at its tail (and an
     // audition writes a wav beside it — Rust also guards that one); block the delete.
+    if (voiceType === "song") return;
     const vm = useVoiceModelStore.getState();
     if (vm.rangeTesting[name] !== undefined || vm.auditionState?.name === name) {
       useAppStore.getState().showToast(
@@ -794,7 +1316,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
   const handleImportPackage = useCallback(async () => {
     const file = await open({
       title: t18({ zh: "导入模型包 (.zip)", en: "Import model package (.zip)", ja: "モデルパッケージを取り込み (.zip)" }, lang),
-      filters: [{ name: "Utai Model / Zip", extensions: ["zip"] }],
+      filters: [{ name: "Muno Model / Zip", extensions: ["zip"] }],
     });
     if (!file || typeof file !== "string") return;
     try {
@@ -829,31 +1351,220 @@ function VoiceModelsTab({ lang }: { lang: string }) {
         <button className={voiceType === "vocoder" ? "active" : ""} onClick={() => setVoiceType("vocoder")}>
           {t18({ zh: "声码器", en: "Vocoder", ja: "ボコーダー" }, lang)}
         </button>
+        <button className={voiceType === "song" ? "active" : ""} onClick={() => setVoiceType("song")}>
+          {t18({ zh: "生成歌曲", en: "Song Generation", ja: "楽曲生成" }, lang)}
+        </button>
         <div className="rm-filter-spacer" />
-        <button
-          className="rm-import-top-btn"
-          onClick={handleImportPackage}
-          title={t18({
-            zh: "从 .zip 模型包导入（本软件「导出」生成的包，含索引/聚类/扩散/头像）",
-            en: "Import from a .zip model package (produced by Export — includes index / cluster / diffusion / avatar)",
-            ja: "「書き出し」で作成した .zip モデルパッケージから取り込み（インデックス/クラスタ/拡散/アバターを含む）",
-          }, lang)}
-        >
-          {t18({ zh: "导入模型包", en: "Import Package", ja: "パッケージ取り込み" }, lang)}
-        </button>
-        <button className="primary rm-import-top-btn" onClick={() => setShowImport(true)}>
-          + {lang === "zh" ? "导入模型" : lang === "ja" ? "モデル取り込み" : "Import Model"}
-        </button>
+        {voiceType !== "song" && (
+          <>
+            <button
+              className="rm-import-top-btn"
+              onClick={handleImportPackage}
+              title={t18({
+                zh: "从 .zip 模型包导入（本软件「导出」生成的包，含索引/聚类/扩散/头像）",
+                en: "Import from a .zip model package (produced by Export — includes index / cluster / diffusion / avatar)",
+                ja: "「書き出し」で作成した .zip モデルパッケージから取り込み（インデックス/クラスタ/拡散/アバターを含む）",
+              }, lang)}
+            >
+              {t18({ zh: "导入模型包", en: "Import Package", ja: "パッケージ取り込み" }, lang)}
+            </button>
+            <button className="primary rm-import-top-btn" onClick={() => setShowImport(true)}>
+              + {lang === "zh" ? "导入模型" : lang === "ja" ? "モデル取り込み" : "Import Model"}
+            </button>
+          </>
+        )}
       </div>
-      {voiceType !== "vocoder" && <RangeBatchRow lang={lang} />}
+      {voiceType !== "vocoder" && voiceType !== "song" && <RangeBatchRow lang={lang} />}
 
       <div className="rm-voice-list">
-        {models.length === 0 && voiceType !== "vocoder" && (
+        {models.length === 0 && voiceType !== "vocoder" && voiceType !== "song" && (
           <p className="msst-empty">
             {lang === "zh"
               ? `暂无 ${voiceType.toUpperCase()} 模型`
               : `No ${voiceType.toUpperCase()} models`}
           </p>
+        )}
+        {voiceType === "song" && (
+          <>
+            <p className="rm-voice-hint">
+              {t18({
+                zh: "歌曲生成模型供「歌曲制作」功能使用。支持根据文本提示词和歌词生成完整歌曲，包括人声、伴奏、MIDI、歌词时间轴等。模型基于 Hugging Face 镜像下载，支持断点续传。",
+                en: "Song generation models power the Song Studio feature. Generate complete songs from text prompts and lyrics, including vocals, backing tracks, MIDI, and timestamped lyrics. Models are downloaded from Hugging Face mirror with resume support.",
+                ja: "楽曲生成モデルは「楽曲制作」機能で使用されます。テキストプロンプトと歌詞から完全な楽曲を生成し、ボーカル、伴奏、MIDI、タイムスタンプ付き歌詞を含みます。Hugging Face ミラーからダウンロード、レジューム対応。",
+              }, lang)}
+            </p>
+            {(Object.keys(SONG_FAMILY_LABELS) as SongModelFamily[]).map((family) => (
+              <div key={family}>
+                <div className="rm-voice-hint" style={{ marginTop: "12px", fontWeight: 600 }}>
+                  {t18(SONG_FAMILY_LABELS[family], lang)}
+                </div>
+                {SONG_MODEL_CATALOG.filter((m) => m.family === family).map((model) => {
+              const status = getSongInstallStatus(songModels, model);
+              const installed = status.installed;
+              const partial = !installed && status.ready > 0;
+              const isDownloading = songDownloading?.id === model.id;
+              const totalBytes = songModelTotalSize(model);
+              return (
+                <div key={model.id} className="rm-voice-item">
+                  <div className="rm-voice-item-info">
+                    <span className="rm-voice-item-name">{t18(model.label, lang)}</span>
+                    <span className="rm-voice-item-meta">
+                      <span className="msst-onnx-ok" title={t18({
+                        zh: `许可证：${model.license}`,
+                        en: `License: ${model.license}`,
+                        ja: `ライセンス：${model.license}`,
+                      }, lang)}>
+                        {model.license}
+                      </span>
+                      <span>{(totalBytes / (1024 * 1024 * 1024)).toFixed(2)} GB</span>
+                      <span title={t18({ zh: "显存需求", en: "VRAM", ja: "VRAM要件" }, lang)}>
+                        {t18({ zh: "显存", en: "VRAM", ja: "VRAM" }, lang)} ≈{model.vramGb}GB
+                      </span>
+                      <span>{model.languages}</span>
+                      {model.supportsMultiTrack && (
+                        <span className="msst-onnx-ok">{t18({ zh: "分轨", en: "Stems", ja: "分離トラック" }, lang)}</span>
+                      )}
+                      {model.supportsMidi && (
+                        <span className="msst-onnx-ok">MIDI</span>
+                      )}
+                      {installed && (
+                        <span className="msst-onnx-ok">
+                          {t18({ zh: "已安装", en: "Installed", ja: "インストール済み" }, lang)}
+                        </span>
+                      )}
+                      {partial && (
+                        <span title={t18({ zh: `缺少：${status.missing.join("、")}`, en: `Missing: ${status.missing.join(", ")}`, ja: `未取得：${status.missing.join("、")}` }, lang)}>
+                          {t18({ zh: "未完整", en: "Incomplete", ja: "未完了" }, lang)} {status.ready}/{status.required}
+                        </span>
+                      )}
+                    </span>
+                    <span className="rm-voice-item-meta" style={{ marginTop: "4px", fontSize: "12px", color: "var(--text-secondary)" }}>
+                      {t18(model.description, lang)}
+                    </span>
+                    <span className="rm-voice-item-meta" style={{ marginTop: "2px", fontSize: "11px" }}>
+                      <span style={{ color: "var(--text-tertiary)" }}>
+                        {t18({ zh: "来源：", en: "Source: ", ja: "ソース：" }, lang)}
+                      </span>
+                      {model.sourceRepo}
+                    </span>
+                    {isDownloading && songDownloading && (
+                      <div className="msst-progress-bar" style={{ marginTop: "8px" }}>
+                        <div
+                          className="msst-progress-fill"
+                          style={{
+                            width: songDownloading.total
+                              ? `${Math.min(100, (songDownloading.downloaded / songDownloading.total) * 100)}%`
+                              : "0%",
+                          }}
+                        />
+                        <span className="msst-progress-text">
+                          {songDownloading.total
+                            ? `${((songDownloading.downloaded / songDownloading.total) * 100).toFixed(1)}%`
+                            : t18({ zh: "准备中...", en: "Preparing...", ja: "準備中..." }, lang)}
+                          {songDownloading.file ? ` · ${songDownloading.file}` : ""}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="rm-voice-item-actions">
+                    {!installed && !isDownloading && (
+                      <button
+                        className="primary"
+                        onClick={async () => {
+                          setSongDownloading({ id: model.id, downloaded: 0, total: totalBytes, file: "" });
+                          let completedBytes = 0;
+                          let currentFile = "";
+                          let unlisten: (() => void) | null = null;
+                          try {
+                            // 已就绪的文件（路径+大小都匹配）直接跳过 → 断点续下剩余文件
+                            const existing = await listSongModels();
+                            const done = new Set(
+                              existing.filter((f) => f.filename.startsWith(`${model.id}/`)).map((f) => `${f.filename}:${f.size}`),
+                            );
+                            unlisten = await listen<{ id: string; downloaded: number; total: number; stage: string }>(
+                              "song-download-progress",
+                              (event) => {
+                                if (event.payload.id !== model.id) return;
+                                setSongDownloading({
+                                  id: model.id,
+                                  downloaded: completedBytes + event.payload.downloaded,
+                                  total: totalBytes,
+                                  file: currentFile,
+                                });
+                              }
+                            );
+                            for (const f of model.files) {
+                              // 主路径或任一等价替代路径（如 xl-turbo/turbo 变体）已就绪则跳过。
+                              // 替代路径只按文件名匹配（变体权重体积不同，不能用 size 匹配）
+                              const donePaths = new Set(existing.filter((x) => x.filename.startsWith(`${model.id}/`)).map((x) => x.filename));
+                              const hasAlt = (f.alts ?? []).some((alt) => donePaths.has(`${model.id}/${alt}`));
+                              if (done.has(`${model.id}/${f.path}:${f.size}`) || hasAlt) {
+                                completedBytes += f.size;
+                                continue;
+                              }
+                              currentFile = f.path;
+                              setSongDownloading({ id: model.id, downloaded: completedBytes, total: totalBytes, file: f.path });
+                              await downloadSongModel(f.urls, model.id, f.path, f.sha256);
+                              completedBytes += f.size;
+                            }
+                            const updated = await listSongModels();
+                            setSongModels(updated);
+                            useAppStore.getState().showToast(
+                              t18({ zh: `已下载：${t18(model.label, lang)}`, en: `Downloaded: ${t18(model.label, lang)}`, ja: `ダウンロード完了：${t18(model.label, lang)}` }, lang),
+                              "success"
+                            );
+                          } catch (e) {
+                            useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), "error");
+                          } finally {
+                            unlisten?.();
+                            setSongDownloading(null);
+                          }
+                        }}
+                      >
+                        {partial
+                          ? t18({ zh: "继续下载", en: "Resume", ja: "続行" }, lang)
+                          : t18({ zh: "下载", en: "Download", ja: "ダウンロード" }, lang)}
+                      </button>
+                    )}
+                    {(installed || partial) && !isDownloading && songDeleteConfirm !== model.id && (
+                      <button onClick={() => setSongDeleteConfirm(model.id)}>
+                        {t18({ zh: "删除", en: "Delete", ja: "削除" }, lang)}
+                      </button>
+                    )}
+                    {songDeleteConfirm === model.id && (
+                      <>
+                        <button
+                          className="danger"
+                          onClick={async () => {
+                            try {
+                              // 传模型 id = 删除整个模型目录（含子目录文件）
+                              await deleteSongModel(model.id);
+                              setSongDeleteConfirm(null);
+                              const updated = await listSongModels();
+                              setSongModels(updated);
+                              useAppStore.getState().showToast(
+                                t18({ zh: `已删除：${t18(model.label, lang)}`, en: `Deleted: ${t18(model.label, lang)}`, ja: `削除完了：${t18(model.label, lang)}` }, lang),
+                                "success"
+                              );
+                            } catch (e) {
+                              useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), "error");
+                            }
+                          }}
+                        >
+                          {t18({ zh: "确认删除", en: "Confirm", ja: "確認" }, lang)}
+                        </button>
+                        <button onClick={() => setSongDeleteConfirm(null)}>
+                          {t18({ zh: "取消", en: "Cancel", ja: "キャンセル" }, lang)}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+                })}
+              </div>
+            ))}
+          </>
         )}
         {voiceType === "vocoder" && (
           // zero-knowledge banner: THE answer to "为什么我的声码器不能用于某个模型"
@@ -1044,7 +1755,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
               {rangeEditing !== m.name && (
                 <VoiceExportButton
                   m={m}
-                  voiceType={voiceType}
+                  voiceType={voiceType === "song" ? "rvc" : voiceType}
                   lang={lang}
                   picking={exportPick === m.name}
                   onPicking={(on) => { setExportPick(on ? m.name : null); if (on) setDeleteConfirm(null); }}
@@ -1063,7 +1774,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
         })}
       </div>
 
-      {showImport && (
+      {showImport && voiceType !== "song" && (
         <ImportDialog
           lang={lang}
           voiceType={voiceType}
@@ -1189,9 +1900,9 @@ function VoiceExportButton({ m, voiceType, lang, picking, onPicking }: {
           className="model-export-btn"
           disabled={busy}
           onClick={() => { onPicking(false); void zipFlow(); }}
-          title={t18({ zh: "UTAI 模型包，可在其它设备导入", en: "UTAI package — import on another device", ja: "UTAI パッケージ。他のデバイスで取り込めます" }, lang)}
+          title={t18({ zh: "Muno 模型包，可在其它设备导入", en: "Muno package — import on another device", ja: "Muno パッケージ。他のデバイスで取り込めます" }, lang)}
         >
-          {t18({ zh: "UTAI 包 (.zip)", en: "UTAI package (.zip)", ja: "UTAI パッケージ (.zip)" }, lang)}
+          {t18({ zh: "Muno 包 (.zip)", en: "Muno package (.zip)", ja: "Muno パッケージ (.zip)" }, lang)}
         </button>
         <button
           className="model-export-btn"
@@ -1251,6 +1962,24 @@ function VoiceAuditionButton({ m, voiceType, lang, spk }: { m: VoiceModelEntry; 
   const speakers = voiceSpeakerOptions(m);
   const showToast = useAppStore((s) => s.showToast);
   const phase = audition?.name === m.name ? audition.phase : "idle";
+  const auditionPath = audition?.name === m.name ? (audition?.path ?? null) : null;
+
+  // 试听完成(正在播放,path 已知)后出现的「下载」按钮：把渲染出的试听 wav 原样复制到本地自选文件夹。
+  const downloadAudition = async () => {
+    if (!auditionPath) return;
+    const out = await open({ directory: true, title: "下载试听音频" });
+    if (!out || typeof out !== "string") return;
+    try {
+      await exportOneAudioFileToFolder(
+        { label: m.name, sourcePath: auditionPath },
+        out,
+        `${m.name}_试听`,
+      );
+      showToast("试听音频已下载", "success");
+    } catch (e) {
+      showToast(laneExportErrorMessage(e), "error");
+    }
+  };
 
   const start = useCallback(async () => {
     const st = useVoiceModelStore.getState();
@@ -1320,6 +2049,21 @@ function VoiceAuditionButton({ m, voiceType, lang, spk }: { m: VoiceModelEntry; 
       >
         {phase === "rendering" ? "…" : phase === "playing" ? "■" : "▶"}
       </button>
+      {auditionPath && (
+        <button
+          className="rm-range-btn rm-audition-dl"
+          title={t18(
+            { zh: "下载这段试听音频", en: "Download this audition audio", ja: "この試聴音声をダウンロード" },
+            lang,
+          )}
+          onClick={(e) => {
+            e.stopPropagation();
+            void downloadAudition();
+          }}
+        >
+          ⬇
+        </button>
+      )}
     </span>
   );
 }

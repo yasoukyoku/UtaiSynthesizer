@@ -275,6 +275,26 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           onReset={() => setVocalParams(trackId, { consonantValley: DEFAULT_CONSONANT_VALLEY })}
           onChange={(v) => setVocalParams(trackId, { consonantValley: v })}
         />
+        {/* Phase 7 ① 高频激励: ≥8 kHz 软饱和带按比例混回(气声/空气感)——UI 存百分数,Rust 吃 /100 后的小数。 */}
+        <Slider
+          label={t("vocalEditor.sidebar.voiceRealism")}
+          value={vocalParams.voiceRealism ?? 0}
+          cfg={{ min: 0, max: 15, step: 0.5, unit: "%", bipolar: false }}
+          overridden={(vocalParams.voiceRealism ?? 0) !== 0}
+          resetTitle={t("vocalEditor.sidebar.voiceRealismTip")}
+          onReset={() => setVocalParams(trackId, { voiceRealism: 0 })}
+          onChange={(v) => setVocalParams(trackId, { voiceRealism: v })}
+        />
+        {/* Phase 7 ② 共振峰微颤: 慢速 LFO 全通级联,音色随时间自然游移。 */}
+        <Slider
+          label={t("vocalEditor.sidebar.formantJitter")}
+          value={vocalParams.formantJitter ?? 0}
+          cfg={{ min: 0, max: 8, step: 0.5, unit: "%", bipolar: false }}
+          overridden={(vocalParams.formantJitter ?? 0) !== 0}
+          resetTitle={t("vocalEditor.sidebar.formantJitterTip")}
+          onReset={() => setVocalParams(trackId, { formantJitter: 0 })}
+          onChange={(v) => setVocalParams(trackId, { formantJitter: v })}
+        />
         {/* S84 E 刀: vowel-clarity articulation oversampling — fast-run short vowels render at an
             inflated S2CV duration and resample back (cv-domain; default ON, absent≡true). */}
         <div title={t("vocalEditor.sidebar.vowelClarityTip")}>
@@ -297,6 +317,15 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             label={t("vocalEditor.sidebar.consonantPreroll")}
             checked={vocalParams.consonantPreroll !== false}
             onChange={(c) => setVocalParams(trackId, { consonantPreroll: c })}
+          />
+        </div>
+        {/* Phase 7 ③ 气息层: ≥520 ms 的纯 SP 间隙中段合成一口程序化吸气(默认 ON,absent≡true;
+            只落在「上一句结束 → 下一句起音」的中段,不贴任何一句的尾音/头音)。 */}
+        <div title={t("vocalEditor.sidebar.breathLayerTip")}>
+          <ToggleRow
+            label={t("vocalEditor.sidebar.breathLayer")}
+            checked={vocalParams.breathLayer !== false}
+            onChange={(c) => setVocalParams(trackId, { breathLayer: c })}
           />
         </div>
         {/* M3 breath token: the lyric that means "audible inhale" (mapped to AP at render). Editable so a

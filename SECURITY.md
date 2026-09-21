@@ -2,13 +2,13 @@
 
 ## Reporting a vulnerability / 报告安全漏洞
 
-If you find a security vulnerability in UtaiSynthesizer (the app, its updater, or its
+If you find a security vulnerability in MunoAI (the app, its updater, or its
 model/asset download pipeline), please **do not open a public issue**. Instead use GitHub's
 private vulnerability reporting:
 
-**[Report a vulnerability](https://github.com/yasoukyoku/UtaiSynthesizer/security/advisories/new)**
+**[Report a vulnerability](https://github.com/junziai/munoai/security/advisories/new)**
 
-如果你发现了 UtaiSynthesizer(应用本体、更新器、或模型/资产下载链)的安全漏洞,请**不要**发公开
+如果你发现了 MunoAI(应用本体、更新器、或模型/资产下载链)的安全漏洞,请**不要**发公开
 issue,改用上面的 GitHub 私密漏洞报告入口。
 
 Please include: affected version, reproduction steps, and impact assessment.

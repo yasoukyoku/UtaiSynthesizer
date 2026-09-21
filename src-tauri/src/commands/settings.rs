@@ -161,6 +161,21 @@ pub struct AppConfig {
     /// training slower", i.e. a regression we manufactured.
     #[serde(default)]
     pub diagnostic_mode: bool,
+    /// Song generation resident mode — keeps the Python sidecar alive between generations
+    /// to avoid cold-loading ~8GB of models every time. Default OFF (user's explicit request:
+    /// no permanent VRAM occupation). When enabled, the sidecar daemon runs a keepalive loop
+    /// and unloads models to CPU after idle_timeout to release VRAM while keeping the process
+    /// warm (skips Python startup + torch import cost).
+    #[serde(default)]
+    pub song_resident_mode: bool,
+    /// Idle timeout in seconds before unloading models to CPU (releasing VRAM). Only applies
+    /// when song_resident_mode is enabled. Default 300s (5 minutes).
+    #[serde(default = "default_song_idle_timeout")]
+    pub song_resident_idle_timeout: u32,
+}
+
+fn default_song_idle_timeout() -> u32 {
+    300
 }
 
 impl Default for AppConfig {
@@ -173,6 +188,8 @@ impl Default for AppConfig {
             pending_delete_dirs: Vec::new(),
             deleted_since_migration: Vec::new(),
             diagnostic_mode: false,
+            song_resident_mode: false,  // 强制禁用常驻模式，避免自动预加载模型
+            song_resident_idle_timeout: 300,
         }
     }
 }
@@ -1142,6 +1159,51 @@ pub fn set_diagnostic_mode(state: State<'_, Arc<AppState>>, on: bool) -> Result<
 }
 
 #[tauri::command]
+pub fn get_song_resident_mode(state: State<'_, Arc<AppState>>) -> bool {
+    let cfg = load_config(&state.app_dir).unwrap_or_default();
+    cfg.song_resident_mode
+}
+
+#[tauri::command]
+pub fn set_song_resident_mode(state: State<'_, Arc<AppState>>, enabled: bool) -> Result<(), String> {
+    let mut cfg = load_config(&state.app_dir).unwrap_or_default();
+    cfg.song_resident_mode = enabled;
+    if let Err(e) = save_config(&state.app_dir, &cfg) {
+        tracing::warn!("Failed to save config: {}", e);
+    }
+    tracing::info!(
+        "Song resident mode {} (takes effect on the next song generation)",
+        if enabled { "ENABLED — sidecar stays alive, unloads to CPU after idle timeout" } else { "disabled" }
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_song_resident_idle_timeout(state: State<'_, Arc<AppState>>) -> u32 {
+    let cfg = load_config(&state.app_dir).unwrap_or_default();
+    cfg.song_resident_idle_timeout
+}
+
+#[tauri::command]
+pub fn set_song_resident_idle_timeout(state: State<'_, Arc<AppState>>, seconds: u32) -> Result<(), String> {
+    let seconds = seconds.max(60);
+    let mut cfg = load_config(&state.app_dir).unwrap_or_default();
+    cfg.song_resident_idle_timeout = seconds;
+    if let Err(e) = save_config(&state.app_dir, &cfg) {
+        tracing::warn!("Failed to save config: {}", e);
+    }
+    tracing::info!("Song resident idle timeout set to {} seconds", seconds);
+    Ok(())
+}
+
+/// 供其他模块（song.rs）读取常驻配置：返回 (是否常驻, 空闲超时秒数)。
+/// load_config 是模块私有的，这里给出唯一的跨模块入口，避免各处重复读 config.json。
+pub fn song_resident_settings(app_dir: &std::path::Path) -> (bool, u32) {
+    let cfg = load_config(app_dir).unwrap_or_default();
+    (cfg.song_resident_mode, cfg.song_resident_idle_timeout.max(60))
+}
+
+#[tauri::command]
 pub fn get_device_preference(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let current = state.inference.engine.device();
     Ok(match current {
@@ -1226,19 +1288,6 @@ pub fn load_and_apply_config(state: &AppState) {
                  Turn it off in Settings → Diagnostics when you are done reproducing."
             );
         }
-    } else if let Some(issue) = CONFIG_ISSUE.get() {
-        // S170: "there is no config" and "we could not read the config" are NOT the same fact, and
-        // the reassuring line below is precisely what made a damaged config read as a first launch
-        // (the same misreading S22 paid for with "No config found"). The diagnosis itself was
-        // already logged ONCE by whichever reader found it — this one runs fifth.
-        tracing::warn!(
-            "device preference: Auto — config.json could not be read this launch ({}: {}); the \
-             previous file is at {}; ORT build loaded: {}",
-            issue.code,
-            issue.detail,
-            if issue.backup.is_empty() { "<could not be moved>" } else { issue.backup.as_str() },
-            build
-        );
     } else {
         tracing::info!(
             "device preference: Auto (default; config.json is only written once changed in Settings); ORT build loaded: {}; per-run EP is logged as \"ONNX device=...\"",
@@ -1253,217 +1302,21 @@ fn config_path(app_dir: &std::path::Path) -> std::path::PathBuf {
 
 fn save_config(app_dir: &std::path::Path, cfg: &AppConfig) -> std::io::Result<()> {
     let path = config_path(app_dir);
-    // ⛔★★S170 ⓐ — never write over bytes this build could not read. All 11 config writers funnel
-    // through here, which makes this the one place where "never clobber" can be STRUCTURAL instead
-    // of a comment on the rename below. Quarantine first; if even that is impossible, REFUSE the
-    // write (the caller surfaces CONFIG_UNREADABLE_LOCKED) rather than destroy the original.
-    //
-    // Stateless on purpose — a re-read of a few hundred bytes, no process-global "config was bad"
-    // latch. Such a latch would leak between callers AND between tests in one binary, which this
-    // repo has already paid for once (see the note on shared statics in
-    // `s115_diagnostic_mode_defaults_off_and_survives_a_round_trip`).
-    if let ConfigRead::Unreadable(why) = read_config(app_dir) {
-        quarantine_unreadable_config(app_dir, &why)?;
-    }
-    // S170: `unwrap_or_default()` turned a serialization failure into an EMPTY string, which the
-    // atomic write below would then faithfully install as a 0-byte config.json — the one corruption
-    // shape whose fingerprint we can already name ("EOF while parsing a value at line 1 column 0",
-    // measured against a replica of load_config). Nothing downstream can do anything with "".
-    let json = serde_json::to_string_pretty(cfg).map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(cfg).unwrap_or_default();
     // Temp + rename so a crash mid-write can't truncate config.json (losing device pref + data_dir).
-    //
-    // ⚠ S170 ⓒ — rename is ATOMICITY, not DURABILITY. NTFS journals the metadata (the temp file's
-    // new size) but not its data, so a power loss inside this window can publish a correctly-sized
-    // config.json full of NULs — which parses as `expected value at line 1 column 1`. `sync_all`
-    // (FlushFileBuffers) before the rename closes exactly that window.
-    // ⚠ DEFENSIVE, and honestly so: this is a CANDIDATE mechanism with ZERO observations. The same
-    // fingerprint is also what a UTF-8 BOM produces (see UTF8_BOM) and THAT one is observed. It
-    // stays because the failure it prevents is unrecoverable and the cost is one flush.
-    // ⚠ No directory fsync: std cannot open a directory on Windows, and a branch that never runs is
-    // an empty predicate (this project's rule) — so there is nothing honest to write here.
     let tmp = path.with_extension("json.tmp");
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(json.as_bytes())?;
-        f.sync_all()?;
-    }
+    std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path)
 }
 
-/// S170 — the ONE classifier for `config.json`'s bytes.
-///
-/// Before this the file had THREE independent parsers (this module's `load_config`, plus
-/// `read_device_preference` and `read_auto_gpu` in lib.rs), and the lib.rs pair answered `None`
-/// for "absent", "not UTF-8" and "shredded" alike — with no WARN at all. One damaged file
-/// therefore reached the field log as three unattributable warnings from the three LATE readers
-/// and nothing from the two that run FIRST (they gate the ORT build pick, i.e. the place a
-/// diagnosis is worth the most). Every reader now comes through here.
-enum ConfigRead {
-    /// No file. The DEFAULT state, never an error: config.json is only written once a setting
-    /// changes — which is exactly what `load_and_apply_config`'s wording promises the reader.
-    Absent,
-    Ok(AppConfig),
-    /// The file exists and this build cannot turn it into an `AppConfig`. Carries the reason,
-    /// already phrased to follow "config.json " in a log line.
-    Unreadable(String),
-}
-
-/// UTF-8 byte-order mark. ⛔S170 ⓑ — PowerShell 5.1's `Out-File -Encoding utf8` and Notepad's
-/// "UTF-8 with BOM" both prepend these three bytes, and serde_json rejects them outright with
-/// `expected value at line 1 column 1` — the EXACT string the 2026-09-09 field log carries. So
-/// anyone who ever opened config.json in either tool was judged corrupt from then on, forever.
-/// RFC 8259 §8.1 says a parser MAY ignore it; on Windows ours MUST, because the OS's own text
-/// tools emit it. (Stripping it is also the one repair that costs the user nothing: with the BOM
-/// gone the file is already a valid config, `data_dir` included.)
-const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-
-fn read_config(app_dir: &std::path::Path) -> ConfigRead {
-    let bytes = match std::fs::read(config_path(app_dir)) {
-        Ok(b) => b,
-        // NotFound is the default state. Every OTHER io error (sharing violation, permissions, a
-        // bad sector) is a real problem that `read_to_string(..).ok()?` used to render
-        // indistinguishable from "the user never changed a setting".
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ConfigRead::Absent,
-        Err(e) => return ConfigRead::Unreadable(format!("could not be read: {e}")),
-    };
-    // ⚠ Only the BOM is forgiven. Anything else that is not UTF-8 (UTF-16, binary) still lands in
-    // Unreadable below — this is not "turn the encoding check off".
-    let body = bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes.as_slice());
-    let text = match std::str::from_utf8(body) {
-        Ok(t) => t,
-        Err(e) => return ConfigRead::Unreadable(format!("is not valid UTF-8: {e}")),
-    };
-    match serde_json::from_str(text) {
-        Ok(cfg) => ConfigRead::Ok(cfg),
-        Err(e) => ConfigRead::Unreadable(format!("failed to parse: {e}")),
-    }
-}
-
-/// How many `config.json.corrupt-<n>` slots we are willing to mint. Deliberately small: after a
-/// successful quarantine the next launch starts from a clean default, so needing even a second one
-/// means something is damaging the file repeatedly and the user has to look at it. Exhausting them
-/// is a REAL branch, not a theoretical one — it is the same branch a read-only directory or an AV
-/// handle lock takes, and it is the one
-/// `s170_a_config_that_cannot_be_moved_aside_refuses_the_write_instead_of_losing_it` triggers
-/// (this project treats a never-executed error branch as an empty predicate).
-const MAX_CONFIG_QUARANTINE_SLOTS: u32 = 20;
-
-/// Move an unreadable `config.json` out of the way — so the defaults we are about to run on cannot
-/// overwrite it — and say so ONCE. Returns the backup path.
-///
-/// ⚠ The name carries a COUNTER, not a timestamp: a bug report quotes `corrupt-1`, two machines'
-/// reports stay comparable, and the name is reproducible from the directory listing alone.
-fn quarantine_unreadable_config(
-    app_dir: &std::path::Path,
-    why: &str,
-) -> std::io::Result<std::path::PathBuf> {
+fn load_config(app_dir: &std::path::Path) -> Option<AppConfig> {
     let path = config_path(app_dir);
-    let free = (1..=MAX_CONFIG_QUARANTINE_SLOTS)
-        .map(|n| app_dir.join(format!("config.json.corrupt-{n}")))
-        .find(|p| !p.exists());
-    let moved = match free {
-        Some(backup) => match std::fs::rename(&path, &backup) {
-            Ok(()) => Ok(backup),
-            // ⛔ S170 adversarial review — this function MUTATES the filesystem, and 4 of
-            // `load_config`'s 10 call sites run outside CONFIG_LOCK (two of them on background
-            // threads: the pending-delete and reclaim spawns). Two readers can pick the same free
-            // slot; one renames, the other gets NotFound because the source is already gone. That
-            // is SUCCESS — the bytes are safe — and reporting it as CONFIG_UNREADABLE_LOCKED would
-            // abort a data-root migration with a CODE naming the wrong thing. "I could not move it"
-            // and "someone moved it first" must not be one red (this repo's first iron rule).
-            // ⛔ Do NOT "fix" this by taking CONFIG_LOCK here: migrate_data_dir already holds it
-            // when it reaches save_config -> load_config, and parking_lot::Mutex is not reentrant.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !path.exists() => Ok((1
-                ..=MAX_CONFIG_QUARANTINE_SLOTS)
-                .map(|n| app_dir.join(format!("config.json.corrupt-{n}")))
-                .filter(|p| p.exists())
-                .next_back()
-                .unwrap_or(backup)),
-            Err(e) => Err(e),
-        },
-        None => Err(std::io::Error::other(format!(
-            "all {MAX_CONFIG_QUARANTINE_SLOTS} backup slots are taken"
-        ))),
-    };
-    match moved {
-        Ok(backup) => {
-            // ONCE per process, and `OnceLock::set` is what enforces it: five readers touch this
-            // file at startup and the user needs one sentence, not five (S170 ⓓ).
-            let first = CONFIG_ISSUE
-                .set(ConfigIssue {
-                    code: "CONFIG_UNREADABLE_QUARANTINED".into(),
-                    backup: backup.to_string_lossy().into_owned(),
-                    detail: why.to_string(),
-                })
-                .is_ok();
-            if first {
-                tracing::error!(
-                    "CONFIG_UNREADABLE_QUARANTINED: config.json {why} — moved to {} and starting \
-                     from defaults. That file also holds `data_dir`, so an install whose data root \
-                     was moved will look EMPTY until it is restored.",
-                    backup.display()
-                );
-            }
-            Ok(backup)
-        }
+    let content = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str(&content) {
+        Ok(cfg) => Some(cfg),
         Err(e) => {
-            let e = std::io::Error::other(format!(
-                "CONFIG_UNREADABLE_LOCKED: config.json {why} and could not be moved aside ({e})"
-            ));
-            if CONFIG_ISSUE
-                .set(ConfigIssue {
-                    code: "CONFIG_UNREADABLE_LOCKED".into(),
-                    backup: String::new(),
-                    detail: why.to_string(),
-                })
-                .is_ok()
-            {
-                tracing::error!("{e} — refusing to save settings this session rather than overwrite it");
-            }
-            Err(e)
-        }
-    }
-}
-
-/// S170 — the startup diagnosis, surfaced to the UI exactly like `DATA_DIR_ISSUE` and for the same
-/// reason: a problem that only exists at boot must not live solely in a log file. Carries a stable
-/// CODE, never a sentence — user-facing text is the frontend's job (i18n hard rule).
-#[derive(serde::Serialize, Clone)]
-pub struct ConfigIssue {
-    /// Stable CODE (see `backendError.ts`).
-    pub code: String,
-    /// Where the unreadable bytes went; empty when they could not be moved at all.
-    pub backup: String,
-    /// serde's / the OS's own message. Technical on purpose: it is the one line a bug report needs
-    /// (the 2026-09-09 field log's `expected value at line 1 column 1` is what named this defect).
-    pub detail: String,
-}
-
-pub static CONFIG_ISSUE: std::sync::OnceLock<ConfigIssue> = std::sync::OnceLock::new();
-
-/// Startup warning for the frontend (null = config.json was readable, or absent, which is normal).
-#[tauri::command]
-pub fn get_config_issue() -> Option<ConfigIssue> {
-    CONFIG_ISSUE.get().cloned()
-}
-
-/// `pub(crate)` since S170: lib.rs's two pre-tauri readers call it instead of parsing the file
-/// themselves (see `read_device_preference`).
-pub(crate) fn load_config(app_dir: &std::path::Path) -> Option<AppConfig> {
-    match read_config(app_dir) {
-        ConfigRead::Ok(cfg) => Some(cfg),
-        ConfigRead::Absent => None,
-        ConfigRead::Unreadable(why) => {
-            // ⛔★★S170 ⓐ — DO NOT just return None here. EVERY caller pairs this with
-            // `unwrap_or_default()` and then calls `save_config` (settings.rs 989 / 1107 / 1132 /
-            // 2097 / 2199), so before this the FIRST unreadable read overwrote the user's config
-            // permanently — while `save_config`'s own comment claimed temp+rename meant it could
-            // "never clobber". `data_dir` lives in that file: for anyone who moved their data root
-            // off C:, losing it reads as "all my models are gone", not "my device pref reset".
-            // Falling back to defaults is still right (the app has to start); RECOVERABILITY is
-            // the requirement, and moving the bytes aside is what provides it.
-            let _ = quarantine_unreadable_config(app_dir, &why);
+            // A corrupt config silently falling back to defaults would look like lost settings.
+            tracing::warn!("config.json exists but failed to parse ({}); using defaults", e);
             None
         }
     }
@@ -2835,47 +2688,26 @@ const MIRROR_LIST_URLS: [&str; 4] = [
 #[tauri::command]
 pub async fn fetch_mirror_list() -> Result<serde_json::Value, String> {
     let client = crate::download::client().map_err(|e| e.to_string())?;
-    // S170: EVERY exit of this loop says something. Before, only the transport-error case did —
-    // a timeout, a non-2xx, an unreadable body, a proxy interstitial that isn't JSON, and "all four
-    // candidates failed" were all completely silent, so the product fell back to the built-in
-    // mirror list with no trace of why. Per-route outcomes stay at debug (same level as the one
-    // line that already existed, and community logs do carry DEBUG); the all-failed summary is a
-    // WARN because it fires at most once per call and is the line a reader actually needs.
     for url in MIRROR_LIST_URLS {
         let fut = client.get(url).send();
         match tokio::time::timeout(std::time::Duration::from_secs(8), fut).await {
-            Ok(Ok(resp)) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    tracing::debug!("mirrors.json from {url}: HTTP {status} — trying the next source");
-                    continue;
-                }
-                match resp.bytes().await {
-                    Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        Ok(v) => {
-                            if v.get("schema").and_then(|s| s.as_i64()) == Some(1) {
-                                tracing::info!("mirrors.json: loaded from {url}");
-                                return Ok(v);
-                            }
-                            tracing::warn!("mirrors.json from {url}: unexpected schema — ignored");
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                if let Ok(bytes) = resp.bytes().await {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if v.get("schema").and_then(|s| s.as_i64()) == Some(1) {
+                            return Ok(v);
                         }
-                        // A gh proxy answering 200 + its own HTML interstitial lands here — the same
-                        // poisoned-proxy shape download.rs guards against (DOWNLOAD_HTML_RESPONSE).
-                        Err(e) => tracing::debug!(
-                            "mirrors.json from {url}: body is not JSON ({e}) — likely a proxy interstitial"
-                        ),
-                    },
-                    Err(e) => tracing::debug!("mirrors.json from {url}: body read failed ({e})"),
+                        tracing::warn!("mirrors.json from {url}: unexpected schema — ignored");
+                    }
                 }
             }
-            Ok(Err(e)) => tracing::debug!("mirrors.json fetch failed via {url}: {e}"),
-            Err(_) => tracing::debug!("mirrors.json from {url}: no response within 8s"),
+            other => {
+                if let Ok(Err(e)) = other {
+                    tracing::debug!("mirrors.json fetch failed via {url}: {e}");
+                }
+            }
         }
     }
-    tracing::warn!(
-        "mirrors.json: all {} sources failed — using the built-in mirror list (presets may be stale)",
-        MIRROR_LIST_URLS.len()
-    );
     Err("MIRROR_LIST_UNAVAILABLE".into())
 }
 
@@ -3585,217 +3417,6 @@ pub(crate) fn is_cuda_available() -> bool {
 
 #[cfg(test)]
 mod tests {
-    /// ⛔★★S170 ⓐ —— 一次解析失败就把整份配置永久覆盖成默认值。
-    ///
-    /// 现场日志(2026-09-09,0.12.2,RTX 2060 + DirectML build)里 config.json 报
-    /// `expected value at line 1 column 1`,而「`load_config` 失败 → `unwrap_or_default()` →
-    /// `save_config`」这一串在五个调用点上一模一样(989 / 1107 / 1132 / 2097 / 2199)⇒ **第一次
-    /// 读失败就把用户那份原件覆盖掉**,而 `save_config` 上那行注释还写着 temp+rename 能保证
-    /// 「never clobber」。丢的不只是设备偏好:`data_dir` 也在这个文件里(settings.rs:113-116),
-    /// 对搬过数据根的用户 = **模型整体消失**。
-    ///
-    /// ⚠ 这条钉的是**字节不许丢**,不是「不许回落到默认」—— 回落是必须的(总得启动),
-    /// **可恢复性**才是要求。
-    /// ⚠ 阴性对照在同一条测试里**先**跑:一份正常配置走同一条路径不许被搬走。没有它,下面
-    ///    那条断言可能只是在测「隔离区无条件生效」(S92p 那条「夹具是空的」血训)。
-    /// ⛔ 刻意不断言 `CONFIG_ISSUE` —— 它是进程级 OnceLock,谁先写谁赢,断言它等于往测试
-    ///    二进制里种一个共享状态(本仓为此付过代价,见 s115 那条的末尾注释)。
-    #[test]
-    fn s170_an_unreadable_config_is_moved_aside_instead_of_being_overwritten() {
-        let app = std::env::temp_dir().join(format!("utai_cfg_clobber_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&app).unwrap();
-
-        // ── 阴性对照:正常配置走同一条路径,必须原样留在原地 ──────────────────────
-        save_config(&app, &AppConfig { cuda_mem_limit_mb: 4096, ..Default::default() }).unwrap();
-        let round = load_config(&app).expect("刚写出去的配置必须读得回来");
-        assert_eq!(round.cuda_mem_limit_mb, 4096);
-        save_config(&app, &round).unwrap();
-        assert!(
-            !app.join("config.json.corrupt-1").exists(),
-            "阴性对照失效:隔离区对【正常】配置也生效了 ⇒ 下面那条断言什么也证明不了"
-        );
-
-        // ── 真身:日志里那一族(NUL 填充 / 二进制垃圾,指纹都是 line 1 column 1)──────
-        let wreck: Vec<u8> = vec![0u8; 64];
-        std::fs::write(config_path(&app), &wreck).unwrap();
-        // 启动时真正跑的就是这两行
-        let cfg = load_config(&app).unwrap_or_default();
-        // ⛔ 归因断言(S170 变异探针实测补上的):隔离必须**在读这一侧**就已经发生。
-        //    `save_config` 自己也有一道(纵深防御),所以只断言最终结果的话,把 `load_config`
-        //    里的隔离整个删掉这条测试**照样绿** —— 实测过,它当时确实没红。一条不能归因到
-        //    某一条路径的闸,就是本仓第一条铁律点名的那种闸。
-        assert!(
-            app.join("config.json.corrupt-1").is_file(),
-            "隔离没有发生在【读】这一侧 —— 那就只剩 save_config 一道,而 load_config 的\r
-             调用点里有 4 个根本不会走到 save_config"
-        );
-        save_config(&app, &cfg).expect("回落到默认之后仍然必须能起来");
-
-        let backup = app.join("config.json.corrupt-1");
-        assert!(
-            backup.is_file(),
-            "用户那份 config.json 被默认值覆盖了,一份备份都没留 —— data_dir 跟着一起没了"
-        );
-        assert_eq!(
-            std::fs::read(&backup).unwrap(),
-            wreck,
-            "备份里不是原件的字节 —— 搬运这一步自己把证据改了"
-        );
-        assert!(
-            load_config(&app).is_some(),
-            "隔离之后必须能正常起来(回落到默认是对的,不可恢复才是 bug)"
-        );
-        let _ = std::fs::remove_dir_all(&app);
-    }
-
-    /// ⛔★★S170 ⓐ 的**错误分支** —— 「搬不动」这一支必须被真正触发过一次。
-    ///
-    /// 本项目的规矩:**一条从没被执行过的错误分支就是一条空判据**。隔离区搬不动的真实成因是
-    /// 只读目录 / 杀软句柄锁,两者都没法在测试里可靠造出来;**槽位耗尽走的是同一支**,而且是
-    /// 确定性的、跨平台的(不依赖权限、不依赖文件锁、不依赖任何计时)。
-    ///
-    /// 它同时钉住那条更重要的话:搬不动时**宁可让写入失败,也不许覆盖**。
-    /// ⚠ 这里刻意把 20 重写一遍而不是引用 `MAX_CONFIG_QUARANTINE_SLOTS`:引用它的话,
-    ///    把常量改小仍然绿(还是耗尽),改**大**则会让隔离在第 21 槽成功 ⇒ 本测试当场红。
-    ///    红是安全方向,而且报文会直接告诉你常量动过了。
-    #[test]
-    fn s170_a_config_that_cannot_be_moved_aside_refuses_the_write_instead_of_losing_it() {
-        let app = std::env::temp_dir().join(format!("utai_cfg_locked_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&app).unwrap();
-        for n in 1..=20u32 {
-            std::fs::write(app.join(format!("config.json.corrupt-{n}")), b"taken").unwrap();
-        }
-        let wreck = b"\xff\xfe<not json>".to_vec();
-        std::fs::write(config_path(&app), &wreck).unwrap();
-
-        let err = save_config(&app, &AppConfig::default()).expect_err(
-            "搬不动的时候写入必须失败 —— 成功就意味着它刚刚覆盖了用户唯一的那份原件",
-        );
-        assert!(
-            err.to_string().contains("CONFIG_UNREADABLE_LOCKED"),
-            "拒绝了,但没有给出可归因的 CODE(前端只会看到一句裸英文):{err}"
-        );
-        assert_eq!(
-            std::fs::read(config_path(&app)).unwrap(),
-            wreck,
-            "拒绝写入之后原件必须一字节未动"
-        );
-        let _ = std::fs::remove_dir_all(&app);
-    }
-
-    /// ⛔S170 ⓑ —— UTF-8 BOM 不是损坏。
-    ///
-    /// PowerShell 5.1 的 `Out-File -Encoding utf8` 与记事本的「UTF-8 with BOM」都会在文件头写
-    /// `EF BB BF`,serde_json 直接拒绝,报 `expected value at line 1 column 1` —— **正是现场
-    /// 日志里的那一句**。⇒ 任何用这两个 Windows 自带工具碰过 config.json 的用户,从此每次启动
-    /// 都被判死,而且(在 ⓐ 修好之前)当场被覆盖成默认值。
-    /// RFC 8259 §8.1 说解析器【可以】忽略它;在 Windows 上我们必须忽略。
-    ///
-    /// ⚠ BOM 的三个字节在这里**刻意重写一遍**,而不是引用 `UTF8_BOM`:引用它的话,把常量打错
-    ///    一位(比如 EF BB BE)会让生产代码什么都不剥,而这条测试照样绿 —— 一条自证的空闸。
-    /// ⚠ 阴性对照在同一条测试里:BOM 之外真正的非 UTF-8 仍然必须判为不可读,否则这一刀就只是
-    ///    把编码校验关掉了。
-    #[test]
-    fn s170_a_utf8_bom_is_not_corruption() {
-        let app = std::env::temp_dir().join(format!("utai_cfg_bom_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&app).unwrap();
-
-        let mut bytes = vec![0xEFu8, 0xBB, 0xBF];
-        bytes.extend_from_slice(
-            br#"{"device":"cpu","data_dir":"D:\\UtaiData","cuda_mem_limit_mb":0}"#,
-        );
-        std::fs::write(config_path(&app), &bytes).unwrap();
-
-        let cfg = load_config(&app)
-            .expect("带 BOM 的 config.json 仍然是一份合法配置(记事本 / PowerShell 5.1 就这么写)");
-        assert_eq!(cfg.device, crate::inference::engine::DeviceConfig::Cpu);
-        assert_eq!(
-            cfg.data_dir.as_deref(),
-            Some(r"D:\UtaiData"),
-            "data_dir 才是这条的要害:丢了它 = 用户的模型整体消失"
-        );
-        assert!(
-            !app.join("config.json.corrupt-1").exists(),
-            "BOM 被当成损坏搬走了 ⇒ 一份本来完好的配置被隔离,用户的 data_dir 跟着没了"
-        );
-
-        // 阴性对照:BOM 之外真正的非 UTF-8 仍然必须判为不可读
-        std::fs::write(config_path(&app), [0xFFu8, 0xFE, 0x7B, 0x00]).unwrap();
-        assert!(
-            load_config(&app).is_none(),
-            "阴性对照失效:非 UTF-8 的字节也被当成了合法配置 —— 这一刀把编码校验关掉了"
-        );
-        let _ = std::fs::remove_dir_all(&app);
-    }
-
-    /// ⛔S170 ⓒ —— 配置落盘必须先持久化,再改名。
-    ///
-    /// temp+rename 保证的是**原子性**(不会写半截),不是**持久性**:NTFS 记录临时文件的新
-    /// **长度**而不记录它的**数据**,所以掉电窗口内 rename 可以把一份长度正确、内容全 NUL 的
-    /// 文件公布成正式 config.json —— 解析出来正是 `expected value at line 1 column 1`。
-    /// ⚠ **如实登记:这条机理零观测**,同一个指纹也来自 BOM(那一条有观测)。它照样值得修,
-    ///   因为代价是一次 flush,而它防的失败不可恢复。
-    ///
-    /// ⚠⚠ 这是一条**结构断言**,不是行为断言:fsync 在进程内没有任何可观测量,而本项目禁止用
-    ///    毫秒级计时夹具论证(本批实测三把合成夹具测同一个量给出 4.4 / 11.4 / 17.9 ms = 4.2×)。
-    ///    所以它钉的是「这一步还在,而且仍然排在 rename 之前」,形状照抄仓里既有的源文本闸
-    ///    (`boot_steps_with_a_single_call_site_stay_wired_into_setup`),并且按本项目铁律把
-    ///    **「闸找不到对象」与「对象丢了 sync」报成两种不同的红**。
-    #[test]
-    fn s170_the_config_write_is_durable_before_it_becomes_the_live_file() {
-        static SRC: &str = include_str!("settings.rs");
-        // ⛔ Walk LINES, never byte offsets into the raw text. This repo has no .gitattributes and
-        // core.autocrlf is on, so settings.rs is 4996 CRLF / 0 bare LF and `include_str!` keeps
-        // that verbatim — `SRC.find("\n}\n")` matches NOWHERE in this file. The first draft of
-        // this gate did exactly that and would have died in its own `.expect` on every run, never
-        // once reaching the assertions it advertises: a gate that never executes its own claim.
-        // (`str::lines()` drops the trailing \r for us; the same two-step is already used by
-        // `boot_steps_with_a_single_call_site_stay_wired_into_setup`, whose comment names the trap.)
-        let lines: Vec<&str> = SRC.lines().map(str::trim_end).collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("fn save_config("))
-            .expect(
-                "闸瞎了:`save_config` 改名或消失了。重新指向它,别删这条闸 —— 它是仓里唯一会注意到\
-                 『持久化那一步没了』的东西(rename 公布未落盘的数据 = 一份全 NUL 的 config.json)",
-            );
-        // 顶格的 `}` = 函数收尾(函数体内所有闭合花括号都是缩进的)。
-        let end = start
-            + lines[start..]
-                .iter()
-                .position(|l| *l == "}")
-                .expect("闸瞎了:save_config 不再顶格收尾,扫描器读不懂它的边界了");
-        let body: String = lines[start..=end]
-            .iter()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n");
-        // 自检(S105):切出来的函数体必须像个函数体,否则下面的断言都是空的。
-        assert!(
-            body.contains("with_extension(\"json.tmp\")"),
-            "闸瞎了:切出来的这段里没有临时文件那一步,说明切错了位置:\n{body}"
-        );
-
-        let sync = body.find("sync_all()").unwrap_or_else(|| {
-            panic!(
-                "save_config 不再在改名之前把临时文件刷到盘上。rename 只搬元数据:掉电窗口内\
-                 公布出去的会是一份长度正确、内容全 NUL 的 config.json(指纹 `expected value \
-                 at line 1 column 1`)。\n函数体:\n{body}"
-            )
-        });
-        let rename = body.find("rename(").unwrap_or_else(|| {
-            panic!(
-                "save_config 不再用 rename 公布 —— 原子性本身没了(temp+rename 是它唯一的保证,\
-                 那行注释就是这么写的)。\n函数体:\n{body}"
-            )
-        });
-        assert!(
-            sync < rename,
-            "sync_all 排到了 rename 后面:先公布再持久化,窗口一点没关。\n函数体:\n{body}"
-        );
-    }
-
     use super::*;
 
     fn gpu(name: &str, vendor: &str) -> GpuAdapter {

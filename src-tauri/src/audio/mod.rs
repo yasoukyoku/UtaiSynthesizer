@@ -1,5 +1,10 @@
-pub mod export;
+pub mod audio_output;
+pub mod fluidsynth;
 pub mod resample;
+pub mod sf2;
+pub mod soundfont;
+pub mod sfz;
+pub mod synth;
 
 use std::path::Path;
 
@@ -269,9 +274,10 @@ fn ffmpeg_decode_to_wav(ffmpeg: &Path, path: &Path, target_sr: Option<u32>) -> R
 
 fn load_with_ffmpeg(path: &Path) -> Result<AudioBuffer> {
     let ffmpeg = find_ffmpeg().ok_or_else(|| {
+        // Stable CODE → i18n (backend.AUDIO_FFMPEG_MISSING): the slim installer no longer bundles
+        // ffmpeg; the user downloads it from the resource manager on demand.
         crate::UtaiError::Audio(format!(
-            "Cannot decode '{}' — symphonia does not support this format and ffmpeg was not found. \
-             Place ffmpeg.exe next to the application binary.",
+            "AUDIO_FFMPEG_MISSING: {}",
             path.display()
         ))
     })?;
@@ -406,7 +412,37 @@ fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
     Some((h * 3600.0 + m * 60.0 + s) * 1000.0)
 }
 
+/// Managed FFmpeg location: the resource-manager copy under the data root
+/// (`<data>/models/amt/ffmpeg/bin/ffmpeg.exe`). The resolved CANDIDATE path is cached (the
+/// data root only changes via config + restart, matching lib.rs's resolve_data_dir semantics),
+/// but existence is re-checked on every call so a download made mid-session is picked up
+/// immediately, without a restart.
+fn managed_ffmpeg_path() -> Option<std::path::PathBuf> {
+    use std::sync::OnceLock;
+    static CANDIDATE: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let candidate = CANDIDATE.get_or_init(|| {
+        let app_dir = crate::resolve_app_dir();
+        let data_dir = crate::commands::settings::resolve_data_dir(&app_dir);
+        data_dir
+            .join("models")
+            .join("amt")
+            .join("ffmpeg")
+            .join("bin")
+            .join("ffmpeg.exe")
+    });
+    if candidate.is_file() {
+        Some(candidate.clone())
+    } else {
+        None
+    }
+}
+
 pub(crate) fn find_ffmpeg() -> Option<std::path::PathBuf> {
+    // 0. Resource-manager download (data root) — the slim-installer's on-demand copy
+    if let Some(p) = managed_ffmpeg_path() {
+        return Some(p);
+    }
+
     // Next to the running binary (bundled — release mode)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -563,6 +599,26 @@ pub fn save_wav_f32(path: &Path, buffer: &AudioBuffer) -> Result<()> {
     let mut writer = hound::WavWriter::create(path, spec)
         .map_err(|e| crate::UtaiError::Audio(format!("Failed to create WAV: {}", e)))?;
     for &sample in &buffer.samples {
+        writer.write_sample(sample).map_err(|e| crate::UtaiError::Audio(format!("Write error: {}", e)))?;
+    }
+    writer.finalize().map_err(|e| crate::UtaiError::Audio(format!("Finalize error: {}", e)))?;
+    Ok(())
+}
+
+/// 16-bit writer for PRE-QUANTIZED samples — `apply_dither_16bit` already does
+/// the dithered quantization, so routing through save_wav would quantize twice
+/// (a second rounding pass that discards the dither's benefit). Same `*32767`
+/// symmetric scale as the rest of the codebase.
+pub fn save_wav_i16(path: &Path, samples: &[i16], sample_rate: u32, channels: u16) -> Result<()> {
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| crate::UtaiError::Audio(format!("Failed to create WAV: {}", e)))?;
+    for &sample in samples {
         writer.write_sample(sample).map_err(|e| crate::UtaiError::Audio(format!("Write error: {}", e)))?;
     }
     writer.finalize().map_err(|e| crate::UtaiError::Audio(format!("Finalize error: {}", e)))?;

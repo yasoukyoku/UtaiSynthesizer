@@ -1,0 +1,1280 @@
+.amt-result-panel {
+  display: flex;
+  flex-direction: column;
+  background: #0a0a0a;
+  border-top: 1px solid #1a1a1a;
+  color: #e0e0e0;
+  height: 100%;
+  overflow: hidden;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.5);
+}
+
+.amt-result-header {
+  display: flex;
+  flex-direction: column;
+  background: #141414;
+  border-bottom: 1px solid #222;
+  flex-shrink: 0;
+  z-index: 100;
+}
+
+/* Row 1 — 标题 + 功能按钮 */
+.amt-header-row-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px 6px;
+  min-height: 42px;
+}
+
+.amt-header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.amt-close-btn {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #888;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  font-size: 12px;
+}
+
+.amt-close-btn:hover {
+  background: rgba(255, 95, 86, 0.2);
+  color: #ff5f56;
+  border-color: #ff5f56;
+}
+
+.amt-title-group h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: #00e5ff;
+  text-shadow: 0 0 10px rgba(0, 229, 255, 0.3);
+}
+
+.amt-subtitle {
+  font-size: 11px;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+/* Row 2 — 播放控制条：三列网格，播放键严格居中 */
+.amt-transport-bar {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px 6px;
+}
+
+.amt-transport-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.amt-transport-left {
+  justify-self: start;
+}
+
+.amt-transport-right {
+  justify-self: end;
+}
+
+.amt-transport-center {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-self: center;
+  white-space: nowrap;
+}
+
+.amt-source-switch {
+  display: flex;
+  background: #1a1a1a;
+  padding: 3px;
+  border-radius: 8px;
+  border: 1px solid #333;
+}
+
+.amt-switch-btn {
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: #888;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.amt-switch-btn.active {
+  background: #333;
+  color: #00e5ff;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+.amt-transport-btn {
+  background: #1a1a1a;
+  border: 1px solid #333;
+  color: #aaa;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.amt-transport-btn:hover {
+  background: #252525;
+  color: #fff;
+  border-color: #444;
+}
+
+.amt-transport-btn.play {
+  width: 46px;
+  height: 46px;
+  background: #00e5ff;
+  color: #000;
+  border: none;
+  font-size: 20px;
+  box-shadow: 0 0 18px rgba(0, 229, 255, 0.35);
+}
+
+.amt-transport-btn.play:hover {
+  transform: scale(1.05);
+  box-shadow: 0 0 20px rgba(0, 229, 255, 0.5);
+}
+
+.amt-transport-btn.playing {
+  background: #fff;
+}
+
+/* Time & Slider */
+.amt-time-display {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+
+.amt-time-display .current { color: #00e5ff; }
+.amt-time-display .divider { color: #444; }
+.amt-time-display .total { color: #888; }
+
+/* 底部全宽播放进度条 */
+.amt-header-progress {
+  padding: 0 16px 8px;
+}
+
+.amt-progress-slider {
+  width: 100%;
+  height: 4px;
+  -webkit-appearance: none;
+  background: #222;
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.amt-progress-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #00e5ff;
+  cursor: pointer;
+  box-shadow: 0 0 10px rgba(0, 229, 255, 0.5);
+  border: 2px solid #000;
+}
+
+/* Actions */
+.amt-header-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* 顶栏功能按钮：缩小、紧凑 */
+.amt-header-actions .amt-action-btn {
+  padding: 5px 11px;
+  border-radius: 6px;
+  font-size: 12px;
+  gap: 5px;
+}
+
+.amt-action-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  border: 1px solid transparent;
+}
+
+.amt-action-btn.primary {
+  background: #00e5ff;
+  color: #000;
+  box-shadow: 0 4px 12px rgba(0, 229, 255, 0.2);
+}
+
+.amt-action-btn.primary:hover {
+  background: #00b8d4;
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(0, 229, 255, 0.3);
+}
+
+.amt-action-btn.secondary {
+  background: #1a1a1a;
+  border-color: #333;
+  color: #eee;
+}
+
+.amt-action-btn.secondary:hover {
+  background: #252525;
+  border-color: #444;
+}
+
+.amt-action-btn.secondary.busy {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+/* ── Download menu (reference download_menu five-piece set) ── */
+.amt-download-menu {
+  position: relative;
+}
+
+.amt-download-caret {
+  margin-left: 2px;
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+.amt-download-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 200;
+  min-width: 280px;
+  max-width: 360px;
+  background: #16181f;
+  border: 1px solid #333;
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.amt-download-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #e6e6e6;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.amt-download-item:hover:not(:disabled) {
+  background: #252a36;
+  color: #fff;
+}
+
+.amt-download-item:disabled {
+  color: #5a5f6a;
+  cursor: not-allowed;
+}
+
+.amt-download-icon {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+}
+
+.amt-download-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.amt-download-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  color: #0b0d12;
+  background: #00e5ff;
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+
+.amt-download-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 2px;
+  padding-top: 4px;
+  border-top: 1px solid #262a33;
+}
+
+.amt-download-group-title {
+  padding: 4px 10px 2px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #8b93a3;
+  letter-spacing: 0.02em;
+}
+
+/* ── SoundFont switcher (P0-C) ── */
+.amt-sf-panel {
+  min-width: 260px;
+}
+
+.amt-sf-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.amt-sf-row .amt-download-item {
+  flex: 1;
+  min-width: 0;
+}
+
+.amt-sf-row.active .amt-download-label {
+  color: #00e5ff;
+  font-weight: 600;
+}
+
+.amt-sf-delete {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: #7a828f;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.amt-sf-delete:hover {
+  background: #3a1f24;
+  color: #ff6b7a;
+}
+
+.amt-sf-empty {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: #8b93a3;
+}
+
+/* Top playable master "音轨" */
+.amt-master-track {
+  display: flex;
+  align-items: stretch;
+  height: 48px;
+  border-bottom: 1px solid #1a1a1a;
+  background: #0b0d12;
+  flex-shrink: 0;
+}
+
+.amt-master-track-label {
+  width: 260px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 16px;
+  border-right: 1px solid #1a1a1a;
+  background: #0d0d0d;
+  box-sizing: border-box;
+}
+
+.amt-master-track-name {
+  font-size: 12px;
+  font-weight: 700;
+  color: #00e5ff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.amt-master-track-meta {
+  font-size: 10px;
+  color: #555;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.amt-master-track-canvas-wrap {
+  flex: 1;
+  position: relative;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.amt-master-track-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Content Area */
+.amt-result-content {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.amt-sidebar {
+  width: 260px;
+  background: #0d0d0d;
+  border-right: 1px solid #1a1a1a;
+  display: flex;
+  flex-direction: column;
+}
+
+.amt-sidebar-header {
+  padding: 12px 16px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #444;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  border-bottom: 1px solid #1a1a1a;
+}
+
+.amt-stem-list {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.amt-stem-item {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  gap: 12px;
+  border-bottom: 1px solid #141414;
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+}
+
+.amt-stem-item:hover {
+  background: #161616;
+}
+
+.amt-stem-item.active {
+  background: #1a1a1a;
+}
+
+.amt-stem-color-bar {
+  width: 4px;
+  height: 24px;
+  border-radius: 2px;
+}
+
+.amt-stem-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.amt-stem-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #aaa;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color 0.2s;
+}
+
+.amt-stem-item.active .amt-stem-name {
+  color: #fff;
+}
+
+.amt-stem-meta {
+  font-size: 11px;
+  color: #555;
+  margin-top: 2px;
+}
+
+.amt-stem-controls {
+  display: flex;
+  gap: 4px;
+}
+
+.amt-mini-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  border: 1px solid #222;
+  background: #141414;
+  color: #444;
+  font-size: 10px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.amt-mini-btn:hover {
+  border-color: #444;
+  color: #888;
+}
+
+.amt-mini-btn.mute.active {
+  background: #ff5f56;
+  color: #fff;
+  border-color: #ff5f56;
+}
+
+.amt-mini-btn.solo.active {
+  background: #ffbd2e;
+  color: #000;
+  border-color: #ffbd2e;
+}
+
+.amt-mini-btn.convert {
+  width: auto;
+  min-width: 34px;
+  padding: 0 5px;
+  color: #00e5ff;
+  border-color: #0b3a44;
+}
+
+.amt-mini-btn.convert:hover {
+  background: rgba(0, 229, 255, 0.12);
+  color: #7ff3ff;
+}
+
+/* ── Separation view (vocal / six-stem): one waveform row per stem ── */
+.amt-sep-rows {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  overflow-y: auto;
+  background: #05070c;
+  min-height: 0;
+}
+
+.amt-sep-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 56px;
+  border: 1px solid #141a24;
+  border-radius: 8px;
+  background: #0a0e15;
+  padding: 0 10px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.amt-sep-row:hover {
+  border-color: #1e2a3a;
+}
+
+.amt-sep-row.active {
+  border-color: #2a4a5e;
+  background: #0d1420;
+}
+
+.amt-sep-row.muted {
+  opacity: 0.55;
+}
+
+.amt-sep-row-name {
+  width: 92px;
+  min-width: 92px;
+  font-size: 12px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.amt-sep-row-wave {
+  flex: 1;
+  height: 42px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.amt-sep-wave-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.amt-sep-row-badge {
+  min-width: 38px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 800;
+  color: #5a7a8a;
+  background: #10151d;
+  border: 1px solid #18202c;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+/* Piano Roll */
+.amt-piano-roll-container {
+  flex: 1;
+  background: #050505;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.amt-piano-roll-viewport {
+  width: 100%;
+  flex: 1;
+  overflow: auto;
+  outline: none;
+}
+
+.amt-piano-roll-viewport:focus-visible {
+  outline: 1px solid rgba(0, 229, 255, 0.4);
+}
+
+/* 编辑模式光标（crosshair，复刻参考编辑交互） */
+.amt-piano-roll-canvas.editing {
+  cursor: crosshair;
+}
+
+/* ── MIDI 编辑器工具栏（复刻参考项目 midiEditorToolbar）── */
+.amt-editor-toolbar {
+  flex-shrink: 0;
+  display: none;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 10px;
+  background: #0d1620;
+  border-bottom: 1px solid #22384e;
+}
+
+.amt-editor-toolbar.active {
+  display: flex;
+}
+
+.amt-editor-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.amt-editor-row.fields {
+  gap: 10px;
+}
+
+.amt-ed-btn {
+  min-height: 26px;
+  padding: 0 10px;
+  font-size: 11px;
+  color: #d7e6f8;
+  background: #1d3150;
+  border: 1px solid #3b5577;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.amt-ed-btn:hover:not(:disabled) {
+  background: #29466e;
+  border-color: #5b91c9;
+}
+
+.amt-ed-btn:disabled {
+  border-color: #2a3b55;
+  background: #182943;
+  color: #607796;
+  cursor: not-allowed;
+}
+
+.amt-ed-btn.toggle.on {
+  border-color: #00e5ff;
+  background: #0e3a52;
+  color: #7ff0ff;
+  box-shadow: 0 0 8px rgba(0, 229, 255, 0.25);
+}
+
+.amt-ed-btn.accent {
+  background: #21486b;
+  border-color: #4789ad;
+  color: #c8edff;
+}
+
+/* ── 快捷键速查卡（§建议4）：「?」按钮弹出，向下展开 ── */
+.amt-editor-row-relative {
+  position: relative;
+  display: inline-flex;
+}
+.amt-ed-btn.on {
+  border-color: #00e5ff;
+  color: #7ff0ff;
+}
+.amt-help-card {
+  position: absolute;
+  top: 30px;
+  right: 0;
+  z-index: 60;
+  min-width: 310px;
+  max-width: min(430px, calc(100vw - 32px));
+  max-height: calc(100vh - 12px);
+  overflow-y: auto;
+  padding: 10px 12px;
+  background: #101d31;
+  border: 1px solid #00e5ff;
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  font-size: 12px;
+  color: #d7e6f8;
+}
+.amt-help-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-weight: 600;
+  color: #7ff0ff;
+}
+.amt-help-close {
+  padding: 0 6px;
+  font-size: 13px;
+  line-height: 1;
+  color: #8fa9c7;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.amt-help-close:hover {
+  color: #d7e6f8;
+}
+.amt-help-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.amt-help-table td {
+  padding: 3px 8px 3px 0;
+  vertical-align: top;
+  color: #d7e6f8;
+}
+.amt-help-table td.amt-help-key {
+  width: 1%;
+  white-space: nowrap;
+  padding-right: 14px;
+}
+.amt-help-table kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: #c8edff;
+  background: #1d3150;
+  border: 1px solid #3b5577;
+  border-radius: 3px;
+}
+
+.amt-ed-field {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #93abc9;
+  white-space: nowrap;
+}
+
+.amt-ed-field select,
+.amt-ed-field input {
+  min-height: 26px;
+  font-size: 11px;
+  color: #d7e6f8;
+  background: #172941;
+  border: 1px solid #3b5577;
+  border-radius: 5px;
+  padding: 0 6px;
+  outline: none;
+}
+
+.amt-ed-field select { min-width: 88px; }
+.amt-ed-field input[type="number"] { width: 58px; }
+
+.amt-ed-field input:disabled {
+  color: #607796;
+  background: #121f31;
+  cursor: not-allowed;
+}
+
+.amt-ed-summary {
+  font-size: 11px;
+  color: #9bb4d5;
+  background: #15263f;
+  border: 1px solid #304b6c;
+  border-radius: 5px;
+  padding: 4px 9px;
+  white-space: nowrap;
+}
+
+/* ── 跟随播放头 / 工程速度 / 工程倍速（参考 follow_checkbox + bpm/speed spin）── */
+.amt-follow-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #9fd8e8;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  padding: 0 2px;
+}
+
+.amt-follow-toggle input {
+  accent-color: #00e5ff;
+  cursor: pointer;
+}
+
+.amt-tempo-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px;
+}
+
+.amt-tempo-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.amt-tempo-label {
+  font-size: 10px;
+  color: #7fa8c0;
+  user-select: none;
+}
+
+.amt-tempo-field input {
+  width: 64px;
+  height: 24px;
+  font-size: 11px;
+  font-family: Consolas, monospace;
+  color: #c8d3e6;
+  background: #101820;
+  border: 1px solid #2a3a4a;
+  border-radius: 4px;
+  padding: 0 5px;
+  outline: none;
+}
+
+.amt-tempo-field input:focus {
+  border-color: #00e5ff;
+}
+
+.amt-tempo-status {
+  font-size: 10px;
+  color: #86b5dd;
+  white-space: nowrap;
+}
+
+.amt-piano-roll-canvas-wrap {
+  position: relative;
+  display: flex;
+}
+
+.amt-piano-keys {
+  background: #e8e8e8;
+  border-right: 2px solid #000;
+  position: sticky;
+  left: 0;
+  z-index: 20;
+}
+
+/* High-contrast REAL piano keys: white keys light with dark borders, black keys solid. */
+.amt-key {
+  border-bottom: 1px solid #b8b8b8;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 6px;
+  background: #ffffff;
+  box-sizing: border-box;
+}
+
+.amt-key.black {
+  background: #1a1a1a;
+  border-bottom: 1px solid #000;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.6);
+}
+
+.amt-key-label {
+  font-size: 9px;
+  color: #333;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.amt-key.black .amt-key-label {
+  color: #999;
+}
+
+/* 原声↔MIDI 混音滑杆（复刻参考项目 mix slider） */
+.amt-mix-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px;
+}
+
+.amt-mix-label {
+  font-size: 10px;
+  color: #7fa8c0;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.amt-mix-slider {
+  width: 90px;
+  height: 4px;
+  accent-color: #00e5ff;
+  cursor: pointer;
+}
+
+/* A/B 模式下混音滑杆禁用（复刻参考项目 mix_slider.setEnabled(... and not stereo)） */
+.amt-mix-slider:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* A/B 立体声对比开关（左=原声，右=MIDI） */
+.amt-stereo-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #9fd8e8;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  padding: 0 4px;
+}
+
+.amt-stereo-toggle input {
+  accent-color: #00e5ff;
+  cursor: pointer;
+}
+
+/* Zoom toolbar (bottom-right of the piano roll) */
+.amt-zoom-toolbar {
+  position: absolute;
+  bottom: 14px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(10, 12, 16, 0.92);
+  border: 1px solid #2a3a4a;
+  border-radius: 10px;
+  padding: 5px 8px;
+  z-index: 30;
+  backdrop-filter: blur(6px);
+}
+
+.amt-zoom-btn {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1a2530;
+  border: 1px solid #31465c;
+  color: #9fd8e8;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s;
+  line-height: 1;
+}
+
+.amt-zoom-btn:hover {
+  background: #24384a;
+  color: #fff;
+  border-color: #00e5ff;
+}
+
+.amt-zoom-value {
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+  color: #7fa8c0;
+  min-width: 42px;
+  text-align: center;
+}
+
+/* "Synthesizing playback audio" badge */
+.amt-prep-badge {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(10, 12, 16, 0.92);
+  border: 1px solid rgba(0, 229, 255, 0.35);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: #00e5ff;
+  z-index: 30;
+  backdrop-filter: blur(6px);
+}
+
+.amt-spinner-sm {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(0, 229, 255, 0.25);
+  border-top-color: #00e5ff;
+  border-radius: 50%;
+  animation: amt-spin-sm 0.8s linear infinite;
+}
+
+@keyframes amt-spin-sm {
+  to { transform: rotate(360deg); }
+}
+
+.amt-piano-roll-canvas {
+  background: transparent;
+}
+
+/* Scrollbars */
+.amt-stem-list::-webkit-scrollbar,
+.amt-piano-roll-viewport::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.amt-stem-list::-webkit-scrollbar-track,
+.amt-piano-roll-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.amt-stem-list::-webkit-scrollbar-thumb,
+.amt-piano-roll-viewport::-webkit-scrollbar-thumb {
+  background: #222;
+  border-radius: 3px;
+}
+
+.amt-stem-list::-webkit-scrollbar-thumb:hover,
+.amt-piano-roll-viewport::-webkit-scrollbar-thumb:hover {
+  background: #333;
+}
+
+.amt-loading-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  backdrop-filter: blur(8px);
+}
+
+.amt-spinner {
+  width: 48px;
+  height: 48px;
+  border: 4px solid rgba(0, 229, 255, 0.1);
+  border-top-color: #00e5ff;
+  border-radius: 50%;
+  animation: amt-spin 1s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes amt-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── §用户：双击音符改歌词的浮层输入框 ── */
+.amt-lyric-input {
+  position: absolute; z-index: 30; width: 96px; padding: 2px 6px;
+  background: rgba(12, 16, 28, 0.96); color: #fff; font-size: 12px;
+  border: 1px solid #7c4dff; border-radius: 4px; outline: none;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+/* Tab switcher for 3-tab workbench */
+.amt-tabs-row {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px 0;
+  border-bottom: 1px solid var(--amt-border, #2a2a35);
+}
+
+.amt-tab-btn {
+  background: transparent;
+  border: none;
+  color: var(--amt-text-muted, #888);
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.18s;
+  white-space: nowrap;
+}
+
+.amt-tab-btn:hover {
+  color: var(--amt-text, #ddd);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.amt-tab-btn.active {
+  color: var(--amt-accent, #b39dff);
+  border-bottom-color: var(--amt-accent, #7c4dff);
+}
+
+/* Export tab — clean card grid */
+.amt-export-content {
+  padding: 20px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.amt-export-hero {
+  margin-bottom: 16px;
+}
+
+.amt-export-hero-btn {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  padding: 20px 24px;
+  background: linear-gradient(135deg, rgba(124, 77, 255, 0.22), rgba(124, 77, 255, 0.08));
+  border: 1px solid rgba(124, 77, 255, 0.35);
+  border-radius: 12px;
+  color: #fff;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.2s;
+}
+
+.amt-export-hero-btn:hover {
+  background: linear-gradient(135deg, rgba(124, 77, 255, 0.3), rgba(124, 77, 255, 0.12));
+  border-color: #7c4dff;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(124, 77, 255, 0.2);
+}
+
+.amt-export-hero-btn .icon {
+  font-size: 36px;
+}
+
+.amt-export-hero-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.amt-export-hero-sub {
+  font-size: 12px;
+  color: #999;
+}
+
+.amt-export-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.amt-export-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 14px;
+  background: var(--amt-bg-card, #1a1a22);
+  border: 1px solid var(--amt-border, #333);
+  border-radius: 10px;
+  color: var(--amt-text, #ccc);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.18s;
+}
+
+.amt-export-card:hover:not(:disabled) {
+  background: var(--amt-bg-card-hover, #22222c);
+  border-color: var(--amt-accent, #7c4dff);
+  transform: translateY(-1px);
+}
+
+.amt-export-card:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.amt-export-card .icon {
+  font-size: 22px;
+  margin-bottom: 2px;
+}
+
+.amt-export-card-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--amt-text, #ccc);
+}
+
+.amt-export-card-sub {
+  font-size: 11px;
+  color: var(--amt-text-muted, #777);
+}

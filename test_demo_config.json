@@ -1,0 +1,12 @@
+{
+  "model": "demo",
+  "output_dir": "e:\\软件开发\\UtaiSynthesizer-main\\UtaiSynthesizer-main\\test_output",
+  "song_name": "测试歌曲",
+  "prompt": "一首欢快的流行歌曲",
+  "lyrics": "这是测试歌词\n用于验证功能",
+  "audio_duration": 10.0,
+  "bpm": 120.0,
+  "want_stems": true,
+  "want_midi": true,
+  "want_lrc": true
+}

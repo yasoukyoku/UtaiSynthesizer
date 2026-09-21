@@ -1,4 +1,4 @@
-//! S68d behavior gates for runtime-pack extraction — the E:\ EXTRACT_FAILED batch.
+﻿//! S68d behavior gates for runtime-pack extraction — the E:\ EXTRACT_FAILED batch.
 //!
 //! Own test binary on purpose: pyenv's RUNTIME_ROOT is a process-wide OnceLock, and
 //! the manual E2E (pyenv_pack.rs) roots it elsewhere — sharing a binary would make
@@ -28,7 +28,7 @@ fn test_root() -> &'static PathBuf {
         }
         let root = std::env::temp_dir().join(format!("utai_extract_gates_{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        utai_lib::pyenv::init_runtime_root(&root);
+        muno_lib::pyenv::init_runtime_root(&root);
         root
     })
 }
@@ -63,9 +63,9 @@ fn build_pack_zst(dir: &Path, id: &str, disk_bytes: u64, mtime: u64) -> PathBuf 
     p
 }
 
-fn extract(parts: &[PathBuf]) -> Result<utai_lib::pyenv::PackMeta, String> {
+fn extract(parts: &[PathBuf]) -> Result<muno_lib::pyenv::PackMeta, String> {
     let cancel = AtomicBool::new(false);
-    utai_lib::pyenv::extract_and_commit(parts, &cancel, |_| {}).map_err(|e| e.to_string())
+    muno_lib::pyenv::extract_and_commit(parts, &cancel, |_| {}).map_err(|e| e.to_string())
 }
 
 /// Root-cause regression gate: an archive whose entries say mtime=0 (all four shipped

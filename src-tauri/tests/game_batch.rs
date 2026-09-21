@@ -1,4 +1,4 @@
-//! GAME 离线批量打谱 harness(SVC2SVS 旋钮线第二刀)— 诊断工具,不是 gate。
+﻿//! GAME 离线批量打谱 harness(SVC2SVS 旋钮线第二刀)— 诊断工具,不是 gate。
 //!
 //! 目的:对 MBS2H 最终训练集的 utterance wav 批量跑生产 GAME 管线(midi_extract::extract_notes,
 //! 零复制铁律:绝不在 Python 重写 GAME),音符 JSON 落盘给 SVC2SVS 的 build_labels.py 消费。
@@ -15,7 +15,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use utai_lib::inference::midi_extract;
+use muno_lib::inference::midi_extract;
 
 fn app_root() -> PathBuf {
     // tests run from src-tauri; the models dir is the dev-checkout data/models (game_parity 同款)
@@ -50,10 +50,10 @@ fn game_batch_label() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("muno_lib=warn")),
         )
         .try_init();
-    utai_lib::suppress_windows_dll_error_dialogs();
+    muno_lib::suppress_windows_dll_error_dialogs();
     // S74: MUST precede init_ort_runtime and MUST be here even though the default tier is CPU —
     // UTAI_GAME_DEVICE=cuda:N makes this harness a GPU harness, and without the app's CUDA DLL
     // directories the cudnn 9 shim can't resolve its engine sub-DLLs (CUDNN_BACKEND_API_FAILED at
@@ -75,9 +75,9 @@ fn game_batch_label() {
         unsafe { AddDllDirectory(wide.as_ptr()) };
         eprintln!("[game_batch] DLL mode = nopath (AddDllDirectory only)");
     } else {
-        utai_lib::setup_cuda_dll_paths(&app_root());
+        muno_lib::setup_cuda_dll_paths(&app_root());
     }
-    utai_lib::init_ort_runtime(&app_root());
+    muno_lib::init_ort_runtime(&app_root());
 
     let models_dir = app_root().join("data").join("models");
     assert!(
@@ -95,15 +95,15 @@ fn game_batch_label() {
         .collect();
     eprintln!("[game_batch] shard {shard}: {}/{} tasks", mine.len(), tasks.len());
 
-    let engine = utai_lib::inference::engine::OnnxEngine::new();
+    let engine = muno_lib::inference::engine::OnnxEngine::new();
     // 默认钉 CPU:S71 实测本机 CUDA 跑 GAME 在 cudnn frontend 构图即炸(encoder conv,
     // CUDNN_FE failure 11)→「先试全局设备」政策会让每任务白付 GPU 会话构建+失败+重建。
     // UTAI_GAME_DEVICE=cuda:<id> 供 GPU 试探(⚠extract_notes 对 GPU 运行期失败会静默退
     // CPU 重试——判断 GPU 是否真通要看 stderr 有无「retrying once on CPU」告警+速度)。
     let dev = std::env::var("UTAI_GAME_DEVICE").unwrap_or_else(|_| "cpu".into());
     let cfg = match dev.strip_prefix("cuda:") {
-        Some(id) => utai_lib::inference::engine::DeviceConfig::Cuda { device_id: id.parse().expect("UTAI_GAME_DEVICE 形如 cuda:0") },
-        None => utai_lib::inference::engine::DeviceConfig::Cpu,
+        Some(id) => muno_lib::inference::engine::DeviceConfig::Cuda { device_id: id.parse().expect("UTAI_GAME_DEVICE 形如 cuda:0") },
+        None => muno_lib::inference::engine::DeviceConfig::Cpu,
     };
     eprintln!("[game_batch] device = {dev}");
     engine.set_device(cfg);
@@ -116,10 +116,10 @@ fn game_batch_label() {
             continue;
         }
         let r = (|| -> Result<usize, String> {
-            let buf = utai_lib::audio::load_audio_at_rate(Path::new(&t.wav), 44100)
+            let buf = muno_lib::audio::load_audio_at_rate(Path::new(&t.wav), 44100)
                 .map_err(|e| format!("load: {e}"))?;
-            let mut mono = utai_lib::audio::resample::to_mono(&buf).samples;
-            utai_lib::audio::sanitize_non_finite(&mut mono);
+            let mut mono = muno_lib::audio::resample::to_mono(&buf).samples;
+            muno_lib::audio::sanitize_non_finite(&mut mono);
             let notes =
                 midi_extract::extract_notes(&engine, &models_dir, &mono, 0, &|| false, &mut |_| {})?;
             let dump: Vec<serde_json::Value> = notes

@@ -7,7 +7,9 @@ import { segmentSourceWindowMs, ticksToMs } from "../../lib/audio/laneOps";
 import { computeTotalTicks, segmentPlaysLanes, segmentLaneSumPeaks, laneSumSig } from "../../lib/trackLayout";
 import { getWaveformCache, blitWaveform } from "../../lib/waveformCache";
 import { rgba, ACCENT_RGB, TRACK_RGB } from "../../lib/trackColors";
-import { drawPlayhead, CANVAS_BORDER } from "../../lib/canvasDraw";
+import { drawPlayhead, CANVAS_BORDER, canvasThemeVars } from "../../lib/canvasDraw";
+import { getContext } from "../../lib/audio/playback";
+import { getAnalyserFor } from "../../lib/audio/effectsBus";
 import "./OverviewMap.css";
 
 export function OverviewMap() {
@@ -25,14 +27,19 @@ export function OverviewMap() {
   const zoom = useAppStore((s) => s.zoom);
   const canvasWidth = useAppStore((s) => s.canvasWidth);
   const audioFiles = useAudioStore((s) => s.audioFiles);
+  const isPlaying = useAudioStore((s) => s.isPlaying);
 
   // SAME basis as DawView's scroll width, so the viewport box + drag map 1:1 to the real scroll range
   // (a smaller minimap range made the box fill the map on short projects → seek/scroll both dead).
   const totalTicks = computeTotalTicks(tracks, timeAxis);
 
   const waveRef = useRef<OffscreenCanvas | null>(null);
-  const waveKeyRef = useRef("");
+  const waveKeyRef = useRef<string>("");
   const [cursor, setCursor] = useState("pointer");
+  const animationFrameRef = useRef<number>(0);
+  const [waveformAmplitudes, setWaveformAmplitudes] = useState<number[]>([]);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const spectrumPeaksRef = useRef<number[]>([]);
 
   // Drag state: "viewport" = scrubbing the window box (scroll), "playhead" = moving the playhead.
   const dragRef = useRef<{ mode: "viewport" | "playhead"; offsetX: number; viewW: number; ppt: number } | null>(null);
@@ -57,12 +64,13 @@ export function OverviewMap() {
       const localX = e.clientX - rect.left;
       const { ppt, startX, endX } = viewportRect(rect.width);
 
-      if (localX >= startX && localX <= endX) {
-        // Grab the window box → drag to scroll (AU-style).
+      const viewportWidth = endX - startX;
+      const clickMargin = Math.max(4, viewportWidth * 0.1);
+
+      if (localX >= startX - clickMargin && localX <= endX + clickMargin) {
         dragRef.current = { mode: "viewport", offsetX: localX - startX, viewW: rect.width, ppt };
         setCursor("grabbing");
       } else {
-        // Seek the playhead (works during playback via the seeking flag → Toolbar reschedules).
         dragRef.current = { mode: "playhead", offsetX: 0, viewW: rect.width, ppt };
         setPlayhead(Math.max(0, Math.round((localX / rect.width) * totalTicks)));
         if (useAudioStore.getState().isPlaying) useAudioStore.getState().setSeeking(true);
@@ -80,7 +88,9 @@ export function OverviewMap() {
       const rect = canvas.getBoundingClientRect();
       const localX = e.clientX - rect.left;
       const { startX, endX } = viewportRect(rect.width);
-      setCursor(localX >= startX && localX <= endX ? "grab" : "pointer");
+      const viewportWidth = endX - startX;
+      const clickMargin = Math.max(4, viewportWidth * 0.1);
+      setCursor(localX >= startX - clickMargin && localX <= endX + clickMargin ? "grab" : "pointer");
     },
     [viewportRect],
   );
@@ -165,14 +175,17 @@ export function OverviewMap() {
       if (sizeChanged) waveRef.current = new OffscreenCanvas(cw, ch);
       const wc = waveRef.current!.getContext("2d")!;
       wc.setTransform(dpr, 0, 0, dpr, 0, 0);
-      wc.fillStyle = "#0a0e1a";
+      const themeVars = canvasThemeVars();
+      wc.fillStyle = themeVars.bgBase;
       wc.fillRect(0, 0, width, height);
       // Overlapping clips (e.g. a split clip whose halves are resized into each other) would otherwise
       // draw two translucent waveforms on top of each other in the overlap, reading as a darker
-      // "doubled" smear. "lighten" makes overlaps take the per-pixel MAX instead — a clean overview
-      // showing the louder of the overlapping clips, with no doubling. Reset to source-over after.
-      wc.globalCompositeOperation = "lighten";
-      const waveColor = rgba(TRACK_RGB.audio, 0.6);
+      // "doubled" smear. Use separate passes for audio and vocal to prevent overlap confusion.
+      wc.globalCompositeOperation = "source-over";
+      
+      const amplitudes: number[] = [];
+      
+      const waveColor = rgba(TRACK_RGB.audio, 0.7);
       for (const track of tracks) {
         if (track.muted || (hasSolo && !track.solo)) continue; // not audible → excluded from the overview
         for (const seg of track.segments) {
@@ -196,9 +209,15 @@ export function OverviewMap() {
             const sumPeaks = segmentPlaysLanes(track, seg) ? segmentLaneSumPeaks(track, seg) : null;
             if (sumPeaks) {
               wave = getWaveformCache(`lanesum:${track.id}:${seg.id}:${laneSumSig(track, seg)}`, sumPeaks, waveColor);
+              const maxAmp = Math.max(...sumPeaks);
+              amplitudes.push(maxAmp);
             } else {
               const audio = audioFiles[seg.content.sourcePath];
-              if (audio && audio.peaks.length) wave = getWaveformCache(seg.content.sourcePath, audio.peaks, waveColor);
+              if (audio && audio.peaks.length) {
+                wave = getWaveformCache(seg.content.sourcePath, audio.peaks, waveColor);
+                const maxAmp = Math.max(...audio.peaks);
+                amplitudes.push(maxAmp);
+              }
             }
             if (wave) blitWaveform(wc, wave, sx, 0, sw, height, startRatio, endRatio, width);
           } else if (seg.content.type === "notes" && seg.processedOutputs && seg.processedOutputs.length > 0) {
@@ -207,20 +226,25 @@ export function OverviewMap() {
             const sx = (seg.startTick / totalTicks) * width;
             const sw = (seg.durationTicks / totalTicks) * width;
             const segMs = ticksToMs(seg.durationTicks, tempo);
-            const vColor = rgba(TRACK_RGB.vocal, 0.6);
+            const vColor = rgba(TRACK_RGB.vocal, 0.85);
             for (const out of seg.processedOutputs) {
               if (!out.waveformPeaks || out.waveformPeaks.length === 0 || out.totalDurationMs <= 0) continue;
-              const off = Math.max(0, out.offsetMs ?? 0); // ② split: window into the SAME stem (off 0 = un-split)
+              const off = Math.max(0, out.offsetMs ?? 0);
               const startRatio = Math.min(1, off / out.totalDurationMs);
               const endRatio = Math.min(1, (off + segMs) / out.totalDurationMs);
               const wave = getWaveformCache(out.audioPath, out.waveformPeaks, vColor);
-              if (wave) blitWaveform(wc, wave, sx, 0, sw, height, startRatio, endRatio, width);
+              if (wave) {
+                blitWaveform(wc, wave, sx, 0, sw, height * 0.75, startRatio, endRatio, width);
+                const maxAmp = Math.max(...out.waveformPeaks);
+                amplitudes.push(maxAmp);
+              }
             }
           }
         }
       }
       wc.globalCompositeOperation = "source-over";
       waveKeyRef.current = waveKey;
+      setWaveformAmplitudes(amplitudes);
     }
 
     // ── Blit the cached waveform, then draw the cheap overlay on top. ──
@@ -228,14 +252,133 @@ export function OverviewMap() {
     ctx.drawImage(waveRef.current!, 0, 0);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
+    // ── 频谱显示：在波形后面显示实时频谱分析 ──
+    if (isPlaying) {
+      try {
+        const audioContext = getContext();
+        if (!analyserRef.current) {
+          analyserRef.current = getAnalyserFor(audioContext);
+          if (analyserRef.current) {
+            analyserRef.current.fftSize = 256;
+          }
+        }
+        
+        const analyser = analyserRef.current;
+        if (analyser) {
+          // 每帧创建新的 Uint8Array 避免类型冲突
+          const freqData = new Uint8Array(analyser.frequencyBinCount);
+          analyser.getByteFrequencyData(freqData);
+          const barCount = 64;
+          const step = Math.max(1, Math.floor(freqData.length / barCount));
+          const barWidth = width / barCount;
+          // 底部留边距，频谱不贴底；整体高度缩小
+          const specBase = height - 3;
+          const specMax = height * 0.68;
+          
+          // 峰值帽状态（每根柱子独立下落）
+          const peaks = spectrumPeaksRef.current;
+          if (peaks.length !== barCount) {
+            peaks.length = 0;
+            for (let i = 0; i < barCount; i++) peaks.push(0);
+          }
+          
+          ctx.globalCompositeOperation = "screen";
+          for (let i = 0; i < barCount; i++) {
+            let sum = 0;
+            for (let j = 0; j < step; j++) sum += freqData[i * step + j] ?? 0;
+            const value = Math.min(1, ((sum / step) / 255) * 1.25);
+            const barH = value * specMax;
+            const x = i * barWidth;
+            // 彩虹色系：橙黄 → 绿 → 青 → 蓝 → 紫 → 品红，越靠高频越绚丽
+            const hue = (i / barCount) * 320 + 20;
+            
+            if (barH > 1) {
+              // 垂直渐变：底部深浓 → 顶部霓虹亮色
+              const grad = ctx.createLinearGradient(0, specBase, 0, specBase - barH);
+              grad.addColorStop(0, `hsla(${hue}, 100%, 38%, 0.95)`);
+              grad.addColorStop(0.55, `hsla(${hue}, 100%, 52%, 0.9)`);
+              grad.addColorStop(1, `hsla(${(hue + 50) % 360}, 100%, 72%, 0.98)`);
+              ctx.fillStyle = grad;
+              ctx.shadowBlur = 9;
+              ctx.shadowColor = `hsla(${hue}, 100%, 55%, 0.85)`;
+              ctx.fillRect(x, specBase - barH, barWidth - 0.5, barH);
+            }
+            
+            // 下落的峰值帽：与柱身不同色，霓虹白亮
+            const peakNow = Math.max(peaks[i] ?? 0, value);
+            const peakFall = Math.max(0, peakNow - 0.01);
+            peaks[i] = peakFall;
+            const capY = specBase - peakFall * specMax - 3;
+            if (peakFall > 0.02) {
+              ctx.shadowBlur = 6;
+              ctx.shadowColor = `hsla(${(hue + 50) % 360}, 100%, 70%, 0.9)`;
+              ctx.fillStyle = `hsla(${(hue + 50) % 360}, 100%, 78%, 0.95)`;
+              ctx.fillRect(x, capY, barWidth - 0.5, 2);
+            }
+          }
+          ctx.shadowBlur = 0;
+          ctx.globalCompositeOperation = "source-over";
+        }
+      } catch (e) {
+        // 如果获取频谱失败，静默处理
+      }
+    }
+
+    // ── 波形跳动效果：根据当前播放位置的振幅动态缩放波形高度 ──
+    if (isPlaying && waveformAmplitudes.length > 0 && waveRef.current) {
+      const playRatio = playheadTick / totalTicks;
+      const ampIndex = Math.floor(playRatio * waveformAmplitudes.length);
+      const currentAmp = waveformAmplitudes[ampIndex] || 0;
+      const normalizedAmp = Math.min(1, currentAmp / 255);
+      
+      // 在当前播放位置绘制跳动的波形叠加效果
+      const jumpScale = 1 + normalizedAmp * 0.4; // 最多放大40%，跳动更明显
+      const phx = playRatio * width;
+      const jumpWidth = width * 0.08; // 增加跳动区域宽度到8%
+      
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.globalAlpha = normalizedAmp * 0.6; // 提高叠加透明度
+      
+      // 在播放头位置绘制放大的波形切片
+      const srcX = Math.max(0, phx - jumpWidth / 2);
+      const srcW = Math.min(width - srcX, jumpWidth);
+      if (srcW > 0) {
+        const destY = (height - height * jumpScale) / 2;
+        const destH = height * jumpScale;
+        ctx.drawImage(
+          waveRef.current,
+          srcX * dpr, 0, srcW * dpr, ch,
+          srcX, destY, srcW, destH
+        );
+      }
+      
+      ctx.restore();
+    }
+
     const ppt = PIXELS_PER_TICK * zoom;
     const viewStartRatio = scrollX / ppt / totalTicks;
     const viewEndRatio = (scrollX + canvasWidth) / ppt / totalTicks;
-    ctx.fillStyle = rgba(ACCENT_RGB, 0.1);
-    ctx.fillRect(viewStartRatio * width, 0, (viewEndRatio - viewStartRatio) * width, height);
-    ctx.strokeStyle = rgba(ACCENT_RGB, 0.4);
-    ctx.lineWidth = 1;
-    ctx.strokeRect(viewStartRatio * width, 0, (viewEndRatio - viewStartRatio) * width, height);
+    const rectX = viewStartRatio * width;
+    const rectWidth = (viewEndRatio - viewStartRatio) * width;
+    const radius = 4; // 圆角半径
+    
+    // 视口框加深加亮，播放时频谱跳动背景下也能看清 - 使用圆角矩形
+    ctx.fillStyle = rgba(ACCENT_RGB, 0.28);
+    ctx.beginPath();
+    ctx.roundRect(rectX, 0, rectWidth, height, radius);
+    ctx.fill();
+    
+    ctx.strokeStyle = rgba(ACCENT_RGB, 0.95);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.roundRect(rectX, 0, rectWidth, height, radius);
+    ctx.stroke();
+    
+    // 顶部加一条高亮线，强化可见度
+    ctx.fillStyle = rgba(ACCENT_RGB, 0.9);
+    ctx.fillRect(rectX + radius, 0, rectWidth - radius * 2, 1.5);
+    ctx.fillRect(rectX + radius, height - 1.5, rectWidth - radius * 2, 1.5);
 
     const phx = (playheadTick / totalTicks) * width;
     drawPlayhead(ctx, { x: phx, height, line: true, lineWidth: 1 });
@@ -243,11 +386,23 @@ export function OverviewMap() {
     ctx.strokeStyle = CANVAS_BORDER;
     ctx.lineWidth = 1;
     ctx.strokeRect(0, 0, width, height);
-  }, [tracks, audioFiles, totalTicks, tempo, playheadTick, scrollX, zoom, canvasWidth]);
+  }, [tracks, audioFiles, totalTicks, tempo, playheadTick, scrollX, zoom, canvasWidth, isPlaying, waveformAmplitudes]);
 
   useEffect(() => {
     draw();
-  }, [draw]);
+    
+    // Animation loop for smooth playback effects
+    if (isPlaying) {
+      const animate = () => {
+        draw();
+        animationFrameRef.current = requestAnimationFrame(animate);
+      };
+      animationFrameRef.current = requestAnimationFrame(animate);
+      return () => {
+        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+      };
+    }
+  }, [draw, isPlaying]);
 
   // Observe size once (redraw via the latest draw without rebuilding the observer each frame).
   const drawRef = useRef(draw);

@@ -11,6 +11,10 @@ interface Props {
   /** Fired once when a drag ends (mouseup) — commit the undo transaction here. */
   onGestureEnd?: () => void;
   width?: number;
+  /** Vertical fader height (px). Horizontal faders ignore this. */
+  height?: number;
+  /** "horizontal" (default, volume/pan in track header) or "vertical" (mixer channel strip). */
+  orientation?: "horizontal" | "vertical";
   /** Drag quantization step. Default 0.5 (dB); pass e.g. 0.1 for a −1..1 pan fader. */
   step?: number;
   /** Fill geometry: "left" (volume: min→thumb) or "center" (pan: zero-notch→thumb). */
@@ -34,9 +38,10 @@ export function formatDb(v: number, min: number): string {
   return v <= min ? "-∞ dB" : `${v > 0 ? "+" : ""}${v.toFixed(1)} dB`;
 }
 
-export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestureEnd, width = 48, step = 0.5, fillFrom = "left", format, tip }: Props) {
+export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestureEnd, width = 48, height = 80, orientation = "horizontal", step = 0.5, fillFrom = "left", format, tip }: Props) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
+  const isVertical = orientation === "vertical";
   // Everything the document listeners need lives in refs so calcValue/the listener effect are STABLE
   // (empty deps). If calcValue depended on `value` (a per-frame controlled prop), the listener effect
   // would tear down + re-create on every drag frame — and its cleanup would fire mid-drag.
@@ -57,27 +62,30 @@ export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestu
 
   const ratio = (value - min) / (max - min);
 
-  const calcValue = useCallback((clientX: number) => {
+  const calcValue = useCallback((clientX: number, clientY: number) => {
     const el = trackRef.current;
     if (!el) return valueRef.current;
     const rect = el.getBoundingClientRect();
-    const r = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    let r: number;
+    if (isVertical) {
+      // Vertical fader: bottom = max, top = min (traditional mixer convention).
+      r = Math.max(0, Math.min(1, 1 - (clientY - rect.top) / rect.height));
+    } else {
+      r = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    }
     const raw = minRef.current + r * (maxRef.current - minRef.current);
     // Quantize to `step`, then snap away float dust (0.1-steps yield 0.30000000000000004).
     return Math.round((Math.round(raw / stepRef.current) * stepRef.current) * 1000) / 1000;
-  }, []);
+  }, [isVertical]);
 
   const handleDown = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
       e.preventDefault();
-      // Commit any focused-field transaction first (e.g. the BPM input) so a field edit-session and
-      // this fader drag don't collapse into one undo step. preventDefault above suppresses the default
-      // focus shift, so blur explicitly.
       (document.activeElement as HTMLElement | null)?.blur?.();
       dragging.current = true;
-      onStartRef.current?.(); // open the undo transaction BEFORE the first value write
-      onChangeRef.current(calcValue(e.clientX));
+      onStartRef.current?.();
+      onChangeRef.current(calcValue(e.clientX, e.clientY));
     },
     [calcValue],
   );
@@ -85,21 +93,18 @@ export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestu
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (!dragging.current) return;
-      onChangeRef.current(calcValue(e.clientX));
+      onChangeRef.current(calcValue(e.clientX, e.clientY));
     };
     const onUp = () => {
       if (!dragging.current) return;
       dragging.current = false;
-      onEndRef.current?.(); // commit the whole drag as one undo step (before-press → on-release)
+      onEndRef.current?.();
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
     return () => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
-      // If the fader unmounts mid-drag (e.g. its track is deleted), still close the gesture so the
-      // undo transaction opened in handleDown can't be left open. This effect mounts ONCE (stable
-      // calcValue), so the cleanup only runs on true unmount — never mid-drag.
       if (dragging.current) {
         dragging.current = false;
         onEndRef.current?.();
@@ -108,25 +113,42 @@ export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestu
   }, [calcValue]);
 
   const zeroRatio = (0 - min) / (max - min);
-  // "center" (pan): fill spans zero-notch→thumb, either side; "left" (volume): min→thumb as before.
   const fillLeft = fillFrom === "center" ? Math.min(ratio, zeroRatio) : 0;
   const fillWidth = fillFrom === "center" ? Math.abs(ratio - zeroRatio) : ratio;
 
+  // Vertical fader: use top/height instead of left/width.
+  const trackStyle = isVertical
+    ? { height, width: Math.max(12, Math.min(20, width * 0.4)) }
+    : { width, height: undefined as number | undefined };
+
   return (
     <div
-      className="vol-fader"
+      className={`vol-fader ${isVertical ? "vol-fader-vertical" : ""}`}
       ref={trackRef}
-      style={{ width }}
+      style={trackStyle}
       onMouseDown={handleDown}
       onClick={(e) => e.stopPropagation()}
-      // Default dB formatter: the fader BOTTOM reads −∞ (mute — see FADER_MIN_DB); a custom `format`
-      // (the pan fader) is never affected.
       title={`${tip ? `${tip} — ` : ""}${format ? format(value) : formatDb(value, min)}`}
     >
       <div className="vol-track" />
-      <div className="vol-zero" style={{ left: `${zeroRatio * 100}%` }} />
-      <div className="vol-fill" style={{ left: `${fillLeft * 100}%`, width: `${fillWidth * 100}%` }} />
-      <div className="vol-thumb" style={{ left: `${ratio * 100}%` }} />
+      <div
+        className="vol-zero"
+        style={isVertical
+          ? { bottom: `${zeroRatio * 100}%`, left: undefined, top: undefined }
+          : { left: `${zeroRatio * 100}%` }}
+      />
+      <div
+        className="vol-fill"
+        style={isVertical
+          ? { bottom: `${fillLeft * 100}%`, height: `${fillWidth * 100}%`, left: undefined, width: undefined, top: undefined }
+          : { left: `${fillLeft * 100}%`, width: `${fillWidth * 100}%` }}
+      />
+      <div
+        className="vol-thumb"
+        style={isVertical
+          ? { bottom: `${ratio * 100}%`, left: undefined, top: undefined }
+          : { left: `${ratio * 100}%` }}
+      />
     </div>
   );
 }

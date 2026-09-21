@@ -16,6 +16,23 @@ const IGNORED_ROOT_DIRS =
 export default defineConfig(async () => ({
   plugins: [react()],
   clearScreen: false,
+  // Splitting: the workflow canvas (@xyflow) and the react/i18n shells are sizable and rarely
+  // change together, so give each its own stable vendor chunk. Tauri loads locally (no network
+  // gain) — the real win is stable chunk boundaries: smaller shell + WebView2's independent
+  // per-chunk caching instead of one 1.4MB blob that invalidates entirely on any edit.
+  build: {
+    chunkSizeWarningLimit: 1500,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "vendor-react": ["react", "react-dom", "react-i18next", "zustand", "scheduler"],
+          "vendor-flow": ["@xyflow/react"],
+          "vendor-i18n": ["i18next"],
+          "vendor-tauri": ["@tauri-apps/api", "@tauri-apps/plugin-dialog", "@tauri-apps/plugin-fs", "@tauri-apps/plugin-shell"],
+        },
+      },
+    },
+  },
   server: {
     port: 1420,
     strictPort: true,

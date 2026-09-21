@@ -1,0 +1,86 @@
+/* 规划 12.4：原创度自检面板样式 —— 复用 confirm-dialog 外壳 + sow 按钮体系，仅补局部布局。 */
+
+.orig-dialog {
+  width: min(520px, 92vw);
+}
+
+.orig-bpm-row {
+  display: flex;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.orig-bpm-card {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 8px;
+  border-radius: 10px;
+  background: var(--bg-2, rgba(255, 255, 255, 0.05));
+}
+
+.orig-bpm-card.diff {
+  background: rgba(64, 158, 255, 0.12);
+}
+
+.orig-bpm-label {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.orig-bpm-value {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.orig-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.orig-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.orig-score {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  justify-content: center;
+  margin: 14px 0;
+  font-size: 14px;
+}
+
+.orig-score strong {
+  font-size: 34px;
+  font-weight: 700;
+}
+
+.orig-score strong.good {
+  color: #34c77b;
+}
+
+.orig-score strong.low {
+  color: #e6a23c;
+}
+
+.orig-disclaimer {
+  font-size: 11px;
+  opacity: 0.55;
+  text-align: center;
+  margin-bottom: 12px;
+}
+
+.orig-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}

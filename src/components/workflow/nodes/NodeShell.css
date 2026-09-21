@@ -1,9 +1,22 @@
+/* 宽度默认仍由内容撑开(180–260px) —— 不传 --node-width 的卡片行为和以前完全一致。
+ * 需要更多横向空间的卡片(多行文本框、会换行的预设按钮组)通过 NodeShell 的 width 属性
+ * 显式设置 --node-width：此时 max-width 一并跟到同一个值,否则 260px 的上限会把它裁回去。 */
 .wf-node {
+  width: var(--node-width, auto);
   min-width: 180px;
-  max-width: 260px;
+  max-width: var(--node-width, 260px);
   border: 1px solid var(--node-color, var(--border-default));
-  background: var(--bg-surface);
+  background: linear-gradient(180deg, var(--bg-surface) 0%, var(--bg-base) 100%);
   font-family: var(--font-mono);
+  border-radius: var(--radius-xl);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  animation: fadeUpIn 0.18s ease;
+}
+.wf-node:hover {
+  border-color: var(--node-color, var(--accent-primary));
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.42);
 }
 
 .wf-node-header {
@@ -41,6 +54,91 @@
   text-transform: uppercase;
   letter-spacing: 0.3px;
   margin-bottom: 2px;
+}
+
+/* 杈撳嚭鑺傜偣鐨?涓嬭浇闊抽"鎸夐挳琛?*/
+.wf-node-download-row {
+  margin-top: 2px;
+}
+.wf-download-btn {
+  font-size: 11px;
+  padding: 5px 10px;
+  width: 100%;
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  cursor: pointer;
+  border-radius: 3px;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.wf-download-btn:hover:not(:disabled) {
+  border-color: var(--node-color, var(--accent-primary));
+  color: var(--accent-primary);
+}
+.wf-download-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* 杈撳嚭鑺傜偣"涓嬭浇"鐨勫懡鍚嶈〃鍗?*/
+.wf-download-form {
+  margin-top: 4px;
+  border: 1px dashed var(--border-default);
+  border-radius: 4px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.wf-download-form label {
+  font-size: 9px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.wf-download-form input {
+  font-size: 11px;
+  padding: 4px 6px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+  border-radius: 3px;
+  outline: none;
+}
+.wf-download-form input:focus {
+  border-color: var(--accent-primary);
+}
+.wf-download-actions {
+  display: flex;
+  gap: 4px;
+}
+.wf-download-actions button {
+  flex: 1;
+  font-size: 11px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.wf-download-save {
+  background: var(--accent-primary);
+  color: #fff;
+}
+.wf-download-save:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.wf-download-save:not(:disabled):hover {
+  filter: brightness(1.08);
+}
+.wf-download-cancel {
+  background: var(--bg-base);
+  border-color: var(--border-default) !important;
+  color: var(--text-primary);
+}
+.wf-download-cancel:hover {
+  border-color: var(--accent-primary) !important;
+  color: var(--accent-primary);
 }
 
 .wf-node-body select,
@@ -81,7 +179,7 @@
   letter-spacing: 0.2px;
 }
 
-/* ── Node status ── */
+/* 鈹€鈹€ Node status 鈹€鈹€ */
 
 .wf-node-header-spacer {
   flex: 1;
@@ -100,7 +198,7 @@
 
 /* Node status colors follow the v1 convention: yellow = locked/queued, BLUE = processing, green = done. */
 .wf-node-running {
-  border-color: #3b82f6 !important; /* 蓝 = 正在处理 */
+  border-color: #3b82f6 !important; /* 钃?= 姝ｅ湪澶勭悊 */
   box-shadow: 0 0 10px rgba(59, 130, 246, 0.35);
   animation: node-border-pulse 1.5s ease-in-out infinite;
 }
@@ -110,12 +208,63 @@
   50% { box-shadow: 0 0 14px rgba(59, 130, 246, 0.5); }
 }
 
+/* 终态动效一律是「一次性」(animation-iteration-count: 1 + both)：状态跃迁的那一刻给足反馈,
+ * 之后归于静态。running/waiting 用无限循环是因为它们表示「仍在进行」,终态再循环就只是干扰。
+ * 只动 box-shadow/border-color/transform,不动 opacity —— 旁通态(.wf-node-bypassed)靠 opacity
+ * 表达「不参与」,抢同一个属性会让两种语义互相打架。 */
 .wf-node-completed {
-  border-color: #4ade80 !important;
+  border-color: var(--color-success) !important;
+  animation: node-success-flash 0.5s ease-out 1 both;
+}
+
+@keyframes node-success-flash {
+  0% { box-shadow: 0 0 0 rgba(34, 197, 94, 0); }
+  35% { box-shadow: 0 0 14px rgba(34, 197, 94, 0.55); }
+  100% { box-shadow: 0 0 0 rgba(34, 197, 94, 0); }
 }
 
 .wf-node-error {
   border-color: #ff4466 !important;
+  animation: node-error-shake 0.4s ease-out 1 both;
+}
+
+/* 位移只有 ±2px 且作用在 .wf-node 这个内层 div 上 —— ReactFlow 的节点定位 transform 挂在
+ * 外层 wrapper,所以这里动 transform 不会和画布坐标打架。 */
+@keyframes node-error-shake {
+  0%, 100% { transform: translateX(0); box-shadow: 0 0 10px rgba(255, 68, 102, 0.45); }
+  20% { transform: translateX(-2px); }
+  50% { transform: translateX(2px); }
+  80% { transform: translateX(-1px); }
+}
+
+/* Degraded = 节点跑完但某步内部走了兜底（如变速失败后透传原样输出）。
+ * 琥珀色边框 + "!" 徽标；具体原因由 toast 交代，徽标 title 存兜底说明。 */
+.wf-node-degraded {
+  border-color: #f59e0b !important;
+  animation: node-degraded-flash 0.5s ease-out 1 both;
+}
+
+@keyframes node-degraded-flash {
+  0% { box-shadow: 0 0 0 rgba(245, 158, 11, 0); }
+  35% { box-shadow: 0 0 12px rgba(245, 158, 11, 0.5); }
+  100% { box-shadow: 0 0 0 rgba(245, 158, 11, 0); }
+}
+
+.wf-node-warn {
+  font-size: 9px;
+  font-family: var(--font-mono);
+  color: #f59e0b;
+  font-weight: 700;
+  cursor: help;
+  animation: node-badge-in 0.26s ease-out 1 both;
+}
+
+/* 终态徽标(OK/!/!!)是「出现」而非「一直在」的元素 —— 一个短促的缩放入场让状态切换
+ * 在余光里也能被捕捉到,不必盯着看。 */
+@keyframes node-badge-in {
+  0% { transform: scale(0.5); opacity: 0; }
+  60% { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
 }
 
 .wf-node-pct {
@@ -144,11 +293,12 @@
 .wf-node-done {
   font-size: 8px;
   font-family: var(--font-mono);
-  color: #4ade80;
+  color: var(--color-success);
   font-weight: 700;
   letter-spacing: 0.3px;
-  border: 1px solid #4ade80;
+  border: 1px solid var(--color-success);
   padding: 0 3px;
+  animation: node-badge-in 0.26s ease-out 1 both;
 }
 
 .wf-node-err {
@@ -157,6 +307,34 @@
   color: #ff4466;
   font-weight: 700;
   cursor: help;
+  animation: node-badge-in 0.26s ease-out 1 both;
+}
+
+/* 规划 6-3/6-4 旁通态: 虚线边框 + 半透明 —— 视觉上「保留在链上、但不参与」。
+ * border-color 仍用节点色（不抢 running/error 的语义色），仅换线型与透明度。 */
+.wf-node-bypassed {
+  border-style: dashed !important;
+  opacity: 0.55;
+}
+.wf-node-bypassed:hover {
+  opacity: 0.85;
+}
+
+.wf-node-bypass-badge {
+  font-size: 9px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  cursor: help;
+  flex-shrink: 0;
+}
+
+/* 规划 6-5 节点损伤徽标: 🟡/🟠/🔴 —— 一眼看到这条链的保真度代价。 */
+.wf-node-damage {
+  font-size: 8px;
+  line-height: 1;
+  cursor: help;
+  flex-shrink: 0;
+  filter: saturate(0.9);
 }
 
 .wf-node-run-btn {
@@ -180,7 +358,7 @@
   color: var(--accent-primary);
 }
 
-/* ── Separation node ── */
+/* 鈹€鈹€ Separation node 鈹€鈹€ */
 
 .sep-node-body {
   display: flex;
@@ -239,14 +417,14 @@
   color: var(--text-primary);
 }
 
-/* Remove the up/down spinner arrows on number inputs — ugly + easy to mis-click. */
+/* Remove the up/down spinner arrows on number inputs 鈥?ugly + easy to mis-click. */
 .sep-param-row input[type="number"]::-webkit-inner-spin-button,
 .sep-param-row input[type="number"]::-webkit-outer-spin-button {
   -webkit-appearance: none;
   margin: 0;
 }
 
-/* Overlap slider (replaces the number input — a number input appended digits → clamped to 2 or 8). */
+/* Overlap slider (replaces the number input 鈥?a number input appended digits 鈫?clamped to 2 or 8). */
 .sep-overlap {
   display: flex;
   align-items: center;
@@ -254,7 +432,7 @@
   flex: 1;
 }
 
-/* Stylized thin-bar slider — no default circle thumb (house style: no abstract solid dots).
+/* Stylized thin-bar slider 鈥?no default circle thumb (house style: no abstract solid dots).
  * Fully self-contained (appearance/track/thumb): the old global input[type="range"] circle-thumb
  * rule was removed in S37; the `.sep-overlap` prefix remains for scoping. */
 .sep-overlap .sep-overlap-range {
@@ -296,7 +474,7 @@
   box-shadow: 0 0 5px var(--accent-primary);
 }
 
-/* Disabled slider (e.g. cluster/index ratio when the model ships no asset) — dim, no pointer. */
+/* Disabled slider (e.g. cluster/index ratio when the model ships no asset) 鈥?dim, no pointer. */
 .sep-overlap .sep-overlap-range:disabled {
   opacity: 0.35;
   cursor: default;
@@ -331,7 +509,7 @@
   color: var(--text-primary);
 }
 
-/* ── Voice nodes (RVC / SoVITS) — form controls reuse the sep-* classes; only meta/empty are new ── */
+/* 鈹€鈹€ Voice nodes (RVC / SoVITS) 鈥?form controls reuse the sep-* classes; only meta/empty are new 鈹€鈹€ */
 
 .voice-model-meta {
   display: flex;
@@ -366,7 +544,7 @@
   color: var(--accent-primary);
 }
 
-/* ── Effects stack ── */
+/* 鈹€鈹€ Effects stack 鈹€鈹€ */
 
 .fx-stack {
   display: flex;
@@ -375,7 +553,7 @@
   min-width: 140px;
 }
 
-/* ①c blend-stack section header (reuses the effects stack chrome) */
+/* 鈶燾 blend-stack section header (reuses the effects stack chrome) */
 .fx-stack-title {
   font-size: 10px;
   font-weight: 600;
@@ -433,7 +611,7 @@
   color: var(--text-muted);
 }
 
-/* ── Node progress bar ── */
+/* 鈹€鈹€ Node progress bar 鈹€鈹€ */
 
 .wf-node-progress {
   height: 3px;
@@ -441,13 +619,30 @@
   border-bottom: 1px solid color-mix(in srgb, var(--node-color, var(--accent-primary)) 30%, transparent);
 }
 
+/* 条纹在填充块内部横向流动：后端在某一步停留很久时百分比是不动的,单纯的静态色块会让人
+ * 以为卡死了。条纹用 background-position 平移(合成器属性,不触发重排),而 width 仍由内联
+ * style 驱动 —— 两者互不干扰。 */
 .wf-node-progress-fill {
   height: 100%;
   background: var(--node-color, var(--accent-primary));
+  background-image: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.4) 50%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  background-size: 24px 100%;
+  background-repeat: repeat-x;
   transition: width 0.2s linear;
+  animation: node-progress-stripe 0.9s linear infinite;
 }
 
-/* ── S66 node output audition (one compact row per output port) ── */
+@keyframes node-progress-stripe {
+  0% { background-position: 0 0; }
+  100% { background-position: 24px 0; }
+}
+
+/* 鈹€鈹€ S66 node output audition (one compact row per output port) 鈹€鈹€ */
 
 .wf-preview {
   display: flex;
@@ -462,6 +657,24 @@
   align-items: center;
   gap: 5px;
   height: 16px;
+}
+
+/* Phase 5: PNG artifact row — height opens up to fit the thumbnail;
+   every other row stays 16px compact. */
+.wf-preview-row-png {
+  height: auto;
+}
+
+.wf-preview-thumb {
+  display: block;
+  width: 100%;
+  height: 84px;
+  object-fit: cover;
+  object-position: top;
+  border: 1px solid var(--border-subtle);
+  border-radius: 3px;
+  background: #000;
+  image-rendering: pixelated;
 }
 
 .wf-preview-btn {
@@ -485,6 +698,25 @@
   box-shadow: 0 0 4px var(--accent-primary);
 }
 
+.wf-preview-dl {
+  flex-shrink: 0;
+  width: 20px;
+  height: 15px;
+  padding: 0;
+  font-size: 9px;
+  line-height: 1;
+  background: none;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.wf-preview-dl:hover {
+  color: var(--accent-secondary);
+  border-color: var(--accent-secondary);
+  background: var(--accent-secondary-glow);
+}
+
 .wf-preview-label {
   flex-shrink: 0;
   max-width: 64px;
@@ -506,4 +738,26 @@
   font-size: 9px;
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* 无障碍兜底：系统开启「减弱动态效果」时停掉节点状态动画(循环脉冲、错误抖动、条纹流动)。
+ * 只摘掉 animation —— 边框色、徽标、进度条宽度全部保留,所以状态语义一个都不丢,
+ * 不依赖动画也能完整读出节点处于什么状态。 */
+@media (prefers-reduced-motion: reduce) {
+  .wf-node-waiting,
+  .wf-node-running,
+  .wf-node-completed,
+  .wf-node-error,
+  .wf-node-degraded,
+  .wf-node-pulse,
+  .wf-node-done,
+  .wf-node-err,
+  .wf-node-warn,
+  .wf-node-progress-fill {
+    animation: none;
+  }
+  /* 抖动关键帧被摘掉后,transform 必须显式归零,否则元素可能停在某个位移量上。 */
+  .wf-node-error {
+    transform: none;
+  }
 }

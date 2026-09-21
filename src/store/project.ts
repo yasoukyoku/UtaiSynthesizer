@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useAppStore } from "./app";
 import type {
   Track,
   Segment,
@@ -12,6 +13,7 @@ import type {
   PitchCurve,
   TempoDetect,
   VocalTrackParams,
+  TrackSoundfont,
 } from "../types/project";
 import { TimeAxis } from "../lib/timeAxis";
 import { normalizeNotesArray, normalizeCurve, DEFAULT_TRANSITION, DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY, DEFAULT_BREATH_TOKEN, DEFAULT_REST_TOKEN } from "../lib/vocalNotes";
@@ -25,6 +27,7 @@ import {
   ticksToMs,
 } from "../lib/audio/laneOps";
 import { MAX_DOWNBEAT } from "../lib/constants";
+import { pickUniqueTrackColor } from "../lib/trackColors";
 import { useWorkflowStore } from "./workflow";
 import { useAudioStore } from "./audio";
 
@@ -55,7 +58,7 @@ let tempoScaleBase: { tempo: number; tracks: Track[]; playheadTick: number } | n
 // ─── ② Vocal-note editing (S48 Phase 3) — data-layer store actions (no editor UI yet) ─────────────
 
 /** Seed for a track's first vocal-param write (partial updates merge onto this). */
-export const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0, formant: 0, transition: { ...DEFAULT_TRANSITION }, breathToken: DEFAULT_BREATH_TOKEN, restToken: DEFAULT_REST_TOKEN, autoTuneExpr: 2, autoTuneVib: 1, autoTuneTake: 0, consonantEmphasis: DEFAULT_CONSONANT_EMPHASIS_DB, consonantValley: DEFAULT_CONSONANT_VALLEY };
+export const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 0, transpose: 0, formant: 0, transition: { ...DEFAULT_TRANSITION }, breathToken: DEFAULT_BREATH_TOKEN, restToken: DEFAULT_REST_TOKEN, autoTuneExpr: 2, autoTuneVib: 1, autoTuneTake: 0, consonantEmphasis: DEFAULT_CONSONANT_EMPHASIS_DB, consonantValley: DEFAULT_CONSONANT_VALLEY, voiceRealism: 0, formantJitter: 0 };
 
 // `normalizeNote` / `normalizeNotesArray` / `normalizeCurve` — the canonical write-hygiene funnel — now
 // live in `../lib/vocalNotes` (the SINGLE source shared by the store, the .usp loader, and the editor;
@@ -183,6 +186,12 @@ interface ProjectState {
   /** Move a track from one position to another (drag-reorder in the track-header column). */
   reorderTrack: (from: number, to: number) => void;
   updateTrack: (id: string, updates: Partial<Track>) => void;
+  /** S12: set a track's FX send (reverb|delay), 0..1. Undoable (in meaningfulSig); while playing it
+   *  bumps the schedule so the aux bus hears the new amount. 0 deletes the key (default = absent). */
+  setTrackFxSend: (id: string, which: "reverbSend" | "delaySend", value: number) => void;
+  /** 乐器轨音源选择(soundfont)——写入/清除 Track.soundfont。undefined = 清除选择。
+   *  可撤销(进 meaningfulSig);正在播放时 bump schedule 让新音色立即生效。 */
+  setTrackSoundfont: (id: string, sf: TrackSoundfont | undefined) => void;
   /** Move many segments at once (multi-selection drag) in a single update — keyed by segment id
    *  to its captured original startTick, shifted by `deltaTicks`. One set ⇒ one redraw per frame. */
   moveSegmentsBy: (origBySeg: Record<string, number>, deltaTicks: number) => void;
@@ -298,12 +307,20 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
   addTrack: (track, index) =>
     set((s) => {
+      // 轨道色统一兜底: 未带色(上传音乐直建的轨)或与现有轨撞色(粘贴克隆) → 分配唯一随机色,
+      // 保证「所有轨道颜色互不相同」(§user)。用户手动选过的色视为占用。
+      const used = new Set(s.tracks.map((t) => t.color).filter(Boolean));
+      const final = track.color && !used.has(track.color) ? track : { ...track, color: pickUniqueTrackColor(s.tracks) };
       const tracks = [...s.tracks];
       if (index === undefined || index < 0 || index >= tracks.length) {
-        tracks.push(track); // append (click-import, or out-of-range)
+        tracks.push(final); // append (click-import, or out-of-range)
       } else {
-        tracks.splice(index, 0, track); // insert at the dragged position
+        tracks.splice(index, 0, final); // insert at the dragged position
       }
+      // 添加新轨后: 单选该轨 + 清空残留的多选片段 (否则旧选中一直是"多个"的状态)
+      const { setActiveTrack, clearSelection } = useAppStore.getState();
+      setActiveTrack(track.id);
+      clearSelection();
       return { tracks, dirty: true };
     }),
 
@@ -336,6 +353,36 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       tracks: s.tracks.map((t) => (t.id === id ? { ...t, ...updates } : t)),
       dirty: true,
     })),
+
+  setTrackFxSend: (id, which, value) => {
+    const v = Math.max(0, Math.min(1, Math.round(value * 100) / 100));
+    set((s) => ({
+      dirty: true,
+      tracks: s.tracks.map((t) => {
+        if (t.id !== id) return t;
+        // Fold-away discipline: 0 deletes the key so a touch-and-restore returns byte-identical.
+        const next: Track = { ...t };
+        if (v > 0) next[which] = v;
+        else delete next[which];
+        return next;
+      }),
+    }));
+    if (useAudioStore.getState().isPlaying) useAudioStore.getState().bumpSchedule();
+  },
+
+  setTrackSoundfont: (id, sf) => {
+    set((s) => ({
+      dirty: true,
+      tracks: s.tracks.map((t) => {
+        if (t.id !== id) return t;
+        const next: Track = { ...t };
+        if (sf) next.soundfont = { ...sf };
+        else delete next.soundfont;
+        return next;
+      }),
+    }));
+    if (useAudioStore.getState().isPlaying) useAudioStore.getState().bumpSchedule();
+  },
 
   moveSegmentsBy: (origBySeg, deltaTicks) =>
     set((s) => {
@@ -539,6 +586,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         }),
       };
     });
+    setTimeout(() => useAudioStore.getState().pruneUnusedAudioCache(), 0);
   },
 
   setTempo: (bpm) => {
@@ -957,6 +1005,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         if (vp.vowelClarity === true) delete vp.vowelClarity;
         // S89 consonantPreroll 同款极性(默认=开):true 折为 ABSENCE。
         if (vp.consonantPreroll === true) delete vp.consonantPreroll;
+        // Phase 7 ③ 气息层(默认=开):true 折为 ABSENCE(vowelClarity/consonantPreroll 同款)。
+        if (vp.breathLayer !== false) delete vp.breathLayer;
         // S91 「音素约定」:默认 = 按单词查词典,存为 ABSENCE(与 rangeExtend 同款正极性折叠)。
         if (!vp.phonemeSet || (vp.phonemeSet as string) === "words") delete vp.phonemeSet;
         return { ...t, vocalParams: vp };

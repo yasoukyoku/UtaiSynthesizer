@@ -1,0 +1,1492 @@
+import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
+import { useEffect, useState, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
+import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
+import { useTranslation } from "react-i18next";
+import { fmtSize } from "../../lib/constants";
+import { useAppStore } from "../../store/app";
+import { useMsstModelStore } from "../../store/msst-models";
+import { useProjectStore } from "../../store/project";
+import { useAudioStore } from "../../store/audio";
+import { useWorkflowStore } from "../../store/workflow";
+import { useTrainingStore } from "../../store/training";
+import { isRunningState } from "../../lib/training/liveRun";
+import { useVoiceModelStore } from "../../store/voice-models";
+import { applyMirror, applyGhMirror, hfBaseForMirror, ghTrustedRoutes } from "../../lib/models/msst-catalog";
+import { stretchedArtifactPaths, stretchInFlight } from "../../lib/audio/stretchCache";
+import { clipboardReferencedPaths } from "../../lib/clipboard";
+import { historyReferencedAudioPaths } from "../../store/history";
+import { backendErrorMessage, isCancelError } from "../../lib/backendError";
+import { maybeShowErrorModal } from "../../lib/errorDisplay";
+import { autoUpdateCheckEnabled, setAutoUpdateCheckEnabled, checkForUpdate } from "../../lib/update";
+import { startupComponentCheckEnabled, setStartupComponentCheckEnabled } from "../../lib/startupCheck";
+import { useFloatingPanel } from "../../lib/useFloatingPanel";
+import { runExitFlow } from "../../lib/exitFlow";
+import { restartWouldChangeOrtBuild } from "../../lib/ortBuild";
+import { PanelResizeHandles } from "./PanelResizeHandles";
+import "./Settings.css";
+/** Localize a backend rejection via the app-wide CODE map, falling back to the raw text. */
+const backendErrText = (e) => backendErrorMessage(e) ?? String(e);
+// A real published asset used only as the probe target (its host = the source being
+// tested). ~236 MB file → Range-GET of the first few MB measures real throughput.
+const PROBE_ASSET = "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-cpu-v1.tar.zst";
+// GH-mirror probe target — the GAME zip's GitHub release URL, same asset as Rust
+// GAME_SOURCES[0] (src-tauri/src/commands/midi_extract.rs). 179 MB real asset; the
+// probe only Range-GETs the first ~4 MB.
+const GH_PROBE_ASSET = "https://github.com/openvpi/GAME/releases/download/v1.0.3/GAME-1.0.3-medium-onnx.zip";
+/** Run the backend throughput probe against `url`, funneling invoke failures into a
+ *  ProbeResult row — ONE funnel shared by the HF and GH source tests. */
+async function runSrcProbe(url) {
+    try {
+        return await invoke("test_download_source", { url });
+    }
+    catch (e) {
+        return { reachable: false, verdict: "unreachable", mbps: 0, ttfb_ms: 0, bytes: 0, error: String(e) };
+    }
+}
+const fmtGB = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
+/** Everything the OPEN project still references inside the cache tree — passed to
+ *  cleanup_render_cache so the sweep can't break the current session: clip sources
+ *  (audio_cache copies), deposited lane audio (run dirs), decode playback paths, and the
+ *  runtime node-output cache (single-node re-runs read these paths). */
+function collectProtectedPaths() {
+    const prot = new Set();
+    for (const t of useProjectStore.getState().tracks) {
+        for (const s of t.segments) {
+            if (s.content.type === "audioClip")
+                prot.add(s.content.sourcePath);
+            for (const o of s.processedOutputs ?? [])
+                prot.add(o.audioPath);
+        }
+    }
+    for (const [p, info] of Object.entries(useAudioStore.getState().audioFiles)) {
+        prot.add(p);
+        if (info.playbackPath)
+            prot.add(info.playbackPath);
+    }
+    for (const perSeg of Object.values(useWorkflowStore.getState().nodeOutputs)) {
+        for (const paths of Object.values(perSeg)) {
+            for (const pp of paths)
+                if (pp)
+                    prot.add(pp);
+        }
+    }
+    // Stretched artifacts the session has already resolved: the stretchCache memo would keep
+    // serving a deleted path (no existence re-check) → stretched clips dead until restart.
+    for (const p of stretchedArtifactPaths())
+        prot.add(p);
+    // UNDO/REDO snapshots + the arrangement clipboard also hold live references (audit S61 MAJOR):
+    // deleting a cut/deleted segment's stem lets a later paste/undo stamp a bake "valid" over a
+    // missing file — permanently silent false-clean. Protect everything they can resurrect.
+    for (const p of historyReferencedAudioPaths())
+        prot.add(p);
+    for (const p of clipboardReferencedPaths())
+        prot.add(p);
+    return [...prot];
+}
+export function Settings({ onClose }) {
+    const { i18n } = useTranslation();
+    const lang = i18n.language;
+    const { style: panelStyle, startDrag, startResize } = useFloatingPanel({
+        storageKey: "utai.settingsRect",
+        initial: () => ({ x: 72, y: 84, w: 340, h: Math.round(window.innerHeight * 0.7) }),
+        minW: 300,
+        minH: 280,
+    });
+    // Download-source preference — the store is shared with the resource manager
+    // (which consumes `mirror` for model downloads); the CONFIG UI now lives here.
+    const mirror = useMsstModelStore((s) => s.mirror);
+    const setMirror = useMsstModelStore((s) => s.setMirror);
+    const [srcTest, setSrcTest] = useState(null);
+    const [srcTesting, setSrcTesting] = useState(false);
+    const handleSrcTest = useCallback(async () => {
+        setSrcTesting(true);
+        setSrcTest(null);
+        // test the SELECTED source's host by pulling a few real MB through it — a
+        // ping/HEAD would pass the GFW's small-packet allowance and false-positive.
+        setSrcTest(await runSrcProbe(applyMirror(PROBE_ASSET, mirror)));
+        setSrcTesting(false);
+    }, [mirror]);
+    // a stale verdict must not linger next to a different, untested source
+    useEffect(() => {
+        setSrcTest(null);
+    }, [mirror.type, mirror.customUrl]);
+    // GitHub mirror — its own selection + probe state, fully independent of the HF
+    // test above so the two verdicts can never cross-talk. S66: presets are data
+    // (remote-refreshable); the selected id falls back to the list head when the
+    // remote list dropped it (mirrors ghProxyPrefix's resolution).
+    const ghMirror = useMsstModelStore((s) => s.ghMirror);
+    const setGhMirror = useMsstModelStore((s) => s.setGhMirror);
+    const ghPresets = useMsstModelStore((s) => s.ghPresets);
+    const refreshGhPresets = useMsstModelStore((s) => s.refreshGhPresets);
+    useEffect(() => { void refreshGhPresets(); }, [refreshGhPresets]);
+    const ghEffectivePresetId = ghPresets.find((p) => p.id === ghMirror.presetId)?.id ?? ghPresets[0]?.id;
+    const [ghSrcTest, setGhSrcTest] = useState(null);
+    const [ghSrcTesting, setGhSrcTesting] = useState(false);
+    const handleGhSrcTest = useCallback(async () => {
+        setGhSrcTesting(true);
+        setGhSrcTest(null);
+        setGhSrcTest(await runSrcProbe(applyGhMirror(GH_PROBE_ASSET, ghMirror, ghPresets)));
+        setGhSrcTesting(false);
+    }, [ghMirror, ghPresets]);
+    useEffect(() => {
+        setGhSrcTest(null);
+        // ghEffectivePresetId included (review S66): a remote preset-list refresh can change which
+        // proxy the SAME persisted choice resolves to — the old verdict would describe a different host.
+    }, [ghMirror.type, ghMirror.presetId, ghMirror.customUrl, ghEffectivePresetId]);
+    const [hw, setHw] = useState(null);
+    const [device, setDevice] = useState("auto");
+    // S68b preferred-GPU picker: the configured ordinal + the per-EP option lists.
+    const [deviceId, setDeviceId] = useState(0);
+    // Auto-mode preferred GPU (DXGI index; null = fully automatic). Separate from
+    // deviceId: Auto's pick is nullable and lives in the DXGI space regardless of
+    // which EP the probe lands on.
+    const [autoGpu, setAutoGpu] = useState(null);
+    const [gpuLists, setGpuLists] = useState(null);
+    const [saving, setSaving] = useState(false);
+    const [cudaReady, setCudaReady] = useState(false);
+    const [cudaDownloading, setCudaDownloading] = useState(false);
+    const [cudaDeleting, setCudaDeleting] = useState(false);
+    const [cudaProgress, setCudaProgress] = useState(null);
+    const [cudaError, setCudaError] = useState(null);
+    const [cudaJustInstalled, setCudaJustInstalled] = useState(false);
+    // S66: CUDA arena cap (MB; 0/blank = unlimited). Text-state so typing stays free; the
+    // commit round-trips through Rust (persist + GPU-session eviction) and re-reads the truth.
+    const [cudaMemLimitText, setCudaMemLimitText] = useState("");
+    useEffect(() => {
+        invoke("get_cuda_mem_limit")
+            .then((mb) => setCudaMemLimitText(mb > 0 ? String(mb) : ""))
+            .catch(() => { });
+    }, []);
+    const commitCudaMemLimit = useCallback(async () => {
+        const mb = Math.max(0, parseInt(cudaMemLimitText || "0", 10) || 0);
+        try {
+            await invoke("set_cuda_mem_limit", { mb });
+            setCudaMemLimitText(mb > 0 ? String(mb) : "");
+        }
+        catch {
+            /* leave the text; the next successful commit heals it */
+        }
+    }, [cudaMemLimitText]);
+    // S66: on-disk layout for the panel (copyable paths for inspection/support) + per-lane
+    // presence + the exact filenames the local-install picker expects.
+    const [cudaPaths, setCudaPaths] = useState(null);
+    const refreshCudaPaths = useCallback(() => {
+        invoke("cuda_runtime_paths")
+            .then(setCudaPaths)
+            .catch(() => { });
+    }, []);
+    const [dataDir, setDataDir] = useState("");
+    // S64: configured-but-missing data dir recovered at startup (recreated empty / fell back) — the
+    // persistent surface for the startup toast (App.tsx), so the cause stays findable after 5s.
+    const [dataDirIssue, setDataDirIssue] = useState(null);
+    const [relocating, setRelocating] = useState(false);
+    const [relocateMsg, setRelocateMsg] = useState(null);
+    // §user S68c: one migration per session — after a successful migrate the button locks into a
+    // "restart first" state (backed by the Rust-side MIGRATE_RESTART_REQUIRED backstop, so a
+    // Settings remount can't re-enable it).
+    const [migratePending, setMigratePending] = useState(false);
+    const showConfirm = useAppStore((s) => s.showConfirm);
+    const [rt, setRt] = useState(null);
+    const [rtBusy, setRtBusy] = useState(false);
+    const [rtProgress, setRtProgress] = useState(null);
+    const [rtError, setRtError] = useState(null);
+    // Terminal "done" payload — kept whole so the render maps code+params to L() text
+    // and the success (green) state keys on the stable INSTALL_DONE code.
+    const [rtNotice, setRtNotice] = useState(null);
+    const [envtesting, setEnvtesting] = useState(null);
+    const [deleting, setDeleting] = useState(null);
+    const refreshRuntime = useCallback(() => {
+        invoke("get_runtime_env_info")
+            .then((info) => {
+            setRt(info);
+            // Rebuild busy state from the backend (panel may have been closed and
+            // reopened mid-install — component state alone would strand the cancel
+            // button and mislabel every other button as available).
+            setRtBusy(info.installing);
+            setEnvtesting((prev) => {
+                if (info.envtest_running)
+                    return prev ?? "__backend__";
+                return prev === "__backend__" ? null : prev;
+            });
+        })
+            .catch(() => { });
+    }, []);
+    useEffect(() => {
+        invoke("get_hardware_info")
+            .then((h) => {
+            setHw(h);
+            setDeviceId(h.current_device_id ?? 0);
+            setAutoGpu(h.auto_gpu ?? null);
+        })
+            .catch(() => { });
+        invoke("get_device_preference").then(setDevice).catch(() => { });
+        invoke("list_inference_gpus").then(setGpuLists).catch(() => { });
+        invoke("is_cuda_runtime_ready").then(setCudaReady).catch(() => { });
+        // Re-latch onto an in-flight CUDA download after a panel remount (S64c audit: `cudaDownloading`
+        // is component-local; the backend refcount is the truth, and the busy interlock rejects a
+        // second start anyway — this keeps the button/progress honest).
+        invoke("running_tasks")
+            .then((ts) => { if (ts.includes("cuda_download"))
+            setCudaDownloading(true); })
+            .catch(() => { });
+        invoke("get_data_dir").then(setDataDir).catch(() => { });
+        invoke("migrate_pending_restart").then(setMigratePending).catch(() => { });
+        invoke("get_data_dir_issue")
+            .then(setDataDirIssue)
+            .catch(() => { });
+        refreshRuntime();
+        refreshCudaPaths();
+    }, [refreshRuntime, refreshCudaPaths]);
+    useEffect(() => {
+        const unlisten = listen("pyenv-progress", (e) => {
+            setRtProgress(e.payload);
+            if (e.payload.phase === "done" || e.payload.phase === "error") {
+                setRtBusy(false);
+                if (e.payload.phase === "error") {
+                    // S68f: modal-class codes (ENVTEST_CRASHED = a stderr-tail wall) go to the
+                    // modal funnel; the inline strip only ever shows toast-sized text.
+                    const disp = backendErrText(e.payload.message);
+                    if (!maybeShowErrorModal(e.payload.message, disp))
+                        setRtError(disp);
+                }
+                // The done payload can carry a REAL verdict (INSTALLED_ENVTEST_FAILED: …) —
+                // it must survive the progress bar disappearing, not vanish with it.
+                if (e.payload.phase === "done")
+                    setRtNotice(e.payload);
+                refreshRuntime();
+            }
+        });
+        return () => { unlisten.then((f) => f()); };
+    }, [refreshRuntime]);
+    useEffect(() => {
+        // Envtest lifecycle channel: the final {type:"done"} is the ONLY signal a
+        // backend-started (or another-instance-started) self-test has ended — without
+        // this, a panel that entered the "__backend__" sentinel could never leave it.
+        const unlisten = listen("pyenv-envtest", (e) => {
+            if (e.payload?.event?.type === "done")
+                refreshRuntime();
+        });
+        return () => { unlisten.then((f) => f()); };
+    }, [refreshRuntime]);
+    const handleRtDownload = useCallback(async (id) => {
+        setRtBusy(true);
+        setRtError(null);
+        setRtNotice(null);
+        setRtProgress(null);
+        try {
+            // S168: pack installs finally ride the mirror choices — the 下载源 HF base (tried
+            // first, deduped into the fixed rotation) and the GH routes for the packs-v1 release
+            // mirror (the only route that actually leaves the huggingface.co network path —
+            // hf-mirror 308s back to it). TRUSTED routes only (explicit choice + direct), never
+            // the community preset tail: the manifest is the pack's unsigned integrity root
+            // (ghTrustedRoutes' doc has the full rule; reviewed S168).
+            await invoke("download_runtime_pack", {
+                id,
+                hfBase: hfBaseForMirror(mirror),
+                ghRoutes: ghTrustedRoutes(ghMirror, ghPresets),
+            });
+        }
+        catch (e) {
+            const disp = backendErrText(e);
+            if (!maybeShowErrorModal(e, disp))
+                setRtError(disp);
+        }
+        finally {
+            setRtBusy(false);
+            refreshRuntime();
+        }
+    }, [refreshRuntime, mirror, ghMirror, ghPresets]);
+    const handleRtLocalInstall = useCallback(async () => {
+        const file = await open({
+            multiple: false,
+            title: "runtime pack (.tar.zst / .part01)",
+            filters: [{ name: "Runtime pack", extensions: ["zst", "part01"] }],
+        });
+        if (!file || typeof file !== "string")
+            return;
+        setRtBusy(true);
+        setRtError(null);
+        setRtNotice(null);
+        setRtProgress(null);
+        try {
+            await invoke("install_runtime_pack_local", { path: file });
+        }
+        catch (e) {
+            setRtError(backendErrText(e));
+        }
+        finally {
+            setRtBusy(false);
+            refreshRuntime();
+        }
+    }, [refreshRuntime]);
+    const handleRtEnvtest = useCallback(async (id) => {
+        setEnvtesting(id);
+        setRtError(null);
+        setRtNotice(null);
+        try {
+            await invoke("run_pack_envtest", { id });
+        }
+        catch (e) {
+            setRtError(backendErrText(e));
+        }
+        finally {
+            setEnvtesting(null);
+            refreshRuntime();
+        }
+    }, [refreshRuntime]);
+    const handleRtDelete = useCallback(async (id) => {
+        const choice = await showConfirm({
+            title: L("rtDeleteTitle"),
+            body: `${id}\n${L("rtDeleteBody")}`,
+            buttons: [
+                { id: "cancel", label: L("rtCancelBtn") },
+                { id: "del", label: L("rtDelete"), kind: "danger" },
+            ],
+        });
+        if (choice !== "del")
+            return;
+        // Visible busy state for the whole removal (a 1 GB tree takes seconds — with
+        // no feedback users assume a hang and click again).
+        setDeleting(id);
+        setRtError(null);
+        setRtNotice(null);
+        try {
+            await invoke("delete_runtime_pack", { id });
+        }
+        catch (e) {
+            setRtError(backendErrText(e));
+        }
+        finally {
+            setDeleting(null);
+            refreshRuntime();
+        }
+    }, [refreshRuntime, showConfirm, lang]);
+    const handleRelocate = useCallback(async () => {
+        const dir = await open({ directory: true, multiple: false, title: "Choose data directory" });
+        if (!dir || typeof dir !== "string")
+            return;
+        setRelocating(true);
+        setRelocateMsg(null);
+        try {
+            await invoke("migrate_data_dir", { newDir: dir });
+            setDataDir(dir);
+            setRelocateMsg("migrated");
+            setMigratePending(true); // lock the button until the restart (one migration per session)
+            setRelocating(false); // done — don't show "migrating…" under the restart dialog
+            // S68c: the copy is verified and the old tree is auto-reclaimed on the next startup — but
+            // NOTHING switches to the new location until a restart, and anything the user does in the
+            // meantime still lands old-side (delta-synced at that next startup). Prompt the restart NOW
+            // so "migrated but my models are gone" never gets filed as a bug.
+            const choice = await showConfirm({
+                title: L("relocatedTitle"),
+                body: L("relocatedBody"),
+                buttons: [
+                    { id: "later", label: L("restartLater") },
+                    { id: "restart", label: L("restartNow"), kind: "primary" },
+                ],
+            });
+            if (choice === "restart")
+                await runExitFlow("restart");
+        }
+        catch (e) {
+            setRelocateMsg(String(e).includes("TRAINING_ACTIVE") ? "error: training" : `error: ${backendErrText(e)}`);
+        }
+        finally {
+            setRelocating(false);
+        }
+    }, [showConfirm, lang]);
+    // ── S61 storage usage + cleanup ──
+    const [storage, setStorage] = useState(null);
+    const [storageScanning, setStorageScanning] = useState(false);
+    const [cleanBusy, setCleanBusy] = useState(null); // "cache"|"audition"|"logs"|<slug>
+    const [cleanMsg, setCleanMsg] = useState(null);
+    // Live gates: never sweep the render cache while anything might be mid-write into it.
+    const isPlaying = useAudioStore((s) => s.isPlaying);
+    const vocalRenderActive = useAppStore((s) => s.vocalRenderActive);
+    const anyWorkflowRunning = useWorkflowStore((s) => Object.values(s.executions).some((e) => e.status === "running"));
+    const trainingBusy = useTrainingStore((s) => isRunningState(s.snapshot.state));
+    const midiExtracting = useAppStore((s) => Object.keys(s.midiExtracting).length > 0);
+    const rangeTesting = useVoiceModelStore((s) => Object.keys(s.rangeTesting).length > 0);
+    const decoding = useAudioStore((s) => s.loadingPaths.length > 0); // in-flight decode writes audio_cache
+    const cacheCleanBlocked = isPlaying || vocalRenderActive || anyWorkflowRunning || midiExtracting || rangeTesting || decoding;
+    const refreshStorage = useCallback(async () => {
+        setStorageScanning(true);
+        try {
+            setStorage(await invoke("get_storage_report"));
+        }
+        catch (e) {
+            setCleanMsg(String(e));
+        }
+        finally {
+            setStorageScanning(false);
+        }
+    }, []);
+    useEffect(() => { void refreshStorage(); }, [refreshStorage]);
+    const cleanupErrText = (e) => {
+        const msg = String(e);
+        if (msg.includes("TRAINING_ACTIVE"))
+            return L("stErrTraining");
+        if (msg.includes("CLEANUP_BUSY"))
+            return L("stErrBusy");
+        if (msg.includes("WORKSPACE_MISSING"))
+            return L("stErrWsMissing");
+        // Any other storage code (WORKSPACE_DELETE_FAILED / STORAGE_JOIN / …) → the app-wide map,
+        // raw-string fallback.
+        return backendErrorMessage(msg) ?? msg;
+    };
+    /** THE single cleanup/delete funnel. `fn` may return a plain byte count (the four original
+     *  cache sweeps) or a structured report — the training-archive actions need the second form
+     *  because「已释放 0 B」is their CORRECT outcome on a migrated project (everything predates
+     *  the export ledger and is protected), and a bare zero reads as a broken button.
+     *
+     *  `confirmLabel` exists because the danger button used to be hardcoded to「清理」— fine for
+     *  a cache sweep, wrong on「删除整个训练项目」. */
+    const runCleanup = useCallback(async (key, fn, confirm) => {
+        if (confirm) {
+            const choice = await showConfirm({
+                title: confirm.title,
+                body: confirm.body,
+                scrollable: true,
+                buttons: [
+                    { id: "cancel", label: L("rtCancelBtn") },
+                    { id: "clean", label: confirm.confirmLabel ?? L("stCleanBtn"), kind: "danger" },
+                ],
+            });
+            if (choice !== "clean")
+                return;
+        }
+        setCleanBusy(key);
+        setCleanMsg(null);
+        setMsgOwner(key.split(":")[0] ?? null);
+        try {
+            const out = await fn();
+            if (typeof out === "number") {
+                setCleanMsg(`${L("stFreed")} ${fmtSize(out)}`);
+            }
+            else {
+                // "kept N" is not filler: it is the difference between「什么都没删」and「按规则保留了
+                // N 项」, and on a migrated project it is the whole answer.
+                const parts = [
+                    out.deferred ? L("stDeferred") : `${L("stFreed")} ${fmtSize(out.freedBytes)}`,
+                ];
+                if (out.kept.length > 0) {
+                    parts.push(L("stKeptNote").replace("{count}", String(out.kept.length)));
+                }
+                setCleanMsg(parts.join(" · "));
+            }
+            await refreshStorage();
+        }
+        catch (e) {
+            setCleanMsg(cleanupErrText(e));
+        }
+        finally {
+            setCleanBusy(null);
+        }
+    }, 
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [refreshStorage, showConfirm, lang]);
+    const handleCleanCache = useCallback(() => {
+        // Non-reactive last-moment gate: an in-flight stretch's output path is minted Rust-side and
+        // can't be protected — refuse instead of racing it (audit S61).
+        if (stretchInFlight()) {
+            setCleanMsg(L("stErrBusy"));
+            return;
+        }
+        void runCleanup("cache", () => invoke("cleanup_render_cache", { protected: collectProtectedPaths() }), { title: L("stCacheTitle"), body: L("stCacheBody") });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [runCleanup, lang]);
+    const handleCleanAudition = useCallback(() => {
+        void runCleanup("audition", () => invoke("cleanup_audition_caches"), {
+            title: L("stAuditionTitle"),
+            body: L("stAuditionBody"),
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [runCleanup, lang]);
+    const handleCleanLogs = useCallback(() => {
+        void runCleanup("logs", () => invoke("cleanup_logs"));
+    }, [runCleanup]);
+    // ── S21 音频缓存明细 — 逐条占用 + 一键清理超大文件 ──
+    const [cacheAudit, setCacheAudit] = useState(null);
+    const [auditingCache, setAuditingCache] = useState(false);
+    const [cacheAuditOpen, setCacheAuditOpen] = useState(false);
+    const refreshCacheAudit = useCallback(async () => {
+        setAuditingCache(true);
+        try {
+            setCacheAudit(await invoke("cache_audit"));
+        }
+        catch {
+            setCacheAudit(null);
+        }
+        finally {
+            setAuditingCache(false);
+        }
+    }, []);
+    useEffect(() => { void refreshCacheAudit(); }, [refreshCacheAudit]);
+    const handleCleanCacheEntry = useCallback((name, bytes) => {
+        void runCleanup(`cache_entry:${name}`, () => invoke("cleanup_cache_entry", { name, protected: collectProtectedPaths() }), {
+            title: L("stEntryTitle"),
+            body: L("stEntryBody").replace("{name}", name).replace("{size}", fmtSize(bytes)),
+        }).then(() => {
+            void refreshCacheAudit();
+            void refreshStorage();
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [runCleanup, lang]);
+    const handleCleanOversizedCache = useCallback(() => {
+        void runCleanup("cache_oversized", () => invoke("cleanup_oversized_cache", { thresholdBytes: 100 * 1024 * 1024, protected: collectProtectedPaths() }), { title: L("stOversizedTitle"), body: L("stOversizedBody") }).then(() => {
+            void refreshCacheAudit();
+            void refreshStorage();
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [runCleanup, lang]);
+    /** Expanded projects, keyed by id — NOT by index: the report re-sorts by size after every
+     *  deletion, so an index would silently expand a different project next render. */
+    const [expandedWs, setExpandedWs] = useState(new Set());
+    /** Which project row owns the current result message (its key's project part). */
+    const [msgOwner, setMsgOwner] = useState(null);
+    const toggleWs = (slug) => setExpandedWs((prev) => {
+        const next = new Set(prev);
+        if (!next.delete(slug))
+            next.add(slug);
+        return next;
+    });
+    /** Architecture ids are shown raw — they are the same proper nouns the project row has always
+     *  displayed (`rvc+sovits`), and inventing a translated vocabulary here would be a second
+     *  source for names the training page already writes as-is. */
+    const famLabel = (f) => f;
+    const handleCleanSnapshots = useCallback((ws, slot) => {
+        // Nothing to free (every snapshot is imported / best / final / predates the ledger — the
+        // normal state of a migrated project): don't pop a confirm for a no-op, just say why. The
+        // real deletion always re-derives the set server-side, so this is only about the dialog.
+        if (slot.cleanableBytes === 0) {
+            setMsgOwner(ws.slug);
+            setCleanMsg(L("stSnapNothing").replace("{n}", String(slot.snapshots)));
+            return;
+        }
+        void runCleanup(`${ws.slug}:snap:${slot.family}`, () => invoke("training_cleanup_snapshots", {
+            projectId: ws.slug,
+            family: slot.family,
+        }), {
+            title: L("stSnapTitle"),
+            body: L("stSnapBody")
+                .replace("{family}", famLabel(slot.family))
+                .replace("{size}", fmtSize(slot.cleanableBytes)),
+            confirmLabel: L("stSnapClean"),
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [runCleanup, lang]);
+    const handleDeleteSlot = useCallback((ws, slot) => {
+        // Shallow diffusion lives INSIDE the sovits slot and the word "sovits" says nothing about
+        // it — the retrain path already warns with a real step count; say the same thing here.
+        const diffNote = slot.diffSteps > 0
+            ? `
+${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
+            : "";
+        void runCleanup(`${ws.slug}:${slot.family}`, () => invoke("training_delete_slot", {
+            projectId: ws.slug,
+            family: slot.family,
+        }), {
+            title: L("stSlotTitle"),
+            body: L("stSlotBody")
+                .replace("{family}", famLabel(slot.family))
+                .replace("{size}", fmtSize(slot.bytes)) + diffNote,
+            confirmLabel: L("stSlotDelete"),
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [runCleanup, lang]);
+    const handleDeleteWorkspace = useCallback((ws) => {
+        void runCleanup(ws.slug, async () => {
+            // S76: one project can hold up to four architecture slots plus the shared dataset —
+            // this deletes ALL of it. The structured report also lets a torn delete (rename done,
+            // background removal blocked) report「已移除,下次启动回收」instead of「删除失败」.
+            const rep = await invoke("training_delete_project", { projectId: ws.slug });
+            const freed = rep.freedBytes;
+            // Keep the training page coherent. It is a different panel with no reason to re-fetch
+            // on its own — none of its effect dependencies change when a deletion happens over
+            // here — so a delete would otherwise leave it showing archives that no longer exist
+            // (still clickable for import) and a「免导入直训」hint for a dataset we just removed.
+            //
+            // S76 batch 4: keyed on the training page's CURRENT PROJECT, not on the typed model
+            // name. Deleting project A while the page sits on project B must not wipe B's view;
+            // deleting the project the page IS on must.
+            const ts = useTrainingStore.getState();
+            if (ts.route.projectId === ws.slug) {
+                // Send it back to the project list. Leaving the route on a project that no longer
+                // exists is not merely stale: its detail page can only answer
+                // PROJECT_META_UNREADABLE, and `route` outlives closing the training page (it is
+                // module-level store state), so the page would come back to the same dead project
+                // every time. `enterProject("")` also drops the staged dataset / run name, which
+                // described the project we just deleted.
+                ts.enterProject("");
+            }
+            return freed;
+        }, {
+            title: L("stWsTitle"),
+            // Itemised on purpose: a project can hold four architectures, and a body that only
+            // says「该模型的…」hides three of them behind one button.
+            body: [
+                `${ws.name} · ${fmtSize(ws.bytes)}`,
+                L("stWsBody"),
+                ...ws.slots.map((sl) => `· ${famLabel(sl.family)} — ${fmtSize(sl.bytes)}`),
+                ws.dataset_bytes > 0
+                    ? `· ${L("stWsDatasetNote").replace("{size}", fmtSize(ws.dataset_bytes))}`
+                    : "",
+            ]
+                .filter((l) => l !== "")
+                .join("\n"),
+            confirmLabel: L("stWsDelete"),
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [runCleanup, lang]);
+    useEffect(() => {
+        const unlisten = listen("cuda-download-progress", (e) => {
+            setCudaProgress(e.payload);
+            if (e.payload.stage === "done") {
+                setCudaDownloading(false);
+                // Re-query the REAL readiness instead of optimistically flipping true — is_cuda_runtime_ready
+                // also verifies the full provider dependency set, and an optimistic true that reverts on the
+                // next restart reads as "CUDA disappeared" (S64b beta report). The hardware badge re-queries
+                // too: the in-session setup_cuda_dll_paths re-run can flip cuda_available without a restart.
+                // The green "restart to activate" note keys on the SAME real verdict (review S66: a partial
+                // local install must not read as ready).
+                invoke("is_cuda_runtime_ready")
+                    .then((r) => {
+                    setCudaReady(r);
+                    setCudaJustInstalled(r);
+                })
+                    .catch(() => { });
+                invoke("get_hardware_info").then(setHw).catch(() => { });
+                invoke("cuda_runtime_paths")
+                    .then(setCudaPaths)
+                    .catch(() => { });
+            }
+            else if (e.payload.stage === "error") {
+                // Terminal failure/cancel (review S66): without this, a late buffered progress event
+                // re-latched cudaDownloading=true forever after a cancel.
+                setCudaDownloading(false);
+                invoke("cuda_runtime_paths")
+                    .then(setCudaPaths)
+                    .catch(() => { });
+            }
+            else {
+                // Any non-terminal event re-latches a remounted panel onto the running download.
+                setCudaDownloading(true);
+            }
+        });
+        return () => { unlisten.then((f) => f()); };
+    }, []);
+    const handleLangChange = (value) => {
+        i18n.changeLanguage(value);
+        try {
+            localStorage.setItem("lang", value);
+        }
+        catch { /* ignore */ }
+    };
+    // S64 — version & update-check section state. The dialog itself (progress/install) is the app-level
+    // UpdateDialog; this section only runs the CHECK and reports its outcome inline.
+    const [appVersion, setAppVersion] = useState("");
+    useEffect(() => { void getVersion().then(setAppVersion).catch(() => { }); }, []);
+    const [autoCheck, setAutoCheck] = useState(autoUpdateCheckEnabled);
+    const [updChecking, setUpdChecking] = useState(false);
+    const [updResult, setUpdResult] = useState(null);
+    const handleAutoCheckToggle = (v) => {
+        setAutoCheck(v);
+        setAutoUpdateCheckEnabled(v);
+    };
+    // S66: startup missing-component check toggle (the dialog's "不再提醒" writes the same key).
+    const [startupCompCheck, setStartupCompCheck] = useState(startupComponentCheckEnabled);
+    const handleStartupCompToggle = (v) => {
+        setStartupCompCheck(v);
+        setStartupComponentCheckEnabled(v);
+    };
+    // S115 §F5-2 — diagnostic mode. Backend-persisted (config.json), NOT localStorage: a crash
+    // repro spans app restarts, and the value has to be readable by the Rust side that injects
+    // the env at the training spawn. Same round trip as the CUDA memory cap above it.
+    const [diagMode, setDiagMode] = useState(false);
+    useEffect(() => {
+        invoke("get_diagnostic_mode").then(setDiagMode).catch(() => { });
+    }, []);
+    const handleDiagToggle = (v) => {
+        setDiagMode(v);
+        invoke("set_diagnostic_mode", { on: v }).catch(() => {
+            setDiagMode(!v);
+        });
+    };
+    const [songResidentMode, setSongResidentMode] = useState(false);
+    const [songIdleTimeoutText, setSongIdleTimeoutText] = useState("");
+    useEffect(() => {
+        invoke("get_song_resident_mode").then(setSongResidentMode).catch(() => { });
+        invoke("get_song_resident_idle_timeout").then((sec) => setSongIdleTimeoutText(String(sec))).catch(() => { });
+    }, []);
+    const commitSongIdleTimeout = useCallback(async () => {
+        const sec = Math.max(60, parseInt(songIdleTimeoutText || "300", 10) || 300);
+        try {
+            await invoke("set_song_resident_idle_timeout", { seconds: sec });
+            setSongIdleTimeoutText(String(sec));
+        }
+        catch {
+        }
+    }, [songIdleTimeoutText]);
+    // 常驻进程的实况。字段名跟 Rust 的 SongResidentStatus 一致(该结构没有 rename_all,
+    // 所以过来的是 snake_case 的 idle_timeout)。
+    const [songDaemonStatus, setSongDaemonStatus] = useState(null);
+    const [songDaemonBusy, setSongDaemonBusy] = useState(false);
+    const refreshSongDaemon = useCallback(async () => {
+        try {
+            setSongDaemonStatus(await invoke("song_resident_status"));
+        }
+        catch {
+            setSongDaemonStatus(null);
+        }
+    }, []);
+    // 进程可能在空闲超时后自行卸载 —— 面板开着的时候轮询一下,否则这里会一直显示
+    // 「运行中」骗人。5 秒一次,这个命令只是读一个 Mutex,代价可以忽略。
+    useEffect(() => {
+        void refreshSongDaemon();
+        if (!songResidentMode)
+            return;
+        const timer = setInterval(() => void refreshSongDaemon(), 5000);
+        return () => clearInterval(timer);
+    }, [songResidentMode, refreshSongDaemon]);
+    const releaseSongDaemon = useCallback(async () => {
+        setSongDaemonBusy(true);
+        try {
+            await invoke("song_resident_shutdown");
+        }
+        catch {
+        }
+        finally {
+            setSongDaemonBusy(false);
+            void refreshSongDaemon();
+        }
+    }, [refreshSongDaemon]);
+    const handleSongResidentToggle = (v) => {
+        setSongResidentMode(v);
+        invoke("set_song_resident_mode", { enabled: v })
+            .then(() => {
+            // 关掉开关就该当场把进程收掉。只写配置的话,已经起来的守护进程会一直挂到空闲
+            // 超时才放显存 —— 那正是用户点这个开关想避免的事。
+            if (!v)
+                return releaseSongDaemon();
+            return refreshSongDaemon();
+        })
+            .catch(() => {
+            setSongResidentMode(!v);
+        });
+    };
+    const handleUpdateCheck = useCallback(async () => {
+        setUpdChecking(true);
+        setUpdResult(null);
+        try {
+            const info = await checkForUpdate();
+            if (info) {
+                setUpdResult({ kind: "found", info });
+                useAppStore.getState().openUpdateDialog(info);
+            }
+            else {
+                setUpdResult({ kind: "latest" });
+            }
+        }
+        catch (e) {
+            setUpdResult({ kind: "error", msg: backendErrorMessage(e) ?? String(e) });
+        }
+        finally {
+            setUpdChecking(false);
+        }
+    }, []);
+    // S64 — model-asset packs (assets.rs): aux inference models + training bases, HF-hosted.
+    const [assetPacks, setAssetPacks] = useState([]);
+    const [assetActive, setAssetActive] = useState(null);
+    const [assetProgress, setAssetProgress] = useState(null);
+    const [assetMsg, setAssetMsg] = useState(null);
+    const refreshAssets = useCallback(() => {
+        invoke("asset_pack_status").then(setAssetPacks).catch(() => { });
+    }, []);
+    useEffect(() => { refreshAssets(); }, [refreshAssets]);
+    useEffect(() => {
+        // Backend events are the progress truth — a remounted panel re-attaches seamlessly (the
+        // pyenv/GAME pattern; per-pack `downloading` in asset_pack_status covers the between-events
+        // gap). ANY non-"download" stage is terminal: done, cancelled (silent, the app-wide cancel
+        // convention) or failed (localized error shown) — the backend always emits one (audit S64).
+        const un = listen("asset-pack-progress", (e) => {
+            if (e.payload.stage !== "download") {
+                setAssetProgress(null);
+                setAssetActive(null);
+                if (e.payload.stage === "failed" && e.payload.error) {
+                    setAssetMsg(backendErrorMessage(e.payload.error) ?? e.payload.error);
+                }
+                refreshAssets();
+            }
+            else {
+                setAssetProgress(e.payload);
+                setAssetActive(e.payload.pack);
+            }
+        });
+        return () => { un.then((f) => f()); };
+    }, [refreshAssets]);
+    const [assetDeleting, setAssetDeleting] = useState(null);
+    // S74b: reclaim an asset pack. aux-inference is deletable like the rest — but its dialog says
+    // what breaks, because refusing outright would just be another dead end (the user may genuinely
+    // be freeing space on a box they only train on).
+    const handleAssetDelete = useCallback(async (id, label) => {
+        const choice = await showConfirm({
+            title: L("assetDeleteTitle").replace("{pack}", label),
+            body: id === "aux-inference" ? L("assetDeleteBodyRequired") : L("assetDeleteBody"),
+            buttons: [
+                { id: "cancel", label: L("rtCancelBtn") },
+                { id: "del", label: L("rtDelete"), kind: "danger" },
+            ],
+        });
+        if (choice !== "del")
+            return;
+        setAssetMsg(null);
+        setAssetDeleting(id);
+        try {
+            await invoke("delete_asset_pack", { id });
+        }
+        catch (e) {
+            setAssetMsg(backendErrorMessage(e) ?? String(e));
+        }
+        finally {
+            setAssetDeleting(null);
+            refreshAssets();
+            void refreshStorage();
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [refreshAssets, showConfirm, lang]);
+    const handleAssetDownload = useCallback(async (id) => {
+        setAssetMsg(null);
+        setAssetActive(id);
+        try {
+            // The chosen HF source rides along as a host-replacement base and is tried FIRST (Rust
+            // dedupes it out of the fixed huggingface.co → hf-mirror.com rotation) — the hf-mirror
+            // preset must reorder the rotation, not be silently ignored (audit S64).
+            await invoke("download_asset_pack", { id, hfBase: hfBaseForMirror(mirror) });
+        }
+        catch (e) {
+            if (!isCancelError(e))
+                setAssetMsg(backendErrorMessage(e) ?? String(e));
+        }
+        finally {
+            setAssetActive(null);
+            setAssetProgress(null);
+            refreshAssets();
+        }
+    }, [mirror, refreshAssets]);
+    const handleDeviceChange = useCallback(async (value) => {
+        setDevice(value);
+        // Switching the MODE resets the pick — the pickers live in different id spaces
+        // (DML = DXGI index, CUDA = CUDA ordinal, Auto = nullable DXGI index), so a
+        // value can't carry across. Auto/CPU send null (= no Auto preference).
+        setDeviceId(0);
+        setAutoGpu(null);
+        const explicit = value === "cuda" || value === "directml";
+        setSaving(true);
+        try {
+            await invoke("set_device_preference", { device: value, deviceId: explicit ? 0 : null });
+        }
+        catch (e) {
+            console.error("Failed to save device preference:", e);
+        }
+        setSaving(false);
+    }, []);
+    // S68b: preferred-GPU pick for the explicit CUDA/DirectML modes. Applies live (the
+    // engine evicts cached sessions on any device change; same ORT build either way).
+    const handleGpuPick = useCallback(async (id) => {
+        setDeviceId(id);
+        setSaving(true);
+        try {
+            await invoke("set_device_preference", { device, deviceId: id });
+        }
+        catch (e) {
+            console.error("Failed to save GPU preference:", e);
+        }
+        setSaving(false);
+    }, [device]);
+    // Auto-mode preferred GPU (§user): null = fully automatic. Applies live too; only a
+    // vendor change that needs the OTHER ORT build requires a restart (hint below).
+    const handleAutoGpuPick = useCallback(async (id) => {
+        setAutoGpu(id);
+        setSaving(true);
+        try {
+            await invoke("set_device_preference", { device: "auto", deviceId: id });
+        }
+        catch (e) {
+            console.error("Failed to save auto GPU preference:", e);
+        }
+        setSaving(false);
+    }, []);
+    // S64c structured progress → localized line (code + proper-noun label; raw message = fallback,
+    // the pyenv pgDownloading/pgExtracting pattern).
+    const cudaProgressText = (p) => {
+        const map = {
+            CUDA_DL_DOWNLOADING: L("cudaPgDownloading"),
+            CUDA_DL_EXTRACTING: L("cudaPgExtracting"),
+            CUDA_DL_SKIP: L("cudaPgSkip"),
+            CUDA_DL_FINALIZING: L("cudaPgFinalizing"),
+            CUDA_DL_DONE: L("cudaPgDone"),
+            CUDA_DL_LOCAL_PARTIAL: L("cudaPgLocalPartial"),
+            CUDA_DL_CANCELLED: L("cudaPgCancelled"),
+            CUDA_DL_FAILED: L("cudaPgFailed"),
+        };
+        const base = p.code ? map[p.code] : undefined;
+        if (!base)
+            return p.message;
+        return p.label ? `${base} · ${p.label}` : base;
+    };
+    const handleCudaDownload = useCallback(async () => {
+        setCudaDownloading(true);
+        setCudaError(null);
+        setCudaProgress({ stage: "start", progress: 0, message: "Starting..." });
+        try {
+            // preferCnMirrors: the HF-source choice doubles as the "I'm in mainland China" signal —
+            // it reorders the CUDA rotation (Chinese PyPI mirrors / hf-mirror first). S66.
+            await invoke("download_cuda_runtime", { preferCnMirrors: mirror.type === "hf-mirror" });
+        }
+        catch (e) {
+            if (isCancelError(e)) {
+                // user cancelled — resumable, not an error (every .part is kept)
+                setCudaDownloading(false);
+                setCudaProgress(null);
+                return;
+            }
+            // CUDA_GPU_REQUIRED etc. → localized via the shared mapper (raw fallback for oddballs).
+            setCudaError(backendErrorMessage(e) ?? String(e));
+            setCudaDownloading(false);
+        }
+    }, [mirror.type]);
+    // S66 install-from-local-file: the user picks the wheels/nupkg listed in the note below
+    // (exact filenames from cuda_runtime_paths.expectedFiles) — the offline escape hatch.
+    const handleCudaLocalInstall = useCallback(async () => {
+        // S74b: local install stays UNGATED on purpose (it is the offline escape hatch, and a machine
+        // whose probe merely failed must keep a way in). But installing ~1.6 GB that this machine
+        // cannot use should be a decision, not a surprise — so say it plainly first and let the user
+        // choose. Informed consent, not a block.
+        if (hw && !hw.cuda_supported) {
+            const go = await showConfirm({
+                title: L("cudaLocalUnsupportedTitle"),
+                body: L("cudaLocalUnsupportedBody"),
+                buttons: [
+                    { id: "cancel", label: L("rtCancelBtn") },
+                    { id: "go", label: L("cudaLocalInstallAnyway"), kind: "primary" },
+                ],
+            });
+            if (go !== "go")
+                return;
+        }
+        const picked = await open({
+            multiple: true,
+            filters: [{ name: "CUDA runtime files", extensions: ["whl", "nupkg", "zip"] }],
+        });
+        if (!picked)
+            return;
+        const paths = Array.isArray(picked) ? picked : [picked];
+        setCudaError(null);
+        setCudaDownloading(true);
+        setCudaProgress({ stage: "local", progress: 0, message: "Installing from local files..." });
+        try {
+            await invoke("install_cuda_runtime_local", { paths });
+        }
+        catch (e) {
+            setCudaError(backendErrorMessage(e) ?? String(e));
+        }
+        finally {
+            setCudaDownloading(false);
+            invoke("is_cuda_runtime_ready").then(setCudaReady).catch(() => { });
+            invoke("get_hardware_info").then(setHw).catch(() => { });
+            refreshCudaPaths();
+            void refreshStorage();
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [refreshCudaPaths, showConfirm, hw, lang]);
+    // S74b: reclaim the CUDA runtime. The backend refuses while a task runs, and refuses outright
+    // when THIS process has the CUDA build mapped (Windows file locks) — both come back as
+    // localized CODEs, so this handler only has to confirm and report.
+    const handleCudaDelete = useCallback(async () => {
+        const choice = await showConfirm({
+            title: L("cudaDeleteTitle"),
+            body: L("cudaDeleteBody"),
+            buttons: [
+                { id: "cancel", label: L("rtCancelBtn") },
+                { id: "del", label: L("cudaDelete"), kind: "danger" },
+            ],
+        });
+        if (choice !== "del")
+            return;
+        setCudaError(null);
+        setCudaDeleting(true);
+        try {
+            await invoke("delete_cuda_runtime");
+        }
+        catch (e) {
+            const disp = backendErrorMessage(e) ?? String(e);
+            if (!maybeShowErrorModal(e, disp))
+                setCudaError(disp);
+        }
+        finally {
+            setCudaDeleting(false);
+            invoke("is_cuda_runtime_ready").then(setCudaReady).catch(() => { });
+            invoke("get_hardware_info").then(setHw).catch(() => { });
+            refreshCudaPaths();
+            // cuda_runtime_bytes just changed — the storage panel would otherwise keep showing the
+            // ~1.6 GB row and an inflated total until the next manual scan.
+            void refreshStorage();
+        }
+        // `lang` IS a dependency: L closes over it, so omitting it froze these dialogs in whatever
+        // language was active at first render (every other handler here lists it).
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [refreshCudaPaths, showConfirm, lang]);
+    const L = (key) => {
+        const map = {
+            title: { zh: "设置", en: "Settings", ja: "設定" },
+            language: { zh: "界面语言", en: "Language", ja: "表示言語" },
+            verTitle: { zh: "版本与更新", en: "Version & Updates", ja: "バージョンと更新" },
+            verCurrent: { zh: "当前版本", en: "Current version", ja: "現在のバージョン" },
+            verCheckBtn: { zh: "检查更新", en: "Check for Updates", ja: "更新を確認" },
+            verChecking: { zh: "检查中…", en: "Checking…", ja: "確認中…" },
+            verLatest: { zh: "已是最新版本", en: "You're on the latest version", ja: "最新バージョンです" },
+            verFound: { zh: "发现新版本", en: "New version available", ja: "新しいバージョンがあります" },
+            verView: { zh: "查看", en: "View", ja: "表示" },
+            verAutoCheck: { zh: "启动时自动检查更新", en: "Check for updates on startup", ja: "起動時に更新を確認" },
+            assetTitle: { zh: "模型资产", en: "Model Assets", ja: "モデルアセット" },
+            assetAux: { zh: "推理核心模型包", en: "Core inference models", ja: "推論コアモデル" },
+            assetAutotune: { zh: "自动调教模型包", en: "Auto pitch tuning model", ja: "自動調声モデル" },
+            assetRvc: { zh: "RVC 训练底模", en: "RVC training base models", ja: "RVC 学習ベースモデル" },
+            assetSovits: { zh: "SoVITS 训练底模", en: "SoVITS training base models", ja: "SoVITS 学習ベースモデル" },
+            assetSovitsV2: { zh: "SoVITS 4.0-v2 训练底模", en: "SoVITS 4.0-v2 training base models", ja: "SoVITS 4.0-v2 学習ベースモデル" },
+            assetVocoder: { zh: "声码器微调底模", en: "Vocoder finetune base model", ja: "ボコーダー微調整ベースモデル" },
+            assetLicenseTip: { zh: "该权重按此许可分发，不随软件本体打包；点击打开上游发布页与署名信息。", en: "These weights are distributed under this license and are not bundled with the app; click to open the upstream release page and attribution.", ja: "この重みは当該ライセンスで配布され、アプリ本体には同梱されません。クリックで配布元のリリースページと帰属表示を開きます。" },
+            // Keep these SHORT: the line ellipsizes at ~204px in the 340px default panel (measured).
+            assetLicenseHint: { zh: "不随软件本体分发 · 点击查看署名", en: "Not bundled · click for attribution", ja: "本体には非同梱 · クリックで帰属表示" },
+            assetInstalled: { zh: "已安装", en: "Installed", ja: "インストール済み" },
+            assetMissing: { zh: "缺失", en: "Missing", ja: "不足" },
+            assetDownload: { zh: "下载", en: "Download", ja: "ダウンロード" },
+            assetNote: { zh: "推理核心包 = 人声渲染 / 音色替换 / 音高提取的必备模型（约 1.4GB）；训练底模按需下载。已在下载中断处自动续传。", en: "The core pack holds the models required for vocal rendering / voice conversion / pitch extraction (~1.4GB); training bases are optional. Interrupted downloads resume automatically.", ja: "推論コアパックはボーカルレンダリング／音声変換／ピッチ抽出に必須のモデルです（約 1.4GB）。学習ベースは必要に応じて。中断したダウンロードは自動で再開されます。" },
+            assetStartupCheck: { zh: "启动时检查必要组件（缺失时弹窗提示）", en: "Check required components on startup (dialog when missing)", ja: "起動時に必須コンポーネントを確認（不足時にダイアログ）" },
+            hardware: { zh: "硬件", en: "Hardware", ja: "ハードウェア" },
+            gpu: { zh: "显卡", en: "GPU", ja: "GPU" },
+            cuda: { zh: "CUDA 可用", en: "CUDA Available", ja: "CUDA 利用可能" },
+            directml: { zh: "DirectML 可用", en: "DirectML Available", ja: "DirectML 利用可能" },
+            epLabel: { zh: "推理设备", en: "Inference Device", ja: "推論デバイス" },
+            auto: { zh: "自动", en: "Auto", ja: "自動" },
+            cudaOpt: { zh: "CUDA (NVIDIA GPU)", en: "CUDA (NVIDIA GPU)", ja: "CUDA (NVIDIA GPU)" },
+            dmlOpt: { zh: "DirectML (通用 GPU)", en: "DirectML (Any GPU)", ja: "DirectML (汎用 GPU)" },
+            cpuOpt: { zh: "CPU", en: "CPU", ja: "CPU" },
+            gpuPick: { zh: "首选 GPU", en: "Preferred GPU", ja: "優先 GPU" },
+            gpuAutoPick: {
+                zh: "自动选择（高性能优先）",
+                en: "Automatic (high-performance first)",
+                ja: "自動選択（高性能優先）",
+            },
+            gpuGone: {
+                zh: "GPU {id}（未检测到——请重新选择）",
+                en: "GPU {id} (not detected — pick again)",
+                ja: "GPU {id}（未検出——選び直してください）",
+            },
+            buildMismatch: {
+                zh: "当前进程加载的是 {build} 运行时——此选择需要重启应用后才会生效",
+                en: "This session loaded the {build} runtime — restart the app for this choice to take effect",
+                ja: "現在のプロセスは {build} ランタイムを読み込んでいます——この選択はアプリ再起動後に有効になります",
+            },
+            saved: { zh: "已保存", en: "Saved", ja: "保存済み" },
+            note: { zh: "切换设备后需要重启应用才能生效。", en: "Restart the app after changing device.", ja: "デバイス変更後、アプリを再起動してください。" },
+            yes: { zh: "是", en: "Yes", ja: "はい" },
+            no: { zh: "否", en: "No", ja: "いいえ" },
+            cudaRuntime: { zh: "CUDA 运行时", en: "CUDA Runtime", ja: "CUDAランタイム" },
+            cudaInstalled: { zh: "已就绪", en: "Ready", ja: "準備完了" },
+            cudaNotInstalled: { zh: "未安装", en: "Not Installed", ja: "未インストール" },
+            cudaDownload: { zh: "下载 CUDA 运行时", en: "Download CUDA Runtime", ja: "CUDAランタイムをダウンロード" },
+            // Shown on EVERY machine without a supported NVIDIA card — including AMD/Intel/CPU-only
+            // boxes — so the wording must not claim "compute capability" (S74b: it did, and that is
+            // simply untrue for a non-NVIDIA machine).
+            cudaUnsupportedNote: { zh: "当前显卡不支持我们的 CUDA 运行时包，使用默认的 DirectML 即可（任何显卡可用）。", en: "This machine's GPU isn't supported by our CUDA runtime package — the default DirectML works on any GPU.", ja: "この PC の GPU は当社の CUDA ランタイムパッケージに非対応です——既定の DirectML はどの GPU でも動作します。" },
+            gpuUnsupportedCc: { zh: "不可用：我们的 CUDA 包不支持这张卡", en: "unavailable: not supported by our CUDA package", ja: "使用不可：当社の CUDA パッケージ非対応" },
+            selfTestCheckFailed: { zh: "该项未通过（技术详情）", en: "check did not pass (technical details)", ja: "このチェックに不合格（技術詳細）" },
+            selfTestCheckWarn: { zh: "该项有警告，但不影响通过（技术详情）", en: "check reported a warning but still passed (technical details)", ja: "このチェックは警告付きで合格（技術詳細）" },
+            rtUnsupported: { zh: "当前设备不支持", en: "Not supported here", ja: "この PC では非対応" },
+            rtTestStale: { zh: "需重新自检", en: "Re-run self-test", ja: "再セルフテストが必要" },
+            rtStaleNote: { zh: "这份自检报告来自不同的硬件配置（显卡或驱动已变更），当前结果仅供参考——请重新自检。", en: "This self-test report was produced on a different hardware configuration (GPU or driver changed) — re-run the self-test for a current verdict.", ja: "このセルフテストレポートは異なるハードウェア構成（GPU またはドライバーが変更）で作成されました。現在の結果を得るにはセルフテストを再実行してください。" },
+            rtWhyNv: { zh: "需要算力 sm_75 及以上的 NVIDIA 显卡（GTX 16 / RTX 20 系及更新）。此包在本机不会被使用；修好驱动后可重新自检，或直接删除。", en: "Needs an NVIDIA GPU of compute capability sm_75 or newer (GTX 16 / RTX 20 series and up). This pack won't be used on this machine — re-run the self-test after fixing a driver, or delete it.", ja: "compute capability sm_75 以上の NVIDIA GPU が必要です（GTX 16 / RTX 20 シリーズ以降）。この PC では使用されません。ドライバー修正後にセルフテストを再実行するか、削除してください。" },
+            // S167 (§F6): runtime-amd-v2 ships general compute kernels for gfx1100/1101/1102/1103
+            // (RX 7000 discrete + 780M/760M/740M iGPUs) — the v1-era "gfx1103 only" wording below was
+            // measured on v1 and is now history. Still true and still worth saying: RDNA2 (RX 6000),
+            // RDNA4 (RX 9000) and other iGPU generations (680M / 880M / 890M) have NO kernels in this
+            // pack — the string must keep naming them as unsupported, or their owners chase a 5 GB
+            // dead end (the Iris-Xe mistake).
+            rtWhyAmd: { zh: "需要 RDNA3 显卡：RX 7000 系独显（gfx1100-1102）或 Radeon 780M/760M/740M 核显（gfx1103）——本包只带这些架构的计算内核，其它 AMD 显卡（RX 6000/9000 系、680M/880M/890M 等核显）都不被它支持。此包在本机不会被使用；可重新自检或直接删除。", en: "Needs an RDNA3 GPU: an RX 7000-series discrete card (gfx1100-1102) or a Radeon 780M/760M/740M iGPU (gfx1103) — this pack ships compute kernels for those targets only, so other AMD GPUs (RX 6000/9000 series, 680M/880M/890M iGPUs) cannot run it. It won't be used on this machine — re-run the self-test or delete it.", ja: "RDNA3 GPU が必要です：RX 7000 シリーズの単体 GPU（gfx1100-1102）または Radeon 780M/760M/740M 内蔵 GPU（gfx1103）——このパックはこれらのアーキテクチャの計算カーネルのみを同梱しています。他の AMD GPU（RX 6000/9000 シリーズ、680M/880M/890M など）では動作しません。この PC では使用されません。セルフテストを再実行するか削除してください。" },
+            rtWhyXpu: { zh: "需要 Arc 系列 Intel 显卡（Iris Xe / UHD / HD Graphics 不被 torch-XPU 支持）。此包在本机不会被使用；可重新自检或直接删除。", en: "Needs an Arc-family Intel GPU (Iris Xe / UHD / HD Graphics are not torch-XPU targets). This pack won't be used on this machine — re-run the self-test or delete it.", ja: "Arc シリーズの Intel GPU が必要です（Iris Xe / UHD / HD Graphics は torch-XPU 非対応）。この PC では使用されません。セルフテストを再実行するか削除してください。" },
+            rtWhyGeneric: { zh: "当前设备不支持此包，它不会被使用；可重新自检或直接删除。", en: "This machine doesn't support this pack, so it won't be used — re-run the self-test or delete it.", ja: "この PC はこのパックに非対応のため使用されません。セルフテストを再実行するか削除してください。" },
+            gpuSoftwareAdapter: { zh: "不可用：软件适配器", en: "unavailable: software adapter", ja: "使用不可：ソフトウェアアダプター" },
+            gpuUnknownCc: { zh: "不可用：读不到该设备的算力", en: "unavailable: couldn't read this device's compute capability", ja: "使用不可：この GPU の計算能力を取得できません" },
+            gpuDuplicateAdapter: { zh: "同一块显卡的重复条目（系统枚举了两次，选上面那条）", en: "duplicate entry for the same GPU (enumerated twice by the system — use the other one)", ja: "同一 GPU の重複エントリ（システムが二重に列挙。もう一方を選んでください）" },
+            cudaDownloading: { zh: "下载中...", en: "Downloading...", ja: "ダウンロード中..." },
+            cudaDelete: { zh: "删除", en: "Delete", ja: "削除" },
+            cudaLocalInstallAnyway: { zh: "仍要安装", en: "Install anyway", ja: "それでもインストール" },
+            cudaLocalUnsupportedTitle: { zh: "当前显卡不支持 CUDA 包", en: "This GPU isn't supported by the CUDA package", ja: "この GPU は CUDA パッケージ非対応です" },
+            cudaLocalUnsupportedBody: {
+                zh: "检测结果显示本机显卡无法运行我们的 CUDA 运行时，安装后推理仍会使用 DirectML，这约 1.6GB 文件不会被用到。\n如果你确认检测有误（例如外接显卡未连接、驱动异常导致检测失败），可以继续安装。",
+                en: "This machine's GPU can't run our CUDA runtime as far as we can tell, so inference will keep using DirectML and these ~1.6 GB will sit unused.\nIf you believe the detection is wrong (an eGPU that isn't connected, or a driver problem that broke the probe), you can install anyway.",
+                ja: "検出結果では、この PC の GPU は当社の CUDA ランタイムを実行できません。推論は DirectML のままで、この約 1.6GB は使用されません。\n検出が誤っていると判断できる場合（未接続の外付け GPU、ドライバー異常で検出失敗など）は、続行できます。",
+            },
+            rtLocalNote: { zh: "本地安装不受硬件门限制；若该包不适用于当前显卡，安装后会标为「当前设备不支持」并可随时删除。", en: "Local install isn't hardware-gated — if the pack doesn't fit this machine it will be marked \"Not supported here\" and can be deleted at any time.", ja: "ローカルインストールはハードウェア判定の対象外です。この PC に適合しないパックは「この PC では非対応」と表示され、いつでも削除できます。" },
+            cudaDeleting: { zh: "删除中...", en: "Deleting...", ja: "削除中..." },
+            cudaDeleteTitle: { zh: "删除 CUDA 运行时？", en: "Delete the CUDA runtime?", ja: "CUDA ランタイムを削除しますか？" },
+            cudaDeleteBody: {
+                zh: "将删除约 1.6GB 的 CUDA 运行库（runtime/ort/cuda 与 runtime/cuda）。删除后推理会使用 DirectML（任何显卡可用）；需要时可以随时重新下载。",
+                en: "This removes ~1.6 GB of CUDA runtime libraries (runtime/ort/cuda and runtime/cuda). Inference then uses DirectML (works on any GPU); you can download it again at any time.",
+                ja: "約 1.6GB の CUDA ランタイム（runtime/ort/cuda と runtime/cuda）を削除します。削除後の推論は DirectML（どの GPU でも動作）を使用します。必要になればいつでも再ダウンロードできます。",
+            },
+            cudaNote: { zh: "无需安装 CUDA Toolkit——自动下载全部运行库（ORT CUDA + cudart/cuBLAS/cuFFT/cuDNN，共约 1.6GB）。需要 NVIDIA 显卡和较新的驱动。", en: "No CUDA Toolkit needed — downloads the full runtime (ORT CUDA + cudart/cuBLAS/cuFFT/cuDNN, ~1.6GB total). Requires an NVIDIA GPU with a recent driver.", ja: "CUDA Toolkit のインストールは不要 — ランタイム一式（ORT CUDA + cudart/cuBLAS/cuFFT/cuDNN、合計約 1.6GB）を自動ダウンロードします。NVIDIA GPU と新しめのドライバーが必要です。" },
+            cudaRestart: { zh: "下载完成，重启应用后生效。", en: "Download complete. Restart to activate.", ja: "ダウンロード完了。再起動で有効になります。" },
+            cudaPgDownloading: { zh: "下载中", en: "Downloading", ja: "ダウンロード中" },
+            cudaPgExtracting: { zh: "解压中", en: "Extracting", ja: "展開中" },
+            cudaPgSkip: { zh: "已存在，跳过", en: "Already present — skipped", ja: "既に存在するためスキップ" },
+            cudaPgFinalizing: { zh: "收尾中…", en: "Finalizing…", ja: "仕上げ中…" },
+            cudaPgDone: { zh: "CUDA 运行时就绪，重启应用后生效", en: "CUDA runtime ready — restart to activate", ja: "CUDA ランタイム準備完了 — 再起動で有効になります" },
+            cudaCancelDl: { zh: "取消下载", en: "Cancel download", ja: "ダウンロード中止" },
+            cudaPgLocalPartial: { zh: "已安装所选文件，但仍缺组件", en: "Selected files installed — parts still missing", ja: "選択ファイルを導入しましたが、まだ不足があります" },
+            cudaMemLimit: { zh: "显存上限（CUDA）", en: "VRAM limit (CUDA)", ja: "VRAM 上限（CUDA）" },
+            cudaMemLimitNote: { zh: "0 或留空 = 不限制（默认）。限制的是 CUDA 显存池上限：设得过低会让大任务直接报「分配失败」而不是变慢——低显存爆显存时再按需设置（例如 6144）。仅对 CUDA 生效。", en: "0 / blank = unlimited (default). Caps the CUDA memory arena: set too low, big jobs fail with an allocation error instead of slowing down — only set it (e.g. 6144) if you actually hit VRAM exhaustion. CUDA only.", ja: "0 または空欄 = 無制限（既定）。CUDA メモリアリーナの上限です。低すぎると大きなジョブは遅くなる代わりに「割り当て失敗」になります — VRAM 不足が実際に起きる場合のみ設定してください（例: 6144）。CUDA のみ有効。" },
+            cudaPgCancelled: { zh: "已取消（进度已保留，可续传）", en: "Cancelled (progress kept — resumable)", ja: "キャンセルしました（進捗は保持、再開可能）" },
+            cudaPgFailed: { zh: "下载失败", en: "Download failed", ja: "ダウンロードに失敗しました" },
+            cudaMissing: { zh: "缺失组件", en: "Missing parts", ja: "不足コンポーネント" },
+            cudaLocalNote: { zh: "「从本地文件安装」接受以下官方文件：", en: "“Install from local file” accepts these official files:", ja: "「ローカルからインストール」は以下の公式ファイルを受け付けます：" },
+            cudaDllDir: { zh: "CUDA 运行库目录", en: "CUDA DLL folder", ja: "CUDA DLL フォルダ" },
+            cudaOrtDir: { zh: "ORT CUDA 目录", en: "ORT CUDA folder", ja: "ORT CUDA フォルダ" },
+            storage: { zh: "存储位置", en: "Storage", ja: "保存場所" },
+            stDirRecreated: { zh: "警告：配置的数据目录 {configured} 此前不存在，已重新创建（内容为空）。若数据在别处，请检查该盘/目录。", en: "Warning: the configured data folder {configured} was missing and has been recreated (empty). If your data lives elsewhere, check that drive/folder.", ja: "警告：設定されたデータフォルダ {configured} が存在しなかったため、再作成しました（空です）。データが別の場所にある場合は、そのドライブ/フォルダを確認してください。" },
+            stDirFellBack: { zh: "警告：配置的数据目录 {configured} 不可用（盘符不存在？），本次改用程序旁的默认目录。恢复该盘后重启即可回到原目录。", en: "Warning: the configured data folder {configured} is unavailable (drive missing?). Using the default folder next to the program for this session; restore the drive and restart to return to it.", ja: "警告：設定されたデータフォルダ {configured} が利用できません（ドライブ未接続？）。今回はプログラム横の既定フォルダを使用します。ドライブを戻して再起動すると元に戻ります。" },
+            dataDir: { zh: "数据目录（模型 + 缓存）", en: "Data folder (models + cache)", ja: "データフォルダ（モデル + キャッシュ）" },
+            relocate: { zh: "更改并迁移…", en: "Change & migrate…", ja: "変更して移行…" },
+            relocating: { zh: "迁移中…", en: "Migrating…", ja: "移行中…" },
+            relocated: { zh: "已迁移并通过完整性核验，重启后生效（旧目录将在下次启动时自动清理）", en: "Migrated & integrity-verified — restart to apply (the old folder is cleaned up automatically on the next launch)", ja: "移行と整合性チェックが完了 — 再起動で有効（旧フォルダは次回起動時に自動削除されます）" },
+            relocatedTitle: { zh: "迁移完成", en: "Migration complete", ja: "移行完了" },
+            relocatedBody: { zh: "数据已复制到新位置并通过完整性核验。\n\n需要重启应用才能在新位置上运行；旧目录会在重启后的下次启动时自动清理。\n\n注意：重启前的所有操作（下载模型、渲染等）仍会写入旧位置（启动清理时会自动补搬），建议现在就重启。", en: "Your data has been copied to the new location and integrity-verified.\n\nA restart is required to run from the new location; the old folder is cleaned up automatically on the launch after the restart.\n\nNote: anything you do before restarting (model downloads, renders…) still writes to the OLD location (it gets carried over during that cleanup) — restarting now is recommended.", ja: "データを新しい場所へコピーし、整合性チェックも完了しました。\n\n新しい場所で動作させるには再起動が必要です。旧フォルダは再起動後の次回起動時に自動削除されます。\n\n注意：再起動までの操作（モデルのダウンロードやレンダリングなど）は旧フォルダに書き込まれます（削除時に自動で引き継がれます）。今すぐの再起動をおすすめします。" },
+            restartNow: { zh: "立即重启", en: "Restart now", ja: "今すぐ再起動" },
+            restartLater: { zh: "稍后重启", en: "Restart later", ja: "後で再起動" },
+            relocatePendingBtn: { zh: "等待重启…", en: "Awaiting restart…", ja: "再起動待ち…" },
+            relocatePendingNote: { zh: "本次会话已完成一次迁移，重启后才能再次迁移（旧目录也将在重启后的下次启动时自动清理）。", en: "A migration already completed this session — restart before migrating again (the old folder is also cleaned up on the launch after the restart).", ja: "このセッションで既に移行が完了しています。再度移行するには再起動が必要です（旧フォルダも再起動後の次回起動時に自動削除されます）。" },
+            dataDirNote: { zh: "默认在程序目录旁，避免占用 C 盘。模型/缓存会很大，可换到其他盘。", en: "Defaults next to the program (off C:). Models/cache grow large — point this at another drive.", ja: "既定はプログラム横（Cドライブ外）。" },
+            stTitle: { zh: "存储占用与清理", en: "Storage Usage & Cleanup", ja: "ストレージ使用量とクリーンアップ" },
+            stScanning: { zh: "统计中…", en: "Scanning…", ja: "集計中…" },
+            stRefresh: { zh: "重新统计", en: "Rescan", ja: "再集計" },
+            stClean: { zh: "清理", en: "Clean", ja: "クリーン" },
+            stCleanBtn: { zh: "清理", en: "Clean", ja: "クリーン" },
+            stCleaning: { zh: "清理中…", en: "Cleaning…", ja: "クリーン中…" },
+            stEntryHeader: { zh: "音频缓存明细", en: "Cache entries", ja: "キャッシュ内訳" },
+            stEntryBody: { zh: "确定清理缓存项 “{name}” 吗？占用 {size}。\n\n若该项正被当前工程引用会被自动跳过；已保存的 .usp 工程自带渲染副本，不受影响。", en: "Delete cache entry “{name}” ({size})?\n\nEntries referenced by the open project are kept; saved .usp projects carry their own render copies.", ja: "キャッシュ項目 「{name}」({size})を削除しますか？\n\n開いているプロジェクトが参照する項目は保持されます。保存済み .usp はレンダーコピーを内蔵しています。" },
+            stEntryTitle: { zh: "清理缓存项", en: "Clean cache entry", ja: "キャッシュ項目をクリーン" },
+            stEntryEmpty: { zh: "暂无缓存项", en: "No cache entries", ja: "キャッシュ項目はありません" },
+            stOversized: { zh: "超大文件（>100 MB）", en: "Oversized files (>100 MB)", ja: "巨大ファイル（>100 MB）" },
+            stOversizedTitle: { zh: "一键清理超大文件", en: "Clean oversized files", ja: "巨大ファイルを一度にクリーン" },
+            stOversizedBody: { zh: "将删除音频缓存中所有大于 100 MB 的可再生文件（解码副本、变速产物、旧渲染输出）。当前工程引用的文件会保留。", en: "Deletes regenerable cache files larger than 100 MB under the cache tree (decode copies, stretch products, old render outputs). Files referenced by the open project are kept.", ja: "キャッシュ内の 100 MB を超える再生成可能なファイル（デコードコピー、テンポ産物、古いレンダー出力）を削除します。開いているプロジェクトが参照するファイルは保持されます。" },
+            stOversizedClean: { zh: "一键清理", en: "Clean now", ja: "今すぐクリーン" },
+            stUspWorkProtected: { zh: "当前打开工程的工作媒体，不可单独清理（清理渲染/解码缓存时自动保留）", en: "The open project's working media — cannot be cleaned individually (kept automatically when cleaning render/decode caches)", ja: "現在開いているプロジェクトの作業メディアのため、単独ではクリーンできません（レンダー/デコードキャッシュのクリーン時は自動保持されます）" },
+            stFreed: { zh: "已释放", en: "Freed", ja: "解放済み" },
+            stCache: { zh: "渲染/解码缓存", en: "Render/decode caches", ja: "レンダー/デコードキャッシュ" },
+            stCacheTitle: { zh: "清理渲染/解码缓存", en: "Clean render/decode caches", ja: "レンダーキャッシュをクリーン" },
+            stCacheBody: { zh: "删除可再生的缓存（解码副本、变速产物、旧渲染输出）。当前打开工程引用的文件会保留；已保存的 .usp 工程自带渲染副本，不受影响。未保存工程的旧渲染需要重新渲染。", en: "Deletes regenerable caches (decode copies, stretch products, old render outputs). Files referenced by the open project are kept; saved .usp projects carry their own render copies. Unsaved projects' old renders will need re-rendering.", ja: "再生成可能なキャッシュ（デコードコピー、テンポ産物、古いレンダー出力）を削除します。開いているプロジェクトが参照するファイルは保持されます。保存済み .usp はレンダーコピーを内蔵しているため影響ありません。未保存プロジェクトの古いレンダーは再レンダリングが必要になります。" },
+            stCacheBlocked: { zh: "播放/渲染进行中，暂不可清理", en: "Unavailable while playing/rendering", ja: "再生/レンダリング中は使用不可" },
+            stAudition: { zh: "试听缓存", en: "Audition caches", ja: "試聴キャッシュ" },
+            stAuditionTitle: { zh: "清理试听缓存", en: "Clean audition caches", ja: "試聴キャッシュをクリーン" },
+            stAuditionBody: { zh: "删除模型试听音频与训练候选试听目录（重新试听会自动重建）。", en: "Deletes model audition wavs + training candidate audition dirs (re-auditioning rebuilds them).", ja: "モデル試聴音声とトレーニング候補の試聴フォルダを削除します（再試聴で再生成されます）。" },
+            stLogs: { zh: "日志", en: "Logs", ja: "ログ" },
+            stTraining: { zh: "训练项目", en: "Training projects", ja: "トレーニングプロジェクト" },
+            stWsDelete: { zh: "删除项目", en: "Delete project", ja: "プロジェクトを削除" },
+            stWsTitle: { zh: "删除整个训练项目", en: "Delete the whole training project", ja: "トレーニングプロジェクト全体を削除" },
+            // ★ Three actions, three bodies. One project can now hold up to four architecture slots
+            // plus the shared dataset, so the old single「该模型的…」text under-stated the blast
+            // radius of the project-level button by three architectures' worth of training.
+            stWsBody: { zh: "将删除这个训练项目的全部内容——共享数据集、预处理特征与所有架构的训练存档。不可恢复，续训将不再可用。已导入资源管理器的成品模型是独立副本，不受影响。", en: "Deletes EVERYTHING in this training project — the shared dataset, preprocessed features and every architecture's archives. Irreversible; resume-training becomes unavailable. Models already imported into the resource manager are independent copies and are unaffected.", ja: "このトレーニングプロジェクトの内容をすべて削除します——共有データセット、前処理特徴、全アーキテクチャのアーカイブ。元に戻せず、続きからのトレーニングは不可になります。リソースマネージャに取り込み済みのモデルは独立したコピーのため影響ありません。" },
+            stWsDatasetNote: { zh: "其中共享数据集 {size}——删除后所有架构的下次训练都需要重新导入数据。", en: "Includes the shared dataset ({size}) — every architecture will need its data imported again.", ja: "共有データセット {size} を含みます。削除後は全アーキテクチャで再インポートが必要になります。" },
+            stSlotDelete: { zh: "删除存档", en: "Delete archives", ja: "アーカイブ削除" },
+            stSlotTitle: { zh: "删除该架构的训练存档", en: "Delete this architecture's archives", ja: "このアーキテクチャのアーカイブを削除" },
+            stSlotBody: { zh: "将删除 {family} 的全部训练存档与预处理缓存({size})。共享数据集与其它架构不受影响;已导入的成品模型也不受影响。", en: "Deletes all {family} archives and preprocessing caches ({size}). The shared dataset and the other architectures are untouched, and so are models already imported.", ja: "{family} の全アーカイブと前処理キャッシュ（{size}）を削除します。共有データセットと他アーキテクチャ、取り込み済みモデルには影響しません。" },
+            // Same warning the retrain path already gives — shallow diffusion lives inside the
+            // sovits slot, and the word "sovits" says nothing about it.
+            stSlotDiffNote: { zh: "注意:该架构里还有浅扩散训练进度({steps} 步),将一并删除。", en: "Note: this slot also holds shallow-diffusion progress ({steps} steps), which goes with it.", ja: "注意：このスロットには浅い拡散の進捗（{steps} ステップ）も含まれ、一緒に削除されます。" },
+            stSnapClean: { zh: "清理快照", en: "Clean snapshots", ja: "スナップショット整理" },
+            stSnapTitle: { zh: "清理未导入的快照", en: "Clean un-imported snapshots", ja: "未取り込みスナップショットを整理" },
+            stSnapBody: { zh: "删除 {family} 里没人再需要的周期快照(约 {size})。已导入的、最佳、最终导出、可续训存档与底模都会保留;迁移前就存在的存档也一律保留。", en: "Deletes {family}'s periodic snapshots that nothing needs any more (about {size}). Imported ones, best, the final export, resumable checkpoints and the pretrained base are all kept — as is everything that predates the export ledger.", ja: "{family} のうち不要になった定期スナップショット（約 {size}）を削除します。取り込み済み・ベスト・最終エクスポート・続行可能なチェックポイント・ベースモデルは保持され、台帳より前から存在するものもすべて保持されます。" },
+            stKeptNote: { zh: "保留 {count} 项", en: "kept {count}", ja: "{count} 件を保持" },
+            stDeferred: { zh: "已移除,占用的空间将在下次启动时回收", en: "Removed; the space is reclaimed on next launch", ja: "削除済み。容量は次回起動時に回収されます" },
+            stDeleting: { zh: "删除中…", en: "Deleting…", ja: "削除中…" },
+            stExpand: { zh: "分项", en: "Details", ja: "内訳" },
+            stDataset: { zh: "共享数据集", en: "Shared dataset", ja: "共有データセット" },
+            stSnapCount: { zh: "{n} 个快照", en: "{n} snapshots", ja: "{n} スナップショット" },
+            stSnapNothing: { zh: "本架构的 {n} 个快照当前都在保护范围内(已导入 / 最佳 / 最终导出 / 迁移前),暂无可清理项。", en: "All {n} of this architecture's snapshots are currently protected (imported / best / final / pre-migration) — nothing to clean.", ja: "このアーキテクチャの {n} 個のスナップショットは現在すべて保護対象です（取り込み済み / ベスト / 最終 / 移行前）。整理できる項目はありません。" },
+            stWsPool: { zh: "共享池", en: "pool", ja: "プール" },
+            stWsNone: { zh: "（无训练项目）", en: "(no training projects)", ja: "（トレーニングプロジェクトなし）" },
+            stWsAttention: { zh: "需人工处理", en: "needs attention", ja: "要確認" },
+            stModels: { zh: "模型资源", en: "Model assets", ja: "モデルアセット" },
+            stModelsNote: { zh: "在「资源管理器」与 MSST 模型管理中管理", en: "Managed in the resource manager & MSST manager", ja: "リソースマネージャと MSST 管理で管理" },
+            stMsst: { zh: "其中分离模型", en: "incl. separation models", ja: "うち分离モデル" },
+            stAmt: { zh: "其中 MIDI 模型", en: "incl. MIDI models", ja: "うち MIDI モデル" },
+            stRuntimes: { zh: "训练环境包", en: "Training runtime packs", ja: "トレーニングランタイム" },
+            stCudaRuntime: { zh: "CUDA 推理运行时", en: "CUDA inference runtime", ja: "CUDA 推論ランタイム" },
+            assetDeleteTitle: { zh: "删除「{pack}」？", en: "Delete \"{pack}\"?", ja: "「{pack}」を削除しますか？" },
+            assetDeleteBody: { zh: "将删除该资产包下载的全部文件（不会碰你自己导入的模型）。需要时可以随时重新下载。", en: "This removes every file this asset pack downloaded (your own imported models are untouched). You can download it again at any time.", ja: "このアセットパックがダウンロードした全ファイルを削除します（自分で取り込んだモデルには触れません）。必要になればいつでも再ダウンロードできます。" },
+            assetDeleteBodyRequired: { zh: "⚠ 这是推理必需的模型包：删除后「音色替换」和「人声渲染」都将无法使用，直到重新下载（约 1.4GB）。\n将删除该资产包下载的全部文件（不会碰你自己导入的模型）。", en: "⚠ This pack is REQUIRED for inference: after deleting it, voice conversion and vocal rendering stop working until you download it again (~1.4 GB).\nThis removes every file this asset pack downloaded (your own imported models are untouched).", ja: "⚠ これは推論に必須のモデルパックです。削除すると、再ダウンロード（約 1.4GB）するまで「音声変換」と「ボーカルレンダリング」が使用できなくなります。\nこのアセットパックがダウンロードした全ファイルを削除します（自分で取り込んだモデルには触れません）。" },
+            stRuntimesNote: { zh: "在下方「训练环境」面板管理", en: "Managed in the Training Runtime panel below", ja: "下の「トレーニング環境」パネルで管理" },
+            stDicts: { zh: "发音词典（必需）", en: "G2P dictionaries (required)", ja: "発音辞書（必須）" },
+            stTotal: { zh: "合计", en: "Total", ja: "合計" },
+            stErrTraining: { zh: "训练进行中，无法清理", en: "Training is running — cleanup unavailable", ja: "トレーニング中はクリーンアップできません" },
+            stErrBusy: { zh: "渲染/试听进行中，稍后再试", en: "Rendering/audition in flight — try again later", ja: "レンダリング/試聴中です。後でもう一度お試しください" },
+            stErrWsMissing: { zh: "工作区不存在（可能已被删除）", en: "Workspace not found (already deleted?)", ja: "ワークスペースが見つかりません" },
+            rtTitle: { zh: "训练环境（内嵌 Python 运行时）", en: "Training Runtime (embedded Python)", ja: "トレーニング環境（内蔵 Python）" },
+            // S115 §F5-2. ⚠ Plain text only — these render as text nodes (settings-note / a <span>
+            // inside a <label>), NOT as markdown, so no `**` here (the house rule that bit S91).
+            diagTitle: { zh: "诊断", en: "Diagnostics", ja: "診断" },
+            diagToggle: { zh: "诊断模式（训练会明显变慢）", en: "Diagnostic mode (training becomes noticeably slower)", ja: "診断モード（学習が目に見えて遅くなります）" },
+            diagNote: {
+                zh: "只在复现问题时打开。开启后训练子进程会以同步方式启动 GPU 计算，崩溃时报出的位置才是真正出错的地方；代价是整个训练过程都会变慢。复现完记得关掉。",
+                en: "Turn this on only while reproducing a problem. It makes the training subprocess launch GPU work synchronously, so a crash reports where it actually happened — at the cost of a slower run from start to finish. Turn it off once you have reproduced it.",
+                ja: "問題を再現するときだけオンにしてください。学習サブプロセスが GPU 処理を同期実行するようになり、クラッシュ時に本当に落ちた場所が報告されます。その代わり学習全体が遅くなります。再現できたらオフに戻してください。",
+            },
+            diagOnNote: {
+                zh: "诊断模式当前开启中 —— 训练会明显变慢。下次开始训练时生效，日志开头会写明这一次具体启用了什么。",
+                en: "Diagnostic mode is currently ON — training will be noticeably slower. It applies to the NEXT run, and the log records exactly what that run enabled.",
+                ja: "診断モードは現在オンです——学習は目に見えて遅くなります。次回の実行から有効になり、そのとき何を有効にしたかがログの先頭に記録されます。",
+            },
+            diagOpenLogs: { zh: "打开日志文件夹", en: "Open log folder", ja: "ログフォルダーを開く" },
+            songTitle: { zh: "歌曲生成", en: "Song Generation", ja: "楽曲生成" },
+            songResidentMode: { zh: "常驻模式（保持 sidecar 进程存活）", en: "Resident mode (keep sidecar alive)", ja: "常駐モード（サイドカーを維持）" },
+            songResidentModeNote: { zh: "默认关闭。开启后，Python 进程会在生成间保持存活，避免每次重新加载约 8GB 模型（首次加载耗时 20~30 秒）；但进程会在空闲超时后自动卸载模型到 CPU 以释放显存（仅保留进程和已导入的 torch 包，节省 Python 启动开销）。", en: "OFF by default. When enabled, the Python process stays alive between generations to avoid reloading ~8GB of models every time (first load takes 20–30s); idle timeout auto-unloads models to CPU to release VRAM (keeps process + imported torch, skips Python startup cost).", ja: "既定ではオフ。オンにすると、Python プロセスは生成間で存続し、約 8GB のモデルを毎回再読み込みする必要がなくなります（初回ロード 20～30 秒）。アイドルタイムアウトでモデルを CPU にアンロードして VRAM を解放（プロセスとインポート済み torch は維持し、Python 起動コストを省略）。" },
+            songIdleTimeout: { zh: "空闲超时（秒）", en: "Idle timeout (seconds)", ja: "アイドルタイムアウト（秒）" },
+            songIdleTimeoutNote: { zh: "最小 60 秒。超时后模型会卸载到 CPU 以释放显存，下次生成时自动重新加载到 GPU（约 5~8 秒）。", en: "Minimum 60s. After timeout, models unload to CPU to release VRAM; next generation auto-reloads to GPU (~5–8s).", ja: "最小 60 秒。タイムアウト後、モデルは CPU にアンロードされ VRAM を解放します。次の生成時に GPU へ自動再ロード（約 5～8 秒）。" },
+            songDaemonRunning: { zh: "常驻进程运行中（PID {pid}）", en: "Resident process running (PID {pid})", ja: "常駐プロセス実行中（PID {pid}）" },
+            songDaemonIdle: { zh: "当前没有常驻进程——下次生成时按需启动", en: "No resident process — it starts on demand at the next generation", ja: "常駐プロセスなし——次の生成時に必要に応じて起動します" },
+            songDaemonRelease: { zh: "立即释放显存", en: "Release VRAM now", ja: "VRAM を今すぐ解放" },
+            songDaemonReleasing: { zh: "释放中…", en: "Releasing…", ja: "解放中…" },
+            diagSubmit: {
+                zh: "复现之后，把日志文件夹里当天的日志交给我们，就能定位问题。",
+                en: "After reproducing it, send us that day's file from the log folder and we can locate the fault.",
+                ja: "再現できたら、ログフォルダー内のその日のログをお送りください。原因を特定できます。",
+            },
+            rtRoot: { zh: "运行时目录", en: "Runtime folder", ja: "ランタイムフォルダ" },
+            rtAsciiWarn: { zh: "数据目录路径含非英文字符——内嵌 Python/torch 在此类路径下会加载失败。请先在「存储位置」迁移到纯英文路径（如 D:\\UtaiData）。", en: "Data folder path contains non-ASCII characters — the embedded Python/torch will fail to load there. Migrate the data folder to an ASCII-only path first.", ja: "データフォルダに非 ASCII 文字が含まれています。内蔵 Python/torch が読み込めないため、英数字のみのパスへ移行してください。" },
+            rtTestPass: { zh: "自检通过", en: "Self-test passed", ja: "セルフテスト合格" },
+            rtTestFail: { zh: "自检未通过", en: "Self-test failed", ja: "セルフテスト不合格" },
+            rtTestNone: { zh: "未自检", en: "Not tested", ja: "未テスト" },
+            rtTest: { zh: "自检", en: "Self-test", ja: "セルフテスト" },
+            rtTesting: { zh: "自检中…", en: "Testing…", ja: "テスト中…" },
+            rtDelete: { zh: "删除", en: "Delete", ja: "削除" },
+            rtDeleting: { zh: "删除中…", en: "Deleting…", ja: "削除中…" },
+            rtDeleteTitle: { zh: "删除运行时包", en: "Delete runtime pack", ja: "ランタイムパックを削除" },
+            rtDeleteBody: { zh: "该运行时包将从磁盘删除（之后可重新下载或从本地文件安装）。", en: "The pack will be removed from disk (it can be re-downloaded or re-installed later).", ja: "ディスクから削除されます（後で再ダウンロード/再インストール可能）。" },
+            rtCancelBtn: { zh: "取消", en: "Cancel", ja: "キャンセル" },
+            rtDownload: { zh: "下载", en: "Download", ja: "ダウンロード" },
+            rtNotPublished: { zh: "在线包尚未发布——可用「从本地文件安装」。", en: "Online pack not published yet — use “Install from local file”.", ja: "オンライン版は未公開——「ローカルから」をご利用ください。" },
+            rtLocalInstall: { zh: "从本地文件安装…", en: "Install from local file…", ja: "ローカルからインストール…" },
+            rtCancel: { zh: "取消安装", en: "Cancel install", ja: "インストール中止" },
+            rtExperimental: { zh: "实验性", en: "Experimental", ja: "実験的" },
+            rtNote: { zh: "模型转换与训练使用此内嵌运行时（无需系统 Python）。GPU 训练包（NVIDIA 20-50 系 / AMD / Intel）按阶段加入。", en: "Model conversion and training run on this embedded runtime (no system Python needed). GPU packs (NVIDIA 20-50 / AMD / Intel) arrive in stages.", ja: "モデル変換とトレーニングはこの内蔵ランタイムで実行されます。GPU 版は段階的に追加されます。" },
+            rtRecommend: { zh: "本机推荐变体", en: "Recommended variant", ja: "推奨バリアント" },
+            rtPackLabel_cpu: { zh: "CPU 运行时（模型转换基座 + CPU 训练）", en: "CPU runtime (model conversion base + CPU training)", ja: "CPU ランタイム（モデル変換基盤 + CPU トレーニング）" },
+            rtPackLabel_nv_cu130: { zh: "NVIDIA 运行时（cu130；RTX 20-50 训练 + 模型转换）", en: "NVIDIA runtime (cu130; RTX 20-50 training + conversion)", ja: "NVIDIA ランタイム（cu130；RTX 20-50 トレーニング + 変換）" },
+            // S167 (§F6): v2 wording — RDNA3 exactly (RX 7000 dGPUs + 780M-class iGPUs); the old
+            // "RDNA3/4" over-promised (RDNA4 has zero kernels in this pack line).
+            rtPackLabel_amd: { zh: "AMD 运行时（ROCm；RX 7000 系 + 780M 族核显训练 + 模型转换）", en: "AMD runtime (ROCm; RX 7000 series + 780M-class iGPU training + conversion)", ja: "AMD ランタイム（ROCm；RX 7000 シリーズ + 780M 系 iGPU トレーニング + 変換）" },
+            rtPackLabel_xpu: { zh: "Intel 运行时（XPU；Arc 训练 + 模型转换）", en: "Intel runtime (XPU; Arc training + conversion)", ja: "Intel ランタイム（XPU；Arc トレーニング + 変換）" },
+            // pyenv-progress channel (code+params → text; zh reproduces the pre-i18n wording)
+            pgFetchManifest: { zh: "获取包清单...", en: "Fetching pack manifest...", ja: "パックマニフェストを取得中..." },
+            pgDownloading: { zh: "下载", en: "Downloading", ja: "ダウンロード中" },
+            pgExtracting: { zh: "解压运行时包...", en: "Extracting runtime pack...", ja: "ランタイムパックを展開中..." },
+            pgFiles: { zh: "个文件", en: "files", ja: "ファイル" },
+            pgEnvtest: { zh: "运行环境自检...", en: "Running environment self-test...", ja: "環境セルフテストを実行中..." },
+            pgVerify: { zh: "校验分卷 sha256...", en: "Verifying part sha256...", ja: "分割ファイルの sha256 を検証中..." },
+            pgVerifySkipped: { zh: "未找到 manifest——跳过校验（仅建议用于本地构建的包）", en: "No manifest found — verification skipped (only recommended for locally built packs)", ja: "manifest が見つかりません——検証をスキップします（ローカルビルドのパックのみ推奨）" },
+            pgInstallDone: { zh: "安装完成，自检通过。", en: "Install complete; self-test passed.", ja: "インストール完了、セルフテスト合格。" },
+            pgInstalledSkipped: { zh: "已安装（取消跳过了自检——可在列表中手动自检）。", en: "Installed (cancel skipped the self-test — run it manually from the pack list).", ja: "インストール済み（キャンセルによりセルフテストをスキップ——リストから手動で実行できます）。" },
+            pgInstalledFailed: { zh: "已安装，但自检未通过：", en: "Installed, but the self-test failed: ", ja: "インストール済みですが、セルフテスト不合格：" },
+            srcTitle: { zh: "下载源 / 网络", en: "Download Source / Network", ja: "ダウンロードソース / ネットワーク" },
+            srcHF: { zh: "HuggingFace（默认）", en: "HuggingFace (default)", ja: "HuggingFace（既定）" },
+            srcMirror: { zh: "HF Mirror (hf-mirror.com) — 中国大陆加速", en: "HF Mirror (hf-mirror.com) — China mainland", ja: "HF Mirror (hf-mirror.com) — 中国本土" },
+            srcCustom: { zh: "自定义", en: "Custom", ja: "カスタム" },
+            srcNote: { zh: "声音 / 分离模型的下载来源，中国大陆建议选 HF Mirror。训练运行时包已自动在 HuggingFace 与镜像间回退，无需在此设置。", en: "Where voice/separation models download from — HF Mirror is recommended in mainland China. Runtime packs already auto-fail-over between HuggingFace and the mirror.", ja: "モデルのダウンロード元。中国本土では HF Mirror 推奨。トレーニングランタイムは自動でフェイルオーバーします。" },
+            srcTest: { zh: "测试连接", en: "Test connection", ja: "接続テスト" },
+            srcTesting: { zh: "测试中…", en: "Testing…", ja: "テスト中…" },
+            srcOk: { zh: "通畅", en: "Good", ja: "良好" },
+            srcSlow: { zh: "偏慢", en: "Slow", ja: "やや遅い" },
+            srcThrottled: { zh: "疑似被限速 / 干扰（大文件可能失败）", en: "Throttled / interfered (large downloads may fail)", ja: "スロットリング / 妨害の疑い（大容量は失敗する可能性）" },
+            srcUnreachable: { zh: "不通", en: "Unreachable", ja: "接続不可" },
+            srcHttpErr: { zh: "源拒绝 / 无测试文件", en: "Rejected / no test file", ja: "拒否 / テストファイルなし" },
+            // GitHub-mirror sub-block (the two preset options show their domain literally —
+            // not translated; the custom option reuses srcCustom, same label ONE source).
+            ghSrcTitle: { zh: "GitHub 镜像", en: "GitHub Mirror", ja: "GitHub ミラー" },
+            ghDirect: { zh: "官方直连", en: "Direct", ja: "直接接続" },
+            ghNote: { zh: "作用于 GitHub 直链下载（分离模型、MIDI 引擎等）。加速代理为社区公共服务，随时可能失效；不可用时请填自定义前缀。", en: "Applies to direct GitHub downloads (separation models, MIDI engine, …). The preset proxies are community-run public services and may vanish; enter a custom prefix if they stop working.", ja: "GitHub 直リンクのダウンロード（分離モデル、MIDI エンジンなど）に適用されます。プリセットのプロキシはコミュニティ運営の公共サービスで、突然使えなくなることがあります。その場合はカスタムプレフィックスを入力してください。" },
+        };
+        return map[key]?.[lang] ?? map[key]?.en ?? key;
+    };
+    /** Catalog labels live in Rust (single catalog source) but as data, not copy —
+     *  translate per variant here, falling back to the backend label for variants
+     *  this build doesn't know yet. */
+    const packLabel = (c) => {
+        const key = `rtPackLabel_${c.variant.replace(/-/g, "_")}`;
+        const v = L(key);
+        return v === key ? c.label : v;
+    };
+    const srcTestLabel = (r) => {
+        const speed = r.bytes > 0 ? ` · ${r.mbps.toFixed(2)} MB/s` : "";
+        if (r.verdict === "ok")
+            return L("srcOk") + speed;
+        if (r.verdict === "slow")
+            return L("srcSlow") + speed;
+        if (r.verdict === "throttled")
+            return L("srcThrottled") + speed;
+        if (r.verdict === "http_error")
+            return L("srcHttpErr") + (r.http_status ? ` (${r.http_status})` : "");
+        // PROBE_* codes localize via the app-wide backend-error map (raw fallback).
+        return L("srcUnreachable") + (r.error ? ` — ${backendErrText(r.error)}` : "");
+    };
+    /** S74b: a disabled GPU option carries WHY it is disabled, localized from the backend's
+     *  stable reason CODE. Device names themselves stay unlocalized (hardware identifiers). */
+    const gpuOptionLabel = (o) => {
+        if (o.selectable)
+            return o.label;
+        const why = o.reason === "CC_UNSUPPORTED" ? L("gpuUnsupportedCc")
+            : o.reason === "CC_UNKNOWN" ? L("gpuUnknownCc")
+                : o.reason === "SOFTWARE_ADAPTER" ? L("gpuSoftwareAdapter")
+                    : o.reason === "DUPLICATE_ADAPTER" ? L("gpuDuplicateAdapter")
+                        : null;
+        return why ? `${o.label} — ${why}` : o.label;
+    };
+    /** pyenv-progress line: localized from the stable code+params; raw message fallback
+     *  (older/legacy emits carry no code). */
+    const progressText = (p) => {
+        const P = p.params ?? [];
+        switch (p.code) {
+            case "STAGE_FETCH_MANIFEST": return L("pgFetchManifest");
+            case "STAGE_DOWNLOADING": return `${L("pgDownloading")} ${P[0] ?? ""}  ${P[1] ?? "?"} / ${P[2] ?? "?"} MB`;
+            case "STAGE_EXTRACTING": return P[0] ? `${L("pgExtracting")} ${P[0]} ${L("pgFiles")}` : L("pgExtracting");
+            case "STAGE_ENVTEST": return L("pgEnvtest");
+            case "STAGE_VERIFY": return L("pgVerify");
+            case "STAGE_VERIFY_SKIPPED": return L("pgVerifySkipped");
+            case "INSTALL_DONE": return L("pgInstallDone");
+            case "INSTALLED_ENVTEST_SKIPPED": return L("pgInstalledSkipped");
+            // params[0] = the inner envtest error (itself CODE-bearing) — localize it too.
+            case "INSTALLED_ENVTEST_FAILED": return L("pgInstalledFailed") + (P[0] ? backendErrText(P[0]) : "");
+            default: return p.message;
+        }
+    };
+    return (_jsxs("aside", { className: "settings-panel", style: panelStyle, children: [_jsxs("div", { className: "panel-header", onMouseDown: startDrag, children: [_jsx("span", { className: "panel-title", children: L("title") }), _jsx("button", { className: "panel-close", onClick: onClose, children: "X" })] }), _jsx(PanelResizeHandles, { start: startResize }), _jsxs("div", { className: "settings-content", children: [_jsxs("section", { className: "settings-section", children: [_jsx("h3", { className: "settings-section-title", children: L("language") }), _jsx("div", { className: "settings-field", children: _jsxs("select", { value: lang, onChange: (e) => handleLangChange(e.target.value), children: [_jsx("option", { value: "zh", children: "\u7B80\u4F53\u4E2D\u6587" }), _jsx("option", { value: "en", children: "English" }), _jsx("option", { value: "ja", children: "\u65E5\u672C\u8A9E" })] }) }), _jsx("div", { className: "settings-row", style: { marginTop: 12 }, children: _jsx("button", { className: "settings-download-btn", onClick: () => {
+                                        onClose();
+                                        useAppStore.getState().toggleModelManager();
+                                    }, children: L("openResourceManager") }) })] }), _jsxs("section", { className: "settings-section", style: { marginTop: 16 }, children: [_jsx("h3", { className: "settings-section-title", children: L("verTitle") }), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("verCurrent") }), _jsx("span", { className: "settings-value", children: appVersion ? `v${appVersion}` : "…" }), _jsx("button", { className: "settings-mini-btn", disabled: updChecking, onClick: () => void handleUpdateCheck(), children: updChecking ? L("verChecking") : L("verCheckBtn") })] }), updResult?.kind === "latest" && _jsx("div", { className: "settings-note", children: L("verLatest") }), updResult?.kind === "found" && (_jsxs("div", { className: "settings-note", children: [L("verFound"), ": v", updResult.info.version, " ", _jsx("button", { className: "settings-mini-btn", onClick: () => useAppStore.getState().openUpdateDialog(updResult.info), children: L("verView") })] })), updResult?.kind === "error" && _jsx("div", { className: "settings-error", children: updResult.msg }), _jsxs("label", { className: "training-check-row", style: { display: "flex", alignItems: "center", gap: 8, marginTop: 6 }, children: [_jsx("input", { type: "checkbox", checked: autoCheck, onChange: (e) => handleAutoCheckToggle(e.target.checked) }), _jsx("span", { children: L("verAutoCheck") })] })] }), _jsxs("section", { className: "settings-section", style: { marginTop: 16 }, children: [_jsx("h3", { className: "settings-section-title", children: L("hardware") }), hw && (_jsxs("div", { className: "settings-hw-info", children: [_jsxs("div", { className: "settings-row", style: { flexDirection: "column", alignItems: "flex-start", gap: 2 }, children: [_jsx("span", { className: "settings-label", children: L("gpu") }), (hw.gpus?.length
+                                                ? hw.gpus
+                                                : hw.gpu_name.split(", ").map((name) => ({ name, vendor: "" }))).map((g, i) => (_jsxs("span", { className: "settings-value", style: { maxWidth: "100%", display: "flex", gap: 6, alignItems: "center" }, children: [_jsx("span", { style: { minWidth: 0, flex: "0 1 auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: g.name }), g.vendor && g.vendor !== "other" && (_jsx("span", { className: "settings-badge ok", style: { textTransform: "uppercase", flexShrink: 0 }, children: g.vendor }))] }, i)))] }), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("cuda") }), _jsx("span", { className: `settings-badge ${hw.cuda_available ? "ok" : "no"}`, children: hw.cuda_available ? L("yes") : L("no") })] }), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("directml") }), _jsx("span", { className: `settings-badge ${hw.directml_available ? "ok" : "no"}`, children: hw.directml_available ? L("yes") : L("no") })] })] })), _jsxs("div", { className: "settings-field", children: [_jsx("label", { children: L("epLabel") }), _jsxs("select", { value: device, onChange: (e) => handleDeviceChange(e.target.value), children: [_jsx("option", { value: "auto", children: L("auto") }), _jsx("option", { value: "cuda", disabled: !hw?.cuda_available || !hw?.cuda_supported, children: L("cudaOpt") }), _jsx("option", { value: "directml", disabled: !hw?.directml_available, children: L("dmlOpt") }), _jsx("option", { value: "cpu", children: L("cpuOpt") })] }), saving && _jsx("span", { className: "settings-saving", children: "..." })] }), (device === "cuda" || device === "directml" || device === "auto") &&
+                                (() => {
+                                    const opts = device === "cuda" ? gpuLists?.cuda : gpuLists?.directml;
+                                    if (!opts || opts.length === 0)
+                                        return null;
+                                    if (device === "auto") {
+                                        // S75: "stale" is not only "that id is gone" — a pick that is still LISTED but
+                                        // has become unselectable (S75 marks duplicate NVIDIA adapters that way) steers
+                                        // the backend just as dangling. Without this, a single-GPU box whose only other
+                                        // entry is the shadow drops to <2 selectable, hides the row, and leaves the
+                                        // stored pick pointing at the shadow with no affordance to clear it.
+                                        const picked = autoGpu === null ? null : opts.find((o) => o.id === autoGpu);
+                                        const stale = autoGpu !== null && !picked?.selectable;
+                                        // Hide the row on single-GPU boxes (nothing to prefer) — but NEVER while
+                                        // a stale pick is stored: the row is the only affordance to clear it
+                                        // (review round 2: hiding it left a dangling pick steering the backend).
+                                        if (opts.filter((o) => o.selectable).length < 2 && !stale)
+                                            return null;
+                                        return (_jsxs("div", { className: "settings-field", children: [_jsx("label", { children: L("gpuPick") }), _jsxs("select", { value: autoGpu === null ? "" : String(autoGpu), onChange: (e) => handleAutoGpuPick(e.target.value === "" ? null : Number(e.target.value)), children: [_jsx("option", { value: "", children: L("gpuAutoPick") }), stale && (_jsx("option", { value: String(autoGpu), disabled: true, children: L("gpuGone").replace("{id}", String(autoGpu)) })), opts.map((o) => (_jsx("option", { value: String(o.id), disabled: !o.selectable, children: gpuOptionLabel(o) }, o.id)))] })] }));
+                                    }
+                                    // A configured id can outlive its adapter (card removed / driver change
+                                    // shrank the index space) — surface it instead of a blank select; the
+                                    // engine still targets the stale ordinal until the user re-picks.
+                                    const stale = !opts.some((o) => o.id === deviceId);
+                                    return (_jsxs("div", { className: "settings-field", children: [_jsx("label", { children: L("gpuPick") }), _jsxs("select", { value: String(deviceId), onChange: (e) => handleGpuPick(Number(e.target.value)), children: [stale && (_jsx("option", { value: String(deviceId), disabled: true, children: L("gpuGone").replace("{id}", String(deviceId)) })), opts.map((o) => (_jsx("option", { value: String(o.id), disabled: !o.selectable, children: gpuOptionLabel(o) }, o.id)))] })] }));
+                                })(), hw &&
+                                (() => {
+                                    const autoVendor = device === "auto" && autoGpu !== null
+                                        ? gpuLists?.directml.find((o) => o.id === autoGpu)?.vendor
+                                        : undefined;
+                                    const mismatch = restartWouldChangeOrtBuild({
+                                        device,
+                                        ortBuild: hw.ort_build,
+                                        autoVendor,
+                                        cudaSupported: hw.cuda_supported,
+                                        cudaReady,
+                                    });
+                                    return mismatch ? (_jsx("p", { className: "settings-error", children: L("buildMismatch").replace("{build}", hw.ort_build) })) : null;
+                                })(), _jsx("p", { className: "settings-note", children: L("note") })] }), _jsxs("section", { className: "settings-section", style: { marginTop: 16 }, children: [_jsx("h3", { className: "settings-section-title", children: L("storage") }), _jsxs("div", { className: "settings-field", style: { flexDirection: "column", alignItems: "flex-start", gap: 2 }, children: [_jsx("label", { children: L("dataDir") }), _jsx("span", { className: "settings-value", style: { maxWidth: "100%", wordBreak: "break-all", fontSize: 11 }, children: dataDir || "…" })] }), dataDirIssue && (_jsx("p", { className: "settings-error", style: { wordBreak: "break-all" }, children: (dataDirIssue.fell_back ? L("stDirFellBack") : L("stDirRecreated")).replace("{configured}", dataDirIssue.configured) })), _jsxs("div", { className: "settings-field", children: [_jsx("button", { className: "settings-btn", onClick: handleRelocate, disabled: relocating || migratePending, style: { padding: "5px 12px", cursor: migratePending ? "not-allowed" : "pointer" }, children: relocating ? L("relocating") : migratePending ? L("relocatePendingBtn") : L("relocate") }), migratePending && (_jsx("button", { className: "settings-btn", onClick: () => void runExitFlow("restart"), style: { padding: "5px 12px", cursor: "pointer" }, children: L("restartNow") }))] }), migratePending && _jsx("p", { className: "settings-note", children: L("relocatePendingNote") }), relocateMsg === "migrated" && _jsx("p", { className: "settings-note", children: L("relocated") }), relocateMsg === "error: training" && _jsx("p", { className: "settings-note", style: { color: "var(--color-error)" }, children: L("stErrTraining") }), relocateMsg?.startsWith("error:") && relocateMsg !== "error: training" && _jsx("p", { className: "settings-note", style: { color: "var(--color-error)" }, children: relocateMsg }), _jsx("p", { className: "settings-note", children: L("dataDirNote") })] }), _jsxs("section", { className: "settings-section", style: { marginTop: 16 }, children: [_jsx("h3", { className: "settings-section-title", children: L("stTitle") }), !storage && _jsx("p", { className: "settings-note", children: storageScanning ? L("stScanning") : "…" }), storage && (_jsxs("div", { className: "settings-hw-info settings-storage", children: [_jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stCache") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.cache_bytes) }), _jsx("button", { className: "settings-mini-btn", disabled: cleanBusy !== null || cacheCleanBlocked, title: cacheCleanBlocked ? L("stCacheBlocked") : undefined, onClick: handleCleanCache, children: cleanBusy === "cache" ? L("stCleaning") : L("stClean") })] }), _jsxs("button", { className: "settings-mini-btn", style: { alignSelf: "flex-start", marginTop: 2 }, onClick: () => {
+                                            if (!cacheAudit)
+                                                void refreshCacheAudit();
+                                            setCacheAuditOpen((v) => !v);
+                                        }, children: [cacheAuditOpen ? "▾" : "▸", " ", L("stEntryHeader"), cacheAudit ? ` · ${fmtSize(cacheAudit.totalBytes)}` : ""] }), cacheAuditOpen && (_jsxs("div", { className: "settings-cache-audit", children: [_jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stOversized") }), _jsx("button", { className: "settings-mini-btn", disabled: cleanBusy !== null || cacheCleanBlocked, title: cacheCleanBlocked ? L("stCacheBlocked") : undefined, onClick: handleCleanOversizedCache, children: cleanBusy === "cache_oversized" ? L("stCleaning") : L("stOversizedClean") })] }), auditingCache && _jsx("p", { className: "settings-note", children: L("stScanning") }), !auditingCache && cacheAudit && cacheAudit.entries.length === 0 && (_jsx("p", { className: "settings-note", children: L("stEntryEmpty") })), !auditingCache && cacheAudit?.entries.map((e) => (_jsxs("div", { className: "settings-row", children: [_jsxs("span", { className: "settings-label", style: { flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: e.name, children: [e.kind === "dir" ? "📁 " : "📄 ", e.name] }), _jsx("span", { className: "settings-value", children: fmtSize(e.bytes) }), _jsx("button", { className: "settings-mini-btn", 
+                                                        // usp_work 是当前打开工程的工作媒体,后端拒绝单删 — 按钮直接禁用而非触发错误。
+                                                        disabled: cleanBusy !== null || cacheCleanBlocked || e.name === "usp_work", title: e.name === "usp_work" ? L("stUspWorkProtected") : cacheCleanBlocked ? L("stCacheBlocked") : undefined, onClick: () => handleCleanCacheEntry(e.name, e.bytes), children: cleanBusy === `cache_entry:${e.name}` ? L("stCleaning") : L("stClean") })] }, e.name)))] })), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stAudition") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.audition_bytes) }), _jsx("button", { className: "settings-mini-btn", disabled: cleanBusy !== null || trainingBusy, onClick: handleCleanAudition, children: cleanBusy === "audition" ? L("stCleaning") : L("stClean") })] }), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stLogs") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.logs_bytes) }), _jsx("button", { className: "settings-mini-btn", disabled: cleanBusy !== null, onClick: handleCleanLogs, children: cleanBusy === "logs" ? L("stCleaning") : L("stClean") })] }), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stModels") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.models_bytes) })] }), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stMsst") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.msst_bytes) })] }), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stAmt") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.amt_bytes) })] }), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stRuntimes") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.runtimes_bytes) })] }), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stTraining") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.training_bytes) })] }), storage.workspaces.length === 0 && (_jsx("p", { className: "settings-note", style: { margin: "2px 0 0" }, children: L("stWsNone") })), storage.workspaces.map((ws) => (
+                                    // Column skeleton (main row + detail rows) — the same shape the licensed asset
+                                    // pack uses. ⚠ The expander is the BUTTON'S TEXT PREFIX, never a separate
+                                    // element: `.settings-storage .settings-row > :first-child` grants the flexible,
+                                    // ellipsised column BY POSITION, so an arrow element would take it and turn the
+                                    // project name into an unshrinkable block — the measured S75 failure (per-character
+                                    // wrapping in zh/ja, en overflowing into a horizontal scrollbar at 340px).
+                                    _jsxs("div", { className: "settings-asset-pack", children: [_jsxs("div", { className: "settings-row", children: [_jsxs("span", { className: "settings-value", title: `${ws.name} (${ws.slug})`, children: [ws.name, ws.family ? ` · ${ws.family}` : "", ws.has_pool ? ` · ${L("stWsPool")}` : "", ws.needs_attention ? ` · ${L("stWsAttention")}` : ""] }), _jsx("span", { className: "settings-value", children: fmtSize(ws.bytes) }), _jsxs("button", { className: "settings-mini-btn", onClick: () => toggleWs(ws.slug), children: [expandedWs.has(ws.slug) ? "▾ " : "▸ ", L("stExpand")] })] }), expandedWs.has(ws.slug) && (_jsxs(_Fragment, { children: [ws.dataset_bytes > 0 && (_jsxs("div", { className: "settings-row settings-ws-sub", children: [_jsx("span", { className: "settings-value", children: L("stDataset") }), _jsx("span", { className: "settings-value", children: fmtSize(ws.dataset_bytes) })] })), ws.slots.map((sl) => (_jsxs("div", { className: "settings-row settings-ws-sub", children: [_jsx("span", { className: "settings-value", title: L("stSnapCount").replace("{n}", String(sl.snapshots)), children: sl.family }), _jsx("span", { className: "settings-value", children: fmtSize(sl.bytes) }), sl.snapshots > 0 && (_jsx("button", { className: "settings-mini-btn", disabled: cleanBusy !== null || trainingBusy, onClick: () => handleCleanSnapshots(ws, sl), children: cleanBusy === `${ws.slug}:snap:${sl.family}`
+                                                                    ? L("stCleaning")
+                                                                    : L("stSnapClean") })), _jsx("button", { className: "settings-mini-btn danger", disabled: cleanBusy !== null || trainingBusy, onClick: () => handleDeleteSlot(ws, sl), children: cleanBusy === `${ws.slug}:${sl.family}`
+                                                                    ? L("stDeleting")
+                                                                    : L("stSlotDelete") })] }, sl.family))), _jsxs("div", { className: "settings-row settings-ws-sub", children: [_jsx("span", { className: "settings-value" }), _jsx("button", { className: "settings-mini-btn danger", disabled: cleanBusy !== null || trainingBusy, onClick: () => handleDeleteWorkspace(ws), children: cleanBusy === ws.slug ? L("stDeleting") : L("stWsDelete") })] })] })), cleanMsg != null && cleanBusy === null && msgOwner === ws.slug && (_jsx("p", { className: "settings-note settings-ws-msg", children: cleanMsg }))] }, ws.slug))), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stModels") }), _jsxs("span", { className: "settings-value", children: [fmtSize(storage.models_bytes), storage.msst_bytes > 0 || storage.amt_bytes > 0 ? "（" : "", storage.msst_bytes > 0 ? `${L("stMsst")} ${fmtSize(storage.msst_bytes)}` : "", storage.msst_bytes > 0 && storage.amt_bytes > 0 ? "；" : "", storage.amt_bytes > 0 ? `${L("stAmt")} ${fmtSize(storage.amt_bytes)}` : "", storage.msst_bytes > 0 || storage.amt_bytes > 0 ? "）" : ""] })] }), _jsx("p", { className: "settings-note", style: { margin: "0 0 4px" }, children: L("stModelsNote") }), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stRuntimes") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.runtimes_bytes) })] }), _jsx("p", { className: "settings-note", style: { margin: "0 0 4px" }, children: L("stRuntimesNote") }), storage.cuda_runtime_bytes > 0 && (_jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stCudaRuntime") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.cuda_runtime_bytes) })] })), _jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("stDicts") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.dictionaries_bytes) })] }), _jsxs("div", { className: "settings-row", style: { borderTop: "1px solid var(--border-subtle)", paddingTop: 4, marginTop: 2 }, children: [_jsx("span", { className: "settings-label", children: L("stTotal") }), _jsx("span", { className: "settings-value", children: fmtSize(storage.cache_bytes + storage.models_bytes + storage.runtimes_bytes + storage.cuda_runtime_bytes + storage.dictionaries_bytes + storage.training_bytes + storage.logs_bytes + storage.amt_bytes) })] })] })), _jsxs("div", { className: "settings-field", style: { marginTop: 6 }, children: [_jsx("button", { className: "settings-mini-btn", disabled: storageScanning || cleanBusy !== null, onClick: () => void refreshStorage(), children: storageScanning ? L("stScanning") : L("stRefresh") }), cleanMsg && _jsx("span", { className: "settings-value", style: { fontSize: 11 }, children: cleanMsg })] })] }), _jsxs("section", { className: "settings-section", style: { marginTop: 16 }, children: [_jsx("h3", { className: "settings-section-title", children: L("srcTitle") }), _jsxs("div", { className: "settings-source", children: [["huggingface", "hf-mirror", "custom"].map((t) => (_jsxs("label", { className: `settings-source-opt ${mirror.type === t ? "active" : ""}`, children: [_jsx("input", { type: "radio", name: "dlsource", checked: mirror.type === t, onChange: () => setMirror({ type: t, customUrl: mirror.customUrl }) }), _jsx("span", { children: t === "huggingface" ? L("srcHF") : t === "hf-mirror" ? L("srcMirror") : L("srcCustom") })] }, t))), mirror.type === "custom" && (_jsx("input", { type: "text", className: "settings-source-url", placeholder: "https://your-mirror.com", value: mirror.customUrl, onChange: (e) => setMirror({ type: "custom", customUrl: e.target.value }) }))] }), _jsxs("div", { className: "settings-source-test", children: [_jsx("button", { className: "settings-mini-btn", disabled: srcTesting, onClick: handleSrcTest, children: srcTesting ? L("srcTesting") : L("srcTest") }), srcTest && (_jsx("span", { className: `settings-source-result ${srcTest.verdict}`, children: srcTestLabel(srcTest) }))] }), _jsx("p", { className: "settings-note", children: L("srcNote") }), _jsxs("div", { className: "settings-field", style: { marginTop: 4 }, children: [_jsx("label", { children: L("ghSrcTitle") }), _jsxs("div", { className: "settings-source", children: [_jsxs("label", { className: `settings-source-opt ${ghMirror.type === "direct" ? "active" : ""}`, children: [_jsx("input", { type: "radio", name: "ghsource", checked: ghMirror.type === "direct", onChange: () => setGhMirror({ type: "direct", customUrl: ghMirror.customUrl }) }), _jsx("span", { children: L("ghDirect") })] }), ghPresets.map((p) => {
+                                                const active = ghMirror.type === "preset" && ghEffectivePresetId === p.id;
+                                                return (_jsxs("label", { className: `settings-source-opt ${active ? "active" : ""}`, children: [_jsx("input", { type: "radio", name: "ghsource", checked: active, onChange: () => setGhMirror({ type: "preset", presetId: p.id, customUrl: ghMirror.customUrl }) }), _jsx("span", { children: p.id })] }, p.id));
+                                            }), _jsxs("label", { className: `settings-source-opt ${ghMirror.type === "custom" ? "active" : ""}`, children: [_jsx("input", { type: "radio", name: "ghsource", checked: ghMirror.type === "custom", onChange: () => setGhMirror({ type: "custom", customUrl: ghMirror.customUrl }) }), _jsx("span", { children: L("srcCustom") })] }), ghMirror.type === "custom" && (_jsx("input", { type: "text", className: "settings-source-url", placeholder: "https://your-gh-proxy.com", value: ghMirror.customUrl, onChange: (e) => setGhMirror({ type: "custom", customUrl: e.target.value }) }))] })] }), _jsxs("div", { className: "settings-source-test", children: [_jsx("button", { className: "settings-mini-btn", disabled: ghSrcTesting, onClick: handleGhSrcTest, children: ghSrcTesting ? L("srcTesting") : L("srcTest") }), ghSrcTest && (_jsx("span", { className: `settings-source-result ${ghSrcTest.verdict}`, children: srcTestLabel(ghSrcTest) }))] }), _jsx("p", { className: "settings-note", children: L("ghNote") })] }), _jsxs("section", { className: "settings-section", style: { marginTop: 16 }, children: [_jsx("h3", { className: "settings-section-title", children: L("assetTitle") }), assetPacks.map((p) => {
+                                const label = p.id === "aux-inference"
+                                    ? L("assetAux")
+                                    : p.id === "aux-autotune"
+                                        ? L("assetAutotune")
+                                        : p.id === "training-rvc"
+                                            ? L("assetRvc")
+                                            : p.id === "training-sovits-v2"
+                                                ? L("assetSovitsV2")
+                                                : p.id === "training-vocoder"
+                                                    ? L("assetVocoder")
+                                                    : L("assetSovits");
+                                // p.downloading = backend truth (survives a panel remount before the next chunk event).
+                                const isDl = assetActive === p.id || assetProgress?.pack === p.id || p.downloading;
+                                const anyDl = assetActive !== null || assetPacks.some((x) => x.downloading);
+                                return (_jsxs("div", { className: "settings-asset-pack", children: [_jsxs("div", { className: "settings-row settings-asset-row", children: [_jsx("span", { className: "settings-label", children: label }), _jsxs("div", { className: "settings-asset-actions", children: [_jsx("span", { className: `settings-badge ${p.missing === 0 ? "ok" : "no"}`, children: p.missing === 0
+                                                                ? L("assetInstalled")
+                                                                : `${L("assetMissing")} ${p.missing}/${p.fileCount} · ${fmtSize(p.missingBytes)}` }), _jsxs("div", { className: "settings-asset-buttons", children: [p.missing > 0 && !isDl && (_jsx("button", { className: "settings-mini-btn", disabled: anyDl, onClick: () => void handleAssetDownload(p.id), children: L("assetDownload") })), p.missing < p.fileCount && !isDl && (_jsx("button", { className: "settings-mini-btn danger", disabled: anyDl || assetDeleting !== null, onClick: () => void handleAssetDelete(p.id, label), children: assetDeleting === p.id ? L("rtDeleting") : L("rtDelete") })), isDl && (_jsx("button", { className: "settings-mini-btn danger", onClick: () => void invoke("cancel_asset_pack_download").catch(() => { }), children: L("rtCancelBtn") }))] })] })] }), p.license && (_jsxs("button", { className: "settings-asset-license", title: L("assetLicenseTip"), disabled: !p.upstream, onClick: () => { if (p.upstream)
+                                                void openUrl(p.upstream).catch(() => { }); }, children: [_jsx("span", { className: "settings-badge license", children: p.license }), _jsx("span", { className: "settings-asset-license-text", children: L("assetLicenseHint") })] }))] }, p.id));
+                            }), assetProgress && (_jsxs("div", { className: "settings-progress", children: [_jsx("div", { className: "settings-progress-bar", children: _jsx("div", { className: "settings-progress-fill", style: { width: `${assetProgress.total > 0 ? Math.round((assetProgress.downloaded / assetProgress.total) * 100) : 0}%` } }) }), _jsx("span", { className: "settings-progress-text", children: `${assetProgress.fileIndex + 1}/${assetProgress.fileCount} · ${fmtSize(assetProgress.downloaded)} / ${fmtSize(assetProgress.total)}` })] })), assetMsg && _jsx("p", { className: "settings-error", children: assetMsg }), _jsx("p", { className: "settings-note", children: L("assetNote") }), _jsxs("label", { className: "training-check-row", style: { display: "flex", alignItems: "center", gap: 8, marginTop: 6 }, children: [_jsx("input", { type: "checkbox", checked: startupCompCheck, onChange: (e) => handleStartupCompToggle(e.target.checked) }), _jsx("span", { children: L("assetStartupCheck") })] })] }), _jsxs("section", { className: "settings-section", style: { marginTop: 16 }, children: [_jsx("h3", { className: "settings-section-title", children: L("cudaRuntime") }), _jsxs("div", { className: "settings-hw-info", children: [_jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: L("cudaRuntime") }), _jsx("span", { className: `settings-badge ${cudaReady ? "ok" : "no"}`, children: cudaReady ? L("cudaInstalled") : L("cudaNotInstalled") })] }), cudaReady && !cudaDownloading && (_jsx("div", { className: "settings-pack-actions", children: _jsx("button", { className: "settings-mini-btn danger", disabled: cudaDeleting, onClick: handleCudaDelete, children: cudaDeleting ? L("cudaDeleting") : L("cudaDelete") }) }))] }), hw && !hw.cuda_supported && _jsx("p", { className: "settings-note", children: L("cudaUnsupportedNote") }), !cudaReady && !cudaDownloading && hw?.cuda_supported && (_jsxs(_Fragment, { children: [_jsx("button", { className: "settings-download-btn", onClick: handleCudaDownload, children: L("cudaDownload") }), _jsx("p", { className: "settings-note", children: L("cudaNote") })] })), cudaDownloading && cudaProgress && (_jsxs("div", { className: "settings-progress", children: [_jsx("div", { className: "settings-progress-bar", children: _jsx("div", { className: "settings-progress-fill", style: { width: `${Math.round(cudaProgress.progress * 100)}%` } }) }), _jsx("span", { className: "settings-progress-text", children: cudaProgressText(cudaProgress) }), cudaProgress.stage !== "local" && (_jsx("button", { className: "settings-mini-btn", onClick: () => { void invoke("cancel_cuda_download"); }, children: L("cudaCancelDl") }))] })), cudaError && (_jsx("p", { className: "settings-error", children: cudaError })), cudaJustInstalled && (_jsx("p", { className: "settings-note", style: { color: "var(--color-success)" }, children: L("cudaRestart") })), cudaReady && hw?.gpus?.some((g) => g.vendor === "nvidia") && (_jsxs("div", { className: "settings-field", style: { marginTop: 6 }, children: [_jsx("label", { children: L("cudaMemLimit") }), _jsxs("div", { style: { display: "flex", alignItems: "center", gap: 6 }, children: [_jsx("input", { type: "text", className: "settings-source-url", style: { width: 90, flex: "none" }, inputMode: "numeric", value: cudaMemLimitText, placeholder: "0", onChange: (e) => setCudaMemLimitText(e.target.value.replace(/[^0-9]/g, "")), onBlur: () => void commitCudaMemLimit(), onKeyDown: (e) => {
+                                                    if (e.key === "Enter")
+                                                        e.target.blur();
+                                                } }), _jsx("span", { className: "settings-value", style: { maxWidth: "none" }, children: "MB" })] })] })), cudaReady && hw?.gpus?.some((g) => g.vendor === "nvidia") && (_jsx("p", { className: "settings-note", children: L("cudaMemLimitNote") })), !cudaDownloading && (_jsx("button", { className: "settings-mini-btn", style: { marginTop: 6 }, onClick: handleCudaLocalInstall, children: L("rtLocalInstall") })), cudaPaths && (_jsxs(_Fragment, { children: [cudaPaths.missing.length > 0 && !cudaDownloading && (_jsxs("p", { className: "settings-note", children: [L("cudaMissing"), ": ", cudaPaths.missing.join(" · ")] })), _jsxs("p", { className: "settings-note", style: { userSelect: "text" }, children: [L("cudaLocalNote"), " ", cudaPaths.expectedFiles.join(" · ")] }), _jsxs("div", { className: "settings-field", style: { flexDirection: "column", alignItems: "flex-start", gap: 2 }, children: [_jsx("label", { children: L("cudaDllDir") }), _jsx("span", { className: "settings-value selectable", style: { maxWidth: "100%", wordBreak: "break-all", whiteSpace: "normal", fontSize: 11 }, children: cudaPaths.dllDir }), _jsx("label", { style: { marginTop: 2 }, children: L("cudaOrtDir") }), _jsx("span", { className: "settings-value selectable", style: { maxWidth: "100%", wordBreak: "break-all", whiteSpace: "normal", fontSize: 11 }, children: cudaPaths.ortDir })] })] }))] }), _jsxs("section", { className: "settings-section", style: { marginTop: 16 }, children: [_jsx("h3", { className: "settings-section-title", children: L("rtTitle") }), rt && (_jsxs(_Fragment, { children: [_jsxs("div", { className: "settings-field", style: { flexDirection: "column", alignItems: "flex-start", gap: 2 }, children: [_jsx("label", { children: L("rtRoot") }), _jsx("span", { className: "settings-value", style: { maxWidth: "100%", wordBreak: "break-all", whiteSpace: "normal", fontSize: 11 }, children: rt.root || "…" })] }), !rt.root_ascii_ok && _jsx("p", { className: "settings-error", children: L("rtAsciiWarn") }), rt.packs.length > 0 && (_jsx("div", { className: "settings-hw-info", children: rt.packs.map((p) => (_jsxs("div", { className: "settings-pack", children: [_jsxs("div", { className: "settings-row", children: [_jsx("span", { className: "settings-label", children: p.variant }), _jsx("span", { className: `settings-badge ${!p.supported || p.envtest_stale ? "no" : p.envtest?.overall === "pass" ? "ok" : "no"}`, children: !p.supported
+                                                                ? L("rtUnsupported")
+                                                                : p.envtest_stale
+                                                                    ? L("rtTestStale")
+                                                                    : p.envtest
+                                                                        ? (p.envtest.overall === "pass" ? L("rtTestPass") : L("rtTestFail"))
+                                                                        : L("rtTestNone") })] }), p.supported && p.envtest_stale && (_jsx("span", { className: "settings-note selectable", style: { textAlign: "left", maxWidth: "100%" }, children: L("rtStaleNote") })), !p.supported && (_jsx("span", { className: "settings-error", style: { textAlign: "left", maxWidth: "100%", wordBreak: "break-word" }, children: L(p.variant === "nv-cu130" ? "rtWhyNv"
+                                                        : p.variant === "amd" ? "rtWhyAmd"
+                                                            : p.variant === "xpu" ? "rtWhyXpu"
+                                                                : "rtWhyGeneric") })), _jsxs("span", { className: "settings-value", style: { textAlign: "left", maxWidth: "100%" }, children: [p.id, " \u00B7 torch ", p.torch || "?", " \u00B7 py ", p.python || "?", " \u00B7 ", fmtGB(p.disk_bytes)] }), (p.envtest?.items ?? [])
+                                                    .filter((it) => it.status === "fail" || it.status === "warn")
+                                                    .map((it) => {
+                                                    // Checks whose failure the user must act on emit a stable CODE → a
+                                                    // localized remedy. Everything else is an integrity diagnostic whose
+                                                    // remedy is uniform (reinstall the pack): show a localized sentence and
+                                                    // present the check's raw text AS technical detail rather than letting a
+                                                    // Chinese diagnostic pose as the user-facing message in an en/ja UI.
+                                                    // A WARN deliberately does NOT flip `overall` (envtest.py: "warns do NOT
+                                                    // flip overall"), so labelling it "did not pass" stated two contradictory
+                                                    // verdicts on one card. Separate wording per status.
+                                                    const generic = it.status === "warn" ? L("selfTestCheckWarn") : L("selfTestCheckFailed");
+                                                    const localized = it.detail ? backendErrorMessage(it.detail) : null;
+                                                    const text = localized ?? (it.detail ? `${generic}: ${it.detail}` : generic);
+                                                    return (_jsxs("span", { className: it.status === "fail" ? "settings-error" : "settings-note selectable", style: { textAlign: "left", maxWidth: "100%", wordBreak: "break-word" }, children: [it.name, " \u2014 ", text] }, it.name));
+                                                }), _jsxs("div", { className: "settings-pack-actions", children: [_jsx("button", { className: "settings-mini-btn", disabled: rtBusy || envtesting !== null || deleting !== null, onClick: () => handleRtEnvtest(p.id), children: envtesting === p.id ? L("rtTesting") : L("rtTest") }), _jsx("button", { className: "settings-mini-btn danger", disabled: rtBusy || envtesting !== null || deleting !== null, onClick: () => handleRtDelete(p.id), children: deleting === p.id ? L("rtDeleting") : L("rtDelete") })] })] }, p.id))) })), rt.catalog.filter((c) => !c.installed && c.supported).map((c) => (_jsxs("div", { className: "settings-field", children: [_jsxs("label", { children: [packLabel(c), c.experimental ? `（${L("rtExperimental")}）` : ""] }), c.downloadable ? (_jsxs("button", { className: "settings-download-btn", disabled: rtBusy || envtesting !== null || deleting !== null, onClick: () => handleRtDownload(c.id), children: [L("rtDownload"), "\uFF08~", fmtGB(c.download_bytes), " / ", L("rtRoot"), " ", fmtGB(c.disk_bytes), "\uFF09"] })) : (_jsx("p", { className: "settings-note", children: L("rtNotPublished") }))] }, c.id))), _jsxs("div", { className: "settings-pack-actions", children: [_jsx("button", { className: "settings-mini-btn", disabled: rtBusy || envtesting !== null || deleting !== null, onClick: handleRtLocalInstall, children: L("rtLocalInstall") }), rtBusy && (_jsx("button", { className: "settings-mini-btn danger", onClick: () => { invoke("cancel_runtime_install").catch(() => { }); }, children: L("rtCancel") }))] }), _jsx("p", { className: "settings-note", children: L("rtLocalNote") }), rtBusy && rtProgress && (_jsxs("div", { className: "settings-progress", children: [_jsx("div", { className: "settings-progress-bar", children: _jsx("div", { className: "settings-progress-fill", style: { width: `${Math.round(Math.min(1, Math.max(0, rtProgress.progress)) * 100)}%` } }) }), _jsx("span", { className: "settings-progress-text", children: progressText(rtProgress) })] })), rtNotice && !rtBusy && (_jsx("p", { className: "settings-note", style: rtNotice.code === "INSTALL_DONE" ? { color: "var(--color-success)" } : undefined, children: progressText(rtNotice) })), rtError && _jsx("p", { className: "settings-error", children: rtError }), _jsxs("p", { className: "settings-note", children: [L("rtNote"), hw?.recommended_variant ? ` ${L("rtRecommend")}: ${hw.recommended_variant}` : ""] })] }))] }), _jsxs("section", { className: "settings-section", style: { marginTop: 16 }, children: [_jsx("h3", { className: "settings-section-title", children: L("diagTitle") }), _jsxs("label", { className: "training-check-row", style: { display: "flex", alignItems: "center", gap: 8, marginTop: 6 }, children: [_jsx("input", { type: "checkbox", checked: diagMode, onChange: (e) => handleDiagToggle(e.target.checked) }), _jsx("span", { children: L("diagToggle") })] }), _jsx("p", { className: "settings-note", children: L("diagNote") }), diagMode && _jsx("p", { className: "settings-error", children: L("diagOnNote") }), _jsx("div", { className: "settings-row", style: { marginTop: 6 }, children: _jsx("button", { className: "settings-mini-btn", onClick: () => void invoke("open_log_dir").catch(() => { }), children: L("diagOpenLogs") }) }), _jsx("p", { className: "settings-note", children: L("diagSubmit") })] }), _jsxs("section", { className: "settings-section", style: { marginTop: 16 }, children: [_jsx("h3", { className: "settings-section-title", children: L("songTitle") }), _jsxs("label", { className: "training-check-row", style: { display: "flex", alignItems: "center", gap: 8, marginTop: 6 }, children: [_jsx("input", { type: "checkbox", checked: songResidentMode, onChange: (e) => handleSongResidentToggle(e.target.checked) }), _jsx("span", { children: L("songResidentMode") })] }), _jsx("p", { className: "settings-note", children: L("songResidentModeNote") }), songResidentMode && (_jsxs("div", { className: "settings-field", style: { marginTop: 6 }, children: [_jsx("label", { children: L("songIdleTimeout") }), _jsxs("div", { style: { display: "flex", alignItems: "center", gap: 6 }, children: [_jsx("input", { type: "text", className: "settings-source-url", style: { width: 90, flex: "none" }, inputMode: "numeric", value: songIdleTimeoutText, placeholder: "300", onChange: (e) => setSongIdleTimeoutText(e.target.value.replace(/[^0-9]/g, "")), onBlur: () => void commitSongIdleTimeout(), onKeyDown: (e) => {
+                                                    if (e.key === "Enter")
+                                                        e.target.blur();
+                                                } }), _jsx("span", { className: "settings-value", style: { maxWidth: "none" }, children: "\u79D2" })] }), _jsx("p", { className: "settings-note", style: { marginTop: 6 }, children: L("songIdleTimeoutNote") })] })), _jsx("div", { className: "settings-field", style: { marginTop: 6 }, children: _jsx("span", { className: "settings-value", style: { maxWidth: "none", fontSize: 11 }, children: songDaemonStatus?.running
+                                        ? L("songDaemonRunning").replace("{pid}", String(songDaemonStatus.pid ?? "?"))
+                                        : L("songDaemonIdle") }) }), songDaemonStatus?.running && (_jsx("div", { className: "settings-field", children: _jsx("button", { className: "settings-btn", onClick: () => void releaseSongDaemon(), disabled: songDaemonBusy, style: { padding: "5px 12px", cursor: songDaemonBusy ? "not-allowed" : "pointer" }, children: songDaemonBusy ? L("songDaemonReleasing") : L("songDaemonRelease") }) }))] })] })] }));
+}

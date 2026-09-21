@@ -16,6 +16,7 @@ import { backendErrorMessage, isBusyError } from "../lib/backendError";
 import { hfBaseForMirror } from "../lib/models/msst-catalog";
 import { useAppStore, type ConfirmButton } from "./app";
 import { useMsstModelStore } from "./msst-models";
+import { isTauri } from "../lib/tauri";
 
 /** Mirror of Rust `commands::training::RequiredAssetStatus` (S66 pre-start asset check). */
 interface RequiredAssetStatus {
@@ -703,8 +704,11 @@ const DEFAULT_CONFIG: TrainingFormConfig = {
   vocAugCopies: 0,
 };
 
-/** Client-side mirror of the Rust history cap: thin to half when exceeded. */
-const HISTORY_CAP = 40000;
+/** Client-side mirror of the Rust `training::HISTORY_CAP` (15_000): thin to half when
+ *  exceeded. Must stay in lockstep with the backend cap, otherwise `refresh()` re-merges a
+ *  local tail far longer than the authoritative history and the loss curve never flattens
+ *  back down after a long run. */
+const HISTORY_CAP = 15_000;
 
 interface TrainingStoreState {
   snapshot: TrainingSnapshot;
@@ -949,6 +953,9 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   },
 
   refresh: async () => {
+    // No Tauri → no backend → nothing to refresh. Bail silently so dev-preview
+    // doesn't spam "Cannot read properties of undefined (reading 'invoke')" errors.
+    if (!isTauri()) return;
     try {
       const snapshot = await invoke<TrainingSnapshot>("get_training_status");
       const history = await invoke<StepPoint[]>("get_training_history");
@@ -1242,62 +1249,74 @@ let installing = false;
  *  and duplicate every history point + toast). */
 export async function setupTrainingListeners() {
   if (unlistens || installing) return;
+  // No Tauri WebView → no Rust event bridge → nothing to listen for.
+  // Bail early so dev-preview / E2E / accidental-browser-open doesn't spam the console
+  // with "Cannot read properties of undefined (reading 'invoke')" every reload.
+  if (!isTauri()) return;
   installing = true;
-  unlistens = await Promise.all([
-    listen<StageInfo>("training-stage", (e) => {
-      useTrainingStore.setState((s) => ({
-        snapshot: { ...s.snapshot, stage: e.payload },
-      }));
-    }),
-    listen<StepInfo>("training-step", (e) => {
-      useTrainingStore.setState((s) => {
-        let history = s.history;
-        if (history.length >= HISTORY_CAP) {
-          history = history.filter((_, i) => i % 2 === 0);
-        }
-        // NB: snapshotAt is NOT touched here — it anchors the elapsed
-        // extrapolation to the last full refresh (elapsed_secs base); resetting
-        // it per step would freeze the displayed elapsed at the base value
-        return {
-          snapshot: { ...s.snapshot, state: "running", step: e.payload },
-          history: [
-            ...history,
-            { step: e.payload.step, lr: e.payload.lr, losses: e.payload.losses },
-          ],
-        };
-      });
-    }),
-    listen<CkptInfo>("training-ckpt", (e) => {
-      useTrainingStore.setState((s) => {
-        const kept =
-          e.payload.kind === "best" || e.payload.kind === "final"
-            ? s.snapshot.ckpts.filter((c) => c.kind !== e.payload.kind)
-            : s.snapshot.ckpts;
-        return { snapshot: { ...s.snapshot, ckpts: [...kept, e.payload] } };
-      });
-    }),
-    listen<TrainingSnapshot>("training-done", (e) => {
-      useTrainingStore.setState({ snapshot: e.payload, snapshotAt: Date.now() });
-      const t = i18n.t.bind(i18n);
-      const app = useAppStore.getState();
-      if (e.payload.state === "completed") {
-        app.showToast(t("training.doneCompleted"), "success");
-      } else if (e.payload.state === "stopped") {
-        app.showToast(t("training.doneStopped"), "info");
-      } else if (e.payload.state === "error") {
-        // snapshot.error carries the run_worker's stable CODE strings — localize known ones.
-        const err = e.payload.error ?? "";
-        app.showToast(`${t("training.doneError")}: ${backendErrorMessage(err) ?? err}`, "error");
-      }
-      // the final force-emitted step may have landed Rust-side only — resync once
-      void useTrainingStore.getState().refresh();
-    }),
-    listen<string>("training-state", (e) => {
-      if (e.payload === "running") {
+  try {
+    unlistens = await Promise.all([
+      listen<StageInfo>("training-stage", (e) => {
         useTrainingStore.setState((s) => ({
-          snapshot: { ...s.snapshot, state: "running" },
+          snapshot: { ...s.snapshot, stage: e.payload },
         }));
-      }
-    }),
-  ]);
+      }),
+      listen<StepInfo>("training-step", (e) => {
+        useTrainingStore.setState((s) => {
+          let history = s.history;
+          if (history.length >= HISTORY_CAP) {
+            history = history.filter((_, i) => i % 2 === 0);
+          }
+          // NB: snapshotAt is NOT touched here — it anchors the elapsed
+          // extrapolation to the last full refresh (elapsed_secs base); resetting
+          // it per step would freeze the displayed elapsed at the base value
+          return {
+            snapshot: { ...s.snapshot, state: "running", step: e.payload },
+            history: [
+              ...history,
+              { step: e.payload.step, lr: e.payload.lr, losses: e.payload.losses },
+            ],
+          };
+        });
+      }),
+      listen<CkptInfo>("training-ckpt", (e) => {
+        useTrainingStore.setState((s) => {
+          const kept =
+            e.payload.kind === "best" || e.payload.kind === "final"
+              ? s.snapshot.ckpts.filter((c) => c.kind !== e.payload.kind)
+              : s.snapshot.ckpts;
+          return { snapshot: { ...s.snapshot, ckpts: [...kept, e.payload] } };
+        });
+      }),
+      listen<TrainingSnapshot>("training-done", (e) => {
+        useTrainingStore.setState({ snapshot: e.payload, snapshotAt: Date.now() });
+        const t = i18n.t.bind(i18n);
+        const app = useAppStore.getState();
+        if (e.payload.state === "completed") {
+          app.showToast(t("training.doneCompleted"), "success");
+        } else if (e.payload.state === "stopped") {
+          app.showToast(t("training.doneStopped"), "info");
+        } else if (e.payload.state === "error") {
+          // snapshot.error carries the run_worker's stable CODE strings — localize known ones.
+          const err = e.payload.error ?? "";
+          app.showToast(`${t("training.doneError")}: ${backendErrorMessage(err) ?? err}`, "error");
+        }
+        // the final force-emitted step may have landed Rust-side only — resync once
+        void useTrainingStore.getState().refresh();
+      }),
+      listen<string>("training-state", (e) => {
+        if (e.payload === "running") {
+          useTrainingStore.setState((s) => ({
+            snapshot: { ...s.snapshot, state: "running" },
+          }));
+        }
+      }),
+    ]);
+  } catch {
+    /* Not in a Tauri WebView — no event listeners available. reset sentinel so
+       a real-Tauri restart has a clean shot (setupTrainingListeners is only
+       called once at App mount, but in dev HMR can re-run it). */
+    installing = false;
+    unlistens = null;
+  }
 }

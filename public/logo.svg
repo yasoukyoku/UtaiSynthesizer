@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Muno 标准版:深空蓝圆角方底 + 白色声波音符 + 荧光青点缀 -->
+  <rect x="0" y="0" width="1024" height="1024" rx="190" fill="#1E2A4A"/>
+  <g fill="#FFFFFF">
+    <!-- 音符头(旋转椭圆) -->
+    <g transform="rotate(-20 372 692)">
+      <ellipse cx="372" cy="692" rx="128" ry="92"/>
+    </g>
+    <!-- 符干 -->
+    <rect x="496" y="232" width="42" height="468" rx="18"/>
+    <!-- 符尾:向上折线(声波) -->
+    <polyline points="520,268 606,312 660,214 742,258 792,158 864,200"
+      fill="none" stroke="#FFFFFF" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <!-- 右下青点(AI 辅助) -->
+  <circle cx="837" cy="837" r="69" fill="#00D4AA"/>
+</svg>

@@ -332,16 +332,7 @@ export function isSilentLyric(lyric: string, tokens: VocalTokens): boolean {
   return isRestLyric(lyric, tokens.rest) || isBreathLyric(lyric, tokens.breath);
 }
 
-// ⛔ S170 — U+3099 / U+309A (COMBINING 濁点/半濁点) belong here for exactly the reason every other
-// member does: they are legal ONLY after a base kana, so they ride on the token before them. They are
-// not exotic — they are the NFD spelling of が/ぱ/ゔ, which is what macOS, several text pipelines and
-// some importers hand you. Without them an NFD phrase was scattered one combining mark per note, each
-// painted OOV-red, while the identical text in NFC distributed correctly: two spellings of the same
-// lyric, two behaviours, no error message. (Rust's `kana_tokenize` composes them — `compose_kana_marks`
-// in score2cv.rs — so the split has to keep them attached for the two halves to agree.)
-// ⚠ the two marks are written as escapes on purpose: a combining character inside a string literal
-// visually glues itself to whatever precedes it, so the next reader cannot see how many there are.
-const SMALL_KANA = new Set([..."ぁぃぅぇぉゃゅょゎっゕゖァィゥェォャュョヮッ", "゙", "゚"]);
+const SMALL_KANA = new Set([..."ぁぃぅぇぉゃゅょゎっゕゖァィゥェォャュョヮッ"]);
 
 /** Split a typed lyric phrase into per-note tokens (§9.2 auto-distribute). Whitespace-separated first;
  *  else an all-kana run splits per mora (a base kana + trailing small kana); an all-Han run splits per
@@ -437,10 +428,16 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     consonantEmphasis: clampNum(p.consonantEmphasis ?? NaN, 0, 12, DEFAULT_CONSONANT_EMPHASIS_DB),
     // S84 C 刀: consonant-valley scale knob (×per-class depth on chain-internal boundaries; 0 = off).
     consonantValley: clampNum(p.consonantValley ?? NaN, 0, 2, DEFAULT_CONSONANT_VALLEY),
+    // Phase 7 ① 高频激励(UI 存百分数 0-15 → Rust 吃 0-0.15,映射侧 /100;0 = off)。
+    voiceRealism: clampNum(p.voiceRealism ?? NaN, 0, 15, 0),
+    // Phase 7 ② 共振峰微颤(0-8 → 0-0.08;0 = off)。
+    formantJitter: clampNum(p.formantJitter ?? NaN, 0, 8, 0),
     // S84 E 刀: vowel clarity toggle — only false is stored (absent≡true, autoTuneFollow pattern).
     ...(p.vowelClarity === false ? { vowelClarity: false } : {}),
     // S89 「自动音素时序」 — same fold: only false is stored (absent≡true = the S83 onset pre-roll).
     ...(p.consonantPreroll === false ? { consonantPreroll: false } : {}),
+    // Phase 7 ③ 气息层 — same fold: only false is stored (absent≡true = ≥520 ms SP 间隙合成吸气)。
+    ...(p.breathLayer === false ? { breathLayer: false } : {}),
     // S91 「音素约定」 — an UNKNOWN value from a newer build must land on the DEFAULT (words), never
     // be carried through: an unrecognised convention would reach Rust, fall back there too, and the
     // project would silently round-trip a setting that does nothing. Whitelist, not passthrough.

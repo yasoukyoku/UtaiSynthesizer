@@ -472,7 +472,7 @@ fn parse_ustx(bytes: &[u8]) -> Result<ImportedScore, String> {
             .iter()
             .map(|(t, dur, n)| {
                 let lyric = n.lyric.trim();
-                let lyric = if lyric.is_empty() { "あ".to_string() } else { lyric.to_string() };
+                let lyric = if lyric.is_empty() { "啊".to_string() } else { lyric.to_string() };
                 ImportedNote {
                     tick: t - base,
                     duration: *dur,
@@ -505,7 +505,7 @@ fn decode_midi_text(bytes: &[u8]) -> String {
 
 /// Close the oldest open note-on for `key` (FIFO — first-on/first-off, the MIDI convention), pushing a
 /// finished (start, end, pitch, lyric) tuple. Zero-length notes are dropped. A missing stashed lyric
-/// (or an empty one) becomes the placeholder "あ" (lyric-less midi requirement).
+/// (or an empty one) becomes the placeholder "啊" (lyric-less midi requirement).
 fn close_note(
     open: &mut std::collections::HashMap<u8, Vec<(i64, Option<String>)>>,
     raw: &mut Vec<(i64, i64, i32, String)>,
@@ -518,7 +518,7 @@ fn close_note(
             if end > start {
                 let lyric = match lyric_opt {
                     Some(l) if !l.trim().is_empty() => l,
-                    _ => "あ".to_string(),
+                    _ => "啊".to_string(),
                 };
                 raw.push((start, end, key as i32, lyric));
             }
@@ -886,7 +886,7 @@ voice_parts:
         use midly::{Header, Format, MetaMessage, MidiMessage, Smf, Timing, Track, TrackEvent, TrackEventKind};
 
         // PPQ = 240 → our tick = midi * 2. Build 3 tracks: a tempo/meter master, a note track with a
-        // lyric, and a note track WITHOUT a lyric (→ placeholder あ).
+        // lyric, and a note track WITHOUT a lyric (→ placeholder 啊).
         let mut smf = Smf::new(Header::new(Format::Parallel, Timing::Metrical(u15::new(240))));
 
         // Track 0: tempo (120 bpm = 500000 us/qn) + time-sig 3/4, no notes → skipped.
@@ -905,7 +905,7 @@ voice_parts:
         mel.push(TrackEvent { delta: u28::new(0), kind: TrackEventKind::Meta(MetaMessage::EndOfTrack) });
         smf.tracks.push(mel);
 
-        // Track 2: no name, a note WITHOUT a lyric at midi-tick 0 for 480 ticks (→ placeholder あ).
+        // Track 2: no name, a note WITHOUT a lyric at midi-tick 0 for 480 ticks (→ placeholder 啊).
         let mut plain: Track = Vec::new();
         plain.push(TrackEvent { delta: u28::new(0), kind: TrackEventKind::Midi { channel: u4::new(0), message: MidiMessage::NoteOn { key: u7::new(72), vel: u7::new(90) } } });
         plain.push(TrackEvent { delta: u28::new(480), kind: TrackEventKind::Midi { channel: u4::new(0), message: MidiMessage::NoteOn { key: u7::new(72), vel: u7::new(0) } } });
@@ -928,11 +928,11 @@ voice_parts:
         assert_eq!(mel.notes[0].duration, 480); // 240 midi ticks * 2
         assert_eq!(mel.notes[0].pitch, 60);
         assert_eq!(mel.notes[0].lyric, "か");
-        // Track 2: lyric-less note → placeholder あ; PPQ scaling 480 midi → 960 our.
+        // Track 2: lyric-less note → placeholder 啊; PPQ scaling 480 midi → 960 our.
         let plain = &s.tracks[1];
         assert_eq!(plain.name, ""); // no TrackName → empty; the frontend names it by the file (+ index)
         assert_eq!(plain.start_tick, 0);
-        assert_eq!(plain.notes[0].lyric, "あ");
+        assert_eq!(plain.notes[0].lyric, "啊");
         assert_eq!(plain.notes[0].duration, 960);
         assert_eq!(plain.notes[0].pitch, 72);
     }

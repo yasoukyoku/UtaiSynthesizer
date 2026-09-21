@@ -68,6 +68,17 @@
   border-color: var(--color-warning);
 }
 
+.wf-preset-select {
+  font-size: 11px;
+  height: 24px;
+  max-width: 150px;
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-default);
+  padding: 0 4px;
+  font-family: var(--font-mono);
+}
+
 .wf-error {
   font-size: 10px;
   color: var(--color-error);
@@ -76,6 +87,18 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 规划 6-5 链路 SNR 徽标:整条工作流的保真度估计,实时随旁通切换刷新 */
+.wf-chain-snr {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  border: 1px solid var(--border-default);
+  border-radius: 3px;
+  padding: 1px 6px;
+  white-space: nowrap;
+  cursor: help;
 }
 
 .workflow-close {
@@ -101,6 +124,33 @@
   flex: 1;
   display: flex;
   overflow: hidden;
+  position: relative;
+}
+
+/* 左侧节点面板的折叠/展开按钮：竖排在面板与画布之间；折叠后贴左侧。 */
+.palette-collapse {
+  flex: 0 0 auto;
+  align-self: stretch;
+  width: 14px;
+  padding: 0;
+  border: none;
+  border-left: 1px solid var(--border-subtle);
+  border-right: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  font-size: 8px;
+  cursor: pointer;
+  writing-mode: vertical-rl;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.palette-collapse.open {
+  border-left: none;
+}
+.palette-collapse:hover {
+  color: var(--accent-primary);
+  background: var(--bg-hover);
 }
 
 .workflow-canvas {
@@ -139,6 +189,29 @@
   box-shadow: 0 0 0 1px var(--accent-primary), 0 0 16px rgba(57, 197, 187, 0.15);
 }
 
+/* 批量选择: Shift+拖拽的框选矩形 + 「已选中 N 个节点」浮标(浮标仅提示,不拦截指针)。 */
+.workflow-canvas .react-flow__selection {
+  background: rgba(57, 197, 187, 0.08);
+  border: 1px dashed var(--accent-primary);
+}
+
+.wf-batch-badge {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  padding: 3px 10px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--accent-primary);
+  background: var(--bg-panel);
+  border: 1px solid var(--accent-primary);
+  border-radius: 3px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
 /* S66 手感: bigger square ports (xyflow's base sheet rounds them 100% — force the house
    angular look), a 24px INVISIBLE hit zone (::after participates in the handle's pointer
    hit-testing, so grabbing a wire no longer needs pixel-precision), and hover/connect glow.
@@ -150,6 +223,31 @@
   border-radius: 1px;
   background: var(--accent-primary);
   border: 2px solid var(--bg-surface);
+  transition: all 0.15s ease;
+}
+
+.workflow-canvas .react-flow__handle[data-port-type="audio"] {
+  background: #4CAF50;
+}
+
+.workflow-canvas .react-flow__handle[data-port-type="midi"] {
+  background: #2196F3;
+}
+
+.workflow-canvas .react-flow__handle[data-port-type="chords"] {
+  background: #FF9800;
+}
+
+.workflow-canvas .react-flow__handle[data-port-type="lyrics"] {
+  background: #E91E63;
+}
+
+.workflow-canvas .react-flow__handle[data-port-type="report"] {
+  background: #9C27B0;
+}
+
+.workflow-canvas .react-flow__handle[data-port-type="any"] {
+  background: #9E9E9E;
 }
 
 .workflow-canvas .react-flow__handle::after {
@@ -227,4 +325,99 @@
 
 .workflow-canvas .react-flow__minimap {
   border: 1px solid var(--border-subtle);
+}
+
+/* 快捷键提示面板 */
+.wf-shortcuts-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wf-shortcuts-panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  width: 90%;
+  max-width: 700px;
+  max-height: 80vh;
+  overflow: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.wf-shortcuts-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-lg);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.wf-shortcuts-header h3 {
+  margin: 0;
+  font-size: var(--font-size-lg);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.wf-shortcuts-close {
+  background: none;
+  border: none;
+  font-size: 24px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wf-shortcuts-close:hover {
+  color: var(--text-primary);
+}
+
+.wf-shortcuts-content {
+  padding: var(--space-lg);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--space-xl);
+}
+
+.wf-shortcuts-section h4 {
+  margin: 0 0 var(--space-md) 0;
+  font-size: var(--font-size-sm);
+  color: var(--accent-secondary);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.wf-shortcut-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) 0;
+  font-size: var(--font-size-sm);
+}
+
+.wf-shortcut-item kbd {
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+
+.wf-shortcut-item span {
+  color: var(--text-secondary);
+  flex: 1;
 }

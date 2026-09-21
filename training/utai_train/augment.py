@@ -35,8 +35,6 @@ import os
 import re
 import random
 import traceback
-from . import stage_codes
-from . import prep_codes
 
 import numpy as np
 
@@ -111,15 +109,11 @@ def psola_shift(x, sr, semitones):
     y = np.asarray(out.values[0], dtype=np.float32)
 
     if np.any(~np.isfinite(y)):
-        raise RuntimeError(
-            "%s: non-finite samples in PSOLA output: n=%d sr=%d shift=%+.2fst"
-            % (prep_codes.PSOLA_OUTPUT_INVALID_CODE, y.size, sr, semitones)
-        )
+        raise RuntimeError("PSOLA 输出包含非有限样本")
     tol = max(int(0.0125 * sr), 512)  # ~one 512@44.1k hop
     if abs(len(y) - len(x)) > tol:
         raise RuntimeError(
-            "%s: PSOLA output length drift too large: %d -> %d (tol %d)"
-            % (prep_codes.PSOLA_OUTPUT_INVALID_CODE, len(x), len(y), tol)
+            "PSOLA 输出长度漂移过大: %d -> %d" % (len(x), len(y))
         )
     if len(y) > len(x):
         y = y[: len(x)]
@@ -437,7 +431,7 @@ def run_f0_gate(entries, load_f0_fn, remove_products_fn, reporter, stop,
                 os.remove(report_path)
             except OSError:
                 pass
-        reporter.stage("aug_check", done=1, total=1, message=stage_codes.NO_AUGMENT, force=True)
+        reporter.stage("aug_check", done=1, total=1, message="无增强样本", force=True)
         return 0, 0
 
     kept = 0

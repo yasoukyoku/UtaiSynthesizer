@@ -84,14 +84,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 logging.getLogger("numba").setLevel(logging.WARNING)
 
-# S172: True on NVIDIA (where the autotune pays for itself), False on ROCm. Measured on
-# our AMD box with the production MIOPEN_FIND_MODE=5 pin: True costs +2.275 s of
-# first-encounter MIOpen search across three conv shapes (1.79x) and gives back
-# steady-state times identical within noise — pure cost, and it scales with the number
-# of distinct shapes, which variable-length audio keeps creating.
-# ⚠ NOT the community report's "stuck 30 minutes on step 1": that does not reproduce
-# here, because FIND_MODE=5 already bounds the search. This is a perf fix, not a rescue.
-torch.backends.cudnn.benchmark = torch.version.hip is None
+torch.backends.cudnn.benchmark = True
 
 # EMA over ~100 steps; same policy as the RVC trainer (see its header)
 BEST_EMA_ALPHA = 2.0 / (100.0 + 1.0)

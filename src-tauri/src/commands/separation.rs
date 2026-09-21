@@ -9,9 +9,7 @@ pub async fn run_msst_separation(
     state: State<'_, Arc<AppState>>,
     config: SeparationConfig,
 ) -> Result<(), String> {
-    // No clear_completed() pre-pass any more: reaping a finished predecessor and admitting the new
-    // job are ONE critical section inside start() now (see SeparationManager::reap_finished). The
-    // two-call shape was a check-then-act across two independent lock acquisitions.
+    state.separation.clear_completed();
     state
         .separation
         .start(config, &state.inference.engine)

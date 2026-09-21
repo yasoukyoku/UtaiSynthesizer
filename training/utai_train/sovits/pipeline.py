@@ -50,8 +50,6 @@ from .extract import extract_all
 from .flist import build_config, build_filelists, resolve_speakers
 from .preprocess import slice_and_resample
 from .train import train
-from .. import stage_codes
-from .. import config_codes
 
 logger = logging.getLogger(__name__)
 
@@ -108,14 +106,7 @@ def run(cfg, reporter, stop):
     assets = cfg["assets"]
     version = cfg["version"]
     if version not in VERSION_ENCODER:
-        raise RuntimeError(
-            "%s: sovits version=%s expected=%s"
-            % (
-                config_codes.BAD_SOVITS_VERSION_CODE,
-                version,
-                "|".join(sorted(VERSION_ENCODER)),
-            )
-        )
+        raise RuntimeError("非法 SoVITS 版本: %s（可选 4.1/4.0）" % version)
     encoder = VERSION_ENCODER[version]
     seed = int(cfg.get("seed", 1234))
     fp16 = bool(cfg.get("fp16", False)) and backend == "cuda"
@@ -250,7 +241,7 @@ def run(cfg, reporter, stop):
             index_rows += rows
 
     stop.check()
-    reporter.stage("train_prep", message=stage_codes.LOADING)
+    reporter.stage("train_prep", message="加载模型与数据，训练即将开始")
     _seed_base_checkpoints(run_dir, cfg)
     summary = train(cfg, run_dir, pool_dir, reporter, stop)
 
@@ -321,10 +312,7 @@ def _seed_base_checkpoints(run_dir, cfg):
             continue
         src = cfg.get(key, "") or ""
         if not src:
-            raise RuntimeError(
-                "%s: run.json asset path empty: %s"
-                % (config_codes.ASSET_PATH_UNSET_CODE, key)
-            )
+            raise RuntimeError("缺少底模路径: %s" % key)
         logger.info("seeding base checkpoint %s -> %s", src, dst_name)
         dst = os.path.join(run_dir, dst_name)
         tmp = dst + ".tmp"

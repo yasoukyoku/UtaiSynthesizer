@@ -1,0 +1,219 @@
+/* ═══════════════════════════════════════════════════
+   🎛 控制台 — 全轨道混音台 (Studio Pro Mixer 风格)
+   底部停靠面板 (非弹窗): 打开后可与页面上的轨道/播放实时交互
+   ═══════════════════════════════════════════════════ */
+
+.mixer-dock {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 384px;
+  background: var(--bg-surface, #16161f);
+  border-top: 1px solid var(--border-default, #444);
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.45);
+  /* 高于轨道参数面板 (900): 控制台打开时浮在其上, 收起后露出 */
+  z-index: 950;
+  display: flex;
+  flex-direction: column;
+  animation: mixerSlideUp 0.18s ease-out;
+}
+@keyframes mixerSlideUp {
+  from { transform: translateY(40px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+
+/* ── HEADER ── */
+.mixer-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--bg-secondary, #20202a);
+  border-bottom: 1px solid var(--border-subtle, #2a2a3a);
+  flex-shrink: 0;
+}
+.mixer-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary, #eee);
+}
+.mixer-hint {
+  flex: 1;
+  font-size: 11px;
+  color: var(--text-tertiary, #888);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mixer-close {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary, #888);
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 15px;
+}
+.mixer-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary, #eee);
+}
+
+/* ── STRIPS ROW ── */
+.mixer-strips {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  padding: 10px 16px;
+  overflow-x: auto;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 每轨通道条 */
+.mixer-strip {
+  flex-shrink: 0;
+  width: 148px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 10px;
+  background: var(--bg-secondary, #1e1e28);
+  border: 1px solid var(--border-subtle, #2a2a3a);
+  border-top: 3px solid var(--accent-primary, #a855f7);
+  border-radius: 6px;
+}
+/* 轨道名 + 序号 — 用轨道头的同款颜色; 最多两行完整显示, 超长 hover 有完整提示 */
+.mixer-strip-name {
+  width: 100%;
+  min-height: 30px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+  text-align: center;
+}
+.mixer-strip-no { opacity: 0.8; margin-right: 2px; }
+
+.mixer-strip-ms {
+  display: flex;
+  gap: 4px;
+}
+.mixer-ms-btn {
+  min-width: 44px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 3px;
+  border: 1px solid var(--border-subtle, #333);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-tertiary, #888);
+  cursor: pointer;
+  padding: 0 6px;
+  transition: all 0.12s;
+}
+.mixer-ms-btn:hover { color: var(--text-primary, #eee); border-color: var(--border-default, #555); }
+.mixer-ms-btn.active-mute { background: #ef4444; border-color: transparent; color: #fff; }
+.mixer-ms-btn.active-solo { background: #f59e0b; border-color: transparent; color: #fff; }
+
+.mixer-strip-fader {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.mixer-strip-db-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+}
+.mixer-strip-db {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-primary, #eee);
+  background: var(--bg-tertiary, #181822);
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border-subtle, #333);
+}
+/* 可点击手动输入 */
+.mixer-strip-db-click {
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+}
+.mixer-strip-db-click:hover {
+  border-color: var(--accent-primary, #a855f7);
+  color: #fff;
+}
+.mixer-strip-db-input {
+  width: 64px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-primary, #eee);
+  background: var(--bg-tertiary, #181822);
+  border: 1px solid var(--accent-primary, #a855f7);
+  border-radius: 3px;
+  text-align: center;
+  padding: 1px 2px;
+  outline: none;
+}
+
+/* 推子 + 分轨电平表 并排 */
+.mixer-fader-meter {
+  display: flex;
+  gap: 5px;
+  align-items: stretch;
+}
+
+.mixer-strip-pan {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+}
+.mixer-mini-label {
+  font-size: 9px;
+  color: var(--text-tertiary, #777);
+}
+
+.mixer-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary, #666);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ── 总输出条 (MASTER) — 宽度与轨道条一致, 推到最右 ── */
+.mixer-master {
+  width: 132px;
+  margin-left: auto;
+  border-top-color: #a855f7;
+  background: linear-gradient(180deg, #1c1530 0%, #16161f 100%);
+}
+.mixer-master-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}

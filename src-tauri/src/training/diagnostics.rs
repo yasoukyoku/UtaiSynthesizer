@@ -24,8 +24,8 @@
 //!   Shipping it would put a variable nothing reads into a list that claims to describe the
 //!   run. An inert member of a self-describing set is worse than no set.
 //! * A log-level change. The `[train-py]` stderr forwarding is `tracing::debug!` with an
-//!   explicit `target: "utai"`, and the FILE layer's filter is `warn,utai=debug` — so python
-//!   tracebacks ALREADY reach `utai.log.<date>` and the in-app panel today. Raising it would
+//!   explicit `target: "muno"`, and the FILE layer's filter is `warn,muno=debug` — so python
+//!   tracebacks ALREADY reach the log file and the in-app panel today. Raising it would
 //!   fix nothing and would dilute the two real warning CODEs.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,7 +136,7 @@ pub fn banner(vars: &[DiagnosticVar], variant: Option<&str>, device_backend: &st
         vars.iter().map(|v| format!("{}={}", v.name, v.value)).collect::<Vec<_>>().join(", ")
     };
     format!(
-        "DIAGNOSTIC MODE is ON for this run — UtaiSynthesizer {} — {} (runtime {}, backend {}). \
+        "DIAGNOSTIC MODE is ON for this run — Muno {} — {} (runtime {}, backend {}). \
          The run will be noticeably slower; turn it off in Settings when you are done.",
         env!("CARGO_PKG_VERSION"),
         set,

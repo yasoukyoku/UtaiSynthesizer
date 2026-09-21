@@ -172,8 +172,15 @@ export interface VocalRenderOptions {
   consonant_valley: number;
   /** S84 E 刀: vowel-clarity articulation oversampling (absent-in-params ≡ true). */
   vowel_clarity: boolean;
-  /** S89 「自动咬字时序」: onset consonants pre-roll ahead of the beat (absent-in-params ≡ true). */
+  /** S89 「自动音素时序」: onset consonants pre-roll ahead of the beat (absent-in-params ≡ true). */
   consonant_preroll: boolean;
+  /** Phase 7 ①: HF-excitation mix — a soft-saturated ≥8 kHz band mixed back in (breath/air).
+   *  Fraction 0-0.15 (the UI stores percent and divides here); 0 = bit-exact no-op. */
+  voice_realism_mix: number;
+  /** Phase 7 ②: allpass formant-jitter depth (slow-LFO timbre drift). Fraction 0-0.08; 0 = no-op. */
+  formant_jitter_depth: number;
+  /** Phase 7 ③: procedural inhale synthesized inside ≥520 ms SP-only gaps (absent-in-params ≡ true). */
+  breath_layer: boolean;
   /** S91 「音素约定」: which UTAU alias convention this track's ENGLISH lyrics use. Omitted/`null` =
    *  words through the dictionary (Rust's `#[serde(default)]` lands there, so an older caller — e.g.
    *  the range-scan literal in rangeTest.ts — is unaffected by construction). */
@@ -859,21 +866,8 @@ export const RANGE_ALGO_VERSION = "s166e";
  *  from (d) because s113 shipped one commit earlier and a bake stamped s113 renders (d) but not (e).
  *  Blast radius over 180 real Japanese scores on disk: ONE note. Truth surface = the shipped
  *  GTSinger annotation, where a `ɴ` held across two notes inside one word occurs 87 times and a
- *  `ɴ` re-opening to a vowel inside one word occurs 0.
- *  (f) s170 — five JA readings changed, and every one of them used to be a SILENT SUCCESS, which is
- *  precisely the case S99 established requires a bump ("the criterion is whether the old behaviour
- *  was an error or a silent success, not how big the change is"): a user can be holding a
- *  signature-clean bake of the WRONG audio.
- *    · くぁくぃくぅくぇくぉ / ぐぁ… / くゎ・クヮ — the /w/ was deleted, so they rendered as the plain
- *      か/が row, phone for phone (community report: 56 notes of one reclist);
- *    · うぁ・いぁ・いぅ・いぉ — same shape one column over, they rendered as a bare vowel;
- *    · てゃてゅてょ・でゃでゅでょ — were `[t j V]`/`[d j V]`, whose ja bigram exposure is 0; the
- *      training labels spell them `ty`/`dy` → `[c V]`/`[ɟ V]` (ja 32..82);
- *    · か゚き゚く゚け゚こ゚ (鼻濁音, U+309A) — the mark was dropped and they sang the UNVOICED か row;
- *    · ⛔ any NFD lyric — a combining U+3099/U+309A was dropped AND truncated the rest of the
- *      phrase, so 「がっこうへいこう」 in NFD rendered as `[k a]` and stopped. This one is not an
- *      exotic column: NFD is what macOS and several importers hand you. */
-export const G2P_ALGO_VERSION = "s170";
+ *  `ɴ` re-opening to a vowel inside one word occurs 0. */
+export const G2P_ALGO_VERSION = "s113b";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a
@@ -1179,6 +1173,9 @@ export function vocalRenderOptions(vp: VocalTrackParams): VocalRenderOptions {
     consonant_valley: vp.consonantValley ?? DEFAULT_CONSONANT_VALLEY,
     vowel_clarity: vp.vowelClarity !== false,
     consonant_preroll: vp.consonantPreroll !== false,
+    voice_realism_mix: (vp.voiceRealism ?? 0) / 100,
+    formant_jitter_depth: (vp.formantJitter ?? 0) / 100,
+    breath_layer: vp.breathLayer !== false,
     phoneme_set: vp.phonemeSet ?? null,
     es_dialect: vp.esDialect ?? null,
     sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },

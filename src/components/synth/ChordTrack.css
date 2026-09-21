@@ -1,0 +1,29 @@
+.chord-track {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.chord-track-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: default;
+}
+
+/* 就地改名单行输入：浮在命中段的块上，白底压住原标签。 */
+.chord-track-edit {
+  position: absolute;
+  top: 3px;
+  height: 18px;
+  padding: 0 4px;
+  border: 1px solid var(--accent-primary);
+  border-radius: 3px;
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  font: bold 11px system-ui, sans-serif;
+  outline: none;
+  z-index: 2;
+}

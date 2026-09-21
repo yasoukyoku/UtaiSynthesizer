@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { NodeShell } from "./NodeShell";
 import { useNodeParams } from "./useNodeParams";
 import { ParamSlider, formatRatio } from "./ParamSlider";
+import { ParamSliderWithUnit } from "./ParamSliderWithUnit";
 import { VoiceModelPicker, SpeakerSelect, SpeakerBlend, useVoiceModelSelection, GpuExtractRow, VocoderSelect, VOICE_STRINGS } from "./VoiceModelPicker";
 import { SOVITS_DEFAULTS, DIFFUSION_METHODS, type SpkMixEntry } from "../../../lib/workflow/voiceDefaults";
 import { voiceHasDiffusion, voiceHasAutoF0, voiceHasRangeRecord, voiceHasSpkMix, governingSpeakerId } from "../../../store/voice-models";
@@ -84,15 +85,17 @@ export function SoVitsNode(props: NodeProps) {
         <VoiceModelPicker models={models} selected={selected} lang={lang} onSelect={handleSelect} />
         {models.length > 0 && (
           <div className="sep-params">
-            <ParamSlider
+            <ParamSliderWithUnit
               label={t18(VOICE_STRINGS.f0Shift, lang)}
+              unitType="semitones"
               title={t18(VOICE_STRINGS.f0ShiftTip, lang)}
               min={-24} max={24} step={1} value={f0Shift}
               onChange={(v) => updateParams({ f0_shift: v })}
             />
             {/* ② 共振腔/formant node scalar — post-decode formant_warp (pitch-preserving timbre shift). */}
-            <ParamSlider
+            <ParamSliderWithUnit
               label={t18({ zh: "共振腔", en: "Formant", ja: "フォルマント" }, lang)}
+              unitType="semitones"
               title={t18({ zh: "共振峰偏移（半音）：正=更亮/更年轻，负=更暗/更浑厚；0=不改。音高不变。", en: "Formant shift (semitones): higher = brighter/younger, lower = darker/fuller; 0 = no change. Pitch is preserved.", ja: "フォルマントシフト（半音）：高い=明るい/若い、低い=暗い/太い、0=変化なし。音高は不変。" }, lang)}
               min={-12} max={12} step={1} value={formant}
               onChange={(v) => updateParams({ formant: v })}
@@ -205,8 +208,9 @@ export function SoVitsNode(props: NodeProps) {
                     onChange={(e) => updateParams({ nsf_enhance: e.target.checked })} />
                 </div>
                 {nsfEnhance && (
-                  <ParamSlider
+                  <ParamSliderWithUnit
                     label={t18({ zh: "音域适应", en: "Adaptive key", ja: "音域適応" }, lang)}
+                    unitType="semitones"
                     title={t18({ zh: "使增强器适应更高的音域（单位：半音）", en: "Adapts the enhancer to a higher range (semitones)", ja: "エンハンサーを高い音域に適応させる（半音単位）" }, lang)}
                     min={-12} max={12} step={1} value={enhancerAdaptiveKey}
                     onChange={(v) => updateParams({ enhancer_adaptive_key: v })}

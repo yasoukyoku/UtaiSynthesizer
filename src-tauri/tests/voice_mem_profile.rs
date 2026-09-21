@@ -1,4 +1,4 @@
-//! Memory-profile harness for the RVC cover pipeline (S67b: community report —
+﻿//! Memory-profile harness for the RVC cover pipeline (S67b: community report —
 //! 16 GB machine, DirectML build, aux on CPU, 264.5 s song → silent crash at 20%
 //! progress = right after the whole-song RMVPE pass, during the first chunk's
 //! ContentVec/net_g). This test reproduces the workload shape and prints a
@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use utai_lib::inference::engine::{DeviceConfig, OnnxEngine};
-use utai_lib::inference::RvcOptions;
+use muno_lib::inference::engine::{DeviceConfig, OnnxEngine};
+use muno_lib::inference::RvcOptions;
 
 fn app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
@@ -30,11 +30,11 @@ fn init_ort() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("muno_lib=info")),
         )
         .try_init();
-    utai_lib::suppress_windows_dll_error_dialogs();
-    utai_lib::setup_cuda_dll_paths(&app_root());
+    muno_lib::suppress_windows_dll_error_dialogs();
+    muno_lib::setup_cuda_dll_paths(&app_root());
     // UTAI_MEM_ORT_DLL: load a SPECIFIC ORT build (e.g. runtime\ort\onnxruntime.dll = the
     // DirectML build the release ships) — dev boxes with CUDA otherwise auto-pick the CUDA
     // build, which has no DirectML provider (same trick as f0.rs's ignored parity test).
@@ -44,7 +44,7 @@ fn init_ort() {
         }
         eprintln!("[mem] ORT loaded from {dll}");
     } else {
-        utai_lib::init_ort_runtime(&app_root());
+        muno_lib::init_ort_runtime(&app_root());
     }
 }
 
@@ -138,7 +138,7 @@ fn spawn_peak_thread(sampler: &Arc<Sampler>, t0: Instant, csv: Option<Arc<parkin
 /// irrelevant to allocator behavior — this exercises shape-dependent DML pool allocation
 /// only). Shared by dml_shape_growth_probe and msst_then_rvc_probe.
 fn run_netg_shape(engine: &OnnxEngine, voice_sid: &str, t: usize) {
-    use utai_lib::inference::engine::InputTensor;
+    use muno_lib::inference::engine::InputTensor;
     let phone: Vec<f32> = (0..t * 768).map(|i| ((i % 997) as f32) / 997.0 - 0.5).collect();
     let pitch: Vec<i64> = (0..t).map(|i| 60 + (i % 40) as i64).collect();
     let pitchf: Vec<f32> = (0..t).map(|i| 220.0 + (i % 40) as f32).collect();
@@ -305,7 +305,7 @@ fn msst_then_rvc_probe() {
     sampler.mark(t0, "start");
 
     // ── separation input: load + tile to `seconds` (mono duplicates to stereo in separate()) ──
-    use utai_lib::separation::pipeline::{load_wav, AudioData, NativePipeline};
+    use muno_lib::separation::pipeline::{load_wav, AudioData, NativePipeline};
     let src = load_wav(&input).expect("load separation input");
     let frames_target = (seconds * src.sample_rate as f64) as usize;
     let tile = |ch: &[f32]| -> Vec<f32> {
@@ -406,7 +406,7 @@ fn rvc_mem_profile() {
     sampler.mark(t0, "start");
 
     // ── input: tile the real vocal to the target duration (user: 264.5 s separated vocal) ──
-    let src = utai_lib::audio::load_audio(&input).expect("load input wav");
+    let src = muno_lib::audio::load_audio(&input).expect("load input wav");
     let frames_target = (seconds * src.sample_rate as f64) as usize;
     let ch = src.channels.max(1) as usize;
     let mut samples = Vec::with_capacity(frames_target * ch);
@@ -414,7 +414,7 @@ fn rvc_mem_profile() {
         let take = (frames_target * ch - samples.len()).min(src.samples.len());
         samples.extend_from_slice(&src.samples[..take]);
     }
-    let audio = utai_lib::audio::AudioBuffer {
+    let audio = muno_lib::audio::AudioBuffer {
         samples,
         sample_rate: src.sample_rate,
         channels: src.channels,
@@ -429,7 +429,7 @@ fn rvc_mem_profile() {
     sampler.mark(t0, "input tiled");
 
     // ── models: mirror run_rvc (aux forced CPU = gpu_extract off, like the reporter) ──
-    let aux = app_root().join("data").join("models").join(utai_lib::models::AUX_DIR_NAME);
+    let aux = app_root().join("data").join("models").join(muno_lib::models::AUX_DIR_NAME);
     let rvc_dir = app_root().join("data").join("models").join("rvc");
     let model = rvc_dir.join("lengv2.3.onnx");
     let sc: serde_json::Value = serde_json::from_str(
@@ -458,10 +458,10 @@ fn rvc_mem_profile() {
     let mel: ndarray::Array2<f32> =
         ndarray_npy::read_npy(aux.join("rmvpe_mel_filters.npy")).expect("mel filters");
     let index =
-        utai_lib::inference::rvc::RvcIndex::load(&rvc_dir.join("lengv2.3.npy")).expect("index");
+        muno_lib::inference::rvc::RvcIndex::load(&rvc_dir.join("lengv2.3.npy")).expect("index");
     sampler.mark(t0, "index loaded");
 
-    let m = utai_lib::inference::rvc::RvcModel {
+    let m = muno_lib::inference::rvc::RvcModel {
         engine: &engine,
         voice_session: &voice_sid,
         contentvec_session: &cv_sid,
@@ -492,7 +492,7 @@ fn rvc_mem_profile() {
         s2.mark(t0, &label);
     };
     let result =
-        utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, None, &progress, &|| false)
+        muno_lib::inference::rvc::run_pipeline(&m, &audio, &options, None, &progress, &|| false)
             .expect("rvc pipeline");
 
     sampler.mark(t0, "returned");

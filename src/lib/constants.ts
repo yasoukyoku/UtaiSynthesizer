@@ -1,5 +1,7 @@
 export const TICKS_PER_BEAT = 480;
 export const PIXELS_PER_TICK = 0.15;
+/** 折叠轨道的默认行高(轨头高度)。64→48:用户反馈要 Studio Pro 式细高轨道头,
+ *  所有布局(computeTrackHeight/getLaneLayout/画布行高)都流经这一个常量,改这里即全局一致。 */
 export const TRACK_HEADER_HEIGHT = 48;
 export const LANE_HEIGHT = 32;
 /** Height of the slim per-组 GROUP BAR above each run of sub-lane rows (group name + the group-level

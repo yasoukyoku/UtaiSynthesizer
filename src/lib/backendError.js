@@ -1,0 +1,693 @@
+import i18n from "../i18n";
+/** Exported for the i18n parity gate ONLY (`src/i18n/parity.test.ts`), which asserts that this
+ *  table and the `backend.*` texts stay bidirectionally closed: a CODE with no text shows the
+ *  user a bare CODE string, a text with no CODE is a dead key. Runtime callers use the
+ *  `backendErrorMessage` / `isBusyError` / `isModalError` helpers below — never this map. */
+export const CODE_KEYS = {
+    // FlightGuard / interlock busy rejections (audition.rs BUSY_RETRY_MSG — 10 commands inherit it).
+    APP_BUSY: { key: "common.busyRetry", busy: true },
+    // Model import/delete refused while an audition holds the model open (models.rs).
+    MODEL_BUSY_AUDITION: { key: "common.busyRetry", busy: true },
+    // Separation single-slot guard (separation/mod.rs) — the TOCTOU backstop behind the pre-flight.
+    SEPARATION_BUSY: { key: "workflow.separationBusy", busy: true },
+    MSST_MODEL_NOT_CONVERTED: { key: "workflow.errSeparationNotConverted" },
+    // Transpose node (utai-stretch wrapper) codes.
+    TRANSPOSE_INPUT_MISSING: { key: "workflow.errTransposeInput" },
+    TRANSPOSE_RANGE: { key: "workflow.errTransposeRange" },
+    TRANSPOSE_FORMANT_RANGE: { key: "workflow.errTransposeFormantRange" },
+    // ── Generated from the S62 full-sweep manifests (4 conversion clusters) — one entry per stable
+    // Rust CODE; texts live under backend.* in src/i18n/{zh,en,ja}.json (TRAINING_NO_DATA reuses the
+    // pre-existing training.needData key). Keep alphabetical; busy flags mark interlock rejections. ──
+    // ── P0 AMT fusion (commands/amt.rs): audio→MIDI sidecar lifecycle failures. ──
+    AMT_CONFIG_ERROR: { key: "backend.AMT_CONFIG_ERROR" },
+    AMT_CONFIG_WRITE_FAILED: { key: "backend.AMT_CONFIG_WRITE_FAILED" },
+    AMT_DELETE_FAILED: { key: "backend.AMT_DELETE_FAILED" },
+    AMT_INVALID_MODE: { key: "backend.AMT_INVALID_MODE" },
+    AMT_KILL_FAILED: { key: "backend.AMT_KILL_FAILED" },
+    AMT_META_PARSE_FAILED: { key: "backend.AMT_META_PARSE_FAILED" },
+    AMT_META_READ_FAILED: { key: "backend.AMT_META_READ_FAILED" },
+    AMT_NO_RESULT: { key: "backend.AMT_NO_RESULT" },
+    AMT_OUTPUT_DIR_FAILED: { key: "backend.AMT_OUTPUT_DIR_FAILED" },
+    AMT_OUTPUT_NOT_FOUND: { key: "backend.AMT_OUTPUT_NOT_FOUND" },
+    AMT_PLAYBACK_PREP_FAILED: { key: "backend.AMT_PLAYBACK_PREP_FAILED" },
+    AMT_READ_FAILED: { key: "backend.AMT_READ_FAILED" },
+    AMT_SHA_FAILED: { key: "backend.AMT_SHA_FAILED" },
+    AMT_SIDECAR_NOT_FOUND: { key: "backend.AMT_SIDECAR_NOT_FOUND" },
+    AMT_SPAWN_FAILED: { key: "backend.AMT_SPAWN_FAILED" },
+    AMT_TRANSCRIPTION_FAILED: { key: "backend.AMT_TRANSCRIPTION_FAILED" },
+    AMT_WAIT_FAILED: { key: "backend.AMT_WAIT_FAILED" },
+    ASSET_DL_BUSY: { key: "backend.ASSET_DL_BUSY", busy: true },
+    ASSET_DL_FAILED: { key: "backend.ASSET_DL_FAILED" },
+    // S74b asset-pack reclamation.
+    ASSET_DELETE_FAILED: { key: "backend.ASSET_DELETE_FAILED" },
+    ASSET_PACK_UNKNOWN: { key: "backend.ASSET_PACK_UNKNOWN" },
+    // P0 AMT fusion: asset-protocol scope grant for the freshly created output folder.
+    ASSET_SCOPE_FAILED: { key: "backend.ASSET_SCOPE_FAILED" },
+    // S74b CUDA-runtime reclamation. IN_USE is a modal: its remedy is a two-step procedure
+    // (change the device preference, restart) that must not be truncated into a toast.
+    CUDA_DELETE_FAILED: { key: "backend.CUDA_DELETE_FAILED" },
+    CUDA_DELETE_IN_USE: { key: "backend.CUDA_DELETE_IN_USE", modal: true },
+    CUDA_DOWNLOAD_BUSY: { key: "backend.CUDA_DOWNLOAD_BUSY", busy: true },
+    CUDA_GPU_REQUIRED: { key: "backend.CUDA_GPU_REQUIRED" },
+    // S74 modal: the GPU's compute capability is outside the window our shipped CUDA build can run
+    // (too-old, or too-new Blackwell/RTX 50 whose sm_120 ships only broken PTX) — actionable
+    // "use DirectML" guidance. Emitted by the inference engine (explicit CUDA + run-time
+    // classification) and the CUDA-runtime download refusal.
+    CUDA_UNSUPPORTED_GPU: { key: "backend.CUDA_UNSUPPORTED_GPU", modal: true },
+    // S74b: the ORT build is fixed at startup — an explicit DirectML pick cannot be honoured by a
+    // process that loaded the CUDA build (registering the DML EP there access-violates), so the
+    // engine refuses instead of probing. Blocking (explicit pick) → modal.
+    DML_NEEDS_RESTART: { key: "backend.DML_NEEDS_RESTART", modal: true },
+    // S66 poisoned-proxy guard (download.rs): a GH proxy answered a download with an HTML page.
+    DOWNLOAD_HTML_RESPONSE: { key: "backend.DOWNLOAD_HTML_RESPONSE" },
+    // S66 CUDA local-file install (settings.rs install_cuda_runtime_local).
+    CUDA_LOCAL_NO_FILES: { key: "backend.CUDA_LOCAL_NO_FILES" },
+    CUDA_LOCAL_UNRECOGNIZED: { key: "backend.CUDA_LOCAL_UNRECOGNIZED" },
+    CUDA_LOCAL_BAD_FILE: { key: "backend.CUDA_LOCAL_BAD_FILE" },
+    // P0-A AMT result workbench: "Download → MIDI (ZIP)" bundle (amt_export_zip).
+    CREATE_ZIP_FAILED: { key: "backend.CREATE_ZIP_FAILED" },
+    READ_MIDI_FAILED: { key: "backend.READ_MIDI_FAILED" },
+    ZIP_ENTRY_FAILED: { key: "backend.ZIP_ENTRY_FAILED" },
+    WRITE_ZIP_FAILED: { key: "backend.WRITE_ZIP_FAILED" },
+    FINALIZE_ZIP_FAILED: { key: "backend.FINALIZE_ZIP_FAILED" },
+    // S66 conversion single-flight + heavy-job interlock (lib.rs acquire_convert_slot).
+    CONVERT_BUSY: { key: "backend.CONVERT_BUSY", busy: true },
+    CONVERT_RENDER_BUSY: { key: "backend.CONVERT_RENDER_BUSY", busy: true },
+    // S74 modal: a host-RAM OOM inside torch.onnx.export (MemoryError: bad allocation), mapped
+    // to a clean actionable line. Modal (not the inline strip) so it reads clearly on its own.
+    CONVERT_LOW_MEMORY: { key: "backend.CONVERT_LOW_MEMORY", modal: true },
+    // S66 MSST conversion errors (msst_models.rs, formerly prose strings).
+    MSST_ARCH_UNKNOWN: { key: "backend.MSST_ARCH_UNKNOWN" },
+    // S74 modal: converter failures carry a long stderr TAIL (the benign com.microsoft
+    // shape-inference warning flood + the real terminating error) — far too long for the inline
+    // strip; route to the scrollable/copyable modal so the real error at the bottom is reachable.
+    MSST_CONVERT_FAILED: { key: "backend.MSST_CONVERT_FAILED", modal: true },
+    MSST_FILE_NOT_FOUND: { key: "backend.MSST_FILE_NOT_FOUND" },
+    // S66/O5: the render commands write the wav Rust-side; disk write failure is its own code.
+    RENDER_WRITE_FAILED: { key: "backend.RENDER_WRITE_FAILED" },
+    // Song Studio (commands/song.rs) — external inference service + model management.
+    SONG_ABC_WRITE_FAIL: { key: "backend.SONG_ABC_WRITE_FAIL" },
+    SONG_CACHE_DIR_ERROR: { key: "backend.SONG_CACHE_DIR_ERROR" },
+    SONG_CONFIG_ERROR: { key: "backend.SONG_CONFIG_ERROR" },
+    SONG_CONFIG_WRITE_FAILED: { key: "backend.SONG_CONFIG_WRITE_FAILED" },
+    // 常驻模式专属:守护进程起不来 / 起来了但迟迟不出结果。两者都会自动退回一次性模式重试,
+    // 所以文案要说清「已自动降级」,否则用户会以为这次生成整体失败了。
+    SONG_DAEMON_SPAWN_FAILED: { key: "backend.SONG_DAEMON_SPAWN_FAILED" },
+    SONG_DAEMON_TIMEOUT: { key: "backend.SONG_DAEMON_TIMEOUT", modal: true },
+    SONG_DELETE_FAILED: { key: "backend.SONG_DELETE_FAILED" },
+    SONG_DELETE_REJECTED: { key: "backend.SONG_DELETE_REJECTED" },
+    SONG_GENERATION_FAILED: { key: "backend.SONG_GENERATION_FAILED" },
+    SONG_KILL_FAILED: { key: "backend.SONG_KILL_FAILED" },
+    SONG_NO_DATA: { key: "backend.SONG_NO_DATA" },
+    SONG_NO_RESULT: { key: "backend.SONG_NO_RESULT" },
+    SONG_READ_FAILED: { key: "backend.SONG_READ_FAILED" },
+    SONG_SERVICE_BAD_RESPONSE: { key: "backend.SONG_SERVICE_BAD_RESPONSE" },
+    SONG_SERVICE_ERROR: { key: "backend.SONG_SERVICE_ERROR" },
+    SONG_SERVICE_UNAVAILABLE: { key: "backend.SONG_SERVICE_UNAVAILABLE" },
+    SONG_SERVICE_URL_EMPTY: { key: "backend.SONG_SERVICE_URL_EMPTY" },
+    SONG_SIDECAR_NOT_FOUND: { key: "backend.SONG_SIDECAR_NOT_FOUND" },
+    SONG_SPAWN_FAILED: { key: "backend.SONG_SPAWN_FAILED" },
+    SONG_WAIT_FAILED: { key: "backend.SONG_WAIT_FAILED" },
+    AUDIO_EMPTY_INPUT: { key: "backend.AUDIO_EMPTY_INPUT" },
+    // Slim installer: ffmpeg is a resource-manager on-demand download now; loading a
+    // compressed format without it points the user at the resource manager's 必备/essential tab.
+    AUDIO_FFMPEG_MISSING: { key: "backend.AUDIO_FFMPEG_MISSING", modal: true },
+    AUDIO_TOO_SHORT_HIGHPASS: { key: "backend.AUDIO_TOO_SHORT_HIGHPASS" },
+    AUDITION_BACKEND_UNSUPPORTED: { key: "backend.AUDITION_BACKEND_UNSUPPORTED" },
+    AUDITION_BAD_CANDIDATE_PATH: { key: "backend.AUDITION_BAD_CANDIDATE_PATH" },
+    AUDITION_BAD_TYPE: { key: "backend.AUDITION_BAD_TYPE" },
+    AUDITION_MODEL_MISSING: { key: "backend.MODEL_NOT_FOUND" },
+    AUDITION_CLIP_MISSING: { key: "backend.AUDITION_CLIP_MISSING" },
+    AUDITION_CONFIG_HOP_ZERO: { key: "backend.AUDITION_CONFIG_HOP_ZERO" },
+    AUDITION_CONFIG_NO_FEATURES_DIM: { key: "backend.AUDITION_CONFIG_NO_FEATURES_DIM" },
+    AUDITION_CONFIG_NO_SAMPLE_RATE: { key: "backend.AUDITION_CONFIG_NO_SAMPLE_RATE" },
+    AUDITION_CONFIG_PARSE_FAILED: { key: "backend.AUDITION_CONFIG_PARSE_FAILED" },
+    AUDITION_CONFIG_READ_FAILED: { key: "backend.AUDITION_CONFIG_READ_FAILED" },
+    AUDITION_DIR_CREATE_FAILED: { key: "backend.AUDITION_DIR_CREATE_FAILED" },
+    AUDITION_HOST_MODEL_MISSING: { key: "backend.AUDITION_HOST_MODEL_MISSING" },
+    AUDITION_RENDER_BUSY: { key: "backend.AUDITION_RENDER_BUSY", busy: true },
+    AUDITION_TASK_PANICKED: { key: "backend.AUDITION_TASK_PANICKED" },
+    AUDITION_TRAINING_ACTIVE: { key: "backend.AUDITION_TRAINING_ACTIVE", busy: true },
+    AUDITION_VOCODER_NONSTANDARD: { key: "backend.AUDITION_VOCODER_NONSTANDARD" },
+    AUDITION_WAV_WRITE_FAILED: { key: "backend.AUDITION_WAV_WRITE_FAILED" },
+    AUTOTUNE_BAD_NOTE: { key: "backend.AUTOTUNE_BAD_NOTE" },
+    AUTOTUNE_EMPTY: { key: "backend.AUTOTUNE_EMPTY" },
+    AUTOTUNE_JOIN: { key: "backend.AUTOTUNE_JOIN" },
+    AUTOTUNE_NO_OUTPUT: { key: "backend.AUTOTUNE_NO_OUTPUT" },
+    AUTOTUNE_SHAPE: { key: "backend.AUTOTUNE_SHAPE" },
+    AUTOTUNE_TOO_MANY_NOTES: { key: "backend.AUTOTUNE_TOO_MANY_NOTES" },
+    AUTOTUNE_UNSORTED: { key: "backend.AUTOTUNE_UNSORTED" },
+    AUTO_F0_FILE_MISSING: { key: "backend.AUTO_F0_FILE_MISSING" },
+    AUTO_F0_FRAMES_MISMATCH: { key: "backend.AUTO_F0_FRAMES_MISMATCH" },
+    AUTO_F0_NOT_EXPORTED: { key: "backend.AUTO_F0_NOT_EXPORTED" },
+    AUTO_F0_NO_F0D_OUTPUT: { key: "backend.AUTO_F0_NO_F0D_OUTPUT" },
+    AUTO_F0_F0D_SHAPE: { key: "backend.AUTO_F0_F0D_SHAPE" },
+    AUTO_F0_NO_OUTPUT: { key: "backend.AUTO_F0_NO_OUTPUT" },
+    AUX_FILE_MISSING: { key: "backend.AUX_FILE_MISSING" },
+    AUX_VOCODER_MEL_MISSING: { key: "backend.AUX_VOCODER_MEL_MISSING" },
+    CONTENTVEC_INPUT_TOO_SHORT: { key: "backend.CONTENTVEC_INPUT_TOO_SHORT" },
+    // S21 cache audit: the per-entry cleanup refuses to touch usp_work — the open project's
+    // extracted media (deleting it would destroy the session). Reached only if a future UI
+    // forgets the same rule; the audit list still SHOWS the row, so the text must say why.
+    CLEANUP_USP_WORK: { key: "backend.CLEANUP_USP_WORK" },
+    CONTENTVEC_NO_OUTPUT: { key: "backend.CONTENTVEC_NO_OUTPUT" },
+    CONTENTVEC_RESHAPE_FAILED: { key: "backend.CONTENTVEC_RESHAPE_FAILED" },
+    CONTENTVEC_SHAPE: { key: "backend.CONTENTVEC_SHAPE" },
+    DELETE_TASK_FAILED: { key: "backend.DELETE_TASK_FAILED" },
+    // S74b: destructive package removals are refused while any long task runs (fail-closed
+    // pre-flight in window.rs). Transient by nature → busy, not an error.
+    DELETE_WHILE_BUSY: { key: "backend.DELETE_WHILE_BUSY", busy: true },
+    DELETE_WHILE_ENVTEST: { key: "backend.DELETE_WHILE_ENVTEST", busy: true },
+    DELETE_WHILE_INSTALLING: { key: "backend.DELETE_WHILE_INSTALLING", busy: true },
+    DIFFUSION_COND_SHAPE: { key: "backend.DIFFUSION_COND_SHAPE" },
+    DIFFUSION_DENOISER_NO_OUTPUT: { key: "backend.DIFFUSION_DENOISER_NO_OUTPUT" },
+    DIFFUSION_DENOISER_SHAPE: { key: "backend.DIFFUSION_DENOISER_SHAPE" },
+    DIFFUSION_DIM_MISMATCH: { key: "backend.DIFFUSION_DIM_MISMATCH" },
+    DIFFUSION_ENCODER_NO_OUTPUT: { key: "backend.DIFFUSION_ENCODER_NO_OUTPUT" },
+    DIFFUSION_FILE_MISSING: { key: "backend.DIFFUSION_FILE_MISSING" },
+    DIFFUSION_GEOMETRY_MISMATCH: { key: "backend.DIFFUSION_GEOMETRY_MISMATCH" },
+    DIFFUSION_KSTEP_EXCEEDS_MAX: { key: "backend.DIFFUSION_KSTEP_EXCEEDS_MAX" },
+    DIFFUSION_KSTEP_MIN: { key: "backend.DIFFUSION_KSTEP_MIN" },
+    DIFFUSION_KSTEP_ZERO: { key: "backend.DIFFUSION_KSTEP_ZERO" },
+    DIFFUSION_MEL_SHAPE: { key: "backend.DIFFUSION_MEL_SHAPE" },
+    DIFFUSION_NOT_ATTACHED: { key: "backend.DIFFUSION_NOT_ATTACHED" },
+    DIFFUSION_REPLACE_FAILED: { key: "backend.DIFFUSION_REPLACE_FAILED" },
+    DIFFUSION_SAMPLER_UNKNOWN: { key: "backend.DIFFUSION_SAMPLER_UNKNOWN" },
+    DIFFUSION_SCHEDULE_UNSUPPORTED: { key: "backend.DIFFUSION_SCHEDULE_UNSUPPORTED" },
+    DIFFUSION_SHALLOW_ONLY: { key: "backend.DIFFUSION_SHALLOW_ONLY" },
+    DIFFUSION_SIDECAR_FIELD_MISSING: { key: "backend.DIFFUSION_SIDECAR_FIELD_MISSING" },
+    DIFFUSION_SPEAKER_OUT_OF_RANGE: { key: "backend.DIFFUSION_SPEAKER_OUT_OF_RANGE" },
+    DIFFUSION_SPEEDUP_TOO_FEW_STEPS: { key: "backend.DIFFUSION_SPEEDUP_TOO_FEW_STEPS" },
+    DIFFUSION_SWAP_FAILED: { key: "backend.DIFFUSION_SWAP_FAILED" },
+    DIFFUSION_T_OUT_OF_RANGE: { key: "backend.DIFFUSION_T_OUT_OF_RANGE" },
+    DIFF_VERSION_MISMATCH: { key: "backend.DIFF_VERSION_MISMATCH" },
+    DIFF_WIPE_FAILED: { key: "backend.DIFF_WIPE_FAILED" },
+    DOWNLOAD_CANCELLED: { key: "backend.DOWNLOAD_CANCELLED" },
+    DOWNLOAD_INCOMPLETE: { key: "backend.DOWNLOAD_INCOMPLETE" },
+    DOWNLOAD_NO_SOURCE: { key: "backend.DOWNLOAD_NO_SOURCE" },
+    DOWNLOAD_OVERSIZE: { key: "backend.DOWNLOAD_OVERSIZE" },
+    DOWNLOAD_RANGE_INVALID: { key: "backend.DOWNLOAD_RANGE_INVALID" },
+    DOWNLOAD_REQUEST_FAILED: { key: "backend.DOWNLOAD_REQUEST_FAILED" },
+    DOWNLOAD_SHA256_MISMATCH: { key: "backend.DOWNLOAD_SHA256_MISMATCH" },
+    DOWNLOAD_STALLED: { key: "backend.DOWNLOAD_STALLED" },
+    DOWNLOAD_STREAM_INTERRUPTED: { key: "backend.DOWNLOAD_STREAM_INTERRUPTED" },
+    ENHANCER_F0_EMPTY: { key: "backend.ENHANCER_F0_EMPTY" },
+    ENVTEST_BUSY: { key: "backend.ENVTEST_BUSY", busy: true },
+    ENVTEST_CANCELLED: { key: "backend.ENVTEST_CANCELLED" },
+    // S68f modal: the crash detail is a stderr tail — far too long for the inline strip
+    // (the community screenshot showed a zh headline + a wall of raw log jammed together).
+    ENVTEST_CRASHED: { key: "backend.ENVTEST_CRASHED", modal: true },
+    ENVTEST_FAILED: { key: "backend.ENVTEST_FAILED" },
+    // S74b: self-test checks whose failure the user must ACT on carry a stable CODE, so the Settings
+    // pack list shows a localized remedy instead of the check's raw diagnostic (which stays as the
+    // technical annex). The driver-floor check deliberately reuses RUNTIME_DRIVER_TOO_OLD.
+    ENVTEST_PACKAGES_BROKEN: { key: "backend.ENVTEST_PACKAGES_BROKEN" },
+    ENVTEST_TORCH_NO_CUDA: { key: "backend.ENVTEST_TORCH_NO_CUDA" },
+    // Self-test WARNs (they do not fail the pack): an Intel-GPU op that silently ran on the CPU.
+    // A hot op (conv/stft/fft) is the difference between usable and useless training throughput.
+    ENVTEST_OP_FALLBACK_HOT: { key: "backend.ENVTEST_OP_FALLBACK_HOT" },
+    ENVTEST_OP_FALLBACK_COLD: { key: "backend.ENVTEST_OP_FALLBACK_COLD" },
+    ENVTEST_REPORT_CLEAR_FAILED: { key: "backend.ENVTEST_REPORT_CLEAR_FAILED" },
+    ENVTEST_REPORT_CONTRADICTION: { key: "backend.ENVTEST_REPORT_CONTRADICTION" },
+    ENVTEST_SCRIPT_MISSING: { key: "backend.ENVTEST_SCRIPT_MISSING" },
+    ENVTEST_SPAWN_FAILED: { key: "backend.ENVTEST_SPAWN_FAILED" },
+    ENVTEST_TIMEOUT: { key: "backend.ENVTEST_TIMEOUT" },
+    ENVTEST_WAIT_FAILED: { key: "backend.ENVTEST_WAIT_FAILED" },
+    // P0 MIDI editor save-back (commands/amt.rs amt_write_edited_midi).
+    EDIT_WRITE_BAD_BPM: { key: "backend.EDIT_WRITE_BAD_BPM" },
+    EDIT_WRITE_DIR_FAILED: { key: "backend.EDIT_WRITE_DIR_FAILED" },
+    EDIT_WRITE_FAILED: { key: "backend.EDIT_WRITE_FAILED" },
+    EDIT_WRITE_NO_TRACKS: { key: "backend.EDIT_WRITE_NO_TRACKS" },
+    // S63 audio/score export (commands/export_audio.rs + export_score.rs). Longest-code-first matching
+    // keeps EXPORT_FFMPEG_MISSING ahead of the training-side FFMPEG_MISSING, and EXPORT_SCORE_WRITE_FAIL
+    // ahead of EXPORT_WRITE_FAIL. The score codes reuse the export.* dialog keys (one text, two funnels).
+    EXPORT_BAD_PCM: { key: "backend.EXPORT_BAD_PCM" },
+    // P0-A AMT result workbench download-menu exports (amt_export.rs).
+    EXPORT_DIR_FAILED: { key: "backend.EXPORT_DIR_FAILED" },
+    EXPORT_DIR_NOT_FOUND: { key: "backend.EXPORT_DIR_NOT_FOUND" },
+    EXPORT_ENCODE_FAIL: { key: "backend.EXPORT_ENCODE_FAIL" },
+    EXPORT_FFMPEG_MISSING: { key: "backend.EXPORT_FFMPEG_MISSING" },
+    EXPORT_FORMAT_UNSUPPORTED: { key: "backend.EXPORT_FORMAT_UNSUPPORTED" },
+    EXPORT_NO_FILES: { key: "backend.EXPORT_NO_FILES" },
+    EXPORT_NO_PCM: { key: "backend.EXPORT_NO_PCM" },
+    EXPORT_PARSE_FAILED: { key: "backend.EXPORT_PARSE_FAILED" },
+    EXPORT_PERMISSION_DENIED: { key: "backend.EXPORT_PERMISSION_DENIED" },
+    EXPORT_READ_FAILED: { key: "backend.EXPORT_READ_FAILED" },
+    EXPORT_RENDER_FAILED: { key: "backend.EXPORT_RENDER_FAILED" },
+    EXPORT_SCORE_EMPTY: { key: "export.errScoreEmpty" },
+    EXPORT_SCORE_UNSUPPORTED: { key: "backend.EXPORT_FORMAT_UNSUPPORTED" },
+    EXPORT_SCORE_WRITE_FAIL: { key: "export.errScoreWrite" },
+    EXPORT_SHEET_FAILED: { key: "backend.EXPORT_SHEET_FAILED" },
+    EXPORT_SOUNDFONT_BAD_NAME: { key: "backend.EXPORT_SOUNDFONT_BAD_NAME" },
+    EXPORT_SOUNDFONT_BAD_TYPE: { key: "backend.EXPORT_SOUNDFONT_BAD_TYPE" },
+    EXPORT_SOUNDFONT_BUILTIN: { key: "backend.EXPORT_SOUNDFONT_BUILTIN" },
+    EXPORT_SOUNDFONT_NOT_FOUND: { key: "backend.EXPORT_SOUNDFONT_NOT_FOUND" },
+    EXPORT_SOUNDFONT_WRITE_FAILED: { key: "backend.EXPORT_SOUNDFONT_WRITE_FAILED" },
+    EXPORT_SRC_NOT_FOUND: { key: "backend.EXPORT_SRC_NOT_FOUND" },
+    EXPORT_WRITE_FAIL: { key: "backend.EXPORT_WRITE_FAIL" },
+    EXPORT_WRITE_FAILED: { key: "backend.EXPORT_WRITE_FAILED" },
+    EXTRACT_FAILED: { key: "backend.EXTRACT_FAILED" },
+    EXTRACT_TASK_FAILED: { key: "backend.EXTRACT_TASK_FAILED" },
+    F0_EMPTY_INPUT: { key: "backend.F0_EMPTY_INPUT" },
+    F0_TASK_PANICKED: { key: "backend.F0_TASK_PANICKED" },
+    FEATURES_DIM_UNSUPPORTED: { key: "backend.FEATURES_DIM_UNSUPPORTED" },
+    FFMPEG_MISSING: { key: "backend.FFMPEG_MISSING" },
+    FILE_READ_FAILED: { key: "backend.FILE_READ_FAILED" },
+    INDEX_LOAD_FAILED: { key: "backend.INDEX_LOAD_FAILED" },
+    // S67c loud guard: DML new-shape compile refused below the system-commit floor —
+    // replaces the OS silently killing the process mid-allocation on low-memory machines.
+    INFERENCE_LOW_MEMORY: { key: "backend.INFERENCE_LOW_MEMORY", modal: true },
+    INFER_TASK_PANICKED: { key: "backend.INFER_TASK_PANICKED" },
+    INSTALL_BUSY: { key: "backend.INSTALL_BUSY", busy: true },
+    INSTALL_CANCELLED: { key: "backend.INSTALL_CANCELLED" },
+    // S68d: pack-install commit marker write failed — path + io cause ride in the detail.
+    INSTALL_COMMIT_WRITE_FAILED: { key: "backend.INSTALL_COMMIT_WRITE_FAILED" },
+    // S68d disk preflight: refused before download/extract — "N MB needed, M MB free" in the detail.
+    INSTALL_DISK_FULL: { key: "backend.INSTALL_DISK_FULL" },
+    INTERNAL_EMPTY_FEATURES: { key: "backend.INTERNAL_EMPTY_FEATURES" },
+    INTERNAL_ENHANCER_NO_VOCODER: { key: "backend.INTERNAL_ENHANCER_NO_VOCODER" },
+    INTERNAL_NO_OUTPUT_PATH: { key: "backend.INTERNAL_NO_OUTPUT_PATH" },
+    INTERNAL_UNIPC_ORDER: { key: "backend.INTERNAL_UNIPC_ORDER" },
+    INTERNAL_UNIPC_SINGULAR: { key: "backend.INTERNAL_UNIPC_SINGULAR" },
+    INTERP_MODE_UNSUPPORTED: { key: "backend.INTERP_MODE_UNSUPPORTED" },
+    JSON_PARSE_FAILED: { key: "backend.JSON_PARSE_FAILED" },
+    // P0-B lyrics extraction / MIDI lyric write-back (amt_lyrics.rs). The five
+    // user-actionable ones reuse the amt.* lyrics-panel texts; the rest are
+    // infrastructural failures whose cause rides in the detail suffix.
+    LYRICS_AUDIO_NOT_FOUND: { key: "amt.lyricsNoAudio" },
+    LYRICS_CONFIG_ERROR: { key: "backend.LYRICS_CONFIG_ERROR" },
+    LYRICS_CONFIG_WRITE_FAILED: { key: "backend.LYRICS_CONFIG_WRITE_FAILED" },
+    LYRICS_DEP_MISSING: { key: "amt.lyricsDepMissing" },
+    LYRICS_EXTRACT_FAILED: { key: "backend.LYRICS_EXTRACT_FAILED" },
+    LYRICS_MIDI_BAD_TIMING: { key: "backend.LYRICS_MIDI_BAD_TIMING" },
+    LYRICS_MIDI_PARSE_FAILED: { key: "backend.LYRICS_MIDI_PARSE_FAILED" },
+    LYRICS_MIDI_READ_FAILED: { key: "backend.LYRICS_MIDI_READ_FAILED" },
+    LYRICS_MODEL_NOT_INSTALLED: { key: "amt.lyricsModelMissing" },
+    LYRICS_NO_RESULT: { key: "backend.LYRICS_NO_RESULT" },
+    LYRICS_OUTDIR_FAILED: { key: "backend.LYRICS_OUTDIR_FAILED" },
+    LYRICS_READ_FAILED: { key: "backend.LYRICS_READ_FAILED" },
+    LYRICS_SPAWN_FAILED: { key: "amt.lyricsSpawnFailed" },
+    LYRICS_WAIT_FAILED: { key: "backend.LYRICS_WAIT_FAILED" },
+    LYRICS_WRITE_DIR_FAILED: { key: "backend.LYRICS_WRITE_DIR_FAILED" },
+    LYRICS_WRITE_EMPTY: { key: "amt.lyricsWriteEmpty" },
+    LYRICS_WRITE_FAILED: { key: "backend.LYRICS_WRITE_FAILED" },
+    LOCAL_FILE_BAD_DIR: { key: "backend.LOCAL_FILE_BAD_DIR" },
+    LOCAL_FILE_BAD_NAME: { key: "backend.LOCAL_FILE_BAD_NAME" },
+    LOCAL_FILE_BAD_TYPE: { key: "backend.LOCAL_FILE_BAD_TYPE" },
+    LOCAL_PARTS_GAP: { key: "backend.LOCAL_PARTS_GAP" },
+    LOCAL_PARTS_NOT_FOUND: { key: "backend.LOCAL_PARTS_NOT_FOUND" },
+    MANIFEST_BAD_ID: { key: "backend.MANIFEST_BAD_ID" },
+    MANIFEST_BAD_PART_NAME: { key: "backend.MANIFEST_BAD_PART_NAME" },
+    MANIFEST_BAD_SHA256: { key: "backend.MANIFEST_BAD_SHA256" },
+    MANIFEST_FETCH_FAILED: { key: "backend.MANIFEST_FETCH_FAILED" },
+    MANIFEST_ID_MISMATCH: { key: "backend.MANIFEST_ID_MISMATCH" },
+    MANIFEST_NO_PARTS: { key: "backend.MANIFEST_NO_PARTS" },
+    MANIFEST_PARSE_FAILED: { key: "backend.MANIFEST_PARSE_FAILED" },
+    MANIFEST_READ_FAILED: { key: "backend.MANIFEST_READ_FAILED" },
+    MANIFEST_REQUEST_FAILED: { key: "backend.MANIFEST_REQUEST_FAILED" },
+    // S68d disk preflight: migration refused before any copy — needed/free MB in the detail.
+    MIGRATE_DISK_FULL: { key: "backend.MIGRATE_DISK_FULL" },
+    // S68c data-dir migration: one migration per session — restart before migrating again.
+    MIGRATE_RESTART_REQUIRED: { key: "backend.MIGRATE_RESTART_REQUIRED", busy: true },
+    // S68c data-dir migration: post-copy integrity check failed — config untouched, old dir stays live.
+    MIGRATE_VERIFY_FAILED: { key: "backend.MIGRATE_VERIFY_FAILED" },
+    MODEL_HOP_SIZE_ZERO: { key: "backend.MODEL_HOP_SIZE_ZERO" },
+    MODEL_LEGACY_EXPORT: { key: "backend.MODEL_LEGACY_EXPORT" },
+    MODEL_NOT_FOUND: { key: "backend.MODEL_NOT_FOUND" },
+    // S78 batch 7: model export / re-import as a portable .zip package (resource manager). Matched
+    // longest-first, so EXPORT_MODEL_NOT_FOUND wins over MODEL_NOT_FOUND on an export failure.
+    EXPORT_MODEL_NOT_FOUND: { key: "backend.EXPORT_MODEL_NOT_FOUND" },
+    EXPORT_FAILED: { key: "backend.EXPORT_FAILED" },
+    // S167 (§F2⒟) community-format export (training archive → .pth + .index / config.json).
+    EXPORT_COMMUNITY_BAD_PROJECT: { key: "backend.EXPORT_COMMUNITY_BAD_PROJECT" },
+    EXPORT_COMMUNITY_CKPT_MISSING: { key: "backend.EXPORT_COMMUNITY_CKPT_MISSING" },
+    EXPORT_COMMUNITY_OUTSIDE_PROJECT: { key: "backend.EXPORT_COMMUNITY_OUTSIDE_PROJECT" },
+    EXPORT_COMMUNITY_DEST_MISSING: { key: "backend.EXPORT_COMMUNITY_DEST_MISSING" },
+    EXPORT_COMMUNITY_NOT_A_RELEASE: { key: "backend.EXPORT_COMMUNITY_NOT_A_RELEASE" },
+    EXPORT_COMMUNITY_NO_FEATURES: { key: "backend.EXPORT_COMMUNITY_NO_FEATURES" },
+    EXPORT_COMMUNITY_BAD_FEATURES: { key: "backend.EXPORT_COMMUNITY_BAD_FEATURES" },
+    EXPORT_COMMUNITY_NO_CONFIG: { key: "backend.EXPORT_COMMUNITY_NO_CONFIG" },
+    EXPORT_COMMUNITY_COPY: { key: "backend.EXPORT_COMMUNITY_COPY" },
+    EXPORT_COMMUNITY_INDEX_COPY: { key: "backend.EXPORT_COMMUNITY_INDEX_COPY" },
+    EXPORT_COMMUNITY_NO_SOURCE: { key: "backend.EXPORT_COMMUNITY_NO_SOURCE" },
+    EXPORT_COMMUNITY_TASK: { key: "backend.EXPORT_COMMUNITY_TASK" },
+    EXPORT_COMMUNITY_UNSUPPORTED: { key: "backend.EXPORT_COMMUNITY_UNSUPPORTED" },
+    PACKAGE_INVALID: { key: "backend.PACKAGE_INVALID" },
+    PACKAGE_EXTRACT_FAILED: { key: "backend.PACKAGE_EXTRACT_FAILED" },
+    // S68d: separation-model delete was a prose error before (i18n rule violation).
+    MSST_DELETE_FAILED: { key: "backend.MSST_DELETE_FAILED" },
+    NPY_LOAD_FAILED: { key: "backend.NPY_LOAD_FAILED" },
+    MODEL_NOT_LOADED: { key: "backend.MODEL_NOT_LOADED" },
+    PACK_BAD_ID: { key: "backend.PACK_BAD_ID" },
+    PACK_DELETE_FAILED: { key: "backend.PACK_DELETE_FAILED" },
+    PACK_EMPTY: { key: "backend.PACK_EMPTY" },
+    PACK_FORMAT_INVALID: { key: "backend.PACK_FORMAT_INVALID" },
+    PACK_JSON_BAD_ID: { key: "backend.PACK_JSON_BAD_ID" },
+    PACK_JSON_PARSE_FAILED: { key: "backend.PACK_JSON_PARSE_FAILED" },
+    PACK_JSON_READ_FAILED: { key: "backend.PACK_JSON_READ_FAILED" },
+    PACK_NOT_FOUND: { key: "backend.PACK_NOT_FOUND" },
+    PACK_NO_DOWNLOAD_SOURCE: { key: "backend.PACK_NO_DOWNLOAD_SOURCE" },
+    PACK_NO_PYTHON: { key: "backend.PACK_NO_PYTHON" },
+    PACK_UNKNOWN: { key: "backend.PACK_UNKNOWN" },
+    PART_MISSING: { key: "backend.PART_MISSING" },
+    PART_SHA256_MISMATCH: { key: "backend.PART_SHA256_MISMATCH" },
+    PART_SIZE_MISMATCH: { key: "backend.PART_SIZE_MISMATCH" },
+    // 工作流预设导入：所选文件不是合法的 JSON 预设数组（storage.rs import_workflow_presets）。
+    PRESET_PARSE: { key: "backend.PRESET_PARSE" },
+    PROBE_CONNECT_FAILED: { key: "backend.PROBE_CONNECT_FAILED" },
+    PROBE_CONNECT_TIMEOUT: { key: "backend.PROBE_CONNECT_TIMEOUT" },
+    PROBE_HTTP_ERROR: { key: "backend.PROBE_HTTP_ERROR" },
+    PROBE_TIMEOUT: { key: "backend.PROBE_TIMEOUT" },
+    // AMT fusion: preview_notes_render (乐器轨音符试听) refused on an empty note set.
+    PREVIEW_NO_NOTES: { key: "backend.PREVIEW_NO_NOTES" },
+    RENAME_FAILED: { key: "backend.RENAME_FAILED" },
+    // S68f: nv-cu130 download gate — CUDA 13 needs an r580+ NVIDIA driver.
+    RUNTIME_DRIVER_TOO_OLD: { key: "backend.RUNTIME_DRIVER_TOO_OLD" },
+    RENAME_RETRY_EXHAUSTED: { key: "backend.RENAME_RETRY_EXHAUSTED" },
+    RESUME_KSTEP_MISMATCH: { key: "backend.RESUME_KSTEP_MISMATCH" },
+    RESUME_PARAMS_MISMATCH: { key: "backend.RESUME_PARAMS_MISMATCH" },
+    RESUME_SPEAKER_COUNT_MISMATCH: { key: "backend.RESUME_SPEAKER_COUNT_MISMATCH" },
+    RESUME_SPEAKER_SET_MISMATCH: { key: "backend.RESUME_SPEAKER_SET_MISMATCH" },
+    RESUME_TARGET_REACHED_DIFF: { key: "backend.RESUME_TARGET_REACHED_DIFF" },
+    RESUME_TARGET_REACHED_VOCODER: { key: "backend.RESUME_TARGET_REACHED_VOCODER" },
+    RESUME_VOL_EMBEDDING_MISMATCH: { key: "backend.RESUME_VOL_EMBEDDING_MISMATCH" },
+    RMVPE_FRAMES_MISMATCH: { key: "backend.RMVPE_FRAMES_MISMATCH" },
+    RMVPE_MEL_SHAPE: { key: "backend.RMVPE_MEL_SHAPE" },
+    RMVPE_NO_OUTPUT: { key: "backend.RMVPE_NO_OUTPUT" },
+    RUNTIME_PACK_REQUIRED: { key: "backend.RUNTIME_PACK_REQUIRED" },
+    // S116 §F5-③ⓒ: a resume checkpoint that exists but cannot be used as one. Both are modal-worthy
+    // — the run stopped, and the alternative was silently poisoning or discarding the user's work.
+    TRAINING_RESUME_CHECKPOINT_INCOMPLETE: { key: "backend.TRAINING_RESUME_CHECKPOINT_INCOMPLETE", modal: true },
+    TRAINING_RESUME_CHECKPOINT_UNREADABLE: { key: "backend.TRAINING_RESUME_CHECKPOINT_UNREADABLE", modal: true },
+    // S116: the pack download's server-side refusal — the twin of CUDA_UNSUPPORTED_GPU. Reached
+    // only from a stale Settings panel or a direct invoke; the list never offers such a pack.
+    RUNTIME_PACK_UNSUPPORTED: { key: "backend.RUNTIME_PACK_UNSUPPORTED" },
+    RUNTIME_PATH_NON_ASCII: { key: "backend.RUNTIME_PATH_NON_ASCII" },
+    RUNTIME_ROOT_UNINIT: { key: "backend.RUNTIME_ROOT_UNINIT" },
+    RVC_CHUNK_TOO_SHORT: { key: "backend.RVC_CHUNK_TOO_SHORT" },
+    RVC_F0_FRAMES_SHORT: { key: "backend.RVC_F0_FRAMES_SHORT" },
+    RVC_MIN_FRAMES: { key: "backend.RVC_MIN_FRAMES" },
+    RVC_NO_OUTPUT: { key: "backend.RVC_NO_OUTPUT" },
+    RVC_SR_NOT_100FPS: { key: "backend.RVC_SR_NOT_100FPS" },
+    SCORE2CV_DIM_UNSUPPORTED: { key: "backend.SCORE2CV_DIM_UNSUPPORTED" },
+    SCORE2CV_NO_OUTPUT: { key: "backend.SCORE2CV_NO_OUTPUT" },
+    SCORE2CV_SHAPE: { key: "backend.SCORE2CV_SHAPE" },
+    SCORE2SVC_ZERO_FRAMES: { key: "backend.SCORE2SVC_ZERO_FRAMES" },
+    SHARED_POOL_REUSED: { key: "backend.SHARED_POOL_REUSED" },
+    // P3 3-9 FluidSynth 通用化：render_soundfont_notes 的 backend="fluidsynth" 守门。
+    SOUNDFONT_BACKEND_LAYERS_UNSUPPORTED: { key: "backend.SOUNDFONT_BACKEND_LAYERS_UNSUPPORTED" },
+    SOUNDFONT_BACKEND_UNSUPPORTED: { key: "backend.SOUNDFONT_BACKEND_UNSUPPORTED" },
+    SOVITS_NO_OUTPUT: { key: "backend.SOVITS_NO_OUTPUT" },
+    SOVITS_VOL_FRAMES_MISMATCH: { key: "backend.SOVITS_VOL_FRAMES_MISMATCH" },
+    // S146: the range-extension inverse is TD-PSOLA, which cannot place a single grain without
+    // knowing where the pitch periods are. Refusing loudly beats the alternative — returning the
+    // model's UN-shifted take, i.e. a render at the wrong pitch that nothing downstream can detect.
+    RANGE_INVERSE_NO_PITCH: { key: "backend.RANGE_INVERSE_NO_PITCH" },
+    SPEECH_ENCODER_UNSUPPORTED: { key: "backend.SPEECH_ENCODER_UNSUPPORTED" },
+    SPK_MIX_DIFFUSION: { key: "vocalEditor.render.spkMixDiffusion" },
+    STORAGE_JOIN: { key: "backend.STORAGE_JOIN" },
+    // S82: the range-extension inverse (Signalsmith) has no fallback engine — a failure aborts
+    // the render loudly instead of returning wrong-pitched audio.
+    STRETCH_ENGINE_FAILED: { key: "backend.STRETCH_ENGINE_FAILED" },
+    TAR_ENTRY_BAD_PATH: { key: "backend.TAR_ENTRY_BAD_PATH" },
+    TAR_ENTRY_CORRUPT: { key: "backend.TAR_ENTRY_CORRUPT" },
+    TAR_READ_FAILED: { key: "backend.TAR_READ_FAILED" },
+    TRAINING_ACTIVE: { key: "backend.TRAINING_ACTIVE", busy: true },
+    TRAINING_ALREADY_RUNNING: { key: "backend.TRAINING_ALREADY_RUNNING", busy: true },
+    TRAINING_ASSET_MISSING: { key: "backend.TRAINING_ASSET_MISSING" },
+    TRAINING_AUG_COPIES_MAX: { key: "backend.TRAINING_AUG_COPIES_MAX" },
+    TRAINING_BACKEND_UNSUPPORTED: { key: "backend.TRAINING_BACKEND_UNSUPPORTED" },
+    TRAINING_BAD_RVC_VERSION: { key: "backend.TRAINING_BAD_RVC_VERSION" },
+    TRAINING_BAD_SAMPLE_RATE: { key: "backend.TRAINING_BAD_SAMPLE_RATE" },
+    TRAINING_BAD_SOVITS_VERSION: { key: "backend.TRAINING_BAD_SOVITS_VERSION" },
+    TRAINING_BAD_VOCODER_FORMAT: { key: "backend.TRAINING_BAD_VOCODER_FORMAT" },
+    TRAINING_CROP_FRAMES_ZERO: { key: "backend.TRAINING_CROP_FRAMES_ZERO" },
+    TRAINING_DATA_FILE_MISSING: { key: "backend.TRAINING_DATA_FILE_MISSING" },
+    // S67 loud-degradation guard (device.py require_wanted_accelerator → protocol error).
+    // S75 training-device gate: why an enumerated GPU cannot be picked (shown IN the dropdown row),
+    // plus the start-time refusals when the choice no longer resolves.
+    TRAINING_GPU_CC_UNKNOWN: { key: "backend.TRAINING_GPU_CC_UNKNOWN" },
+    TRAINING_GPU_NO_RUNTIME: { key: "backend.TRAINING_GPU_NO_RUNTIME" },
+    TRAINING_GPU_NEEDS_PACK_UPDATE: { key: "backend.TRAINING_GPU_NEEDS_PACK_UPDATE" },
+    TRAINING_PROJECT_RESERVED: { key: "backend.TRAINING_PROJECT_RESERVED" },
+    TRAINING_GPU_PACK_MISSING: { key: "backend.TRAINING_GPU_PACK_MISSING" },
+    TRAINING_GPU_UNAVAILABLE: { key: "backend.TRAINING_GPU_UNAVAILABLE" },
+    TRAINING_GPU_UNKNOWN: { key: "backend.TRAINING_GPU_UNKNOWN" },
+    TRAINING_GPU_UNSUPPORTED: { key: "backend.TRAINING_GPU_UNSUPPORTED" },
+    TRAINING_RUNTIME_VARIANT_MISSING: { key: "backend.TRAINING_RUNTIME_VARIANT_MISSING" },
+    // S169 AMD arch-keyed device pick (device.py::apply_amd_arch_mask): two DISTINCT reds by
+    // design — "the enum probe could not run" vs "it ran and no HIP device carries the arch".
+    TRAINING_AMD_ENUM_FAILED: { key: "backend.TRAINING_AMD_ENUM_FAILED" },
+    TRAINING_AMD_GPU_NOT_FOUND: { key: "backend.TRAINING_AMD_GPU_NOT_FOUND" },
+    // …and the envtest-side third red (the self-test panel renders it): the installed pack
+    // carries kernels for none of this machine's GPUs — the remedy is a NEWER pack, not a
+    // reinstall, so it must not fall to the generic "reinstall this pack" fallback lane.
+    ENVTEST_AMD_NO_COVERED_GPU: { key: "backend.ENVTEST_AMD_NO_COVERED_GPU" },
+    // S68b loud-degradation guard (training/mod.rs try_start): GPU present but only the
+    // CPU runtime pack installed — refuse instead of the old log-file-only warn.
+    TRAINING_RUNTIME_CPU_ONLY: { key: "backend.TRAINING_RUNTIME_CPU_ONLY" },
+    TRAINING_IMPORT_COPY_FAILED: { key: "backend.TRAINING_IMPORT_COPY_FAILED" },
+    TRAINING_INTERNAL_ASSET_BRANCH: { key: "backend.TRAINING_INTERNAL_ASSET_BRANCH" },
+    TRAINING_KILL_FAILED: { key: "backend.TRAINING_KILL_FAILED" },
+    TRAINING_MULTI_BACKEND: { key: "backend.TRAINING_MULTI_BACKEND" },
+    // S114 §F5-3 divergence guard (numerics.DivergenceGuard → protocol error).
+    // Community issue #2: every loss went nan ~600 steps after a resume, the loop
+    // ran 13+ more hours, and the previously valid *_best.pth was overwritten with
+    // the poisoned weights. The run now dies loudly instead.
+    TRAINING_NUMERICS_DIVERGED: { key: "backend.TRAINING_NUMERICS_DIVERGED" },
+    TRAINING_RESUME_DATASET_CHANGED: { key: "backend.TRAINING_RESUME_DATASET_CHANGED" },
+    // ★S118 §F8⒜ — a WARNING, not a failure: the moments are gone either way and refusing
+    // would leave the user unable to continue at all. NOT `modal` — the run is still training.
+    TRAINING_RESUME_OPTIMIZER_MISSING: { key: "backend.TRAINING_RESUME_OPTIMIZER_MISSING" },
+    // ★S118 §F8⒡ — used BOTH as a warning (an older healthy archive rescued the run) and as the
+    // run's error (nothing healthy left). ⛔ NOT `modal`: in the warning case the run is training.
+    TRAINING_RESUME_ARCHIVE_POISONED: { key: "backend.TRAINING_RESUME_ARCHIVE_POISONED" },
+    // S114 §F5-1 live diagnostics (TrainingSnapshot.warnings) — raised while the run is
+    // still going, so they never set `state = "error"`. The "froze" report had NO failure
+    // to show: the DataLoader's feeder thread dies in a daemon thread and the trainer just
+    // waits forever, so these two are the only thing the UI can say.
+    TRAINING_HOST_MEMORY_EXHAUSTED: { key: "backend.TRAINING_HOST_MEMORY_EXHAUSTED" },
+    TRAINING_NO_PROGRESS: { key: "backend.TRAINING_NO_PROGRESS" },
+    TRAINING_NAME_EMPTY: { key: "backend.TRAINING_NAME_EMPTY" },
+    // ★S143 §E2E-M25 笔 5 —— 同槽两个 run 同名 ⇒ 同 slug ⇒ `plan_cleanup` 会把另一个 run 的
+    // 快照永久保留。改名那条路此前前后端都只判空,而「再训一个」那条早有闸。
+    TRAINING_NAME_TAKEN: { key: "backend.TRAINING_NAME_TAKEN" },
+    TRAINING_NO_DATA: { key: "training.needData" },
+    TRAINING_NO_SHARED_POOL: { key: "backend.TRAINING_NO_SHARED_POOL" },
+    TRAINING_PROCESS_CRASHED: { key: "backend.TRAINING_PROCESS_CRASHED" },
+    TRAINING_PYTHON_SPAWN_FAILED: { key: "backend.TRAINING_PYTHON_SPAWN_FAILED" },
+    TRAINING_SAVE_INTERVAL_ZERO: { key: "backend.TRAINING_SAVE_INTERVAL_ZERO" },
+    TRAINING_SPEAKER_LIMIT: { key: "backend.TRAINING_SPEAKER_LIMIT" },
+    TRAINING_SPEAKER_NAME_DUP: { key: "backend.TRAINING_SPEAKER_NAME_DUP" },
+    TRAINING_SPEAKER_NAME_EMPTY: { key: "backend.TRAINING_SPEAKER_NAME_EMPTY" },
+    TRAINING_SPEAKER_NO_DATA: { key: "backend.TRAINING_SPEAKER_NO_DATA" },
+    TRAINING_SR_FIXED_44K: { key: "backend.TRAINING_SR_FIXED_44K" },
+    TRAINING_THREAD_SPAWN_FAILED: { key: "backend.TRAINING_THREAD_SPAWN_FAILED" },
+    TRAINING_TOTAL_STEPS_ZERO: { key: "backend.TRAINING_TOTAL_STEPS_ZERO" },
+    TRAINING_UNKNOWN_ERROR: { key: "backend.TRAINING_UNKNOWN_ERROR" },
+    // S76 shared project dataset: `dataset/` now belongs to the PROJECT, so replacing it would
+    // re-fingerprint every sibling architecture slot and make their progress unresumable.
+    PROJECT_DATASET_IN_USE: { key: "backend.PROJECT_DATASET_IN_USE", modal: true },
+    // S76 project layout: identity/metadata failures on the start path, and the two states the
+    // startup migration can legitimately leave behind (undecidable directory / not folded yet).
+    // All fail-closed — reaching the user means their existing training progress was NOT touched.
+    PROJECT_META_WRITE_FAILED: { key: "backend.PROJECT_META_WRITE_FAILED", modal: true },
+    // S76 batch 3 — destructive training-archive actions. Every one of these is a REFUSAL that
+    // left the files intact, so they read as guidance, not as failure. (DELETE_WHILE_BUSY is
+    // NOT here — it already exists above, shared with the asset-pack delete: one CODE, one text.)
+    PROJECT_LEDGER_UNSTAMPED: { key: "backend.PROJECT_LEDGER_UNSTAMPED", modal: true },
+    PROJECT_LEDGER_STALE: { key: "backend.PROJECT_LEDGER_STALE", modal: true },
+    DELETE_OTHER_INSTANCE: { key: "backend.DELETE_OTHER_INSTANCE", modal: true },
+    DELETE_RECLAIM_IN_PROGRESS: { key: "backend.DELETE_RECLAIM_IN_PROGRESS", busy: true },
+    TRAINING_DELETE_FAILED: { key: "backend.TRAINING_DELETE_FAILED" },
+    TRAINING_BAD_FAMILY: { key: "backend.TRAINING_BAD_FAMILY" },
+    TRAINING_DELETE_JOIN: { key: "backend.TRAINING_DELETE_JOIN" },
+    PROJECT_META_ENCODE_FAILED: { key: "backend.PROJECT_META_ENCODE_FAILED" },
+    PROJECT_META_UNREADABLE: { key: "backend.PROJECT_META_UNREADABLE", modal: true },
+    PROJECT_NEEDS_ATTENTION: { key: "backend.PROJECT_NEEDS_ATTENTION", modal: true },
+    TRAINING_LAYOUT_MIGRATION_PENDING: { key: "backend.TRAINING_LAYOUT_MIGRATION_PENDING", modal: true },
+    AUDITION_WORKSPACE_OUTSIDE_ROOT: { key: "backend.AUDITION_WORKSPACE_OUTSIDE_ROOT" },
+    AUDITION_WORKSPACE_IS_A_SLOT: { key: "backend.AUDITION_WORKSPACE_IS_A_SLOT" },
+    PROJECT_DATASET_SHAPE: { key: "backend.PROJECT_DATASET_SHAPE" },
+    TRAINING_DATASET_SELF_SOURCE: { key: "backend.TRAINING_DATASET_SELF_SOURCE" },
+    // S76 batch 5b — managing the project's shared dataset outside a run. The three interlocks are
+    // the DELETE_* trio's twins (same conditions, different sentence: nothing is being deleted when
+    // an IMPORT is refused). DATASET_SPEAKERS_FROZEN is the one that carries the design: a slot's
+    // emb_g rows pin the speaker SET, so the structure may only change while no slot has frozen it.
+    DATASET_WHILE_BUSY: { key: "backend.DATASET_WHILE_BUSY", busy: true },
+    DATASET_OTHER_INSTANCE: { key: "backend.DATASET_OTHER_INSTANCE", modal: true },
+    DATASET_RECLAIM_IN_PROGRESS: { key: "backend.DATASET_RECLAIM_IN_PROGRESS", busy: true },
+    DATASET_SPEAKERS_FROZEN: { key: "backend.DATASET_SPEAKERS_FROZEN", modal: true },
+    // ★§F2⒝ ④e —— 「我读不动那个 run 的冻结载体」的**专属**出口。它此前与
+    // DATASET_SPEAKERS_FROZEN 的反面(「没有人冻过」)共用一个静默的空答案,而空是宽容答案 ⇒
+    // 恰好在文件系统出问题时把那道拒绝拿掉。modal:它挡的是一次会改动数据集结构的操作。
+    FROZEN_SPEAKERS_UNREADABLE: { key: "backend.FROZEN_SPEAKERS_UNREADABLE", modal: true },
+    // ★§F2⒝ ④e —— 与 `RUN_ID_INVALID`(「这个名字不合法」)是两件事:这一条是「你必须指名一个」。
+    // 它挡的是房规 `opt_run_id("") → None → resolve_run_dir → 槽根` 那条路 —— 一次伪装成
+    // 「删一个 run」的删槽。
+    RUN_ID_REQUIRED: { key: "backend.RUN_ID_REQUIRED", modal: true },
+    // ★S133 —— 以前它只从 Settings 的内联 `L()` 表出去(`stErrWsMissing`),所以不在这张表里也没人发现。`delete_run` 让它头一次能落到项目详情页的
+    // `backendErrorMessage(e) ?? String(e)` 漏斗上 —— 那里没映射就是一串裸 Rust 串。Settings 那一条内联处理排在前面，它自己的措辞不变。
+    WORKSPACE_MISSING: { key: "backend.WORKSPACE_MISSING" },
+    DATASET_COPY_FAILED: { key: "backend.DATASET_COPY_FAILED" },
+    DATASET_DELETE_FAILED: { key: "backend.DATASET_DELETE_FAILED" },
+    DATASET_WRITE_FAILED: { key: "backend.DATASET_WRITE_FAILED" },
+    DATASET_REL_INVALID: { key: "backend.DATASET_REL_INVALID" },
+    DATASET_META_WRITE_FAILED: { key: "backend.DATASET_META_WRITE_FAILED" },
+    DATASET_META_ENCODE_FAILED: { key: "backend.DATASET_META_ENCODE_FAILED" },
+    // S76 batch 4 — explicit project CRUD. The name rules are inline validation the create/rename
+    // dialogs surface as-is; they are not failures of anything already on disk.
+    PROJECT_NAME_EMPTY: { key: "backend.PROJECT_NAME_EMPTY" },
+    PROJECT_NAME_TOO_LONG: { key: "backend.PROJECT_NAME_TOO_LONG" },
+    PROJECT_NAME_INVALID: { key: "backend.PROJECT_NAME_INVALID" },
+    PROJECT_NOTE_TOO_LONG: { key: "backend.PROJECT_NOTE_TOO_LONG" },
+    PROJECT_NAME_EXISTS: { key: "backend.PROJECT_NAME_EXISTS" },
+    // Both of these mean a bug on our side reached the backend rather than a user mistake, so
+    // they are modal: silently swallowing them would leave the user staring at a dead button.
+    PROJECT_ID_EXHAUSTED: { key: "backend.PROJECT_ID_EXHAUSTED", modal: true },
+    PROJECT_ID_INVALID: { key: "backend.PROJECT_ID_INVALID", modal: true },
+    // fail-closed wipe consent (training/mod.rs): fresh=true without wipe_confirmed on a
+    // workspace that holds checkpoints / an imported dataset. Reaching a user means a UI probe
+    // failed — modal, because the remedy is「重新点开始并在对话框里选重训」, not a retry.
+    TRAINING_WIPE_NOT_CONFIRMED: { key: "backend.TRAINING_WIPE_NOT_CONFIRMED", modal: true },
+    // ★§E2E-M1 —— **前端自己发的** CODE（不是 Rust）：存档导入时连「去哪找索引」都不知道。
+    // 它与「确实没有索引」必须可区分：后者正常，前者会装出一个缺检索矩阵的模型，
+    // 而那是**听不出来**的（只是相似度下降）—— 所以它必须走同一个漏斗到达用户。
+    WARN_INDEX_CONTEXT_UNKNOWN: { key: "backend.WARN_INDEX_CONTEXT_UNKNOWN" },
+    // ★§F2⒝ 批 2 ④ —— 批 1-3 引入的训练布局 CODE。它们在 ④ 之前【结构上不可达】(每个槽恒一个 run),
+    // 而 ④ 让第一条真的可达 —— 没有这张表的话,用户看到的是一串带绝对路径的英文 Rust 字符串。
+    RUN_AMBIGUOUS: { key: "backend.RUN_AMBIGUOUS", modal: true },
+    RUN_NOT_FOUND: { key: "backend.RUN_NOT_FOUND" },
+    RUN_ID_INVALID: { key: "backend.RUN_ID_INVALID" },
+    RUN_CREATE_FAILED: { key: "backend.RUN_CREATE_FAILED", modal: true },
+    // ★§F2⒝ 批 2 ④e(S132)—— flip 与它的准入。
+    // ⛔ 前四条是「读不动 ≠ 不存在」那一族:它们的**存在**就是本轮修掉的缺陷的另一半 ——
+    //    此前这些情形被静默当成「这个槽没有 run / 这个池没有身份」,于是覆盖进度、误盖版本章。
+    //    既然现在响亮拒绝,用户就必须读得懂,而且要读得懂**为什么拒绝比继续好**。
+    RUNS_DIR_UNREADABLE: { key: "backend.RUNS_DIR_UNREADABLE", modal: true },
+    POOLS_DIR_UNREADABLE: { key: "backend.POOLS_DIR_UNREADABLE", modal: true },
+    POOL_FINGERPRINT_UNREADABLE: { key: "backend.POOL_FINGERPRINT_UNREADABLE", modal: true },
+    POOL_SAMPLE_RATE_UNKNOWN: { key: "backend.POOL_SAMPLE_RATE_UNKNOWN", modal: true },
+    // 「再训一个」自己的两条:槽折不动 / 铸出来的目录名撞了。
+    SLOT_NOT_MIGRATABLE: { key: "backend.SLOT_NOT_MIGRATABLE", modal: true },
+    RUN_ID_COLLISION: { key: "backend.RUN_ID_COLLISION" },
+    // ★§F2⒝ 批 2 ④b —— 改名(训练名从此只是标签)。
+    RUN_NEVER_NAMED: { key: "backend.RUN_NEVER_NAMED" },
+    RUN_RENAME_FAILED: { key: "backend.RUN_RENAME_FAILED", modal: true },
+    RENAME_WHILE_BUSY: { key: "backend.RENAME_WHILE_BUSY", busy: true },
+    RENAME_OTHER_INSTANCE: { key: "backend.RENAME_OTHER_INSTANCE", modal: true },
+    // ★§F2⒝ 批 2 ④e 笔 1 —— **python 抛的** CODE(不是 Rust)。它们经 `utai_train.runner` 的
+    // `reporter.error("<类型>: <消息>")` 到达 `store/training.ts`,而 `findCode` 是子串匹配,
+    // 所以这两行就是 python 侧 CODE 头一次不再是一串裸英文。
+    // ⚠ 队列 ④e 检查表第 ⑤ 条要求同批重估「python CODE 没有 i18n」那张表 —— 本轮至少不往里加新条目。
+    FRESH_RUN_HAS_PRODUCTS: { key: "backend.FRESH_RUN_HAS_PRODUCTS", modal: true },
+    FRESH_RUN_FLAG_INVALID: { key: "backend.FRESH_RUN_FLAG_INVALID", modal: true },
+    RUN_MIGRATE_FAILED: { key: "backend.RUN_MIGRATE_FAILED", modal: true },
+    SLOT_MIGRATE_FAILED: { key: "backend.SLOT_MIGRATE_FAILED", modal: true },
+    POOL_FINGERPRINT_WRITE_FAILED: { key: "backend.POOL_FINGERPRINT_WRITE_FAILED" },
+    SLOT_META_WRITE_FAILED: { key: "backend.SLOT_META_WRITE_FAILED" },
+    SLOT_META_ENCODE_FAILED: { key: "backend.SLOT_META_ENCODE_FAILED" },
+    TRAINING_MIGRATE_UNDO_BLOCKED: { key: "backend.TRAINING_MIGRATE_UNDO_BLOCKED", modal: true },
+    TRAINING_SCAN_JOIN: { key: "backend.TRAINING_SCAN_JOIN" },
+    UPDATE_CHECK_FAILED: { key: "backend.UPDATE_CHECK_FAILED" },
+    UPDATE_DOWNLOAD_FAILED: { key: "backend.UPDATE_DOWNLOAD_FAILED" },
+    UPDATE_INSTALL_FAILED: { key: "backend.UPDATE_INSTALL_FAILED" },
+    UPDATE_NO_PENDING: { key: "backend.UPDATE_NO_PENDING" },
+    VERIFY_TASK_FAILED: { key: "backend.VERIFY_TASK_FAILED" },
+    VOCAL_BACKEND_UNKNOWN: { key: "backend.VOCAL_BACKEND_UNKNOWN" },
+    VOCAL_F0_FRAMES_MISMATCH: { key: "backend.VOCAL_F0_FRAMES_MISMATCH" },
+    VOCAL_F0_LEN_MISMATCH: { key: "backend.VOCAL_F0_LEN_MISMATCH" },
+    VOCAL_SEGMENT_TOO_LONG: { key: "backend.VOCAL_SEGMENT_TOO_LONG" },
+    VOCAL_TASK_PANICKED: { key: "backend.VOCAL_TASK_PANICKED" },
+    VOCAL_TOO_MANY_NOTES: { key: "backend.VOCAL_TOO_MANY_NOTES" },
+    VOCODER_CONFIG_FIELD_MISSING: { key: "backend.VOCODER_CONFIG_FIELD_MISSING" },
+    VOCODER_CONFIG_MISSING: { key: "backend.VOCODER_CONFIG_MISSING" },
+    VOCODER_F0_FRAMES_SHORT: { key: "backend.VOCODER_F0_FRAMES_SHORT" },
+    VOCODER_FILTER_SHAPE_MISMATCH: { key: "backend.VOCODER_FILTER_SHAPE_MISMATCH" },
+    VOCODER_GEOMETRY_MISMATCH: { key: "backend.VOCODER_GEOMETRY_MISMATCH" },
+    VOCODER_JSON_PARSE_FAILED: { key: "backend.VOCODER_JSON_PARSE_FAILED" },
+    VOCODER_JSON_REQUIRED: { key: "backend.VOCODER_JSON_REQUIRED" },
+    VOCODER_MEL_FORMAT_MISMATCH: { key: "backend.VOCODER_MEL_FORMAT_MISMATCH" },
+    VOCODER_MEL_MISSING: { key: "backend.VOCODER_MEL_MISSING" },
+    VOCODER_NOT_FOUND: { key: "backend.VOCODER_NOT_FOUND" },
+    VOCODER_NO_OUTPUT: { key: "backend.VOCODER_NO_OUTPUT" },
+    VOCODER_PCNSF_UNSUPPORTED: { key: "backend.VOCODER_PCNSF_UNSUPPORTED" },
+    WARN_AUTO_F0_COPY_FAILED: { key: "backend.WARN_AUTO_F0_COPY_FAILED" },
+    WARN_COMMUNITY_SRC_RETAIN_FAILED: { key: "backend.WARN_COMMUNITY_SRC_RETAIN_FAILED" },
+    WARN_AUTO_F0_MISSING: { key: "backend.WARN_AUTO_F0_MISSING" },
+    WARN_AVATAR_IMPORT_FAILED: { key: "backend.WARN_AVATAR_IMPORT_FAILED" },
+    WARN_AVATAR_MISSING: { key: "backend.WARN_AVATAR_MISSING" },
+    WARN_CLUSTER_CONVERT_FAILED: { key: "backend.WARN_CLUSTER_CONVERT_FAILED" },
+    WARN_CLUSTER_COPY_FAILED: { key: "backend.WARN_CLUSTER_COPY_FAILED" },
+    WARN_CLUSTER_DIR_FAILED: { key: "backend.WARN_CLUSTER_DIR_FAILED" },
+    WARN_CLUSTER_EMPTY_OUTPUT: { key: "backend.WARN_CLUSTER_EMPTY_OUTPUT" },
+    WARN_CLUSTER_FILE_MISSING: { key: "backend.WARN_CLUSTER_FILE_MISSING" },
+    WARN_CLUSTER_MULTI_COPY_FAILED: { key: "backend.WARN_CLUSTER_MULTI_COPY_FAILED" },
+    WARN_CLUSTER_TYPE_UNSUPPORTED: { key: "backend.WARN_CLUSTER_TYPE_UNSUPPORTED" },
+    WARN_DIFFUSION_CONVERT_FAILED: { key: "backend.WARN_DIFFUSION_CONVERT_FAILED" },
+    WARN_DIFFUSION_COPY_FAILED: { key: "backend.WARN_DIFFUSION_COPY_FAILED" },
+    WARN_DIFFUSION_DIM_MISMATCH: { key: "backend.WARN_DIFFUSION_DIM_MISMATCH" },
+    WARN_DIFFUSION_FILE_MISSING: { key: "backend.WARN_DIFFUSION_FILE_MISSING" },
+    WARN_DIFFUSION_SOVITS_ONLY: { key: "backend.WARN_DIFFUSION_SOVITS_ONLY" },
+    // ★S119 §F9 — INFORMATION, raised once at IMPORT and never during a render. A shallow-diffusion
+    // model predicts mel, so the vocoder it was fitted to is part of what it is; a model shared
+    // without its fine-tuned vocoder arrives sounding wrong and nothing used to say why. The render
+    // path is untouched — the user still picks the vocoder per render.
+    WARN_DIFFUSION_VOCODER_CUSTOM: { key: "backend.WARN_DIFFUSION_VOCODER_CUSTOM" },
+    WARN_DIFFUSION_VOCODER_UNKNOWN: { key: "backend.WARN_DIFFUSION_VOCODER_UNKNOWN" },
+    WARN_INDEX_CONVERT_FAILED: { key: "backend.WARN_INDEX_CONVERT_FAILED" },
+    WARN_INDEX_COPY_FAILED: { key: "backend.WARN_INDEX_COPY_FAILED" },
+    WARN_INDEX_MISSING: { key: "backend.WARN_INDEX_MISSING" },
+    WARN_INDEX_TYPE_UNSUPPORTED: { key: "backend.WARN_INDEX_TYPE_UNSUPPORTED" },
+    WARN_SIDECAR_REGENERATED: { key: "backend.WARN_SIDECAR_REGENERATED" },
+    WARN_SIDECAR_SYNTHESIZED: { key: "backend.WARN_SIDECAR_SYNTHESIZED" },
+    WORKSPACE_BACKEND_MISMATCH: { key: "backend.WORKSPACE_BACKEND_MISMATCH" },
+    WORKSPACE_MANIFEST_MISSING: { key: "backend.WORKSPACE_MANIFEST_MISSING" },
+    WORKSPACE_DELETE_FAILED: { key: "backend.WORKSPACE_DELETE_FAILED" },
+    // ⚰ `WORKSPACE_WIPE_FAILED` 曾经在这里。它的**最后一个产生点**随 S132 的 flip 一起没了
+    // (那一笔删掉的正是 `remove_dir_all_robust(&workspace)`),而它描述的动作在产品里已经不存在 ——
+    // 一条到不了用户面前的文案就是一条会误导下一个人的文案。S133 连同三语一起清掉。
+    // S74: emitted by the runtime-pack self-test (utai_train/envtest.py check_torch_backend, xpu
+    // tier) — torch-XPU found no Arc-family GPU. Surfaces per-check in the Settings pack list, so
+    // a pre-Arc Intel user learns WHY instead of reading a bare check name.
+    XPU_NO_DEVICE: { key: "backend.XPU_NO_DEVICE" },
+    ZSTD_INIT_FAILED: { key: "backend.ZSTD_INIT_FAILED" },
+};
+/** Longest-first so a code that happens to be a prefix of another can never shadow it. */
+const CODES = Object.keys(CODE_KEYS).sort((a, b) => b.length - a.length);
+function findCode(msg) {
+    for (const code of CODES) {
+        const at = msg.indexOf(code);
+        if (at < 0)
+            continue;
+        const detail = msg.slice(at + code.length).replace(/^[:：]\s*/, "").trim();
+        return { entry: CODE_KEYS[code], detail };
+    }
+    return null;
+}
+/** Localized text for a backend error carrying a known CODE, or null when it carries none (the caller
+ *  falls back to its own default display). */
+export function backendErrorMessage(e) {
+    const hit = findCode(String(e));
+    if (!hit)
+        return null;
+    const text = i18n.t(hit.entry.key);
+    return hit.detail ? `${text} (${hit.detail})` : text;
+}
+/** True iff the error is a transient busy/interlock rejection (show as INFO, not error). */
+export function isBusyError(e) {
+    return findCode(String(e))?.entry.busy === true;
+}
+/** S67c: true iff the error should surface in the modal error dialog (see CodeEntry.modal).
+ *  Callers still localize via backendErrorMessage; this only picks the display vessel. */
+export function isModalError(e) {
+    return findCode(String(e))?.entry.modal === true;
+}
+/** THE cancel-sentinel check (single source — the workflow engine and every toast funnel share it).
+ *  Backend cancel rejections arrive as "Inference error: 已取消" (legacy) or the stable "CANCELLED"
+ *  code; the frontend sentinel is the bare "Cancelled". A user cancel is never an error — funnels
+ *  swallow it silently, and it must be checked BEFORE code localization. */
+export function isCancelError(e) {
+    const msg = String(e);
+    return msg === "Cancelled" || msg.includes("已取消") || msg.includes("CANCELLED");
+}

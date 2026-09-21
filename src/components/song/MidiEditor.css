@@ -1,0 +1,219 @@
+/* MidiEditor 轻量 MIDI 编辑器（钢琴卷帘窗） */
+
+.mid-editor-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+}
+
+.mid-editor-dialog {
+  position: relative;
+  width: min(1120px, 94vw);
+  height: min(720px, 90vh);
+  display: flex;
+  flex-direction: column;
+  background: #1b1d24;
+  border: 1px solid #333745;
+  border-radius: 12px;
+  color: #e6e8ee;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+.mid-editor-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 14px 18px 10px;
+  border-bottom: 1px solid #2a2d38;
+}
+
+.mid-editor-title {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.mid-editor-subtitle {
+  font-size: 12px;
+  color: #8b90a0;
+  flex: 1;
+}
+
+.mid-editor-close {
+  background: none;
+  border: none;
+  color: #8b90a0;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.mid-editor-close:hover { color: #fff; }
+
+.mid-editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 18px;
+  border-bottom: 1px solid #2a2d38;
+}
+
+.mid-editor-sep {
+  width: 1px;
+  height: 20px;
+  background: #333745;
+  margin: 0 2px;
+}
+
+.mid-editor-spacer { flex: 1; }
+
+.mid-inline-label,
+.mid-editor-count {
+  font-size: 12px;
+  color: #8b90a0;
+}
+
+.mid-btn {
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.mid-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.mid-btn-primary {
+  background: #6b7cff;
+  color: #fff;
+  font-weight: 600;
+}
+.mid-btn-primary:hover:not(:disabled) { background: #5a6af0; }
+
+.mid-btn-ghost {
+  background: transparent;
+  border-color: #333745;
+  color: #aeb3c2;
+}
+.mid-btn-ghost:hover:not(:disabled) { border-color: #55596b; color: #fff; }
+
+.mid-btn-danger {
+  background: transparent;
+  border-color: rgba(255, 84, 84, 0.5);
+  color: #ff8a8a;
+}
+.mid-btn-danger:hover:not(:disabled) { border-color: #ff5454; color: #fff; }
+
+.mid-input,
+.mid-select {
+  background: #242732;
+  border: 1px solid #333745;
+  border-radius: 8px;
+  color: #e6e8ee;
+  padding: 6px 8px;
+  font-size: 13px;
+  outline: none;
+}
+.mid-input:focus,
+.mid-select:focus { border-color: #6b7cff; }
+.mid-input-num { width: 68px; }
+
+/* 卷帘主体 */
+.mid-editor-roll {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: auto;
+  background: #14161b;
+}
+
+.mid-editor-keys {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  flex: 0 0 54px;
+  background: #1b1d24;
+  border-right: 1px solid #333745;
+}
+
+.mid-editor-key {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 6px;
+  font-size: 9px;
+  color: #6a6f7e;
+  background: #20232b;
+  border-bottom: 1px solid #191c22;
+  box-sizing: border-box;
+}
+.mid-editor-key.black { background: #14161b; }
+.mid-editor-key.labeled { color: #c8ccd8; font-weight: 600; }
+
+.mid-editor-canvas-wrap {
+  position: relative;
+  flex: 1;
+}
+
+.mid-editor-canvas {
+  display: block;
+}
+
+.mid-editor-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: #8b90a0;
+}
+.mid-editor-empty-icon { font-size: 40px; }
+.mid-editor-empty-text { font-size: 13px; }
+
+.mid-editor-error {
+  margin: 0 18px 8px;
+  background: rgba(255, 84, 84, 0.12);
+  border: 1px solid rgba(255, 84, 84, 0.4);
+  border-radius: 8px;
+  color: #ff8a8a;
+  padding: 10px 12px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.mid-editor-status {
+  margin: 0 18px 8px;
+  background: rgba(126, 226, 160, 0.1);
+  border: 1px solid rgba(126, 226, 160, 0.35);
+  border-radius: 8px;
+  color: #7ee2a0;
+  padding: 8px 12px;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.mid-editor-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border-top: 1px solid #2a2d38;
+}
+
+.mid-editor-working {
+  position: absolute;
+  right: 18px;
+  bottom: 58px;
+  font-size: 12px;
+  color: #c8ccd8;
+  background: rgba(20, 22, 27, 0.92);
+  border: 1px solid #333745;
+  border-radius: 8px;
+  padding: 6px 10px;
+}

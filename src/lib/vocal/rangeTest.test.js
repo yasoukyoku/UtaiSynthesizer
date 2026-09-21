@@ -1,0 +1,237 @@
+// S60-2 音域测试 — classification math gates (the v1 criteria must not drift).
+import { describe, expect, it, vi } from "vitest";
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
+vi.mock("../../i18n", () => ({ default: { t: (k) => k } }));
+import { buildScaleScore, classifySemitones, deriveRanges, deriveCautionZones, collectRangeTestTargets, SCAN_VERSION, buildSpeakerRecord, midiToHz, midiName, RANGE_MIDI_LO, RANGE_MIDI_HI, } from "./rangeTest";
+function stat(midi, errCents, voicedRatio) {
+    return { midi, errCents, voicedRatio };
+}
+describe("buildScaleScore", () => {
+    it("covers C2..C7 with contiguous frames and aligned 100fps spans", () => {
+        const { triples, spans } = buildScaleScore();
+        expect(spans.length).toBe(RANGE_MIDI_HI - RANGE_MIDI_LO + 1);
+        // triples tile the timeline: Σframes*2 == the last span end + trailing rest
+        const total50 = triples.reduce((a, t) => a + t.frames, 0);
+        expect(spans[spans.length - 1].end100).toBe((total50 - 6) * 2);
+        // spans are note-only windows, monotonically increasing
+        for (let i = 1; i < spans.length; i++) {
+            expect(spans[i].start100).toBeGreaterThan(spans[i - 1].end100 - 1);
+        }
+    });
+    it("S81: each probe note is long enough to reach steady state", () => {
+        // The pre-S81 probe was 120 ms, and for a vol_embedding model the phrase ADSR (80 ms
+        // attack + 100 ms release) covered the WHOLE note — it peaked at 0.8875x and never sang
+        // at full level, so the hardest condition for a high note was never measured. The quality
+        // analysis reads only the BACK HALF of each span, so that half alone has to clear the
+        // envelope. This is the invariant, not the constant: shortening the note breaks it.
+        const { spans } = buildScaleScore();
+        const noteMs = (spans[0].end100 - spans[0].start100) * 10; // 100 fps → ms
+        expect(noteMs / 2).toBeGreaterThanOrEqual(180); // measured half past attack+release
+    });
+});
+describe("classifySemitones", () => {
+    it("measures a perfect note as ~0 cents with full voicing, and erodes edges", () => {
+        const { spans } = buildScaleScore();
+        const span = spans[10];
+        const f0 = new Array(spans[spans.length - 1].end100 + 8).fill(0);
+        for (let i = span.start100; i < span.end100; i++)
+            f0[i] = midiToHz(span.midi);
+        // poison the edge frames — erosion must exclude them from the stats
+        f0[span.start100] = midiToHz(span.midi) * 2;
+        f0[span.end100 - 1] = midiToHz(span.midi) / 2;
+        const stats = classifySemitones(f0, spans);
+        expect(stats[10].errCents).toBeLessThan(1);
+        expect(stats[10].voicedRatio).toBe(1);
+        // a fully silent note reads unvoiced/Infinity
+        expect(stats[0].voicedRatio).toBe(0);
+        expect(stats[0].errCents).toBe(Infinity);
+    });
+});
+describe("deriveRanges (v1 criteria)", () => {
+    it("usable=<100¢&voiced>50%, comfort=<50¢&voiced>80%, contiguous runs", () => {
+        const stats = [];
+        for (let m = 36; m <= 96; m++) {
+            if (m >= 48 && m <= 84) {
+                const comfy = m >= 52 && m <= 79;
+                stats.push(stat(m, comfy ? 20 : 80, comfy ? 0.95 : 0.6));
+            }
+            else {
+                stats.push(stat(m, 500, 0.1));
+            }
+        }
+        const r = deriveRanges(stats);
+        expect(r.usable).toEqual([48, 84]);
+        expect(r.comfort).toEqual([52, 79]);
+    });
+    it("takes the LONGEST contiguous usable run (a stray good semitone far away doesn't win)", () => {
+        const stats = [];
+        for (let m = 36; m <= 96; m++) {
+            const inMain = m >= 55 && m <= 75;
+            const stray = m === 40;
+            stats.push(inMain || stray ? stat(m, 10, 1) : stat(m, 400, 0.2));
+        }
+        const r = deriveRanges(stats);
+        expect(r.usable).toEqual([55, 75]);
+    });
+    it("comfort falls back to usable when nothing reaches comfort grade; null when nothing usable", () => {
+        const stats = [];
+        for (let m = 36; m <= 96; m++) {
+            stats.push(m >= 60 && m <= 70 ? stat(m, 90, 0.6) : stat(m, 900, 0));
+        }
+        const r = deriveRanges(stats);
+        expect(r.comfort).toEqual(r.usable);
+        expect(deriveRanges(stats.map((s) => stat(s.midi, 900, 0)))).toBeNull();
+    });
+});
+describe("deriveRanges noise bridging (S60d)", () => {
+    it("bridges isolated 1-wide octave-flip dropouts (the lengv2.3 field case)", () => {
+        // clean passes 36..77 except single 1180¢ points at 57 and 61 — without bridging the
+        // longest run is [36,56] (ceiling truncated by 21 st); bridged it must be [36,77]
+        const stats = [];
+        for (let m = 36; m <= 96; m++) {
+            if (m === 57 || m === 61)
+                stats.push(stat(m, 1180, 1));
+            else if (m <= 77)
+                stats.push(stat(m, 5, 1));
+            else
+                stats.push(stat(m, 3800, 0));
+        }
+        const r = deriveRanges(stats);
+        expect(r.usable).toEqual([36, 77]);
+        expect(r.comfort).toEqual([36, 77]);
+    });
+    it("does NOT bridge a real saturation gap (>2 wide) or leading/trailing failures", () => {
+        // passes 42..70 and 76..79, real 5-wide failure at 71..75 (the 風音サヨ field case)
+        const stats = [];
+        for (let m = 36; m <= 96; m++) {
+            if ((m >= 42 && m <= 70) || (m >= 76 && m <= 79))
+                stats.push(stat(m, 5, 1));
+            else
+                stats.push(stat(m, 1500, 1));
+        }
+        const r = deriveRanges(stats);
+        expect(r.usable).toEqual([42, 70]); // the island at 76-79 stays a separate (losing) run
+    });
+});
+describe("deriveCautionZones (S60d3 model-quirk chips)", () => {
+    it("finds 'sings confidently wrong' artifact runs near usable (風音サヨ shape)", () => {
+        // usable [42,70]; 71-73 voiced but 1223-2410¢ off; 74 at 187¢ (below the 200¢ bar);
+        // 80-82 the saturation ramp start (327-535¢, voiced); everything past 82 out of window
+        const semis = {};
+        for (let m = 36; m <= 96; m++) {
+            if (m >= 42 && m <= 70)
+                semis[m] = [5, 1];
+            else if (m >= 71 && m <= 73)
+                semis[m] = [1223 + (m - 71) * 590, 1];
+            else if (m === 74)
+                semis[m] = [187, 0.75];
+            else if (m >= 75 && m <= 79)
+                semis[m] = [9999, 0];
+            else
+                semis[m] = [327 + (m - 80) * 100, 1];
+        }
+        const z = deriveCautionZones(semis, [42, 70]);
+        expect(z.artifact).toEqual([[71, 73], [80, 82]]); // window caps at usable[1]+12 = 82
+        expect(z.weak).toEqual([]);
+    });
+    it("finds in-usable bridged weak notes (lengv2.3 shape) and ignores single outside points", () => {
+        const semis = {};
+        for (let m = 36; m <= 96; m++) {
+            if (m === 57 || m === 61)
+                semis[m] = [1180, 1]; // octave-flip points INSIDE usable
+            else if (m <= 77)
+                semis[m] = [5, 1];
+            else if (m === 80)
+                semis[m] = [3655, 0.75]; // isolated (81+ unvoiced) → no ≥2 run
+            else
+                semis[m] = [9999, 0];
+        }
+        const z = deriveCautionZones(semis, [36, 77]);
+        expect(z.weak).toEqual([57, 61]);
+        expect(z.artifact).toEqual([]);
+    });
+    it("S81: reports notes bridged into COMFORT that fail the comfort bar", () => {
+        // The zone the render aims at is comfort, so a semitone the bridging carried into comfort
+        // while failing the comfort criterion is a note we deliberately transpose material ONTO
+        // and then label a defect. Pre-S81 only usable-grade failures were reported, so this note
+        // — good enough to be "usable", not good enough to be a target — was invisible.
+        const semis = {};
+        for (let m = 36; m <= 96; m++) {
+            if (m === 60)
+                semis[m] = [80, 0.9]; // passes isUsable (<100¢), fails isComfort (<50¢)
+            else if (m <= 77)
+                semis[m] = [5, 1];
+            else
+                semis[m] = [9999, 0];
+        }
+        expect(deriveCautionZones(semis, [36, 77]).weak).toEqual([]); // usable bar alone: invisible
+        expect(deriveCautionZones(semis, [36, 77], [36, 77]).weak).toEqual([60]);
+    });
+});
+describe("collectRangeTestTargets (S81 batch)", () => {
+    const model = (name, speakers, multi = false) => ({
+        name,
+        path: `C:/${name}.onnx`,
+        config: {
+            ...(multi ? { speakers: { A: 0, B: 1 } } : {}),
+            ...(speakers ? { vocal_range: { speakers } } : {}),
+        },
+    });
+    const rec = (scanVersion) => ({
+        usable: [36, 77],
+        comfort: [36, 77],
+        comfort_auto: [36, 77],
+        semitones: {},
+        tested_at: "2026-07-01",
+        ...(scanVersion ? { scan_version: scanVersion } : {}),
+    });
+    it("lists untested and pre-timbre records, and leaves current ones alone", () => {
+        const targets = collectRangeTestTargets({
+            sovits: [
+                model("never", null),
+                model("old", { "0": rec() }), // pre-S81 scan → worth re-testing, still usable
+                model("current", { "0": rec(SCAN_VERSION) }),
+            ],
+            rvc: [],
+        });
+        expect(targets.map((x) => [x.name, x.reason])).toEqual([
+            ["never", "missing"],
+            ["old", "stale"],
+        ]);
+    });
+    it("covers EVERY speaker of a multi-speaker model, not just 0", () => {
+        // The bug this whole feature exists next to: only speaker 0 was ever writable, so the
+        // other singers could never get a record at all.
+        const targets = collectRangeTestTargets({
+            sovits: [model("duo", { "0": rec(SCAN_VERSION) }, true)],
+            rvc: [],
+        });
+        expect(targets).toHaveLength(1);
+        expect(targets[0].speakerId).toBe(1);
+        expect(targets[0].reason).toBe("missing");
+    });
+    it("treats a single-speaker model as speaker 0 only", () => {
+        const targets = collectRangeTestTargets({ sovits: [model("solo", null)], rvc: [] });
+        expect(targets.map((x) => x.speakerId)).toEqual([0]);
+    });
+});
+describe("buildSpeakerRecord", () => {
+    it("stores the raw per-semitone scan and comfort_auto = detected comfort", () => {
+        const stats = [];
+        for (let m = 36; m <= 96; m++)
+            stats.push(m >= 50 && m <= 80 ? stat(m, 15, 0.97) : stat(m, Infinity, 0));
+        const rec = buildSpeakerRecord(stats);
+        expect(rec.comfort).toEqual(rec.comfort_auto);
+        expect(rec.semitones["50"]).toEqual([15, 0.97]);
+        expect(rec.semitones["36"][0]).toBe(9999); // Infinity is stored finitely (JSON-safe)
+    });
+});
+describe("midiName", () => {
+    it("labels C4=60 and friends", () => {
+        expect(midiName(60)).toBe("C4");
+        expect(midiName(48)).toBe("C3");
+        expect(midiName(69)).toBe("A4");
+        expect(midiName(61)).toBe("C#4");
+    });
+});

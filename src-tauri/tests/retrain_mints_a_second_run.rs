@@ -1,4 +1,4 @@
-//! S141 —— 「再训一个」**在一个真实形状的未迁移槽上**到底会不会铸出第二个 run。
+﻿//! S141 —— 「再训一个」**在一个真实形状的未迁移槽上**到底会不会铸出第二个 run。
 //!
 //! ## 为什么这条腿存在
 //!
@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
-use utai_lib::training::{migrate_one_slot, trun};
+use muno_lib::training::{migrate_one_slot, trun};
 
 fn w(p: &Path, body: &str) {
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -156,7 +156,7 @@ fn retraining_a_flat_slot_folds_it_and_mints_a_second_run_beside_the_first() {
         );
     }
     assert_eq!(
-        utai_lib::training::tproject::run_model_name(&old).as_deref(),
+        muno_lib::training::tproject::run_model_name(&old).as_deref(),
         Some("test-rvc"),
         "旧 run 的名字被动了 —— 那正是实机撞到的那条:新名字盖到了旧 run 头上"
     );

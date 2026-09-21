@@ -28,8 +28,6 @@ import numpy as np
 import torch
 
 from ..augment import is_aug_name
-from .. import stage_codes
-from .. import prep_codes
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +46,7 @@ def _load_features(spk_dir, stop):
         if n.endswith(".wav.soft.pt") and not is_aug_name(n)
     ]
     if not names:
-        raise RuntimeError(
-            "%s: %s: 0 non-aug *.wav.soft.pt (%d entries total)"
-            % (prep_codes.FEATURE_DIR_EMPTY_CODE, spk_dir, len(os.listdir(spk_dir)))
-        )
+        raise RuntimeError("特征目录为空，无法构建检索/聚类库")
     mats = []
     for name in names:
         stop.check()
@@ -61,7 +56,7 @@ def _load_features(spk_dir, stop):
 
 
 def build_retrieval(exp_dir, spk_dir, seed, reporter, stop, n_cpu=None, spk_id=0):
-    reporter.stage("index", message=stage_codes.BUILD_INDEX)
+    reporter.stage("index", message="构建检索特征库")
     big_npy = _load_features(spk_dir, stop)
 
     big_npy_idx = np.arange(big_npy.shape[0])
@@ -116,7 +111,7 @@ def build_kmeans(exp_dir, named_spk_dirs, reporter, stop):
     owns <safe_name>.centers.npy naming). `named_spk_dirs` = [(name, spk_dir), ...];
     single-speaker passes one pair -> byte-identical to the pre-①c {name:{...}} dict.
     ①c accumulates every co-trained speaker into the one .pt."""
-    reporter.stage("index", message=stage_codes.KMEANS)
+    reporter.stage("index", message="训练聚类中心 (kmeans)")
     ckpt = {}
     total = 0
     dim = 0

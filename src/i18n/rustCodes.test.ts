@@ -49,12 +49,6 @@ const EMIT = [
   /"([A-Z][A-Z0-9_]{4,})"\s*\.\s*into\(\)/g, //      "CODE".into()
   /"([A-Z][A-Z0-9_]{4,})"\s*\.\s*to_string\(\)/g, // "CODE".to_string()
   /Err\(\s*"([A-Z][A-Z0-9_]{4,})"/g, //              Err("CODE")
-  // S172: the fifth form, and the gate was blind to it until now — a CODE declared as a
-  // named constant and emitted through that name. `training/mod.rs`'s whole `warn_code`
-  // module is written this way, so TRAINING_HOST_MEMORY_EXHAUSTED and TRAINING_NO_PROGRESS
-  // have never been checked by this gate at all. Measured against today's tree, widening it
-  // adds ZERO snapshot churn: every CODE this reveals is already mapped.
-  /(?:const|static)\s+[A-Z][A-Z0-9_]*\s*:\s*&(?:'static\s+)?str\s*=\s*"([A-Z][A-Z0-9_]{4,})"/g,
 ];
 
 /** S126 当天未映射的 Rust CODE。分组只在**有依据**时才写理由。 */
@@ -73,6 +67,7 @@ const UNMAPPED_SNAPSHOT_S126 = [
   "VOCAL_UNKNOWN_PHONE", // ↑ `vocalRenderErrorMessage` 带载荷自行处理
   // ── 未判定 —— 留在快照里【不代表】它们没问题,每条都欠一次判定 ────────────────
   "AMD_SERIALIZE_KERNEL",
+  "BAD_CACHE_NAME", // cleanup_cache_entry 的调用方约束;UI 只传审计出的合法条目名,永不触发
   "BREATH",
   "CONTROL",
   "CUDA_LAUNCH_BLOCKING",

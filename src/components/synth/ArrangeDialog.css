@@ -1,0 +1,312 @@
+.arrange-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(2px);
+}
+
+.arrange-panel {
+  width: 340px;
+  max-width: 92vw;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg, 8px);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  animation: fadeUpIn 0.15s ease;
+}
+.arrange-panel-wide { width: 460px; }
+.arrange-panel-wide .arrange-body { overflow-y: auto; }
+
+.arrange-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.arrange-title {
+  font-size: var(--font-size-md, 13px);
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.02em;
+}
+
+.arrange-close {
+  background: none;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 11px;
+}
+.arrange-close:hover:not(:disabled) {
+  color: var(--color-error);
+  border-color: var(--color-error);
+}
+
+.arrange-body {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.arrange-target {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.arrange-target strong {
+  color: var(--text-primary);
+}
+
+.arrange-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.arrange-field > span {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.arrange-field select {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 7px 9px;
+  font-size: var(--font-size-sm);
+  outline: none;
+}
+.arrange-field select:focus {
+  border-color: var(--accent-primary);
+}
+
+.arrange-hint {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.arrange-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 11px 14px;
+  border-top: 1px solid var(--border-subtle);
+}
+.arrange-foot-split { justify-content: space-between; align-items: center; }
+.arrange-foot-right { display: flex; gap: 8px; }
+
+.arrange-btn {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 7px 14px;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.arrange-btn:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+}
+.arrange-btn.primary {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: #fff;
+}
+.arrange-btn.active {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+.arrange-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.arrange-source {
+  padding: 0 14px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.arrange-source strong { color: var(--text-secondary); font-weight: 600; }
+
+/* ── 歌曲身份证 ── */
+.idcard {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.idcard-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+}
+.idcard-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+.idcell {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+  justify-content: center;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 6px 4px;
+}
+.idcell-k { font-size: 10px; color: var(--text-muted); }
+.idcell-v { font-size: 15px; font-weight: 600; color: var(--text-primary); }
+.idcell-u { font-size: 10px; color: var(--text-muted); }
+.idcard-chords {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.idcard-chordseq {
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow-x: auto;
+  flex: 1;
+  padding-bottom: 2px;
+}
+.idcard-empty { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+
+/* ── 乐器分组勾选 ── */
+.inst-block { display: flex; flex-direction: column; gap: 9px; }
+.inst-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+}
+.inst-block-actions { display: flex; gap: 4px; }
+.inst-block-actions button {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.inst-block-actions button:hover { color: var(--accent-primary); }
+
+.inst-group { display: flex; flex-direction: column; gap: 5px; }
+.inst-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.inst-group-title { font-size: 11px; color: var(--text-secondary); }
+.inst-group-toggle {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.inst-group-toggle:hover { color: var(--accent-primary); }
+
+.inst-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.inst-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 78px;
+  flex: 1 1 78px;
+  padding: 6px 9px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.inst-chip:hover { border-color: var(--accent-primary); color: var(--text-primary); }
+.inst-chip.on {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: #fff;
+}
+.inst-chip-name { font-size: 12px; font-weight: 600; line-height: 1.2; }
+.inst-chip-desc { font-size: 10px; opacity: 0.7; line-height: 1.2; }
+
+/* ── 兼容旧引用(ChordMidiDialog 同族) ── */
+.arrange-row { display: flex; gap: 10px; }
+.arrange-row > .arrange-field { flex: 1; }
+.arrange-section { margin-bottom: 12px; }
+.arrange-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.arrange-count {
+  background: var(--accent-primary);
+  color: #fff;
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.arrange-instruments { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+.arrange-inst {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 4px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: inherit;
+}
+.arrange-inst.on {
+  border-color: var(--accent-primary);
+  background: var(--accent-primary);
+  color: #fff;
+}
+.arrange-inst-icon { font-size: 20px; margin-bottom: 2px; }
+.arrange-inst-label { font-size: 12px; font-weight: 600; }
+.arrange-inst-desc { font-size: 10px; opacity: 0.65; margin-top: 1px; }
+.arrange-tracks-summary { color: var(--text-primary); font-weight: 600; }
+.arrange-warn { color: var(--color-error); font-weight: 600; margin-left: 4px; }

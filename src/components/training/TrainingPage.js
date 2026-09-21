@@ -1,0 +1,2000 @@
+import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
+/**
+ * Full-screen training page (S37) — four stages: 数据 → 对象 → 参数 → 运行.
+ * Covers the DAW (which stays mounted) as an absolute overlay inside app-content.
+ * Training itself is fully backend-driven; this page is a projection of the
+ * training store (event-fed) and may be closed/reopened at any time mid-run.
+ */
+import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { exists, readFile } from "@tauri-apps/plugin-fs";
+import { useAppStore } from "../../store/app";
+import { logToBackend } from "../../lib/log";
+import { trainingDataOk, backendSupportsMultiSpeaker, setupTrainingListeners, useTrainingStore, backendFamily, mergeCkptSources, segTab, asTrainingBackend, IDLE_SNAPSHOT, } from "../../store/training";
+import { ProjectsStep } from "./ProjectsStep";
+import { ProjectDetail } from "./ProjectDetail";
+import { useVoiceModelStore, voiceFeatureDim, voiceVersionBadge, } from "../../store/voice-models";
+import { AUDIO_EXT_RE, AUDIO_EXTENSIONS, fmtDur, fmtSize } from "../../lib/constants";
+import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
+import { resolveArchiveIndex, indexPathArg, indexWarningCode, } from "../../lib/training/indexPath";
+import { resolveRowIdentity } from "../../lib/training/rowIdentity";
+import { isRunningState, trainingIsLive } from "../../lib/training/liveRun";
+import { attachToasts, batchImportToast, collectWarningCodes, importToast, } from "../../lib/training/importToast";
+import { poolAtStake, poolCostFieldIds } from "../../lib/training/costlyNote";
+import { maybeShowErrorModal } from "../../lib/errorDisplay";
+import { lockedFieldIds, resumeWouldBeGuarded } from "../../lib/resumeLock";
+import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
+import { Dropdown } from "../common/Dropdown";
+import { preview } from "../common/previewPlayer";
+import { PreviewFileRow, useFilePreview } from "./PreviewFileRow";
+import { LossChart } from "./LossChart";
+import "./TrainingPage.css";
+/** Preprocessing stage sequence per backend (stage names come from the sidecar
+ *  protocol; these arrays only order/tick the checklist display). */
+const STAGE_ORDERS = {
+    // S41: augment + aug_check always emit (an instant "skipped" tick when
+    // copies=0), and the sovits/diff filelist stage moved AFTER extract/gate
+    // (the aug quality gate must finish before the filelists are written)
+    rvc: ["import", "slice", "augment", "f0", "feature", "aug_check", "index", "filelist", "train_prep"],
+    sovits: ["import", "slice", "augment", "extract", "aug_check", "filelist", "index", "train_prep"],
+    sovits_v2: ["import", "slice", "augment", "extract", "aug_check", "filelist", "index", "train_prep"],
+    sovits_diff: ["import", "slice", "augment", "extract", "aug_check", "filelist", "diff_prep", "train_prep"],
+    vocoder: ["import", "slice", "augment", "process", "aug_check", "filelist", "train_prep"],
+};
+/** family → its i18n label key, for the archive page header (RunStep sees only a backend id). */
+const FAMILY_LABEL_KEY = {
+    rvc: "backendRvc",
+    sovits: "familySovits",
+    sovits_v2: "backendSovits40v2",
+    vocoder: "backendVocoder",
+};
+export function TrainingPage() {
+    const { t } = useTranslation();
+    const closePage = useAppStore((s) => s.toggleTrainingPage);
+    const { route, setRoute, goSeg, snapshot, refresh, config, diffWsInfo, projectDataset } = useTrainingStore();
+    const [dropActive, setDropActive] = useState(false);
+    useEffect(() => {
+        void setupTrainingListeners();
+        void refresh();
+    }, [refresh]);
+    // S115 §F5-2: diagnostic mode is PERSISTED, so a user who turned it on to reproduce a crash
+    // will still have it on weeks later — and its only symptom is a slower run. Unexplained
+    // slowness gets reported to us as a regression, so the page says so permanently while it is
+    // set. Re-read on every step change: the switch lives in the Settings panel, and the moment
+    // that matters is the user coming back here to start a run.
+    const [diagMode, setDiagMode] = useState(false);
+    const diagStep = route.seg;
+    useEffect(() => {
+        invoke("get_diagnostic_mode").then(setDiagMode).catch(() => { });
+    }, [diagStep]);
+    // single fetch site for the diff host's slot info (S41 共享池模式):
+    // DataStep/ParamsStep/RunStep all consume the store copy via diffPoolReady.
+    // S76 batch 4: keyed by PROJECT, not by the typed model name. Picking a host that belongs to
+    // another project routes there first (ProjectDetail.startDiff), so the current project always
+    // IS the host's project — and a rename can no longer make this probe address nothing.
+    // S78: fetched for EVERY backend, not just diffusion — the parameters page needs the slot's
+    // frozen values to render the resume-locked fields read-only (`resume_lock`). `diffWsInfo`
+    // keeps its name and its diff-only meaning (免导入直训 asks it about the SHARED slice pool);
+    // `slotInfo` is the same probe for whichever backend is selected.
+    useEffect(() => {
+        const pid = route.projectId;
+        if (!pid) {
+            useTrainingStore.getState().setDiffWsInfo(null);
+            useTrainingStore.getState().setSlotInfo(null);
+            return;
+        }
+        let cancelled = false;
+        void (async () => {
+            try {
+                const info = await invoke("get_training_slot_info", {
+                    projectId: pid,
+                    backend: config.backend,
+                    // ⛔★§F2⒝ ④e —— **这个参数不是可选的**。S132 的 flip 让「再训一个」真的铸出第二个
+                    // run,而 `resolve_run_dir(None)` 对多于一个 run **拒绝作答**(`RUN_AMBIGUOUS`)——
+                    // 不传就等于问「这个槽整体练到哪了」,那是一个从此没有答案的问题。
+                    //
+                    // 这一条是三处里**静默**的那一处:catch 把它吞成 `setSlotInfo(null)`,而
+                    // `resumeWouldBeGuarded` 头一行就是 `if (!info) return false` ⇒ 续训锁全部解除、
+                    // `costly` 变空集合 ⇒ 「改这个字段会重跑预处理」的提示**整体消失**。locked 那一档
+                    // 改了还会被后端响亮拒;costly 那一档按设计就是「允许,但要把代价说出来」——
+                    // 提示没了,用户改一个字段,下次运行静默落到另一个池、切片/f0/特征重跑几小时,
+                    // 屏幕上一个字都没有。
+                    runId: config.runId,
+                });
+                if (cancelled)
+                    return;
+                useTrainingStore.getState().setSlotInfo(info);
+                useTrainingStore
+                    .getState()
+                    .setDiffWsInfo(config.backend === "sovits_diff" ? info : null);
+            }
+            catch {
+                if (cancelled)
+                    return;
+                useTrainingStore.getState().setSlotInfo(null);
+                useTrainingStore.getState().setDiffWsInfo(null);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [config.backend, config.runId, route.projectId]);
+    // Does the CURRENT project hold a reusable flat (single-speaker) dataset? Derived HERE, keyed
+    // on route.projectId, so it stays correct on every path — including「训练中直落运行段」, which
+    // switches project via setRoute and never mounts ProjectDetail. Consumed via poolReusable so
+    // an existing flat project trains without being sent back to re-import.
+    useEffect(() => {
+        const pid = route.projectId;
+        if (!pid) {
+            useTrainingStore.getState().setProjectInfo(null);
+            return;
+        }
+        let cancelled = false;
+        void (async () => {
+            try {
+                const d = await invoke("get_training_project", { projectId: pid });
+                if (!cancelled)
+                    useTrainingStore.getState().setProjectInfo(d);
+            }
+            catch {
+                if (!cancelled)
+                    useTrainingStore.getState().setProjectInfo(null);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [route.projectId]);
+    const running = isRunningState(snapshot.state);
+    /** ★★§E2E-M25 ⑵ —— 这盏灯此前只写「训练中」,而它读的是**全局**快照、不比 `project_id`:
+     *  站在项目 B 的详情页、项目 A 在训练时,它照样亮着 —— 而同一屏上运行段那一层特意做了项目
+     *  过滤(`snapshot` 在那里被换成 IDLE),于是两句话说的不是一件事。
+     *  ⇒ ⑵ 的真正内容不是「从无到有加一句话」,是**把这句已经在说的含糊话收窄成「是哪个」**。
+     *  ⚠ 收窄成「只在本项目时才亮」是**错的方向**:那会让「有训练在跑」在别的页面上**消失**,
+     *  而它恰恰是「为什么这里的按钮是灰的」的答案(§E2E-M25 ⑶)。⇒ 亮,但说清是别的项目。 */
+    const liveName = snapshot.model_name || t("training.runUnnamed");
+    const liveElsewhere = !!route.projectId && snapshot.project_id !== route.projectId;
+    // 训练中打开训练页 = 直接落到运行段。
+    //
+    // 以前这件事「能用」纯属巧合:向导恰好停在第 4 段,所以刷新一次就回到第 1 段,训练还在跑却
+    // 找不到它。做成显式路由之后要小心两点:
+    //  · 挂载首帧的 snapshot 是 IDLE_SNAPSHOT(refresh() 是异步的),这一帧判「没在跑」是错的,
+    //    所以只在真的看到 starting/running 时才落;
+    //  · 只落一次(ref 守卫)。否则用户在训练中主动切到别的段,会被反复拽回来。
+    const landedRef = useRef(false);
+    /** Where the page was WHEN IT OPENED. `route` survives closing the page (module-level store),
+     *  so "did the user open this page while parked on some other project?" can only be asked of
+     *  the mount-time value — asking it of the live one made the answer change under us. */
+    const openedAtRef = useRef(route.projectId);
+    useEffect(() => {
+        if (landedRef.current || !running || !snapshot.project_id)
+            return;
+        // Never yank a user who was deliberately looking at ANOTHER project when they opened the
+        // page. Besides the jump itself, this effect rewrites `config`, so from another project it
+        // would re-label that project's half-filled form with this run's name and backend.
+        //
+        // ★ Anchored on the MOUNT-time route, and latched either way. Keyed on the live
+        // `route.projectId` (which is a dependency of this effect) it re-armed on every navigation:
+        // the very next thing such a user does is press「← 全部项目」, which sets it to "" — the
+        // guard then read as「no project selected」and threw them into the running project's run
+        // segment instead of the list, with `updateConfig` undoing the clear `enterProject` had
+        // just performed.
+        landedRef.current = true;
+        if (openedAtRef.current !== "" && openedAtRef.current !== snapshot.project_id)
+            return;
+        // 让整页与这次运行一致:存档列表、参数回显、试听都读 config
+        const backend = asTrainingBackend(snapshot.backend);
+        useTrainingStore.getState().updateConfig({
+            ...(backend ? { backend } : {}),
+            modelName: snapshot.model_name,
+        });
+        setRoute({ seg: "run", projectId: snapshot.project_id });
+    }, [running, snapshot.project_id, snapshot.backend, snapshot.model_name, setRoute]);
+    // OS drag-drop: the webview event is global, so the Arrangement timeline (which
+    // stays mounted under this page) short-circuits while this page is open and we
+    // take the drop here as dataset import. Registered ONCE (reads live state via
+    // getState, like Arrangement) — addFiles dedupes, so a StrictMode double-mount
+    // is harmless. NB Tauri's "over" payload has NO `paths` (only enter/drop do).
+    useEffect(() => {
+        let unlisten;
+        let cancelled = false;
+        // enter-time decision (is this an audio drag we accept?) — reused on `over`
+        // and `drop`, which is why it lives in the effect closure, not React state.
+        let dragAccept = false;
+        // Drag-drop events are Tauri-WebView-only; skip cleanly in a plain browser
+        // so the app shell still mounts (dev preview / E2E / accidental open).
+        try {
+            getCurrentWebview()
+                .onDragDropEvent((event) => {
+                const p = event.payload;
+                const liveNow = () => {
+                    return isRunningState(useTrainingStore.getState().snapshot.state);
+                };
+                // ①c: with ≥2 singers a drop lands on the singer CARD under the cursor,
+                // else the FIRST singer (the fallback) — returning that id means the
+                // hover highlight always shows exactly where the drop will land, so a
+                // fallback-to-first is never a surprise. Hit-test by card GEOMETRY
+                // (getBoundingClientRect), NOT elementFromPoint — the full-screen drop
+                // overlay sits on top of the cards, so elementFromPoint would always
+                // return the overlay (and it isn't torn down synchronously by
+                // setDropActive(false)). Tauri gives a PHYSICAL-pixel position; rects
+                // are CSS px, so divide by DPR.
+                const hitTestSpeaker = (position) => {
+                    const st = useTrainingStore.getState();
+                    // S78: the singers are the project's on-disk directories; a card's identity is its slug.
+                    const groups = st.projectDataset?.groups ?? [];
+                    if (!backendSupportsMultiSpeaker(st.config.backend) || groups.length <= 1) {
+                        return null;
+                    }
+                    if (position) {
+                        const dpr = window.devicePixelRatio || 1;
+                        const x = position.x / dpr;
+                        const y = position.y / dpr;
+                        const cards = document.querySelectorAll("[data-spk-id]");
+                        for (const card of cards) {
+                            const r = card.getBoundingClientRect();
+                            if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+                                return card.getAttribute("data-spk-id");
+                            }
+                        }
+                    }
+                    return groups[0]?.slug ?? null; // fallback: the first singer
+                };
+                const setHover = (id) => {
+                    const st = useTrainingStore.getState();
+                    if (st.dragOverSpeakerId !== id)
+                        st.setDragOverSpeakerId(id);
+                };
+                if (p.type === "enter") {
+                    // don't invite a drop we'll refuse: adding to the dataset only affects
+                    // the NEXT run, so while one is live we accept nothing (matches the
+                    // Arrangement convention: no affordance for a drop that won't import).
+                    // S76 batch 4: the project list is the same case — a drop there has no
+                    // project to import INTO, so it must not light up either.
+                    dragAccept =
+                        !liveNow() &&
+                            !!useTrainingStore.getState().route.projectId &&
+                            p.paths.some((pp) => AUDIO_EXT_RE.test(pp));
+                    setDropActive(dragAccept);
+                    setHover(dragAccept ? hitTestSpeaker(p.position) : null);
+                }
+                else if (p.type === "over") {
+                    // 'over' carries no paths — reuse the enter-time accept decision
+                    setHover(dragAccept ? hitTestSpeaker(p.position) : null);
+                }
+                else if (p.type === "leave") {
+                    dragAccept = false;
+                    setDropActive(false);
+                    setHover(null);
+                }
+                else if (p.type === "drop") {
+                    setDropActive(false);
+                    const target = dragAccept ? hitTestSpeaker(p.position) : null;
+                    dragAccept = false;
+                    setHover(null);
+                    if (liveNow())
+                        return;
+                    const audio = p.paths.filter((pp) => AUDIO_EXT_RE.test(pp));
+                    if (audio.length === 0)
+                        return;
+                    const st = useTrainingStore.getState();
+                    // ①c: SoVITS/RVC data is the singer list — a drop lands on the card under
+                    // the cursor (or the first singer if not over a card, so files are
+                    // never lost); diff/vocoder use the flat dataset.
+                    // S76 batch 4: a drop is「往某个项目里导数据」. On the landing there is no project to
+                    // import INTO, so an audio drop there has no destination — ignore it rather than
+                    // route somewhere arbitrary. (`goSeg` refuses a project-less jump too; this keeps the
+                    // files from being staged into a form nothing will read.)
+                    if (!st.route.projectId)
+                        return;
+                    // S78: a drop IMPORTS — the files land in `<project>/dataset/` immediately. The target
+                    // is a singer directory when the project has singers, else the flat dataset. Failures
+                    // surface here because there is no form left to leave the files sitting in.
+                    const groups = st.projectDataset?.groups ?? [];
+                    const slug = backendSupportsMultiSpeaker(st.config.backend)
+                        ? (target ?? groups[0]?.slug ?? null)
+                        : null;
+                    const owner = groups.find((g) => g.slug === slug);
+                    st.goSeg("data");
+                    void st.importIntoProject(audio, owner ? owner.name || owner.slug : null).catch((e) => {
+                        const msg = backendErrorMessage(e) ?? String(e);
+                        if (!maybeShowErrorModal(e, msg))
+                            useAppStore.getState().showToast(msg, "error");
+                    });
+                }
+            })
+                .then((u) => {
+                if (cancelled)
+                    u();
+                else
+                    unlisten = u;
+            })
+                .catch(() => { });
+        }
+        catch {
+            /* getCurrentWebview() itself throws outside Tauri — skip */
+        }
+        return () => {
+            cancelled = true;
+            if (unlisten)
+                unlisten();
+        };
+    }, []);
+    // 「数据满足了吗」= 项目**盘上**有没有这个架构能吃的数据(S78:导入即落盘,不再有暂存表)。
+    const hasProject = route.projectId !== "";
+    // 一次运行的身份 = 项目 + 架构槽 + 本次训练名。名字只在详情页点某张槽卡片时才产生
+    //(askRunName,已跑过的槽直接沿用冻结的旧名),换项目会清掉它。没有它就不该往参数/运行段走:
+    // 那两段的每个动作最终都要把这个名字发给后端当产物身份,而中间没有任何一处能填它。
+    const runNameSet = config.modelName.trim() !== "";
+    const step3Ok = hasProject && runNameSet && trainingDataOk(config.backend, projectDataset, diffWsInfo);
+    // 运行段属于「这个项目的这次运行」。以前的判据是「有任何非 idle 的 snapshot」——那时没有项目
+    // 概念,所以够用;现在它有两个洞:①没选项目时也为真,tab 亮着但一点就被防逃课弹回;
+    // ②在项目 B 上会亮出项目 A 的运行结果。运行中的 run 由 project_id 认领(批 1 起每次运行都带)。
+    const runIsHere = hasProject && snapshot.state !== "idle" && snapshot.project_id === route.projectId;
+    const step4Ok = step3Ok || runIsHere;
+    const stepOk = [true, hasProject, step3Ok, step4Ok];
+    const tab = segTab(route.seg);
+    // 防逃课 invariant (S41 用户实测报的):任何让当前段失效的路径(清空结果后没有数据、
+    // 后端从浅扩散切走……)都要把用户弹回去,而不是留在一个点不动的段上。
+    //
+    // 落点是**项目详情**,不是项目列表:失效的是「这个项目的下一步」,把人一路踢回卡片墙
+    // 等于说「你刚才干的事整个作废了」。没有项目才回列表(那是唯一说得通的落点)。
+    useEffect(() => {
+        if (!hasProject) {
+            if (route.seg !== "projects")
+                setRoute({ seg: "projects", projectId: "" });
+            return;
+        }
+        if ((route.seg === "params" && !step3Ok) || (route.seg === "run" && !step4Ok)) {
+            goSeg("detail");
+        }
+    }, [route.seg, hasProject, step3Ok, step4Ok, goSeg, setRoute]);
+    const steps = [
+        t("training.step1"),
+        t("training.step2"),
+        t("training.step3"),
+        t("training.step4"),
+    ];
+    /** Tab 1 覆盖两个段:有项目就回它的详情,没有就是列表本身。 */
+    const tabSeg = (n) => n === 1 ? (hasProject ? "detail" : "projects") : n === 2 ? "data" : n === 3 ? "params" : "run";
+    return (_jsxs("div", { className: "training-page", children: [_jsxs("div", { className: "training-page-header", children: [_jsx("span", { className: "panel-title", children: t("training.title") }), running && (_jsxs("span", { className: "training-live", children: [_jsx("span", { className: "pulse-dot" }), liveElsewhere
+                                ? t("training.activeOther", { name: liveName })
+                                : t("training.activeNamed", { name: liveName })] })), _jsx("div", { className: "training-header-spacer" }), _jsx("button", { className: "panel-close", onClick: closePage, title: t("training.close"), children: "X" })] }), diagMode && (_jsx("div", { className: "training-warn-list", children: _jsxs("div", { className: "training-warn-row", children: [_jsx("span", { className: "training-warn-mark", children: "!" }), _jsx("span", { children: t("training.diagnosticOn") })] }) })), _jsx("nav", { className: "training-steps", children: steps.map((label, i) => {
+                    const n = (i + 1);
+                    const enabled = stepOk[i];
+                    return (_jsxs("button", { className: `training-step-tab ${tab === n ? "active" : ""}`, disabled: !enabled, onClick: () => setRoute({ seg: tabSeg(n), projectId: route.projectId }), children: [_jsx("span", { className: "training-step-num", children: n }), label] }, n));
+                }) }), _jsxs("div", { className: `training-step-body ${tab === 1 ? "wide" : ""}`, children: [route.seg === "projects" && _jsx(ProjectsStep, {}), route.seg === "detail" && _jsx(ProjectDetail, {}), route.seg === "data" && _jsx(DataStep, {}), route.seg === "params" && _jsx(ParamsStep, {}), route.seg === "run" && _jsx(RunStep, {}), route.seg === "archive" && _jsx(RunStep, { archiveOnly: true })] }), dropActive &&
+                !(backendSupportsMultiSpeaker(config.backend) &&
+                    (projectDataset?.groups.length ?? 0) > 1 &&
+                    route.seg === "data") && _jsx("div", { className: "training-drop-overlay", children: t("training.dropHint") })] }));
+}
+/* -------------------- step 2 (since the S41 order swap): data -------------------- */
+// PreviewPlayer extracted to components/common/previewPlayer.ts in S41 (the
+// audition rows share it; singleton = data-step preview and audition playback
+// preempt each other, which is the intended behavior)
+// Scrubber extracted to components/common/Scrubber.tsx (S66) — the workflow node output
+// preview shares it. The data-list margin moved to .training-scrubber-slot (caller-owned).
+/**
+ * 第 2 段 · 数据 —— 项目数据集的编辑器(S78 批 5)。
+ *
+ * 以前这里是一张**新导入的暂存表**:选好文件,等训练开始时才整体写进 `<project>/dataset/`。
+ * 于是「项目上方写着有数据、点进来却是空表」,而且在这里选一个文件会**整体替换**已经攒好的
+ * 一整份数据。现在导入是它自己的动作:文件立刻落盘,这一页显示的就是磁盘上的真实内容。
+ *
+ * 三条不变量:
+ *  1. 唯一真源是磁盘。每次增删都以 `refreshProjectDataset()` 收尾,界面从不自己打补丁。
+ *  2. 歌手的**顺序就是 emb_g 行号**(0 起,与 config.spk、推理歌手下拉同一套编号)。
+ *  3. 歌手集合被任一架构冻结后,增删歌手会被后端硬拒(`DATASET_SPEAKERS_FROZEN`);
+ *     给已有歌手增删文件不受限,只是下次续训要重做特征提取。
+ */
+function DataStep() {
+    const { t } = useTranslation();
+    const { goSeg, config, diffWsInfo, projectDataset, importIntoProject, deleteFromProject, dragOverSpeakerId, flashSpeaker, clearFlashSpeaker, } = useTrainingStore();
+    const showConfirm = useAppStore((s) => s.showConfirm);
+    const showToast = useAppStore((s) => s.showToast);
+    const [busy, setBusy] = useState(false);
+    const ds = projectDataset;
+    const groups = ds?.groups ?? [];
+    const flat = ds?.entries.filter((e) => !e.rel.includes("/")) ?? [];
+    // ①c: SoVITS (α) + RVC (α′) + v2 take a SINGER LIST; diff/vocoder are flat-only.
+    const singerList = backendSupportsMultiSpeaker(config.backend);
+    const dataOk = trainingDataOk(config.backend, ds, diffWsInfo);
+    // The preview reads files by absolute path; the presence check re-reads the CURRENT listing
+    // because a long decode outlives its gesture and the row may be deleted by then.
+    const dsRef = useRef(ds);
+    dsRef.current = ds;
+    const p = useFilePreview((path) => {
+        const d = dsRef.current;
+        return !!d && d.entries.some((e) => `${d.datasetDir}/${e.rel}` === path);
+    });
+    const run = async (fn) => {
+        setBusy(true);
+        try {
+            await fn();
+        }
+        catch (e) {
+            const msg = backendErrorMessage(e) ?? String(e);
+            if (!maybeShowErrorModal(e, msg))
+                showToast(msg, "error");
+        }
+        finally {
+            setBusy(false);
+        }
+    };
+    const pickAudio = async () => {
+        const picked = await open({
+            multiple: true,
+            filters: [{ name: "Audio", extensions: AUDIO_EXTENSIONS }],
+            title: t("training.addFiles"),
+        });
+        if (!picked)
+            return null;
+        return Array.isArray(picked) ? picked : [picked];
+    };
+    const addTo = async (speaker) => {
+        const files = await pickAudio();
+        if (!files)
+            return;
+        await run(() => importIntoProject(files, speaker));
+    };
+    /** A new singer only exists once it has audio — an empty directory is a speaker with no data,
+     *  which the start guard refuses anyway. So the name prompt is followed straight by the file
+     *  picker, and nothing is created if the user backs out of either. */
+    const addSinger = async () => {
+        const taken = new Set(groups.map((g) => (g.name || g.slug).trim()));
+        const name = await showConfirm({
+            title: t("training.addSpeaker"),
+            body: t("training.addSpeakerBody"),
+            buttons: [
+                { id: "__cancel", label: t("training.cancel") },
+                { id: "ok", label: t("training.next"), kind: "primary" },
+            ],
+            input: {
+                initial: "",
+                invalid: (v) => !v.trim()
+                    ? t("backend.TRAINING_SPEAKER_NAME_EMPTY")
+                    : taken.has(v.trim())
+                        ? t("backend.TRAINING_SPEAKER_NAME_DUP")
+                        : null,
+            },
+        });
+        if (!name || name === "__cancel")
+            return;
+        const files = await pickAudio();
+        if (!files)
+            return;
+        await run(() => importIntoProject(files, name.trim()));
+    };
+    /** Deleting is confirmed only when it COSTS something: with a trained slot in the project the
+     *  next run has to redo slicing + feature extraction. With nothing trained it is free, and a
+     *  dialog per file would just be in the way. */
+    const removeFile = async (rel, label) => {
+        if (useTrainingStore.getState().projectHasProgress) {
+            const ok = await showConfirm({
+                title: t("training.datasetRemoveTitle"),
+                body: t("training.datasetRemoveBody", { name: label }),
+                buttons: [
+                    { id: "__cancel", label: t("training.cancel") },
+                    { id: "go", label: t("training.remove"), kind: "danger" },
+                ],
+            });
+            if (ok !== "go")
+                return;
+        }
+        if (ds)
+            p.stopIfPlaying(`${ds.datasetDir}/${rel}`);
+        await run(() => deleteFromProject([rel]));
+    };
+    const removeSinger = async (slug, label, files) => {
+        const ok = await showConfirm({
+            title: t("training.removeSpeaker"),
+            body: t("training.datasetRemoveSpeakerBody", { name: label, count: files }),
+            buttons: [
+                { id: "__cancel", label: t("training.cancel") },
+                { id: "go", label: t("training.remove"), kind: "danger" },
+            ],
+        });
+        if (ok !== "go")
+            return;
+        const rels = (ds?.entries ?? [])
+            .filter((e) => e.rel.startsWith(`${slug}/`))
+            .map((e) => e.rel);
+        if (ds)
+            rels.forEach((r) => p.stopIfPlaying(`${ds.datasetDir}/${r}`));
+        await run(() => deleteFromProject(rels));
+    };
+    const row = (e, lead) => (_jsx(PreviewFileRow, { p: p, path: `${ds.datasetDir}/${e.rel}`, title: e.rel, lead: lead, 
+        // No original name = imported before the annotation existed; showing the on-disk name is
+        // the honest fallback.
+        name: e.name || e.rel, meta: e.durationMs != null ? fmtDur(e.durationMs / 1000) : fmtSize(e.bytes), onRemove: busy ? undefined : () => void removeFile(e.rel, e.name || e.rel) }, e.rel));
+    const total = (entries) => {
+        const ms = entries.reduce((a, e) => a + (e.durationMs ?? 0), 0);
+        return (_jsxs("span", { className: "training-data-total", children: [t("training.files", { count: entries.length }), ms > 0 && _jsxs(_Fragment, { children: [" \u00B7 ", t("training.totalDur", { dur: fmtDur(ms / 1000) })] })] }));
+    };
+    return (_jsxs("div", { className: "training-data-step", children: [_jsx("div", { className: "training-hint", children: t("training.dataHint") }), singerList && groups.length > 0 ? (
+            // ── 多歌手:每位歌手一张卡,顺序 = emb_g 行号 ──────────────────────────
+            _jsxs("div", { className: "training-spk-stack", children: [groups.map((g, i) => {
+                        const mine = (ds?.entries ?? []).filter((e) => e.rel.startsWith(`${g.slug}/`));
+                        return (_jsxs("div", { "data-spk-id": g.slug, className: `training-spk-group${dragOverSpeakerId === g.slug ? " drop-target" : ""}`, children: [flashSpeaker?.id === g.slug && (_jsx("span", { className: "training-spk-flash", onAnimationEnd: () => clearFlashSpeaker(flashSpeaker.nonce) }, flashSpeaker.nonce)), _jsxs("div", { className: "training-spk-header", children: [_jsx("span", { className: "training-spk-idx", title: t("training.projectDatasetOrderNote"), children: ds?.orderKnown ? i : "?" }), _jsx("span", { className: "training-spk-name tproj-ds-spk-name", title: g.slug, children: g.name || g.slug }), _jsxs("span", { className: "training-spk-count", children: [t("training.files", { count: g.files }), " \u00B7 ", fmtSize(g.bytes)] }), _jsx("button", { className: "training-file-remove", disabled: busy, onClick: () => void removeSinger(g.slug, g.name || g.slug, g.files), title: t("training.removeSpeaker"), children: "X" })] }), _jsx("div", { className: "training-data-actions", children: _jsx("button", { className: "training-btn", disabled: busy, onClick: () => void addTo(g.name || g.slug), children: t("training.addFiles") }) }), _jsx("div", { className: "training-file-list training-spk-files", children: mine.map((e) => row(e)) })] }, g.slug));
+                    }), _jsx("button", { className: "training-btn training-spk-add", disabled: busy, onClick: () => void addSinger(), children: t("training.addSpeaker") }), _jsx("div", { className: "training-hint training-spk-hint", children: ds?.orderKnown
+                            ? t("training.multiSpeakerHint")
+                            : t("training.projectDatasetOrderUnknown") })] })) : (
+            // ── 平铺(单歌手 / 浅扩散 / 声码器)───────────────────────────────────
+            _jsxs(_Fragment, { children: [_jsxs("div", { className: "training-data-actions", children: [_jsx("button", { className: "training-btn", disabled: busy, onClick: () => void addTo(null), children: t("training.addFiles") }), total(flat), singerList && flat.length > 0 && (
+                            // Turning a flat project into a co-training one: the existing audio stays where it
+                            // is, the new singer gets its own directory. Refused by the backend once a slot has
+                            // frozen the (single-speaker) structure, with a CODE that says why.
+                            _jsx("button", { className: "training-btn", disabled: busy, onClick: () => void addSinger(), children: t("training.addSpeaker") }))] }), flat.length === 0 ? (_jsxs("div", { className: "training-empty", children: [t("training.empty"), config.backend === "sovits_diff" && dataOk && (_jsx("div", { className: "training-fixed-note", children: t("training.diffPoolHint") }))] })) : (_jsx("div", { className: "training-file-list", children: flat.map((e) => row(e)) }))] })), _jsx("div", { className: "training-step-nav", children: config.modelName.trim() === "" ? (_jsx("button", { className: "training-btn primary", onClick: () => goSeg("detail"), children: t("training.pickSlot") })) : (_jsx("button", { className: "training-btn primary", disabled: !dataOk || busy, onClick: () => goSeg("params"), children: t("training.next") })) })] }));
+}
+/* ---------------------------------- step 3: params ---------------------------------- */
+/** Number field with themed square ▲/▼ steppers (native spinner hidden in CSS).
+ *  Typing goes through a DRAFT: clamping only on blur/steppers — a clamp on
+ *  every keystroke makes values below `min` untypeable (typing "100" with
+ *  min=50 would clamp the leading "1" to 50). In-range keystrokes commit live. */
+function NumberField({ value, min, max, step = 1, onChange, }) {
+    const [draft, setDraft] = useState(null);
+    const clamp = (v) => Math.max(min, Math.min(max, v));
+    const commitDraft = () => {
+        if (draft !== null) {
+            const n = parseInt(draft, 10);
+            if (Number.isFinite(n))
+                onChange(clamp(n));
+        }
+        setDraft(null);
+    };
+    const stepBy = (d) => {
+        setDraft(null);
+        onChange(clamp(value + d));
+    };
+    return (_jsxs("div", { className: "training-number", children: [_jsx("input", { type: "number", min: min, max: max, value: draft ?? value, onChange: (e) => {
+                    setDraft(e.target.value);
+                    const n = parseInt(e.target.value, 10);
+                    if (Number.isFinite(n) && n >= min && n <= max)
+                        onChange(n);
+                }, onBlur: commitDraft, onKeyDown: (e) => {
+                    if (e.key === "Enter")
+                        commitDraft();
+                } }), _jsxs("div", { className: "training-number-steps", children: [_jsx("button", { type: "button", tabIndex: -1, onClick: () => stepBy(step), children: "\u25B2" }), _jsx("button", { type: "button", tabIndex: -1, onClick: () => stepBy(-step), children: "\u25BC" })] })] }));
+}
+function ParamsStep() {
+    const { t } = useTranslation();
+    const { config, updateConfig, goSeg, diffWsInfo, slotInfo, retrainIntent } = useTrainingStore();
+    const [gpus, setGpus] = useState([]);
+    /** S75: "usable GPU" = at least one SELECTABLE entry. A list of nothing but greyed-out cards
+     *  must land on the force-CPU path, not on a dropdown where every choice is dead. */
+    const [gpuOk, setGpuOk] = useState(true);
+    const [showAdvanced, setShowAdvanced] = useState(false);
+    // diff inherits 数据增强份数 from the host workspace manifest — show the
+    // REAL inherited value (store diffWsInfo, fetched by the root effect)
+    // 有没有主模型共用这个槽的切片池 —— 判据与后端 `eff_aug_copies` 同源(has_main_progress)
+    const diffHasHost = config.backend === "sovits_diff" && !!diffWsInfo?.has_main_progress;
+    const diffAugInherit = config.backend === "sovits_diff" && diffWsInfo?.exists ? diffWsInfo.aug_copies : null;
+    useEffect(() => {
+        void (async () => {
+            try {
+                // S67: the dropdown consumes training_gpus (accelerator-native identities:
+                // NVIDIA UUID / vendor index) — NEVER the display string's WMI positions,
+                // which silently CPU'd multi-adapter boxes via a wrong visibility mask.
+                // "No trainable GPU" now means no NVIDIA/AMD/Intel adapter at all, instead
+                // of the old cuda_available (an INFERENCE-runtime probe that wrongly forced
+                // AMD/Intel — and NVIDIA-without-CUDA-download — boxes to CPU training).
+                // S75: entries now carry selectable/reason (the S74b shape). Unsupported or
+                // pack-less cards are LISTED with their reason but cannot be chosen — before, every
+                // adapter of the winning vendor was offered unconditionally, so picking a card our
+                // runtime cannot drive trained on the CPU with no visible hint.
+                const hw = await invoke("get_hardware_info");
+                const list = hw.training_gpus ?? [];
+                setGpus(list);
+                const usable = list.filter((g) => g.selectable);
+                setGpuOk(usable.length > 0);
+                const cur = useTrainingStore.getState().config.gpu;
+                if (list.length === 0) {
+                    // NO adapter at all: nothing to pick, ever. Keep the PAYLOAD truthful, not just the
+                    // checkbox display. (Pre-S75 behaviour, unchanged — and deliberately the ONLY case
+                    // that force-checks CPU for the user.)
+                    useTrainingStore.getState().updateConfig({ forceCpu: true });
+                }
+                else if (usable.length === 0) {
+                    // Adapters exist but none is usable (no pack installed / card unsupported). We must
+                    // NOT auto-check force-CPU here: `refuse_cpu_only_runtime` returns Ok immediately when
+                    // force_cpu is set, so doing so would silently disarm the S68b guard that exists for
+                    // exactly this machine ("GPU present, only the CPU pack installed") and hand the user
+                    // a multi-hour CPU run with no warning. Leave the flag alone, show the reasons, and
+                    // let the backend refuse loudly (S75 review).
+                }
+                else if (!usable.some((g) => g.id === cur)) {
+                    // heal "" (fresh session), stale identities, AND an id that is still listed but no
+                    // longer selectable (pack deleted since the last run) — first USABLE entry wins
+                    useTrainingStore.getState().updateConfig({ gpu: usable[0].id });
+                }
+            }
+            catch {
+                setGpus([]);
+            }
+        })();
+    }, []);
+    // sovits-family: 4.1/4.0 and 4.0-v2 share the same param form; v2-only
+    // differences (no vol_embedding / fp16 / all_in_mem) are gated inline below
+    const sovits = config.backend === "sovits" || config.backend === "sovits_v2";
+    const sovitsV2 = config.backend === "sovits_v2";
+    const diff = config.backend === "sovits_diff";
+    const voc = config.backend === "vocoder";
+    // 续训锁:这些值已经写进了槽里现有的产物(图形状、线上输入、emb_g 行、缓存的 ContentVec
+    // 空间),续训改不了 —— 后端会拒。所以这里**原地只读显示**,而不是让人改完、到开始训练时
+    // 才被拒绝。表在 `lib/resumeLock.ts`,与 Rust 的 `resume_lock.rs` 有跨语言对拍 gate。
+    // 「再训一个」会清空这个架构 ⇒ 什么都没被烧进去了,锁自然解除(与后端 `!fresh` 同义)。
+    const guarded = !retrainIntent && resumeWouldBeGuarded(config.backend, slotInfo);
+    const locked = guarded ? lockedFieldIds(config.backend, "locked") : new Set();
+    /** 锁定项的只读渲染:值 + 悬停解释。要改只能在开始训练时选「重训」。 */
+    const fixed = (v) => (_jsxs("span", { className: "training-fixed-value", title: t("training.resumeLockedTip"), children: [v, " \u00B7 ", t("training.resumeLocked")] }));
+    // ★§F2⒝ 批 2 ④d —— costly 档头一次在屏幕上有东西。`resume_lock.rs` 的档位文档写着
+    // 「Costly … These are NOT refused; the UI says what it will cost」,而在此之前那句话是空的:
+    // `lockedFieldIds(_, "costly")` 全仓零调用点,i18n 里也没有一条 costly 串。
+    // ★S142(§E2E-M10):这三行整段搬进了 `lib/training/costlyNote.ts`。搬的理由不是整洁 ——
+    // 它此前是组件体内的内联表达式,vitest **结构上**够不着,所以那一跳的任何变异都会存活
+    // (S128 的 L9 就是那么活下来的),而整段提示今天可以被删光而全仓零红。
+    // ⛔ 判据是 **scope 不是 tier**,而两者今天恰好等价 ⇒ 那一半只有喂一张合成锁表才验得到。
+    // ★S142 笔 3:`poolAtStake` 现在直接问盘(`WorkspaceInfo.has_preprocessing`,与擦除同意闸
+    // 同一个谓词),不再用「不是重训 ∧ 这个 run 的 manifest 说它跑过」那个近似 —— 那个近似
+    // 在重训路径上是错的(池是槽级共享的,重训不再清空整槽),在 diff-first 的槽上也是错的。
+    // ⛔ 它对「探针失败 ⇒ info=null」仍然是**静默**的,那条取舍写在那个文件的函数头上。
+    const costly = poolCostFieldIds(config.backend, poolAtStake(slotInfo));
+    /** costly 项的代价标记:改它合法,但下一次运行会落到**另一个**预处理池上,切片与特征全部重跑。 */
+    const costlyNote = (id) => costly.has(id) ? (_jsx("span", { className: "training-costly-note", title: t("training.resumeCostlyTip"), children: t("training.resumeCostly") })) : null;
+    // S68b: an empty GPU list used to hide ALL device UI (dropdown AND the force-CPU
+    // checkbox) while silently forcing CPU — a community RTX 3080 box with a dead GPU
+    // probe trained on CPU with zero visual hint. The CPU fact now shows on the form.
+    // S75 — three states, not two. The middle one is new and is the one that used to lie:
+    //   no adapter at all      → "no trainable GPU" (true)
+    //   adapters, none usable  → the LIST, each with its reason. Saying "no trainable GPU" here
+    //                            would be false (the card is there; a pack is missing), and the
+    //                            only actionable CODE we have would never reach the screen.
+    //   at least one usable    → the picker
+    const gpuOption = (g) => {
+        const why = g.selectable ? null : (backendErrorMessage(g.reason) ?? g.reason ?? "");
+        return {
+            value: g.id,
+            label: why ? `${g.label} — ${why}` : g.label,
+            title: why ? `${g.label}\n${why}` : g.label,
+            disabled: !g.selectable,
+        };
+    };
+    const gpuRow = gpus.length === 0 ? (_jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.gpu") }), _jsx("span", { className: "training-cpu-note", children: t("training.noGpuCpuNote") })] })) : !config.forceCpu ? (_jsxs(_Fragment, { children: [_jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.gpu") }), _jsx(Dropdown, { value: config.gpu, options: gpus.map(gpuOption), onChange: (v) => updateConfig({ gpu: v }) })] }), !gpuOk && (_jsxs("div", { className: "training-form-row", children: [_jsx("label", {}), _jsx("span", { className: "training-cpu-note", children: t("training.noUsableGpuNote") })] }))] })) : null;
+    // S75: gated on "adapters exist", not "a usable one exists". When every card is greyed out,
+    // opting into CPU is the user's only way forward — hiding the checkbox there (the old `gpuOk`
+    // gate) left them with a dead picker and no exit.
+    const forceCpuRow = gpus.length > 0 && (_jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.forceCpu, onChange: (e) => updateConfig({ forceCpu: e.target.checked }) }), t("training.forceCpu")] }));
+    return (_jsxs("div", { className: "training-params-step", children: [diff ? (_jsxs(_Fragment, { children: [_jsxs("div", { className: "training-form-grid", children: [_jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.version") }), _jsxs("span", { className: "training-fixed-value", children: ["SoVITS ", config.diffVersion, " \u00B7 ", t("training.versionFollowsModel")] })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.totalSteps") }), _jsx(NumberField, { min: 1000, max: 1000000, step: 1000, value: config.diffTotalSteps, onChange: (v) => updateConfig({ diffTotalSteps: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.batchSize") }), _jsx(NumberField, { min: 1, max: 128, value: config.diffBatchSize, onChange: (v) => updateConfig({ diffBatchSize: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.saveEverySteps") }), _jsx(NumberField, { min: 100, max: 20000, step: 100, value: config.diffSaveEverySteps, onChange: (v) => updateConfig({ diffSaveEverySteps: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.kStepMax") }), locked.has("kStepMax") ? (fixed(config.diffKStepMax === 0
+                                        ? t("training.kStepFull")
+                                        : String(config.diffKStepMax))) : (_jsx(Dropdown, { value: config.diffKStepMax, options: [
+                                            { value: 0, label: t("training.kStepFull") },
+                                            { value: 100, label: "100" },
+                                            { value: 200, label: "200" },
+                                            { value: 300, label: "300" },
+                                        ], onChange: (v) => updateConfig({ diffKStepMax: v }) }))] }), gpuRow] }), config.diffVersion === "4.0" && (_jsx("div", { className: "training-hint", children: t("training.diffNoBase40") }))] })) : voc ? (_jsxs(_Fragment, { children: [_jsxs("div", { className: "training-form-grid", children: [_jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.vocScope") }), _jsx("span", { className: "training-fixed-value", children: t("training.vocScopeValue") })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { title: t("training.vocTotalStepsTip"), children: t("training.totalSteps") }), _jsx(NumberField, { min: 100, max: 100000, step: 100, value: config.vocTotalSteps, onChange: (v) => updateConfig({ vocTotalSteps: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { title: t("training.vocBatchTip"), children: t("training.batchSize") }), _jsx(NumberField, { min: 1, max: 64, value: config.vocBatchSize, onChange: (v) => updateConfig({ vocBatchSize: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.saveEverySteps") }), _jsx(NumberField, { min: 50, max: 10000, step: 50, value: config.vocSaveEverySteps, onChange: (v) => updateConfig({ vocSaveEverySteps: v }) })] }), gpuRow] }), _jsx("div", { className: "training-hint", children: t("training.vocLicenseNote") })] })) : !sovits ? (_jsxs("div", { className: "training-form-grid", children: [_jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.version") }), locked.has("version") ? (fixed(config.version)) : (_jsx(Dropdown, { value: config.version, options: [
+                                    { value: "v2", label: "v2" },
+                                    { value: "v1", label: "v1" },
+                                ], onChange: (v) => updateConfig({ version: v }) }))] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.sampleRate") }), locked.has("sampleRate") ? (fixed(config.sampleRate)) : (
+                            // ★S144 §E2E-M10-⒜′ —— 提示挂在**可编辑那一臂里面**。
+                            // ⛔ 挂在三元之外(或挂进下一行控件)三种写法都过得了源码闸,而后两种会在
+                            //    **续训锁定**档下把这句话贴在一行只读文字旁边 —— 让用户去做一件他此刻
+                            //    做不到的事。`locked` 与 `poolAtStake` 可以同时为真(在有池的槽上续训),
+                            //    所以这不是理论形状。
+                            _jsxs(_Fragment, { children: [_jsx(Dropdown, { value: config.sampleRate, options: [
+                                            { value: "48k", label: "48k" },
+                                            { value: "40k", label: "40k" },
+                                            { value: "32k", label: "32k" },
+                                        ], onChange: (v) => updateConfig({ sampleRate: v }) }), costlyNote("sampleRate")] }))] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.totalEpoch") }), _jsx(NumberField, { min: 1, max: 10000, value: config.totalEpoch, onChange: (v) => updateConfig({ totalEpoch: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.batchSize") }), _jsx(NumberField, { min: 1, max: 64, value: config.batchSize, onChange: (v) => updateConfig({ batchSize: v }) })] }), gpuRow] })) : (_jsxs("div", { className: "training-form-grid", children: [_jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.totalEpoch") }), _jsx(NumberField, { min: 1, max: 100000, value: config.sovitsTotalEpoch, onChange: (v) => updateConfig({ sovitsTotalEpoch: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.batchSize") }), _jsx(NumberField, { min: 1, max: 64, value: config.sovitsBatchSize, onChange: (v) => updateConfig({ sovitsBatchSize: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.saveEverySteps") }), _jsx(NumberField, { min: 50, max: 20000, step: 50, value: config.sovitsSaveEverySteps, onChange: (v) => updateConfig({ sovitsSaveEverySteps: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.keepCkpts") }), _jsx(NumberField, { min: 1, max: 50, value: config.sovitsKeepCkpts, onChange: (v) => updateConfig({ sovitsKeepCkpts: v }) })] }), gpuRow] })), _jsxs("div", { className: "training-fixed-note", children: [diff
+                        ? t("training.diffFixedNote")
+                        : voc
+                            ? t("training.vocFixedNote")
+                            : sovits
+                                ? t("training.sovitsFixedNote")
+                                : t("training.fixedNote"), locked.size > 0 && _jsx("div", { children: t("training.resumeLockedNote") })] }), _jsxs("button", { className: "training-advanced-toggle", onClick: () => setShowAdvanced((v) => !v), children: [showAdvanced ? "▼" : "▶", " ", t("training.advanced")] }), showAdvanced &&
+                (diff ? (_jsxs("div", { className: "training-form-grid", children: [_jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.forceSaveSteps") }), _jsx(NumberField, { min: 1000, max: 200000, step: 1000, value: config.diffForceSaveSteps, onChange: (v) => updateConfig({ diffForceSaveSteps: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { title: t("training.augCopiesTip"), children: t("training.augCopies") }), diffHasHost ? (_jsxs("span", { className: "training-fixed-value", children: [t("training.augFollowWorkspace"), diffAugInherit !== null
+                                            ? ` · ${t("training.augInheritCount", { count: diffAugInherit })}`
+                                            : ""] })) : (_jsxs(_Fragment, { children: [_jsx(NumberField, { value: config.diffAugCopies, min: 0, max: 3, onChange: (v) => updateConfig({ diffAugCopies: v }) }), costlyNote("augCopies")] }))] }), _jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.diffFp16, onChange: (e) => updateConfig({ diffFp16: e.target.checked }) }), t("training.fp16")] }), _jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.diffCacheAllData, onChange: (e) => updateConfig({ diffCacheAllData: e.target.checked }) }), t("training.cacheAllData")] }), forceCpuRow] })) : voc ? (_jsxs("div", { className: "training-form-grid", children: [_jsxs("div", { className: "training-form-row", children: [_jsx("label", { title: t("training.vocCropTip"), children: t("training.vocCrop") }), _jsx(NumberField, { min: 16, max: 128, step: 8, value: config.vocCropMelFrames, onChange: (v) => updateConfig({ vocCropMelFrames: v }) })] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.keepCkpts") }), _jsx(NumberField, { min: 1, max: 50, value: config.vocKeepCkpts, onChange: (v) => updateConfig({ vocKeepCkpts: v }) })] }), _jsxs("label", { className: "training-check-row", title: t("training.vocFreezeMpdTip"), children: [_jsx("input", { type: "checkbox", checked: config.vocFreezeMpd, onChange: (e) => updateConfig({ vocFreezeMpd: e.target.checked }) }), t("training.vocFreezeMpd")] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { title: t("training.augCopiesTip"), children: t("training.augCopies") }), _jsx(NumberField, { min: 0, max: 3, value: config.vocAugCopies, onChange: (v) => updateConfig({ vocAugCopies: v }) }), costlyNote("augCopies")] }), forceCpuRow] })) : !sovits ? (_jsxs("div", { className: "training-form-grid", children: [_jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.saveEvery") }), _jsx(NumberField, { min: 1, max: 1000, value: config.saveEveryEpoch, onChange: (v) => updateConfig({ saveEveryEpoch: v }) })] }), _jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.saveEveryWeights, onChange: (e) => updateConfig({ saveEveryWeights: e.target.checked }) }), t("training.saveWeights")] }), _jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.keepOnlyLatest, onChange: (e) => updateConfig({ keepOnlyLatest: e.target.checked }) }), t("training.keepLatest")] }), _jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.cacheGpu, onChange: (e) => updateConfig({ cacheGpu: e.target.checked }) }), t("training.cacheGpu")] }), _jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.fp16, onChange: (e) => updateConfig({ fp16: e.target.checked }) }), t("training.fp16")] }), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { title: t("training.augCopiesTip"), children: t("training.augCopies") }), _jsx(NumberField, { min: 0, max: 3, value: config.augCopies, onChange: (v) => updateConfig({ augCopies: v }) }), costlyNote("augCopies")] }), forceCpuRow] })) : (_jsxs("div", { className: "training-form-grid", children: [!sovitsV2 && config.sovitsVersion === "4.1" && (locked.has("volEmbedding") ? (_jsxs("div", { className: "training-form-row", children: [_jsx("label", { children: t("training.volEmbedding") }), fixed(t(config.sovitsVolEmbedding ? "training.on" : "training.off"))] })) : (_jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.sovitsVolEmbedding, onChange: (e) => updateConfig({ sovitsVolEmbedding: e.target.checked }) }), t("training.volEmbedding")] }))), _jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.sovitsKmeans, onChange: (e) => updateConfig({ sovitsKmeans: e.target.checked }) }), t("training.kmeansOpt")] }), _jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.sovitsLoudnorm, onChange: (e) => updateConfig({ sovitsLoudnorm: e.target.checked }) }), t("training.loudnorm"), costlyNote("loudnorm")] }), !sovitsV2 && (_jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.sovitsFp16, onChange: (e) => updateConfig({ sovitsFp16: e.target.checked }) }), t("training.fp16")] })), !sovitsV2 && (_jsxs("label", { className: "training-check-row", children: [_jsx("input", { type: "checkbox", checked: config.sovitsAllInMem, onChange: (e) => updateConfig({ sovitsAllInMem: e.target.checked }) }), t("training.allInMem")] })), _jsxs("div", { className: "training-form-row", children: [_jsx("label", { title: t("training.augCopiesTip"), children: t("training.augCopies") }), _jsx(NumberField, { min: 0, max: 3, value: config.sovitsAugCopies, onChange: (v) => updateConfig({ sovitsAugCopies: v }) }), costlyNote("augCopies")] }), forceCpuRow] }))), _jsx("div", { className: "training-step-nav", children: _jsx("button", { className: "training-btn primary", onClick: () => goSeg("run"), children: t("training.next") }) })] }));
+}
+/* ---------------------------------- step 4: run ---------------------------------- */
+/** `archiveOnly` = the standalone 存档中心 reached from a project's model card: same product
+ *  logic (audition / import / attach), none of the run chrome (start / progress / summary). */
+function RunStep({ archiveOnly = false } = {}) {
+    const { t } = useTranslation();
+    const showConfirm = useAppStore((s) => s.showConfirm);
+    const showToast = useAppStore((s) => s.showToast);
+    const { snapshot: liveSnapshot, snapshotAt, history, config, starting, start, stop, forceStop, resetRun, goSeg, route, diffWsInfo, slotInfo, } = useTrainingStore();
+    const chartRef = useRef(null);
+    const [, forceTick] = useState(0);
+    /** ★ THE run this segment is about — the store holds exactly ONE snapshot, and after S76 the
+     *  page can be pointed at a project that snapshot does not belong to.
+     *
+     *  Without this substitution, opening project B's run segment while project A's finished run
+     *  is still in memory rendered A's completion card, A's loss curve, A's候选 checkpoints and
+     *  their 试听/导入 buttons — all filed under B. `mergeCkptSources` made it concrete: A's
+     *  in-memory ckpts merge into B's disk scan with `mtimeMs = MAX_SAFE_INTEGER`, i.e. pinned to
+     *  the TOP of B's archive list. Substituting the idle snapshot gives B exactly what it should
+     *  have: the pre-start view.
+     *
+     *  Liveness stays keyed on the LIVE snapshot (`anyRunning`): a run in another project still
+     *  blocks starting one here, and pretending otherwise would just move the refusal to Rust. */
+    const snapshot = liveSnapshot.project_id === route.projectId ? liveSnapshot : IDLE_SNAPSHOT;
+    const anyRunning = trainingIsLive(liveSnapshot, starting);
+    const running = isRunningState(snapshot.state);
+    const finished = snapshot.state === "completed" || snapshot.state === "stopped";
+    // Which architecture this segment is ACTING on. A displayed run owns the question; with no
+    // run to show (idle after「清空结果」/ a restart) it is the form's current pick. S78: the
+    // audition/import/attach machine keys on THIS, not on `snapshot.backend`, so it keeps working
+    // when there is no live run — during/after a run the two are identical (snapshot.state is not
+    // idle then), so run behaviour is unchanged.
+    // The standalone 存档中心 always speaks for the family its card chose (`config.backend`), even
+    // if some OTHER project's run is live — otherwise its list would follow that run.
+    const archiveBackend = archiveOnly || snapshot.state === "idle" ? config.backend : snapshot.backend;
+    const isDiff = archiveBackend === "sovits_diff";
+    // vocoder shares the "best = true validation loss" semantics with diff
+    // (labels only; its checkpoints go through importCkpt, not the attach flow)
+    const isVocoderRun = archiveBackend === "vocoder";
+    // ---- diffusion attach flow (S39): a trained diffusion ckpt is not a
+    // standalone model — it converts into `<stem>.diffusion/` of an INSTALLED
+    // SoVITS model whose ContentVec dim matches; the rvc list feeds the
+    // installed-model version check in onStart ----
+    const sovitsModels = useVoiceModelStore((s) => s.models.sovits);
+    const rvcModels = useVoiceModelStore((s) => s.models.rvc);
+    const vocoderModels = useVoiceModelStore((s) => s.models.vocoder);
+    const [attachTarget, setAttachTarget] = useState("");
+    const [attaching, setAttaching] = useState(null);
+    const summaryDim = snapshot.summary?.encoder_dim;
+    // Attach is possible for a diffusion RUN (isDiff) AND for the sovits-family 存档中心, whose
+    // list can hold diffusion checkpoints from a prior run. Gating on isDiff alone left the archive
+    // page with ZERO candidates — the exact death-lock this whole change exists to remove (an
+    // archive diffusion row would show「无可挂接的模型」and never attach). Only sovits slots ever
+    // hold diffusion, so the family test is the right widening.
+    const canAttachHere = isDiff || backendFamily(archiveBackend) === "sovits";
+    const attachCandidates = canAttachHere
+        ? sovitsModels.filter((m) => {
+            if (!summaryDim)
+                return true; // dim unknown (cold archive / force-stopped) — Rust re-validates
+            const dim = voiceFeatureDim(m);
+            return dim === null || dim === summaryDim;
+        })
+        : [];
+    useEffect(() => {
+        // refresh the installed-model list when attach becomes relevant: a finished diff run, OR the
+        // archive page opening (so its host dropdown is current)
+        if ((isDiff && finished) || archiveOnly)
+            void useVoiceModelStore.getState().fetchModels();
+    }, [isDiff, finished, archiveOnly]);
+    // a NEW run invalidates any previously chosen target — without this reset a
+    // still-valid selection from the last run survives and the default-target
+    // effect below early-returns, silently pointing this run's checkpoints at
+    // the previous run's model (review F16)
+    useEffect(() => {
+        setAttachTarget("");
+    }, [snapshot.model_name, snapshot.workspace]);
+    // default the target to the same-named model (the intended pairing). Runs for the archive page
+    // too (canAttachHere), so a diffusion row there lands on a sensible default host.
+    useEffect(() => {
+        if (!canAttachHere)
+            return;
+        if (attachTarget && attachCandidates.some((m) => m.name === attachTarget))
+            return;
+        // same-name pairing is the just-finished-diff-run nicety (snapshot.model_name is set then);
+        // the archive page has no run name, so it lands on the first candidate — fine.
+        const sameName = attachCandidates.find((m) => m.name === snapshot.model_name);
+        setAttachTarget(sameName?.name ?? attachCandidates[0]?.name ?? "");
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [canAttachHere, sovitsModels, summaryDim, snapshot.model_name]);
+    const attachCkpt = async (ckpt) => {
+        if (!attachTarget || attaching)
+            return;
+        setAttaching(ckpt.path);
+        try {
+            // ★S120: attach_diffusion now answers with the import shape ({entry, warnings}) instead of
+            // a bare entry — attaching is one of the three ways an attachment becomes live, and §F9's
+            // vocoder hint has to be able to reach the user from THIS route too (it is the one the
+            // reported case walks). Same rendering funnel as import_model: localize known CODEs.
+            const outcome = await invoke("attach_diffusion", {
+                name: attachTarget,
+                ckptPath: ckpt.path,
+            });
+            await useVoiceModelStore.getState().fetchModels();
+            // Attach IS the export path for shallow diffusion — its checkpoints never go through
+            // import_model, so `attach_diffusion` writes the ledger row itself (Rust side, batch 3);
+            // this only re-reads the list so its「已导入」marks are current.
+            await refreshArchive();
+            // ⛔ S141 §E2E-M6:这条路无条件先弹一条 success,再**另开** N 条 info —— 与导入
+            // (把 warning 折进同一条 toast)不是同一个漏斗。决策与判据在 lib/training/importToast。
+            for (const toast of attachToasts(t("training.diffAttached", { name: attachTarget }), collectWarningCodes(outcome).map((w) => backendErrorMessage(w) ?? w))) {
+                showToast(toast.text, toast.level);
+            }
+        }
+        catch (e) {
+            showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
+        }
+        finally {
+            setAttaching(null);
+        }
+    };
+    const [auditionState, setAuditionState] = useState({});
+    // S60c: per-checkpoint tested ranges (this run's auto-test results; the record itself
+    // persists in each candidate's audition sidecar — this map only feeds the row label).
+    const [candRanges, setCandRanges] = useState({});
+    const candRangeRunRef = useRef(null);
+    const [auditionWavs, setAuditionWavs] = useState({});
+    const [selectedCkpts, setSelectedCkpts] = useState({});
+    const [missingCkpts, setMissingCkpts] = useState({});
+    // 批 6: ONE predicate for「这个候选会被批量导入」= 在盘上 AND keep-勾选(默认勾)。行内勾选框、
+    // 导入过滤、批量按钮的计数/启用全读它,不再四处内联 `!missingCkpts[c.path] && (…?? true)`。
+    const ckptChosen = (c) => !missingCkpts[c.path] && (selectedCkpts[c.path] ?? true);
+    const importableCkpts = snapshot.ckpts.filter((c) => !missingCkpts[c.path]);
+    const allCkptsChosen = importableCkpts.length > 0 && importableCkpts.every(ckptChosen);
+    const toggleAllCkpts = () => {
+        const next = !allCkptsChosen;
+        setSelectedCkpts((s) => {
+            const m = { ...s };
+            for (const c of importableCkpts)
+                m[c.path] = next;
+            return m;
+        });
+    };
+    const [importingAll, setImportingAll] = useState(false);
+    const [archiveOpen, setArchiveOpen] = useState(archiveOnly);
+    const projectCkpts = useTrainingStore((s) => s.projectCkpts);
+    // Re-scan whenever the run's identity or state changes: a finished run just wrote new
+    // archives, and「清空结果」clears the in-memory candidates while the files stay on disk.
+    // Keyed on the ROUTE's project, never on the snapshot: an app restart or「清空结果」leaves
+    // the snapshot idle and its project_id empty — which is exactly when this inventory is the
+    // only way left to reach the files on disk. (Pre-batch-4 it resolved the project from the
+    // typed model name, which is now an editable per-run label rather than an identity.)
+    //
+    // `archiveBackend` (defined at the top of RunStep) is THE family this segment acts on — a
+    // displayed run owns it, else the form's pick. Keying anything here on `config.backend` alone
+    // let the two diverge: leave a finished SoVITS run, click the RVC slot in the detail page,
+    // come back to the run segment (still lit, because the run is this project's) and the
+    // candidates were SoVITS while the archive list was RVC, `mergeCkptSources` filing one under
+    // the other.
+    useEffect(() => {
+        void useTrainingStore.getState().refreshProjectCkpts(route.projectId, archiveBackend);
+    }, [route.projectId, archiveBackend, snapshot.state, snapshot.ckpts.length]);
+    // The scan is the truth, but it is only as fresh as its last run — a ckpt the sidecar just
+    // announced would blink out of the list for the moment between the event and the re-scan
+    // above, which reads exactly like a checkpoint that failed to save.
+    /** Export context for the slot this segment is showing, read from DISK.
+     *
+     *  The三 things an export needs — the artifact name, the workspace, the index companion —
+     *  used to come only from `TrainingSnapshot`, i.e. only while a run was displayed. That is
+     *  exactly why a finished diffusion checkpoint went unreachable once anything else was
+     *  trained. A live run still wins (its summary knows the真 index it produced); this is what
+     *  answers when there is none. */
+    const [slotCtx, setSlotCtx] = useState(null);
+    useEffect(() => {
+        const pid = route.projectId;
+        if (!pid) {
+            setSlotCtx(null);
+            return;
+        }
+        let cancelled = false;
+        void (async () => {
+            try {
+                const c = await invoke("get_slot_export_context", {
+                    projectId: pid,
+                    backend: archiveBackend,
+                    // ★§F2⒝ ④e —— R2 的**第四处**(前三处是那两个 onStart 探针与页根 effect)。同样在
+                    // 两个 run 之后 `RUN_AMBIGUOUS`,只是它的失败被 catch 吞成 `slotCtx = null`。
+                    //
+                    // ⚠ 这里只有在**同一个 family** 时才传得动:`config.runId` 说的是「本次训练选中的
+                    // run」,而这一段问的是 `archiveBackend` 那个族的存档。族不同就没有可用的 id,
+                    // 那时保持今天的行为(退回 `ctxForRun` 的按行现问 / live 身份)。
+                    runId: backendFamily(archiveBackend) === backendFamily(config.backend) ? config.runId : "",
+                });
+                if (!cancelled)
+                    setSlotCtx(c);
+            }
+            catch {
+                if (!cancelled)
+                    setSlotCtx(null);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [route.projectId, archiveBackend, config.backend, config.runId, snapshot.state]);
+    /** 产物身份:有 run(且这一段就在看它)用 run 的,否则用槽里冻结的(再没有就用项目名)。
+     *  archiveOnly 一律走槽——那时的 live snapshot 可能是别的项目的运行。 */
+    const useLiveIdentity = !archiveOnly;
+    /** ★§F2⒝ 批 2 ④ —— **这一行所属那个 run** 的导出上下文,现取现问。
+     *
+     *  ⛔ 为什么必须按行问:这条命令的错误在上面的 effect 里是被 `catch` 吃掉的,于是工作区
+     *  塌成 `""` —— 而空串不是一个可见的失败,是一个**继续往下走的错答案**。链条实测过:
+     *  `resolveIndexPath` 拿 `""` 拼出的路径不存在 ⇒ `indexPath` 是 undefined ⇒
+     *  `import_model` 收到 `index_file: None` ⇒ **整个 WARN_INDEX_MISSING 分支被跳过**,它转而在
+     *  **存档文件旁边**(`<run>/weights/`)自动探测,而 RVC 的索引在 `<run>/total_fea.npy`,
+     *  三条探测全落空、`warnings` 里一个字都不 push ⇒ 装出来的模型没有检索矩阵,
+     *  **无警告、无 CODE、无 toast**,只是听起来不对。
+     *
+     *  `null` = 这一行是 `pending`(还没被磁盘扫描看见,`runId` 未知)⇒ 退回槽级上下文,
+     *  那正是它今天的行为。 */
+    const ctxForRun = async (runId) => {
+        if (runId == null || !route.projectId)
+            return slotCtx;
+        try {
+            return await invoke("get_slot_export_context", { projectId: route.projectId, backend: archiveBackend, runId });
+        }
+        catch {
+            return slotCtx;
+        }
+    };
+    /** ★§F2⒝ 批 2 ④b —— 一行的**名字**与**工作区**由同一次解析回答(决策抽成纯函数
+     *  `resolveRowIdentity`,`src/lib/training/rowIdentity.ts`)。
+     *
+     *  ⛔ 它们分头回答时的失败形态:行标着 run B 的名字、试听放的却是 run A 的缓存 ——
+     *  而缓存命中只看 `<dir>/model.json` 在不在,那道结构闸对**兄弟 run** 也放行。
+     *  症状是「这个存档听起来像那个存档」,耳朵判不出来。 */
+    const rowIdentityFor = async (runId) => resolveRowIdentity({
+        runId,
+        ctx: await ctxForRun(runId),
+        live: useLiveIdentity
+            ? {
+                modelName: snapshot.model_name,
+                workspace: snapshot.workspace,
+                summaryIndex: snapshot.summary?.index,
+            }
+            : null,
+        fallbackName: config.modelName,
+    });
+    const archiveRows = mergeCkptSources(
+    // the standalone archive must not fold in a DIFFERENT run's in-memory candidates
+    archiveOnly ? [] : snapshot.ckpts, projectCkpts, backendFamily(archiveBackend));
+    // ── what a given archive row can DO (S78) ─────────────────────────────────────────────────
+    // The action follows the FILE, not the run. A single sovits slot can hold both a main model
+    // (import) and shallow-diffusion checkpoints (attach), so a per-run `isDiff` flag cannot
+    // decide it — the diffusion ones live under `.../diffusion/`.
+    const rowIsDiffusion = (rel) => rel.replace(/\\/g, "/").includes("/diffusion/");
+    /** Deployable model → import. Release/best/final weights, but NOT the diffusion ones. */
+    const rowConvertible = (r) => !rowIsDiffusion(r.rel) && (r.kind === "release" || r.kind === "best" || r.kind === "final");
+    /** ★S118 §F8⒜ — a resume SNAPSHOT (`resume_best/` / `resume_latest/`), not a product. */
+    const rowIsResumeSnapshot = (rel) => /\/resume_(best|latest)\//.test(rel.replace(/\\/g, "/"));
+    /** Shallow-diffusion product → attach to an installed SoVITS host.
+     *  ⛔ NOT the diffusion resume snapshots: `export_diffusion.py` resolves the config yaml NEXT
+     *  TO the .pt and errors when there is none, and a snapshot subdirectory has no yaml — so the
+     *  button would be there and fail. It is also the wrong offer: the snapshot is a resume point,
+     *  and its deployable twin (`diffusion/model_best.pt`, same weights) is listed right beside it. */
+    const rowAttachable = (r) => rowIsDiffusion(r.rel) && r.kind !== "base" && !rowIsResumeSnapshot(r.rel);
+    /** Auditionable = anything that renders through the inference chain. Raw resume state (G_/D_
+     *  pairs, model_ckpt_steps) is not a deployable model — it has no audition. */
+    const rowAuditionable = (r) => rowConvertible(r) || rowAttachable(r);
+    const anyAttachable = archiveRows.some(rowAttachable);
+    // ①c: audition a chosen speaker of a multi-speaker rvc/sovits run. Names come from the RUN's
+    // frozen speaker list (snapshot.speakers, index = emb_g id = the converter's speaker-map id) —
+    // NOT the editable DataStep state, so it survives a DataStep edit and reflects what was trained.
+    // Empty for single-speaker / diff / vocoder → the render falls back to speaker 0 (unchanged).
+    const [auditionSpeaker, setAuditionSpeaker] = useState(0);
+    // In the 存档中心 there is no run, so the singer names come from the slot's FROZEN list
+    // (`slotInfo.speakers`, index = emb_g id — the same order the model was trained with); during
+    // or right after a run they come from the run snapshot. Without this the archive could only
+    // ever preview emb_g 0 of a multi-speaker model, silently.
+    const auditionSpeakerNames = archiveOnly ? (slotInfo?.speakers ?? []) : (snapshot.speakers ?? []);
+    const auditionSpeakers = backendSupportsMultiSpeaker(archiveBackend) && auditionSpeakerNames.length > 1
+        ? auditionSpeakerNames.map((name, i) => ({ id: i, name: name.trim() || `#${i}` }))
+        : [];
+    // S67: the auto range battery holds this for its WHOLE duration — the old code's
+    // stuck-busy accidentally blocked clicks between candidates, and un-sticking it
+    // (terminal events) opened interleave windows (a user 试听 in a gap stole the
+    // FlightGuard from the probe AND the probe's busy-skip then wiped the user's row).
+    const [rangeTesting, setRangeTesting] = useState(false);
+    const auditionBusy = rangeTesting ||
+        Object.values(auditionState).some((s) => s === "converting" || s === "rendering");
+    // stale-resolution fence (审查修复 FE-3/FE-5/AUD-HOST-SWITCH-STALE): every
+    // context change that invalidates in-flight results bumps the epoch; a
+    // resolving invoke compares its captured epoch and discards itself
+    const auditionEpochRef = useRef(0);
+    // new-run reset (red-team R9): best/final snapshot PATHS are identical across
+    // runs of the same model — a stale ready-state would replay the previous
+    // run's render as this run's voice
+    useEffect(() => {
+        auditionEpochRef.current += 1;
+        setAuditionState({});
+        setAuditionWavs({});
+        setSelectedCkpts({});
+        setMissingCkpts({});
+        setAuditionSpeaker(0);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [snapshot.model_name, snapshot.workspace, running]);
+    // the diffusion audition cache is host-specific — switching the host must invalidate every
+    // rendered result INCLUDING one still in flight. Gated on「列表里有可挂接行」(`anyAttachable`),
+    // not the per-run `isDiff`: in the 存档中心 isDiff is false but diffusion rows are auditionable,
+    // and a host change there must still clear their stale renders. (Over-clearing a main-model
+    // row's cache is harmless — it just re-renders on the next play.)
+    useEffect(() => {
+        if (!anyAttachable)
+            return;
+        auditionEpochRef.current += 1;
+        setAuditionState({});
+        setAuditionWavs({});
+    }, [attachTarget, anyAttachable]);
+    // remount reconciliation (审查修复 FE-1/AUD-DONE-DROPPED): transient
+    // converting/rendering phases die with the page — if Rust says nothing is
+    // in flight, drop any stranded busy phase so auditionBusy can't deadlock
+    // the whole finished area
+    useEffect(() => {
+        if (!finished)
+            return;
+        void (async () => {
+            try {
+                const active = await invoke("audition_active");
+                if (!active) {
+                    setAuditionState((s) => {
+                        const n = {};
+                        for (const [k, v] of Object.entries(s)) {
+                            if (v === "ready" || v === "playing")
+                                n[k] = v;
+                        }
+                        return n;
+                    });
+                }
+            }
+            catch {
+                /* reconciliation is best-effort */
+            }
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [finished]);
+    // ── S60c: post-training auto range test (§user) — every rvc/sovits checkpoint gets the
+    // C2–C7 scale test (~1-2 s each) so ① its audition pre-shifts a low-range singer into
+    // comfort (the bundled clip skews high — an untested low singer sounds "training failed")
+    // and ② the row shows the singer's range. Once per finished run (ref-guarded), sequential
+    // (the Rust audition FlightGuard is single-flight anyway); failures skip silently — the
+    // audition still works without a record.
+    // S67: the dep is the STRING key, not the snapshot.ckpts array — every status
+    // refresh rebuilds the snapshot arrays, and an identity-keyed rerun used to
+    // alive=false this loop right after candidate #1 (the runKey ref then blocked a
+    // restart, so candidates 2+ never got a range record).
+    const rangeRunKey = `${snapshot.workspace}|${snapshot.ckpts.map((c) => c.path).join(",")}`;
+    useEffect(() => {
+        // ★ NOT in the 存档中心: this is a just-FINISHED-RUN feature (auto-test THIS run's candidates
+        // for their vocal range). archiveOnly shares RunStep's hooks, and `snapshot` there may be a
+        // same-project leftover run of a DIFFERENT family — firing the battery would grey every
+        // archive 试听 button (auditionBusy) and burn GPU on candidates the archive never displays.
+        if (archiveOnly)
+            return;
+        if (!finished || snapshot.ckpts.length === 0)
+            return;
+        if (!["rvc", "sovits", "sovits_v2"].includes(snapshot.backend))
+            return;
+        if (candRangeRunRef.current === rangeRunKey)
+            return;
+        candRangeRunRef.current = rangeRunKey;
+        const ckpts = snapshot.ckpts;
+        let alive = true;
+        void (async () => {
+            // hold auditionBusy for the WHOLE battery — the inter-candidate gaps must not
+            // invite clicks (a user render would steal the probe's FlightGuard, and a
+            // busy-skipped probe wiping the user's busy row was review finding S67-1)
+            setRangeTesting(true);
+            try {
+                for (const c of ckpts) {
+                    if (!alive)
+                        return;
+                    // persisted-record short-circuit: a candidate tested in a previous mount
+                    // keeps its sidecar record — restore the label instead of re-running the
+                    // whole battery (and re-freezing the buttons) on every page open
+                    try {
+                        const rec = await invoke("get_candidate_vocal_range", {
+                            workspace: snapshot.workspace,
+                            ckptPath: c.path,
+                        });
+                        const sp = rec?.speakers?.["0"];
+                        if (sp) {
+                            if (alive) {
+                                setCandRanges((s) => ({ ...s, [c.path]: { usable: sp.usable, comfort: sp.comfort } }));
+                            }
+                            continue;
+                        }
+                    }
+                    catch {
+                        /* unreadable sidecar — fall through to a fresh test */
+                    }
+                    let busySkip = false;
+                    try {
+                        const r = await runCandidateRangeTest(snapshot.workspace, snapshot.backend, c.path, c.path);
+                        if (alive && r)
+                            setCandRanges((s) => ({ ...s, [c.path]: r }));
+                    }
+                    catch (e) {
+                        // busy (a voice render elsewhere holds the guard) or a broken ckpt — skip;
+                        // an untested candidate has no sidecar record, so the next mount retests it
+                        busySkip = isBusyError(e);
+                    }
+                    finally {
+                        // belt-and-braces vs a dropped terminal event (S67): the probe render must
+                        // never leave its row stranded busy — but a BUSY rejection means the probe
+                        // never emitted anything, so a busy phase on that row belongs to a REAL
+                        // audition and must survive
+                        if (!busySkip) {
+                            setAuditionState((s) => {
+                                if (s[c.path] !== "converting" && s[c.path] !== "rendering")
+                                    return s;
+                                const n = { ...s };
+                                delete n[c.path];
+                                return n;
+                            });
+                        }
+                    }
+                }
+            }
+            finally {
+                setRangeTesting(false);
+            }
+        })();
+        return () => {
+            alive = false;
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [finished, rangeRunKey, snapshot.backend]);
+    // archive policies prune files the snapshot still lists (diff periodics,
+    // red-team F16) — grey those rows instead of offering dead buttons
+    useEffect(() => {
+        if (!finished || snapshot.ckpts.length === 0)
+            return;
+        let alive = true;
+        void (async () => {
+            const gone = {};
+            for (const c of snapshot.ckpts) {
+                try {
+                    if (!(await exists(c.path)))
+                        gone[c.path] = true;
+                }
+                catch {
+                    /* treat unprobeable as present — Rust errors loudly on use */
+                }
+            }
+            if (alive)
+                setMissingCkpts(gone);
+        })();
+        return () => {
+            alive = false;
+        };
+    }, [finished, snapshot.ckpts]);
+    // conversion/render phases arrive as events (the invoke itself resolves with
+    // the wav path; a closed page loses transient phases — the wav cache makes a
+    // re-click instant, design A19)
+    useEffect(() => {
+        const un = listen("audition-progress", (e) => {
+            const { candidate_id, phase, wav } = e.payload;
+            if (phase === "converting" || phase === "rendering") {
+                setAuditionState((s) => ({ ...s, [candidate_id]: phase }));
+            }
+            else if (phase === "done") {
+                // terminal events are the busy-state ground truth (审查修复 FE-1):
+                // the invoke resolution may belong to a dead component instance
+                if (wav)
+                    setAuditionWavs((s) => ({ ...s, [candidate_id]: wav }));
+                setAuditionState((s) => {
+                    if (s[candidate_id] === "playing")
+                        return s;
+                    // S67: a wav-less done is the range-test scale finishing — that row has
+                    // nothing to play, so it returns to idle instead of a cache-less ▶
+                    if (!wav) {
+                        const n = { ...s };
+                        delete n[candidate_id];
+                        return n;
+                    }
+                    return { ...s, [candidate_id]: "ready" };
+                });
+            }
+            else if (phase === "error") {
+                setAuditionState((s) => {
+                    const n = { ...s };
+                    delete n[candidate_id];
+                    return n;
+                });
+            }
+        });
+        return () => {
+            void un.then((f) => f());
+        };
+    }, []);
+    // shared preview singleton — consumer contract (previewPlayer.ts): stop +
+    // release onEnd on unmount so a stale callback can't drive dead state
+    useEffect(() => {
+        return () => {
+            auditionEpochRef.current += 1; // in-flight resolutions become no-ops
+            preview.stop();
+            preview.onEnd = null;
+        };
+    }, []);
+    const playAuditionWav = async (id, wavPath) => {
+        preview.stop();
+        const bytes = await readFile(wavPath);
+        const buf = await preview.decode(bytes);
+        preview.onEnd = () => setAuditionState((s) => ({ ...s, [id]: "ready" }));
+        await preview.play(wavPath, buf);
+        // single-playing invariant (审查修复 FE-4): the preview singleton can only
+        // play one thing — every other 'playing' marker demotes to 'ready'
+        setAuditionState((s) => {
+            const n = {};
+            for (const [k, v] of Object.entries(s))
+                n[k] = v === "playing" ? "ready" : v;
+            n[id] = "playing";
+            return n;
+        });
+    };
+    /** c === null → the built-in default vocoder A/B reference row. */
+    // S78: the render command is decided PER ROW, not per run — a unified archive list can hold a
+    // main model (voice) and a shallow-diffusion checkpoint (diffusion) in the same sovits slot.
+    // `null` candidate = the vocoder A/B reference row.
+    const auditionCandidate = async (
+    /** ★§F2⒝ 批 2 ④b —— 行带着自己的 `runId`:试听缓存在 `<run>/audition/<stem>/`,而命中
+     *  只看 `model.json` 在不在,兄弟 run 的目录也过得了那道结构闸。 */
+    c, mode) => {
+        const id = c ? c.path : "__default__";
+        const phase = auditionState[id];
+        // pause only when this row REALLY owns the playback — a stale 'playing'
+        // marker (superseded by another row) falls through to replay (FE-4)
+        if (phase === "playing" && preview.path === auditionWavs[id]) {
+            preview.pause();
+            setAuditionState((s) => ({ ...s, [id]: "ready" }));
+            return;
+        }
+        if ((phase === "ready" || phase === "playing") && auditionWavs[id]) {
+            try {
+                await playAuditionWav(id, auditionWavs[id]);
+            }
+            catch {
+                // cache swept underneath us (清空结果/new run) — drop back to idle
+                setAuditionState((s) => {
+                    const n = { ...s };
+                    delete n[id];
+                    return n;
+                });
+                setAuditionWavs((s) => {
+                    const n = { ...s };
+                    delete n[id];
+                    return n;
+                });
+            }
+            return;
+        }
+        if (phase === "converting" || phase === "rendering" || auditionBusy || importingAll)
+            return;
+        if (mode === "diffusion" && !attachTarget) {
+            showToast(t("training.auditionNeedHost"), "error");
+            return;
+        }
+        // stale fence: unmount / new run / host switch bump the epoch — a late
+        // resolution must not populate state or start playback (FE-3/FE-5)
+        const epoch = auditionEpochRef.current;
+        setAuditionState((s) => ({ ...s, [id]: "converting" }));
+        try {
+            let wav;
+            // S78: the workspace comes from the slot-resolved context, not the live snapshot — so a row
+            // auditions the same whether it is a just-finished candidate or a cold archive entry (with a
+            // run displayed the two are equal). The render command is `mode`, decided by the CALLER.
+            // ★§F2⒝ 批 2 ④b —— 现在它是**按行**解析的:一个槽有两个 run 之后,槽级的那一个标量会
+            // 把 run B 的行渲染成 run A 的缓存,而缓存命中只看 `model.json` 在不在 ⇒ 无声、无 CODE,
+            // 症状只是「这个存档听起来像那个存档」。
+            const auditionWs = (await rowIdentityFor(c?.runId)).workspace;
+            if (mode === "vocoder" || c === null) {
+                wav = await invoke("render_audition_vocoder", {
+                    ckptPath: c?.path ?? null,
+                    workspace: auditionWs,
+                    candidateId: id,
+                });
+            }
+            else if (mode === "diffusion") {
+                wav = await invoke("render_audition_diffusion", {
+                    hostName: attachTarget,
+                    ckptPath: c.path,
+                    workspace: auditionWs,
+                    candidateId: id,
+                });
+            }
+            else {
+                wav = await invoke("render_audition_voice", {
+                    // main-model render: the FAMILY, never sovits_diff (a stray main row in a diff-run view)
+                    backend: backendFamily(archiveBackend),
+                    ckptPath: c.path,
+                    workspace: auditionWs,
+                    candidateId: id,
+                    // ①c: null for single-speaker (→ speaker 0, byte-identical); the chosen speaker otherwise
+                    speakerId: auditionSpeakers.length > 0 ? auditionSpeaker : null,
+                });
+            }
+            if (epoch !== auditionEpochRef.current)
+                return; // superseded — discard
+            setAuditionWavs((s) => ({ ...s, [id]: wav }));
+            await playAuditionWav(id, wav);
+        }
+        catch (e) {
+            if (epoch !== auditionEpochRef.current)
+                return;
+            setAuditionState((s) => {
+                const n = { ...s };
+                delete n[id];
+                return n;
+            });
+            if (isCancelError(e))
+                return; // user cancelled the audition — not an error, no toast
+            // S74: audition runs render_audition_* (blocking inference) — leave a copyable log trace.
+            logToBackend(isBusyError(e) ? "warn" : "error", `Training audition failed (${id}): ${e instanceof Error ? e.message : String(e)}`);
+            // S67c: fatal modal-class errors (INFERENCE_LOW_MEMORY) open the alert dialog instead.
+            const display = backendErrorMessage(e) ?? String(e);
+            if (maybeShowErrorModal(e, display))
+                return;
+            // APP_BUSY: another audition/render holds the FlightGuard → info; real failures stay errors.
+            showToast(display, isBusyError(e) ? "info" : "error");
+        }
+    };
+    const auditionLabel = (id) => {
+        switch (auditionState[id]) {
+            case "converting":
+                return t("training.auditionConverting");
+            case "rendering":
+                return t("training.auditionRendering");
+            case "playing":
+                return "❚❚";
+            case "ready":
+                return "▶";
+            default:
+                return t("training.audition");
+        }
+    };
+    // ①c: switching the audition speaker invalidates every rendered clip (they were the OLD
+    // speaker's voice) — bump the epoch (discard in-flight) + clear the display caches so the
+    // next play re-renders with the new speaker (the Rust side caches per speaker, so re-picking
+    // a previously-heard speaker is an instant cache hit).
+    const changeAuditionSpeaker = (id) => {
+        if (id === auditionSpeaker)
+            return;
+        preview.stop();
+        auditionEpochRef.current += 1;
+        setAuditionState({});
+        setAuditionWavs({});
+        setAuditionSpeaker(id);
+    };
+    // elapsed ticker (1 Hz) while running
+    useEffect(() => {
+        if (!running)
+            return;
+        const id = setInterval(() => forceTick((n) => n + 1), 1000);
+        return () => clearInterval(id);
+    }, [running]);
+    const elapsed = running
+        ? snapshot.elapsed_secs + Math.max(0, (Date.now() - snapshotAt) / 1000)
+        : snapshot.elapsed_secs;
+    const bestCkpt = snapshot.ckpts.find((c) => c.kind === "best");
+    const onStart = async () => {
+        // 免导入直训: a run may start with no fresh import when the project holds a reusable
+        // pool (flat on-disk dataset, or a diff host's shared pool) — Rust re-verifies
+        // authoritatively. ①c: multi-speaker needs ≥2 named non-empty groups (trainingDataOk).
+        if (!trainingDataOk(config.backend, useTrainingStore.getState().projectDataset, diffWsInfo)) {
+            showToast(t("training.needData"), "error");
+            return;
+        }
+        const name = config.modelName.trim();
+        if (!name) {
+            showToast(t("training.needName"), "error");
+            return;
+        }
+        if (config.backend === "sovits_diff") {
+            // diff semantics: a same-named workspace is the EXPECTED case (cache
+            // reuse); the dialog fires whenever one exists so the user always gets
+            // the 重训-only-diffusion escape hatch (a half-baked diff-first
+            // workspace version-locks the manifest — retrain is the way out)
+            // A failed probe must NOT read as「没有工作区」: that would skip the foreign-family
+            // check and the resume/retrain dialog. Refuse loudly instead (see the main branch).
+            let info;
+            try {
+                info = await invoke("get_training_slot_info", {
+                    projectId: route.projectId,
+                    backend: config.backend,
+                    runId: config.runId, // ⛔ 见页根 effect 那条:不传 = 问一个从 flip 起没有答案的问题
+                });
+            }
+            catch (e) {
+                showToast(t("training.probeFailed", { err: backendErrorMessage(e) ?? String(e) }), "error");
+                return;
+            }
+            if (info.exists && info.family && info.family !== "sovits") {
+                showToast(t("training.diffWorkspaceForeign", { family: info.family }), "error");
+                return;
+            }
+            let fresh = false;
+            let diffResumeFrom = "latest";
+            if (info.exists) {
+                const hasProgress = info.diff_steps > 0;
+                // ★★§F2⒝ ④e — this branch's meaning FLIPPED and the text did not follow.
+                // `diff_partial_wipe` requires `has_main`, so with NO main model 「重训」 falls through to
+                // `mints_fresh_run` ⇒ it mints a new run and deletes nothing. The old note promised
+                // 「清空整个工作区(含预处理缓存)」, which is now exactly backwards — the pool is shared
+                // and untouched, and the previous diff-only run stays where it is.
+                const wipeNote = info.has_main_progress
+                    ? ""
+                    : " " + t("training.diffRetrainMintsNewRunNote");
+                // ★S118 §F8⒜ — the diffusion twin of the GAN dialog's option, gated on the DIFFUSION
+                // snapshot (`diff_best_resume_step`) and never on `best_resume_step`: a sovits_diff probe
+                // resolves to the sovits SLOT, so that field describes the MAIN model's G+D snapshot and
+                // this label would carry the wrong model's step.
+                const bestResume = info.diff_best_resume_step != null
+                    ? [
+                        {
+                            id: "resumeBest",
+                            label: t("training.resumeFromBest", { step: info.diff_best_resume_step }),
+                        },
+                    ]
+                    : [];
+                const choice = await showConfirm({
+                    title: t("training.diffConfirmTitle"),
+                    body: (hasProgress
+                        ? t("training.diffConfirmResumeBody", { name, steps: info.diff_steps })
+                        : t("training.diffConfirmReuseBody", { name })) + wipeNote,
+                    buttons: [
+                        {
+                            id: "resume",
+                            label: hasProgress ? t("training.resume") : t("training.continueTrain"),
+                            kind: "primary",
+                        },
+                        ...bestResume,
+                        { id: "retrain", label: t("training.retrainDiff"), kind: "danger" },
+                        { id: "cancel", label: t("training.cancel") },
+                    ],
+                });
+                if (choice !== "resume" && choice !== "retrain" && choice !== "resumeBest")
+                    return;
+                fresh = choice === "retrain";
+                if (choice === "resumeBest")
+                    diffResumeFrom = "best";
+            }
+            // fresh here can only come from the「重训(仅扩散)」button above = an answered dialog
+            // ⚠ `fresh` also means「wipe confirmed」on this path (same argument twice, as before);
+            // resume_from is ignored by the backend for a fresh start (it normalizes to "").
+            await start(fresh, fresh, diffResumeFrom).catch(() => undefined);
+            return;
+        }
+        // ⚠ `fresh` seeds to true (= WIPE) and is only narrowed inside the dialog branches below,
+        // every one of which hangs off a probe. So a swallowed probe failure used to mean「没弹任何
+        // 对话框就把几小时的进度整目录删了」. Every probe below is therefore fail-closed: it either
+        // answers, or we refuse to start. `wipeConfirmed` carries「用户真的按了重训」to the backend,
+        // which refuses an unconfirmed wipe of a workspace that holds work.
+        let fresh = true;
+        let wipeConfirmed = false;
+        let resumeFrom = "latest";
+        let modelExists = false;
+        try {
+            modelExists = await invoke("check_model_exists", {
+                name,
+                modelType: config.backend,
+            });
+        }
+        catch (e) {
+            showToast(t("training.probeFailed", { err: backendErrorMessage(e) ?? String(e) }), "error");
+            return;
+        }
+        // ⚠ FAIL-CLOSED, like every other probe on this path. `fresh` is seeded to true = WIPE and
+        // is only narrowed inside the dialogs below, each of which hangs off this answer — so
+        // swallowing a failure here means「没弹任何对话框就把几小时的进度整目录删了」.
+        //
+        // Until batch 4 this one probe was deliberately fail-OPEN, degrading to a cruder
+        // `check_training_workspace(name, backend)`. That fallback made sense while the two
+        // commands asked DIFFERENT questions of different code paths; once both became
+        // `checked_project_id` + a path join off the same project id, they fail and succeed
+        // together — the fallback was answering exactly when it could not.
+        let info;
+        try {
+            info = await invoke("get_training_slot_info", {
+                projectId: route.projectId,
+                backend: config.backend,
+                runId: config.runId, // ⛔ 见页根 effect 那条:不传 = 问一个从 flip 起没有答案的问题
+            });
+        }
+        catch (e) {
+            showToast(t("training.probeFailed", { err: backendErrorMessage(e) ?? String(e) }), "error");
+            return;
+        }
+        const wsExists = info.exists;
+        // vocoder's "version" is the fixed manifest marker — hitting the sovits fallback here would
+        // compare "nsf_hifigan" vs "4.1" (红队 A16). Still needed by the diffusion host check below.
+        const selectedVersion = config.backend === "rvc"
+            ? config.version
+            : config.backend === "vocoder"
+                ? "nsf_hifigan"
+                : config.backend === "sovits_v2"
+                    ? "4.0-v2"
+                    : config.sovitsVersion;
+        // ★★§F2⒝ ④e — 「重训」 no longer wipes anything: it MINTS a new run beside this one. So the
+        // shallow-diffusion progress in the CURRENT run is not destroyed — it simply does not come
+        // along, and the new run starts without it. The old wording (「重训将一并清除」) survived the
+        // flip and was still telling the user their diffusion was about to be deleted.
+        const diffWarn = info.diff_steps > 0 ? " " + t("training.retrainKeepsDiffBehind", { steps: info.diff_steps }) : "";
+        if (wsExists) {
+            // S78: the resume-guarded params can no longer DIFFER — the parameters page renders them
+            // read-only from the slot's own values (`resume_lock` + `lib/resumeLock.ts`), and the
+            // speaker set comes from the project's on-disk directories rather than a form. So this is
+            // back to the plain resume/retrain choice.
+            //
+            // What used to be here was an itemized「配置与原工作区不一致」dialog: six inline t18
+            // literals (outside the i18n JSON, so the parity gate never saw them) re-deriving the
+            // guard's rule a third time. Keeping a copy that can only ever disagree with the source is
+            // how a dialog ends up promising 续训 for a start the backend refuses.
+            // Arriving via「再训一个」means the user already chose to wipe (and the parameters page
+            // unlocked the resume-locked fields on that basis) — so lead with 重训 rather than making
+            // them re-decide against a primary-styled 续训 that may now be refused. Both options stay:
+            // this dialog is the authoritative wipe consent, and changing one's mind must be possible.
+            const wantsRetrain = useTrainingStore.getState().retrainIntent;
+            // ⛔⛔ S141(用户实机连报两次)——「再训一个」这条路上**不再问第三遍**。
+            //
+            // 用户已经在项目页答过两次:①「重训这个架构」那个 danger 对话框(它明说会新建一个 run、
+            // 旧的原样保留)②「给这个新 run 起个名字」。走到这里再弹一个标题写着**「模型已存在」**、
+            // 正文把**新**名字说成「已存在名为 X 的模型/训练记录」的框,是第三遍 —— 而且那句话是**假的**:
+            // 这个分支的条件是 `wsExists`,而 `wsExists` 问的是 `config.runId` 指的那个【旧】run 有没有
+            // 产物,**与用户输入的名字毫无关系**。用户原话:「无论我输入什么训练名都会提示已存在」。
+            //
+            // ⛔ 它也不再是一道「擦除同意」:`wipe_confirmed` 在后端**只有一个消费点**
+            // (`training/mod.rs` 的 `if diff_partial_wipe && !req.wipe_confirmed && …`),而
+            // `diff_partial_wipe` 要求 `backend == "sovits_diff"`;而 `retrainIntent` **只由**
+            // `ProjectDetail.retrainFamily` 置位,它只传 family(rvc/sovits/sovits_v2/vocoder)——
+            // 结构上到不了那个分支。⇒ 这一问没有任何东西要被同意。
+            //
+            // ⚠ `wipeConfirmed` 保持 false:这条路读不到它,而万一将来那个分类变了,
+            // 「没同意过」是 fail-closed 的方向(后端会拒绝而不是默默删)。
+            if (wantsRetrain) {
+                fresh = true; // 与种子值相同;写出来是让这条路的意图显式,而不是靠「没人改过它」
+            }
+            else {
+                // ★S117 §F2⒜ — offered ONLY when the slot really holds a complete resumable best snapshot
+                // (`resume_best/` with its completion marker). A button that silently continues from the
+                // latest instead would be the same class of lie as the one this feature exists to remove:
+                // until now the best point was an inference-only export, i.e. a dead end.
+                const bestResume = info.best_resume_step != null
+                    ? [{ id: "resumeBest", label: t("training.resumeFromBest", { step: info.best_resume_step }) }]
+                    : [];
+                const choice = await showConfirm({
+                    title: t("training.confirmExistTitle"),
+                    body: t("training.confirmExistBody", { name }) + diffWarn,
+                    buttons: [
+                        { id: "resume", label: t("training.resume"), kind: "primary" },
+                        ...bestResume,
+                        { id: "retrain", label: t("training.retrain"), kind: "danger" },
+                        { id: "cancel", label: t("training.cancel") },
+                    ],
+                });
+                if (choice !== "resume" && choice !== "retrain" && choice !== "resumeBest")
+                    return;
+                fresh = choice === "retrain";
+                wipeConfirmed = fresh;
+                if (choice === "resumeBest")
+                    resumeFrom = "best";
+            }
+            // (The old `else if (wsExists)` branch — "the slot exists but its facts are unreadable" —
+            // is gone with the fail-open probe that produced it. `get_training_slot_info` either
+            // answers or the start is refused above; an unreadable MANIFEST still lands in the branch
+            // above with empty version/sample_rate fields, which is what `diffRows` skips on.)
+        }
+        else if (modelExists) {
+            // installed model, NO workspace: there is nothing to resume —「续训」
+            // would silently train from scratch; say what actually happens (and
+            // call out a version mismatch when the registry knows the version)
+            const installed = (config.backend === "rvc"
+                ? rvcModels
+                : config.backend === "vocoder"
+                    ? vocoderModels
+                    : sovitsModels).find((m) => m.name === name);
+            const installedVersion = installed ? voiceVersionBadge(installed) : null;
+            const mismatch = installedVersion && installedVersion !== selectedVersion;
+            const choice = await showConfirm({
+                title: t("training.confirmExistTitle"),
+                body: mismatch
+                    ? t("training.modelVersionMismatchBody", {
+                        name,
+                        old: installedVersion,
+                        new: selectedVersion,
+                    })
+                    : t("training.noWorkspaceBody", { name }),
+                buttons: [
+                    { id: "go", label: t("training.continueTrain"), kind: "primary" },
+                    { id: "cancel", label: t("training.cancel") },
+                ],
+            });
+            if (choice !== "go")
+                return;
+            // installed model but NO workspace: nothing on disk to wipe, so this stays unconfirmed
+            // (the backend guard is a no-op when the workspace holds nothing).
+            fresh = true;
+        }
+        await start(fresh, wipeConfirmed, resumeFrom).catch(() => undefined);
+    };
+    const onStop = async () => {
+        await stop();
+    };
+    // confirm before clearing: the ckpt list (with its import/attach buttons)
+    // is the LAST surface for this run's artifacts — a confirmed clear means
+    // the user is done with them, which is why there is deliberately no
+    // "re-attach later" entry elsewhere (user decision 2026-07-06)
+    const onClearResult = async () => {
+        const choice = await showConfirm({
+            title: t("training.clearResult"),
+            body: t("training.clearResultConfirmBody"),
+            buttons: [
+                { id: "clear", label: t("training.clearResult"), kind: "primary" },
+                { id: "cancel", label: t("training.cancel") },
+            ],
+        });
+        if (choice !== "clear")
+            return;
+        // anti-escape (user report, S41 live test): after a page refresh the
+        // dataset list is gone (in-memory) while the snapshot survives (backend);
+        // clearing from that state used to leave the wizard parked on the run
+        // segment with zero data. 清空 semantically ends the round — go back to the
+        // project (only on an ACCEPTED clear; a refused one keeps the results visible).
+        if (await resetRun())
+            goSeg("detail");
+    };
+    const onForceStop = async () => {
+        const choice = await showConfirm({
+            title: t("training.forceStopConfirmTitle"),
+            body: t("training.forceStopConfirmBody"),
+            buttons: [
+                { id: "kill", label: t("training.forceStop"), kind: "danger" },
+                { id: "cancel", label: t("training.cancel") },
+            ],
+        });
+        if (choice === "kill")
+            await forceStop();
+    };
+    const exportChart = async () => {
+        const blob = await chartRef.current?.toPngBlob();
+        if (!blob)
+            return;
+        const path = await save({
+            defaultPath: `${snapshot.model_name || "training"}_loss.png`,
+            filters: [{ name: "PNG", extensions: ["png"] }],
+        });
+        if (!path)
+            return;
+        const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
+        try {
+            await invoke("save_binary_file", { path, data: bytes });
+            showToast(t("training.chartSaved"), "success");
+        }
+        catch (e) {
+            showToast(String(e), "error");
+        }
+    };
+    // sovits/vocoder periodics are step-cadenced (several per epoch) — an
+    // epoch-keyed suggestion would collide and silently replace the previous
+    // import (rvc keeps its historical epoch tag)
+    /** ★§F2⒝ 批 2 ④b —— `exportName` 由**调用方按行解析**后传进来。以前它取的是槽级的那一个
+     *  标量,于是同一个槽的两个 run **提议同一个模型名**,而 `import_model` 同名即 REPLACE、
+     *  连对话框都没有 ⇒ 第二次导入把第一次的整套文件删掉,而**保存过的工程按名字绑音源**
+     *  (`Track.voiceModel` 是字符串,加载时 `modelPathHeal` 按名重绑)⇒ 几个月没打开的工程
+     *  静默换了歌手。 */
+    const suggestedName = (ckpt, exportName) => {
+        // an archive row (CkptRecord) carries no epoch — recover it from the release filename.
+        // Anchor to the FULL `_e<epoch>_s<step>` tail, never a bare `_e<digits>_`: the model slug
+        // ends in an 8-hex hash, and a hash of the form `e1234567` would otherwise be read as the
+        // epoch (the Rust step-parser documents this exact ~2% hazard). Fall back to the step tag.
+        const epoch = ckpt.epoch ?? (ckpt.rel ? Number(/_e(\d+)_s\d+\./.exec(ckpt.rel)?.[1]) : NaN);
+        const tag = ckpt.kind === "best"
+            ? "best"
+            : archiveBackend === "rvc" && Number.isFinite(epoch)
+                ? `e${epoch}`
+                : `s${ckpt.step ?? 0}`;
+        return ckpt.kind === "final" ? exportName : `${exportName}_${tag}`;
+    };
+    // fallbacks for runs without a summary (e.g. force-stopped): rvc keeps its
+    // historical total_fea.npy; sovits probes the workspace cluster assets
+    // (built before training, so they exist even for early stops). Shared by the
+    // single-import prompt and the S41 batch import (single source).
+    /** §E2E-M1 —— 决策本身已抽成纯函数 `resolveArchiveIndex`（`src/lib/training/indexPath.ts`），
+     *  因为它的失败是**静默**的：缺检索矩阵的症状只是音色相似度下降，而它在盘上不过是一个
+     *  文件在不在 ⇒ 这件事不能留给实机窗口去「看一眼」。探针注入之后，vitest 能把每一种形状
+     *  （含工作区未知的退化态）当普通用例跑。
+     *
+     *  ★§F2⒝ 批 2 ④b —— 工作区与 summary 的取舍搬进 `resolveRowIdentity`:实时 run 的 summary
+     *  索引以前只按「本段是不是实时视图」判,而那个条件对**兄弟 run 的存档行**同样为真 ⇒
+     *  run A 产出的检索矩阵会被装进 run B 的模型。现在它挂在一个肯定事实上(两个工作区相等)。 */
+    const resolveIndexOf = (id) => resolveArchiveIndex({
+        backend: archiveBackend,
+        workspace: id.workspace,
+        summaryIndex: id.summaryIndex,
+        ctxIndexPath: id.indexPath,
+        exists,
+    });
+    /** 已装模型的名字(这一族)。sovits 与 sovits_v2 共用 SoVITS 注册表(`parse_voice_type`)。 */
+    const installedNames = (family) => (family === "rvc" ? rvcModels : family === "vocoder" ? vocoderModels : sovitsModels).map((m) => m.name);
+    /** ★§F2⒝ 批 2 ④b —— 同名导入是 REPLACE,而单条导入这条路以前**连问都不问**。
+     *
+     *  ⛔ 它删掉的不只是那个模型的文件。保存过的工程里,音轨是**按显示名**绑定音源的
+     *  (`Track.voiceModel` 是一个字符串,`.usp` 里存的就是它,加载时 `modelPathHeal` 按名重绑)——
+     *  于是「同名替换」会让**几个月没打开过的工程静默换成另一个歌手**,没有 undo、没有日志,
+     *  症状出现在完全不同的功能区。而 ④ 这一批正是让**同一个槽的两个 run 提议同一个名字**的那批。
+     *
+     *  ⚠ 这里只是**训练侧的止血**:引用完整性本身(音轨改为按模型 id 绑定 + 存量 .usp 迁移)
+     *  是队列里单独的一格,不在本批。 */
+    const confirmReplaceInstalled = async (name) => {
+        if (!installedNames(backendFamily(archiveBackend)).includes(name))
+            return true;
+        const id = await showConfirm({
+            title: t("training.importReplaceTitle"),
+            body: t("training.importReplaceBody", { name }),
+            buttons: [
+                { id: "__cancel", label: t("training.cancel") },
+                { id: "go", label: t("training.importReplace"), kind: "danger" },
+            ],
+        });
+        return id === "go";
+    };
+    /** Re-read the archive list after an export, so its「已导入」marks are current.
+     *
+     *  S76 batch 4: this used to ALSO write the ledger row itself — a second write beside the
+     *  one Rust already does inside `import_model` / `attach_diffusion` (`record_training_export`,
+     *  THE single source since batch 3). Two writers was not merely redundant: they disagreed
+     *  about `model_type` and the later one won, so a shallow-diffusion attach ended up recorded
+     *  as `sovits_diff` — a value the registry's own type table does not know. And the frontend
+     *  half was skipped entirely whenever `snapshot.project_id` was empty, i.e. after a reload
+     *  or「清空结果」, which is exactly when exporting from the archive list happens. */
+    const refreshArchive = async () => {
+        await useTrainingStore.getState().refreshProjectCkpts(route.projectId, archiveBackend);
+    };
+    const importCkpt = async (ckpt) => {
+        // ⛔ ONE resolution for this row: the suggested NAME and the WORKSPACE the index is probed in
+        // must come from the same run, or the row is labelled after run B and rendered from run A.
+        const rowId = await rowIdentityFor(ckpt.runId);
+        const name = await showConfirm({
+            title: t("training.import"),
+            body: t("training.importName"),
+            buttons: [
+                { id: "ok", label: t("training.import"), kind: "primary" },
+                // "__cancel": with input mode the PRIMARY resolves the typed VALUE, other
+                // buttons resolve their id — a plain "cancel" id would collide with a
+                // model literally named "cancel"
+                { id: "__cancel", label: t("training.cancel") },
+            ],
+            input: { initial: suggestedName(ckpt, rowId.name) },
+        });
+        if (!name || name === "__cancel")
+            return;
+        if (!(await confirmReplaceInstalled(name)))
+            return;
+        const idx = await resolveIndexOf(rowId);
+        try {
+            // ★§F2⒝ — the warnings were DROPPED here while the batch import below collected them, and
+            // this one-row button is the path the archive list actually uses. `import_model` reports the
+            // failures it can recover from as warnings, not errors (WARN_INDEX_MISSING above all), so
+            // discarding them meant「装上了但没有检索索引」reached the user as nothing at all.
+            const outcome = await invoke("import_model", {
+                name,
+                path: ckpt.path,
+                // the family this segment is acting on — `snapshot.backend` is "" with no run displayed
+                modelType: backendFamily(archiveBackend),
+                indexPath: indexPathArg(idx),
+            });
+            await useVoiceModelStore.getState().fetchModels();
+            await refreshArchive();
+            // ⛔§E2E-M1：「我们不知道该去哪找索引」必须跟后端的 warning 走**同一个漏斗**——
+            // 否则它与「确实没有索引」在界面上长得一模一样，而两者的后果完全不同。
+            const warns = collectWarningCodes(outcome, indexWarningCode(idx)).map((w) => backendErrorMessage(w) ?? w);
+            const toast = importToast(t("training.imported", { name }), warns);
+            showToast(toast.text, toast.level);
+        }
+        catch (e) {
+            // MODEL_BUSY_AUDITION / APP_BUSY land here raw without the shared mapper (audit gap).
+            showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
+        }
+    };
+    /** S167 (§F2⒟): export a release snapshot as the COMMUNITY file set — rvc: `.pth` (already
+     *  upstream savee()'s format) + a faiss `added_*.index` built from the run's own features;
+     *  sovits: `.pth` + `config.json`. The ecosystem-compat counterpart of our lossless .zip
+     *  package (which only WE can read back). */
+    const exportCommunity = async (ckpt) => {
+        const rowId = await rowIdentityFor(ckpt.runId);
+        const name = await showConfirm({
+            title: t("training.exportCommunity"),
+            body: t("training.exportCommunityName"),
+            buttons: [
+                { id: "ok", label: t("training.exportCommunity"), kind: "primary" },
+                { id: "__cancel", label: t("training.cancel") },
+            ],
+            input: { initial: suggestedName(ckpt, rowId.name) },
+        });
+        if (!name || name === "__cancel")
+            return;
+        const dir = await open({ directory: true, title: t("training.exportCommunityPick") });
+        if (!dir || typeof dir !== "string")
+            return;
+        try {
+            const files = await invoke("export_community_ckpt", {
+                projectId: route.projectId,
+                backend: archiveBackend,
+                ckptPath: ckpt.path,
+                name,
+                destDir: dir,
+            });
+            showToast(t("training.exportCommunityDone", { n: files.length }), "success");
+        }
+        catch (e) {
+            showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
+        }
+    };
+    /** S41 batch import of the checked candidates, auto-named by the single-
+     *  import suggestion rules with in-batch dedupe (red-team A9: a stop archive
+     *  can share its step/epoch with a periodic — REPLACE would silently eat
+     *  one). Prefers the audition-converted onnx when present (instant copy). */
+    const importSelected = async () => {
+        const chosen = snapshot.ckpts.filter(ckptChosen);
+        if (chosen.length === 0 || importingAll)
+            return;
+        // 批量导入只处理【实时 run】的候选（`snapshot.ckpts`），所以整批共用一次解析。
+        const rowId = await rowIdentityFor(null);
+        const names = new Map();
+        const used = new Set();
+        for (const c of chosen) {
+            let n = suggestedName(c, rowId.name);
+            if (used.has(n))
+                n = `${n}_${c.kind}`;
+            let i = 2;
+            while (used.has(n)) {
+                n = `${suggestedName(c, rowId.name)}_${c.kind}${i}`;
+                i += 1;
+            }
+            used.add(n);
+            names.set(c.path, n);
+        }
+        const lines = chosen.map((c) => `${names.get(c.path)}  ←  ${c.path.split(/[\\/]/).pop()}`);
+        // ★§F2⒝ 批 2 ④b —— 批量这条路的清单以前也不说哪几行会**顶掉一个已装的同名模型**。
+        // 与单条那条同一个理由(见 `confirmReplaceInstalled`),只是这里把它并进已有的清单里,
+        // 而不是为一批弹 N 个对话框。
+        const already = installedNames(backendFamily(archiveBackend));
+        const clashes = [...used].filter((n) => already.includes(n));
+        const okId = await showConfirm({
+            title: t("training.importSelectedTitle"),
+            body: `${t("training.importSelectedBody")}\n\n${lines.join("\n")}` +
+                (clashes.length > 0
+                    ? `\n\n${t("training.importReplaceBody", { name: clashes.join("、") })}`
+                    : ""),
+            buttons: [
+                { id: "ok", label: t("training.import"), kind: "primary" },
+                { id: "cancel", label: t("training.cancel") },
+            ],
+        });
+        if (okId !== "ok")
+            return;
+        setImportingAll(true);
+        try {
+            // 那时 `useLiveIdentity` 下的 `snapshot.workspace` 就是那个 run 的目录 —— 这里没有
+            // 【哪个 run】的歧义可言。
+            const idx = await resolveIndexOf(rowId);
+            const audName = isVocoderRun ? "vocoder" : "model";
+            let ok = 0;
+            const failed = [];
+            const warns = [];
+            for (const c of chosen) {
+                let path = c.path;
+                try {
+                    const stem = c.path
+                        .split(/[\\/]/)
+                        .pop()
+                        .replace(/\.[^.]+$/, "");
+                    const dir = `${snapshot.workspace}\\audition\\${stem}`;
+                    // the sidecar json is the conversion's COMPLETION marker (exporters
+                    // write it last, 审查修复 S41-RUST-1/2) — a bare onnx is an
+                    // interrupted/rejected conversion and must fall back to the raw ckpt
+                    if ((await exists(`${dir}\\${audName}.onnx`)) &&
+                        (await exists(`${dir}\\${audName}.json`))) {
+                        path = `${dir}\\${audName}.onnx`;
+                    }
+                }
+                catch {
+                    /* fall back to the raw ckpt (import converts it itself) */
+                }
+                try {
+                    const outcome = await invoke("import_model", {
+                        name: names.get(c.path),
+                        path,
+                        // family (identity for every backend the batch bar shows — it is !isDiff gated)
+                        modelType: backendFamily(archiveBackend),
+                        indexPath: indexPathArg(idx),
+                        // ★ the ledger must record the ORIGINAL checkpoint, not `path` — which may have
+                        // been swapped to the audition-converted onnx above. Recording the onnx would leave
+                        // the real snapshot looking un-imported, and batch 3's cleanup would delete it.
+                        sourceCkpt: path === c.path ? null : c.path,
+                    });
+                    ok += 1;
+                    for (const w of collectWarningCodes(outcome, indexWarningCode(idx))) {
+                        warns.push(`${names.get(c.path)}: ${backendErrorMessage(w) ?? w}`);
+                    }
+                }
+                catch (e) {
+                    failed.push(`${names.get(c.path)}: ${backendErrorMessage(e) ?? e}`);
+                }
+            }
+            await useVoiceModelStore.getState().fetchModels();
+            await refreshArchive();
+            const batchToast = batchImportToast({
+                doneText: t("training.importSelectedDone", { count: ok }),
+                partialText: t("training.importSelectedPartial", { ok, total: chosen.length }),
+                failed,
+                warns,
+            });
+            showToast(batchToast.text, batchToast.level);
+        }
+        finally {
+            setImportingAll(false);
+        }
+    };
+    /** The project's on-disk inventory, made ACTIONABLE (S78) — rendered in EVERY run state,
+     *  deliberately.
+     *
+     *  It first lived inside the finished-run summary card, which meant it was invisible after an
+     *  app restart or「清空结果」— exactly the two situations it exists for (the sidecar's in-memory
+     *  candidate list is empty then while the files are on disk). That is why a finished shallow-
+     *  diffusion checkpoint became a dead end the moment anything else was trained: its attach
+     *  button lived only on the summary card. Here every row carries the action its FILE supports,
+     *  at any time. */
+    const archiveBlock = archiveRows.length > 0 && (_jsxs("div", { className: "training-archive", children: [_jsxs("button", { className: "training-archive-toggle", onClick: () => setArchiveOpen((v) => !v), children: [archiveOpen ? "▾" : "▸", " ", t("training.archiveTitle", { count: archiveRows.length })] }), archiveOpen && (_jsxs(_Fragment, { children: [anyAttachable &&
+                        (attachCandidates.length > 0 ? (_jsxs("div", { className: "training-attach-row", children: [_jsx("label", { children: t("training.attachTarget") }), _jsx(Dropdown, { value: attachTarget, options: attachCandidates.map((m) => ({ value: m.name, label: m.name })), onChange: (v) => setAttachTarget(v) })] })) : (_jsx("div", { className: "training-hint", children: t("training.noAttachTarget") }))), archiveOnly && auditionSpeakers.length > 0 && (_jsxs("div", { className: "training-attach-row", children: [_jsx("label", { title: t("training.auditionSpeakerTip"), children: t("training.auditionSpeaker") }), _jsx(Dropdown, { value: String(auditionSpeaker), options: auditionSpeakers.map((s) => ({ value: String(s.id), label: s.name })), onChange: (v) => changeAuditionSpeaker(parseInt(v, 10)) })] })), _jsx("div", { className: "training-archive-list", children: archiveRows.map((r) => {
+                            const gone = missingCkpts[r.path] === true;
+                            const phase = auditionState[r.path];
+                            const diffusion = rowIsDiffusion(r.rel);
+                            const canAudition = rowAuditionable(r);
+                            const canImport = rowConvertible(r);
+                            const canAttach = rowAttachable(r);
+                            return (_jsxs("div", { className: `training-archive-row${gone ? " missing" : ""}`, title: gone ? t("training.ckptMissing") : r.path, children: [_jsx("span", { className: "training-archive-name", title: r.path, children: r.rel }), _jsx("span", { className: "training-archive-tag", children: t(`training.ckptKind.${r.kind}`) }), _jsx("span", { className: "training-archive-step", children: r.step != null
+                                            ? t("training.ckptStep", { step: r.step })
+                                            : // A missing step means two different things and only ONE is「最新」:
+                                                // RVC's「只保留最新」writes the sentinel G_2333333.pth, whereas
+                                                // `<slug>.pth` / `_best.pth` just carry no step. Labelling the latter
+                                                //「最新」would be a lie — and on _best actively misleading.
+                                                r.kind === "resumable"
+                                                    ? t("training.ckptLatest")
+                                                    : "—" }), _jsx("span", { className: "training-archive-size", children: fmtSize(r.bytes) }), r.imported && (_jsx("span", { className: "training-archive-tag imported", children: t("training.ckptImported") })), gone ? (_jsx("span", { className: "training-ckpt-missing", children: t("training.ckptMissing") })) : (_jsxs("span", { className: "training-archive-actions", children: [canAudition && (_jsx("button", { className: "training-btn small", disabled: (auditionBusy && phase !== "converting" && phase !== "rendering") ||
+                                                    (diffusion && !attachTarget) ||
+                                                    importingAll, onClick: () => void auditionCandidate(r, diffusion ? "diffusion" : archiveBackend === "vocoder" ? "vocoder" : "voice"), children: auditionLabel(r.path) })), canAttach && attachCandidates.length > 0 && (_jsx("button", { className: "training-btn small", disabled: !attachTarget || attaching != null, onClick: () => void attachCkpt(r), children: attaching === r.path ? t("training.attaching") : t("training.attach") })), canImport && (_jsx("button", { className: "training-btn small", disabled: importingAll, onClick: () => void importCkpt(r), children: t("training.import") })), canImport && backendFamily(archiveBackend) !== "vocoder" && (_jsx("button", { className: "training-btn small", disabled: importingAll, onClick: () => void exportCommunity(r), children: t("training.exportCommunity") }))] }))] }, r.rel));
+                        }) })] }))] }));
+    /* -------- 存档中心(独立页,从项目详情的槽卡片进入)-------- */
+    if (archiveOnly) {
+        return (_jsxs("div", { className: "tproj-detail", children: [_jsxs("div", { className: "tproj-detail-head", children: [_jsxs("button", { className: "tproj-back", onClick: () => useTrainingStore.getState().setRoute({ seg: "detail", projectId: route.projectId }), children: ["\u2190 ", t("training.archiveBack")] }), _jsxs("span", { className: "tproj-detail-name", children: [t(`training.${FAMILY_LABEL_KEY[backendFamily(archiveBackend)] ?? "backendRvc"}`), " \u00B7", " ", t("training.archivePageTitle")] })] }), archiveRows.length > 0 ? (archiveBlock) : (_jsx("div", { className: "training-empty", children: t("training.archiveEmpty") }))] }));
+    }
+    /* -------- idle -------- */
+    if (snapshot.state === "idle") {
+        return (_jsxs("div", { className: "training-run-step", children: [_jsx("div", { className: "training-run-summary-line", children: config.backend === "rvc" ? (_jsxs(_Fragment, { children: [config.modelName || "—", " \u00B7 RVC ", config.version, " \u00B7 ", config.sampleRate, " \u00B7", " ", t("training.totalEpoch"), " ", config.totalEpoch, " \u00B7 batch ", config.batchSize] })) : config.backend === "vocoder" ? (_jsxs(_Fragment, { children: [config.modelName || "—", " \u00B7 ", t("training.backendVocoder"), " \u00B7 44.1k \u00B7", " ", t("training.totalSteps"), " ", config.vocTotalSteps, " \u00B7 batch ", config.vocBatchSize] })) : config.backend === "sovits_diff" ? (_jsxs(_Fragment, { children: [config.modelName || "—", " \u00B7 ", t("training.backendDiff"), " \u00B7 SoVITS", " ", config.diffVersion, " \u00B7 ", t("training.totalSteps"), " ", config.diffTotalSteps, " \u00B7 batch ", config.diffBatchSize] })) : (_jsxs(_Fragment, { children: [config.modelName || "—", " \u00B7 SoVITS", " ", config.backend === "sovits_v2" ? "4.0-v2" : config.sovitsVersion, " \u00B7 44.1k \u00B7", " ", t("training.totalEpoch"), " ", config.sovitsTotalEpoch, " \u00B7 batch", " ", config.sovitsBatchSize] })) }), _jsx("button", { className: "training-btn primary training-start-btn", disabled: starting || anyRunning, title: anyRunning ? t("training.active") : undefined, onClick: () => void onStart(), children: t("training.start") }), archiveBlock] }));
+    }
+    const trainingStarted = snapshot.step != null || history.length > 0;
+    return (_jsxs("div", { className: "training-run-step", children: [(snapshot.warnings ?? []).length > 0 && (_jsx("div", { className: "training-warn-list", children: (snapshot.warnings ?? []).map((code) => (_jsxs("div", { className: "training-warn-row", children: [_jsx("span", { className: "training-warn-mark", children: "!" }), _jsx("span", { children: backendErrorMessage(code) ?? code })] }, code))) })), !trainingStarted && running && (_jsx("div", { className: "training-stages", children: (STAGE_ORDERS[snapshot.backend] ?? STAGE_ORDERS.rvc).map((stage, idx, order) => {
+                    const cur = snapshot.stage;
+                    const curIdx = cur ? order.indexOf(cur.stage) : -1;
+                    const state = idx < curIdx ? "done" : idx === curIdx ? "active" : "pending";
+                    return (_jsxs("div", { className: `training-stage-row ${state}`, children: [_jsx("span", { className: "training-stage-mark", children: state === "done" ? "✓" : state === "active" ? "▸" : "·" }), _jsx("span", { className: "training-stage-label", children: t(`training.stage_${stage}`) }), state === "active" && cur?.progress != null && (_jsx("div", { className: "training-stage-bar", children: _jsx("div", { className: "training-stage-bar-fill", style: { width: `${Math.round((cur.progress ?? 0) * 100)}%` } }) })), state === "active" && cur?.message && (
+                            // Stage messages are mostly file names (pass through raw); the odd status CODE
+                            // (SHARED_POOL_REUSED) localizes via the shared mapper.
+                            _jsx("span", { className: "training-stage-msg", children: backendErrorMessage(cur.message) ?? cur.message }))] }, stage));
+                }) })), trainingStarted && (_jsxs(_Fragment, { children: [_jsxs("div", { className: "training-monitor-row", children: [_jsxs("span", { children: [t("training.step"), " ", snapshot.step?.step ?? 0, "/", snapshot.step?.total_steps ?? 0] }), (snapshot.step?.total_epochs ?? snapshot.total_epochs) > 0 && (_jsxs("span", { children: ["epoch ", snapshot.step?.epoch ?? 0, "/", snapshot.step?.total_epochs ?? snapshot.total_epochs] })), _jsxs("span", { children: [t("training.elapsed"), " ", fmtDur(elapsed)] }), running && snapshot.step?.eta_secs != null && (_jsxs("span", { children: [t("training.eta"), " ", fmtDur(snapshot.step.eta_secs)] })), _jsxs("span", { children: [isDiff || isVocoderRun ? t("training.bestVal") : t("training.best"), ":", " ", bestCkpt
+                                        ? `${bestCkpt.metric?.toFixed(3) ?? "?"} @ ${bestCkpt.step}`
+                                        : t("training.bestNone")] })] }), _jsx(LossChart, { ref: chartRef, history: history, bestStep: bestCkpt?.step ?? null }), _jsx("div", { className: "training-chart-actions", children: _jsx("button", { className: "training-btn", onClick: () => void exportChart(), children: t("training.exportChart") }) })] })), running && (_jsx("div", { className: "training-run-controls", children: !snapshot.stop_requested ? (_jsx("button", { className: "training-btn danger", onClick: () => void onStop(), children: t("training.stop") })) : (_jsxs(_Fragment, { children: [_jsx("span", { className: "training-stopping", children: t("training.stopping") }), _jsx("button", { className: "training-btn danger", onClick: () => void onForceStop(), children: t("training.forceStop") })] })) })), (snapshot.state === "completed" || snapshot.state === "stopped") && (_jsxs("div", { className: "training-summary-card", children: [_jsx("div", { className: "training-summary-title", children: snapshot.state === "completed"
+                            ? t("training.doneCompleted")
+                            : t("training.doneStopped") }), _jsxs("div", { className: "training-summary-facts", children: [_jsxs("span", { children: [t("training.sumSteps"), ": ", snapshot.step?.step ?? 0] }), _jsxs("span", { children: [t("training.sumTime"), ": ", fmtDur(snapshot.elapsed_secs)] }), bestCkpt && (_jsxs("span", { children: [isDiff || isVocoderRun ? t("training.sumBestVal") : t("training.sumBest"), ":", " ", bestCkpt.metric?.toFixed(3), " @ ", bestCkpt.step] }))] }), isDiff &&
+                        (attachCandidates.length > 0 ? (_jsxs("div", { className: "training-attach-row", children: [_jsx("label", { children: t("training.attachTarget") }), _jsx(Dropdown, { value: attachTarget, options: attachCandidates.map((m) => ({ value: m.name, label: m.name })), onChange: (v) => setAttachTarget(v) })] })) : (_jsx("div", { className: "training-hint", children: t("training.noAttachTarget") }))), auditionSpeakers.length > 0 && (_jsxs("div", { className: "training-attach-row", children: [_jsx("label", { title: t("training.auditionSpeakerTip"), children: t("training.auditionSpeaker") }), _jsx(Dropdown, { value: String(auditionSpeaker), options: auditionSpeakers.map((s) => ({ value: String(s.id), label: s.name })), onChange: (v) => changeAuditionSpeaker(parseInt(v, 10)) })] })), _jsxs("div", { className: "training-ckpt-list", children: [isVocoderRun && (_jsxs("div", { className: "training-ckpt-row reference", children: [_jsx("span", { className: "training-ckpt-kind reference", children: "A/B" }), _jsx("span", { className: "training-ckpt-name", children: t("training.auditionRef") }), _jsx("button", { className: "training-btn small", disabled: (auditionBusy && !auditionState["__default__"]) || importingAll, onClick: () => void auditionCandidate(null, "vocoder"), children: auditionLabel("__default__") })] })), snapshot.ckpts.map((c) => {
+                                const gone = missingCkpts[c.path] === true;
+                                const phase = auditionState[c.path];
+                                return (_jsxs("div", { className: `training-ckpt-row${gone ? " missing" : ""}`, title: gone ? t("training.ckptMissing") : undefined, children: [!isDiff && (_jsx("input", { type: "checkbox", className: "training-ckpt-check", disabled: gone, checked: ckptChosen(c), onChange: (e) => setSelectedCkpts((s) => ({ ...s, [c.path]: e.target.checked })) })), _jsx("span", { className: `training-ckpt-kind ${c.kind}`, children: t(`training.kind_${c.kind}`) }), _jsx("span", { className: "training-ckpt-name", title: c.path, children: c.path.replace(/\\/g, "/").split("/").pop() }), _jsxs("span", { className: "training-ckpt-meta", children: [isDiff ? _jsxs(_Fragment, { children: ["s", c.step] }) : _jsxs(_Fragment, { children: ["e", c.epoch, " \u00B7 s", c.step] }), c.metric != null && _jsxs(_Fragment, { children: [" \u00B7 ", c.metric.toFixed(3)] }), candRanges[c.path] && (_jsxs("span", { className: "training-ckpt-range", title: t("training.ckptRangeTip"), children: [" · ", midiName(candRanges[c.path].comfort[0]), "\u2013", midiName(candRanges[c.path].comfort[1])] }))] }), gone ? (_jsx("span", { className: "training-ckpt-missing", children: t("training.ckptMissing") })) : (_jsxs(_Fragment, { children: [_jsx("button", { className: "training-btn small", disabled: (auditionBusy && phase !== "converting" && phase !== "rendering") ||
+                                                        (isDiff && !attachTarget) ||
+                                                        // batch import copies audition onnx files — a render
+                                                        // writing one concurrently would be a TOCTOU (FE-2)
+                                                        importingAll, onClick: () => void auditionCandidate(c, isVocoderRun ? "vocoder" : isDiff ? "diffusion" : "voice"), children: auditionLabel(c.path) }), isDiff ? (attachCandidates.length > 0 && (_jsx("button", { className: "training-btn small", disabled: !attachTarget || attaching != null, onClick: () => void attachCkpt(c), children: attaching === c.path
+                                                        ? t("training.attaching")
+                                                        : t("training.attach") }))) : (_jsxs(_Fragment, { children: [_jsx("button", { className: "training-btn small", onClick: () => void importCkpt(c), children: t("training.import") }), !isVocoderRun && (_jsx("button", { className: "training-btn small", onClick: () => void exportCommunity(c), children: t("training.exportCommunity") }))] }))] }))] }, `${c.kind}-${c.step}-${c.path}`));
+                            })] }), !isDiff && importableCkpts.length > 0 && (_jsxs("div", { className: "training-audition-bar", children: [_jsx("button", { className: "training-btn small", disabled: importingAll || auditionBusy, onClick: toggleAllCkpts, children: allCkptsChosen ? t("training.deselectAllCkpts") : t("training.selectAllCkpts") }), _jsx("button", { className: "training-btn primary small", disabled: importingAll ||
+                                    auditionBusy ||
+                                    snapshot.ckpts.filter(ckptChosen).length === 0, onClick: () => void importSelected(), children: importingAll
+                                    ? t("training.importingSelected")
+                                    : t("training.importSelected", {
+                                        count: snapshot.ckpts.filter(ckptChosen).length,
+                                    }) })] }))] })), archiveBlock, snapshot.state === "error" && (_jsxs("div", { className: "training-error-card", children: [_jsx("div", { className: "training-error-title", children: t("training.doneError") }), _jsx("div", { className: "training-error-msg", children: backendErrorMessage(snapshot.error) ?? snapshot.error }), snapshot.stderr_tail.length > 0 && (_jsx("pre", { className: "training-error-tail", children: snapshot.stderr_tail.join("\n") })), _jsxs("div", { className: "training-error-hint", children: [t("training.errorHint"), " (", snapshot.workspace, ")"] })] })), snapshot.state === "stopped" &&
+                (snapshot.warnings ?? []).length > 0 &&
+                snapshot.stderr_tail.length > 0 && (_jsxs("div", { className: "training-error-card", children: [_jsx("div", { className: "training-error-title", children: t("training.stoppedWithWarnings") }), _jsx("div", { className: "training-error-msg", children: t("training.stoppedWithWarningsHint") }), _jsx("pre", { className: "training-error-tail", children: snapshot.stderr_tail.join("\n") }), _jsx("div", { className: "training-error-hint", children: _jsx("button", { className: "settings-mini-btn", onClick: () => void invoke("open_log_dir").catch(() => { }), children: t("training.openLogFolder") }) })] })), (snapshot.state === "completed" ||
+                snapshot.state === "stopped" ||
+                snapshot.state === "error") && (_jsxs("div", { className: "training-run-controls", children: [_jsx("button", { className: "training-btn primary", disabled: starting || auditionBusy || importingAll, onClick: () => void onStart(), children: t("training.start") }), _jsx("button", { className: "training-btn", disabled: starting || auditionBusy || importingAll, title: t("training.clearResultTip"), onClick: () => void onClearResult(), children: t("training.clearResult") })] }))] }));
+}

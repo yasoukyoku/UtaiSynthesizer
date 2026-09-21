@@ -6,9 +6,12 @@ import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
 import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
+import i18n from "../../i18n";
+import { songTaskSubmenuItems } from "../../lib/song/daw-menu";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { isTauri } from "../../lib/tauri";
 import { TICKS_PER_BEAT, PIXELS_PER_TICK, TRACK_HEADER_HEIGHT, LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_ADD_FOOTER, AUDIO_EXT_RE } from "../../lib/constants";
-import { computeTrackYOffsets, computeTrackHeight, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, laneRowAtY, isLaneRowMuted, laneControlFor, loudnessBandH, segmentPlaysLanes, segmentLaneSumPeaks, laneSumSig, clipCollides } from "../../lib/trackLayout";
+import { computeTrackYOffsets, computeTrackHeight, computeTotalTracksHeight, findTrackAtY, hiddenTrackIds, getLanes, getLaneLayout, laneRowAtY, isLaneRowMuted, laneControlFor, loudnessBandH, segmentPlaysLanes, segmentLaneSumPeaks, laneSumSig, clipCollides } from "../../lib/trackLayout";
 import { importAudioToNewTrack, importAudioToExistingTrack, probeAudioDuration, DEFAULT_DURATION_MS } from "../../lib/audio/import";
 import { durationMsToTicks } from "../../lib/audio/playback";
 import {
@@ -22,8 +25,8 @@ import { copySelectedSegments, cutSelectedSegments, pasteWithFeedback, clipboard
 import { paramToY, yToParam, LOUDNESS_DB_RANGE } from "../../lib/vocalGeometry";
 import { evalCurveAt } from "../../lib/f0eval";
 import { collectSnapTicks, snapTick, snapMovedStart, SNAP_PX } from "../../lib/snapping";
-import { trackRgb, rgba, ACCENT, ACCENT_RGB, ENVELOPE_HALO, ENVELOPE_LINE, LANE_COLORS, SELECTION_GLOW_RGB } from "../../lib/trackColors";
-import { drawBeatGrid, drawPlayhead, SEPARATOR_RGB } from "../../lib/canvasDraw";
+import { trackDrawRgb, rgba, ACCENT, ACCENT_RGB, ENVELOPE_HALO, ENVELOPE_LINE, LANE_COLORS, SELECTION_GLOW_RGB } from "../../lib/trackColors";
+import { drawBeatGrid, drawPlayhead, SEPARATOR_RGB, canvasThemeVars } from "../../lib/canvasDraw";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import { sliceLaneGroupAtPlayhead, deleteLanePiece } from "../../lib/laneEdit";
 import { detectSegmentTempo, doubleTempoDetect, halveTempoDetect, nudgeDownbeat } from "../../lib/audio/tempoDetect";
@@ -178,6 +181,10 @@ export function Arrangement() {
   // S60 MIDI-extraction jobs — a draw dep (per-frame overlay + rAF-loop predicate); progress %
   // is read from the module map each frame (no store churn), only the SET membership lives here.
   const midiExtracting = useAppStore((s) => s.midiExtracting);
+  // Skin/theme — a draw dep + a staticKey term so the baked background re-bakes on every switch
+  // (the baked static layer reads --bg-base via canvasThemeVars at bake time).
+  const skin = useAppStore((s) => s.skin);
+  const theme = useAppStore((s) => s.theme);
   const selectedSegments = useAppStore((s) => s.selectedSegments);
   const selectedLane = useAppStore((s) => s.selectedLane);
   const selectSegment = useAppStore((s) => s.selectSegment);
@@ -294,10 +301,12 @@ export function Arrangement() {
       const tp = tempoRef.current;
       const yOffsets = computeTrackYOffsets(tracks, scale);
       const headerH = TRACK_HEADER_HEIGHT * scale;
+      const hidden = hiddenTrackIds(tracks);
 
       for (let i = 0; i < tracks.length; i++) {
         const track = tracks[i];
         if (!track) continue;
+        if (hidden.has(track.id) || track.isFolder) continue;
         const trackY = yOffsets[i]!;
         const trackH = computeTrackHeight(track, scale);
         if (y < trackY || y > trackY + trackH) continue;
@@ -413,7 +422,7 @@ export function Arrangement() {
       if (!canvas) return -1;
       const rect = canvas.getBoundingClientRect();
       const y = clientY - rect.top + scrollYRef.current;
-      return findTrackAtY(computeTrackYOffsets(tracks, vZoomRef.current), y);
+      return findTrackAtY(computeTrackYOffsets(tracks, vZoomRef.current), y, tracks);
     },
     [tracks],
   );
@@ -475,11 +484,11 @@ export function Arrangement() {
     if (boundary !== null) return { target: "new", index: boundary, tick };
 
     // Over a track body.
-    const idx = findTrackAtY(offsets, contentY);
+    const idx = findTrackAtY(offsets, contentY, trks);
     if (idx >= 0 && idx < trks.length && contentY <= totalH) {
       const track = trks[idx]!;
       const half = offsets[idx]! + computeTrackHeight(track, scale) / 2;
-      if (track.trackType === "audio") {
+      if (track.trackType === "audio" && !track.isFolder) {
         // Insert onto this audio track unless the clip would collide with existing content there —
         // then drop a new track just above/below (by cursor half) so clips never overlap on import.
         // (An empty audio track has no content → never collides → the clip lands in it.)
@@ -616,7 +625,7 @@ export function Arrangement() {
       const scrollYNow = useAppStore.getState().scrollY;
       const mouseY = clientY - rect.top + scrollYNow;
       const yOffsets = computeTrackYOffsets(trks, vZoomRef.current);
-      const targetIdx = Math.max(0, Math.min(trks.length - 1, findTrackAtY(yOffsets, mouseY)));
+      const targetIdx = Math.max(0, Math.min(trks.length - 1, findTrackAtY(yOffsets, mouseY, trks)));
       const targetTrack = trks[targetIdx];
       // S61: cross-track hop for SAME-type tracks — audio↔audio (original) AND vocal↔vocal (a notes
       // part was inexplicably locked to its own track). Track-level state (singer/vocalParams) stays
@@ -1299,6 +1308,25 @@ export function Arrangement() {
           disabled: !!useAppStore.getState().midiExtracting[extractKey(segId, group)],
           onClick: () => { void extractMidiForLaneGroup(track.id, segId, group); },
         });
+        // —— 规划 10.4：lane 分支同样提供歌曲模型子菜单（源优先取该 lane 组的渲染产物）——
+        const clip = seg.content as { sourcePath?: string };
+        const lanePath =
+          seg.processedOutputs?.filter((o) => !o.loading && o.outputNodeId === group).slice(-1)[0]?.audioPath
+          ?? clip.sourcePath;
+        if (lanePath) {
+          items.push({
+            type: "submenu",
+            label: i18n.t("songMenu.remixGroup"),
+            icon: "🎤",
+            items: songTaskSubmenuItems({
+              source: { kind: "track", trackId: track.id, segmentId: segId },
+              sourceLabel: track.name,
+              audioPath: lanePath,
+              trackId: track.id,
+              segmentId: segId,
+            }),
+          });
+        }
       }
       return items;
     }
@@ -1388,6 +1416,22 @@ export function Arrangement() {
             onClick: () => useProjectStore.getState().setSegmentTempoDetect(track.id, segId, undefined),
           });
         }
+        // —— 规划 10.3：歌曲模型子菜单（片段 → 歌曲制作带参打开；插在拉伸系列之前，不删改现有项）——
+        const finalPath =
+          seg.processedOutputs?.filter((o) => !o.loading).slice(-1)[0]?.audioPath ?? clip.sourcePath;
+        items.push({
+          type: "submenu",
+          label: i18n.t("songMenu.remixGroup"),
+          icon: "🎤",
+          items: songTaskSubmenuItems({
+            source: { kind: "track", trackId: track.id, segmentId: segId },
+            sourceLabel: `${track.name}`,
+            audioPath: finalPath,
+            trackId: track.id,
+            segmentId: segId,
+          }),
+        });
+        items.push({ type: "divider" });
       }
     }
     // Empty-row right-click still offers 粘贴 (this row's track at the playhead) — S61.
@@ -1541,6 +1585,7 @@ export function Arrangement() {
   }, [requestRedraw, clearGhostGap, stopDragAutoScroll]);
 
   useEffect(() => {
+    if (!isTauri()) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     getCurrentWebview()
@@ -1665,7 +1710,7 @@ export function Arrangement() {
       }
     }
 
-    const staticKey = `${ppt}:${scale}:${scrollX}:${scrollY}:${tempo}:${timeSignature[0]}/${timeSignature[1]}:${selKeyStr}:${selectedLaneKey ?? ""}:${dragOver}:${ghostGap ? `${ghostGap.index}_${ghostGap.height}` : ""}:${Object.keys(audioFiles).length}:${tracks.map(t => {
+    const staticKey = `${skin}:${theme}:${ppt}:${scale}:${scrollX}:${scrollY}:${tempo}:${timeSignature[0]}/${timeSignature[1]}:${selKeyStr}:${selectedLaneKey ?? ""}:${dragOver}:${ghostGap ? `${ghostGap.index}_${ghostGap.height}` : ""}:${Object.keys(audioFiles).length}:${tracks.map(t => {
       // Both mute sources: per-row laneMutes + the legacy per-laneId muted flag (isLaneRowMuted reads both).
       const laneMutes = Object.entries(t.laneControls).map(([k, v]) => `${k}${v?.muted ? 1 : 0}`).join("|")
         + "/" + Object.entries(t.laneMutes ?? {}).map(([k, v]) => `${k}${v ? 1 : 0}`).join("|");
@@ -1751,9 +1796,11 @@ export function Arrangement() {
       const headerH = TRACK_HEADER_HEIGHT * scale;
       const laneH = LANE_HEIGHT * scale - 2;
       const label = t("tracks.loading");
+      const hidden = hiddenTrackIds(tracks);
       for (let i = 0; i < tracks.length; i++) {
         const track = tracks[i];
         if (!track) continue;
+        if (hidden.has(track.id) || track.isFolder) continue;
         // Match drawStaticContent's track Y, including the drag-import ghost-gap shift, so the loading
         // overlay stays glued to the static box while a new-track gap is open below/at this track.
         const trackY = loadOffsets[i]! - scrollY + (ghostGap && i >= ghostGap.index ? ghostGap.height : 0);
@@ -1761,7 +1808,7 @@ export function Arrangement() {
         // extend well below the header, and culling by header alone froze their loading indicators
         // once the header scrolled off the top while the rows were still visible (review-caught).
         if (trackY + computeTrackHeight(track, scale) < 0 || trackY > height) continue;
-        const c = trackRgb(track.trackType);
+        const c = trackDrawRgb(track);
         for (const seg of track.segments) {
           const sx = seg.startTick * ppt - scrollX;
           const sw = seg.durationTicks * ppt;
@@ -1812,28 +1859,35 @@ export function Arrangement() {
       const gx = ghost.tick * ppt - scrollX;
       const durAt = (i: number) =>
         (paths[i] ? dragDurationsRef.current[paths[i]!] : undefined) ?? DEFAULT_DURATION_MS;
-      const drawBox = (gy: number, durMs: number) => {
+      const drawBox = (gy: number, durMs: number, rgb: readonly [number, number, number] = [96, 165, 250]) => {
         const w = Math.max(6, durationMsToTicks(durMs, tempoRef.current) * ppt);
-        ctx.fillStyle = "rgba(96,165,250,0.22)";
+        ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.22)`;
         ctx.fillRect(gx, gy, w, boxH);
-        ctx.strokeStyle = "rgba(96,165,250,0.9)";
+        ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.9)`;
         ctx.lineWidth = 1.5;
         ctx.setLineDash([6, 4]);
         ctx.strokeRect(gx, gy, w, boxH);
         ctx.setLineDash([]);
       };
 
+      // Ghost 用目标轨道的颜色(与轨道头/画布 clip 一致);无目标轨(末尾新轨)回退默认蓝
+      const ghostRgb = (i: number): readonly [number, number, number] => {
+        const ti = ghost.target === "insert" ? ghost.index : ghost.index + i;
+        const tr = ti >= 0 && ti < trks.length ? trks[ti] : undefined;
+        return tr ? trackDrawRgb(tr) : [96, 165, 250];
+      };
+
       ctx.save();
       if (ghost.target === "insert") {
-        drawBox(offsets[ghost.index]! - scrollY + 2, durAt(0));
+        drawBox(offsets[ghost.index]! - scrollY + 2, durAt(0), ghostRgb(0));
         if (fileCount > 1) {
           const bottom = computeTotalTracksHeight(trks, scale) - scrollY;
-          for (let i = 1; i < fileCount; i++) drawBox(bottom + 2 + (i - 1) * rowH, durAt(i));
+          for (let i = 1; i < fileCount; i++) drawBox(bottom + 2 + (i - 1) * rowH, durAt(i), ghostRgb(i));
         }
       } else {
         const rowTop =
           (ghost.index < trks.length ? offsets[ghost.index]! : computeTotalTracksHeight(trks, scale)) - scrollY;
-        for (let i = 0; i < fileCount; i++) drawBox(rowTop + 2 + i * rowH, durAt(i));
+        for (let i = 0; i < fileCount; i++) drawBox(rowTop + 2 + i * rowH, durAt(i), ghostRgb(i));
       }
       ctx.restore();
     }
@@ -1861,7 +1915,7 @@ export function Arrangement() {
       const near = Math.abs(mouseXRef.current - phx) < 10;
       drawPlayhead(ctx, { x: phx, height, line: true, glow: near, cap: "top" });
     }
-  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, vocalDropped, vocalShort, midiExtracting, t]);
+  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, vocalDropped, vocalShort, midiExtracting, skin, theme, t]);
 
   drawRef.current = draw;
 
@@ -1930,7 +1984,9 @@ function drawStaticContent(
   // eviction for this pass, so the visible working set never thrashes (rebuilds) frame-to-frame.
   beginWaveformFrame();
 
-  ctx.fillStyle = "#0d1220";
+  // Theme-aware background: reads the live --bg-base so the canvas follows skin + light/dark
+  // switches (cached inside canvasThemeVars; staticKey includes skin/theme to force re-bake).
+  ctx.fillStyle = canvasThemeVars().bgBase;
   ctx.fillRect(0, 0, width, height);
 
   if (dragOver) {
@@ -1946,9 +2002,12 @@ function drawStaticContent(
   const yOffsets = computeTrackYOffsets(tracks, scale);
   const headerH = TRACK_HEADER_HEIGHT * scale;
   const laneH = LANE_HEIGHT * scale - 2;
+  const hidden = hiddenTrackIds(tracks);
   for (let i = 0; i < tracks.length; i++) {
     const track = tracks[i];
     if (!track) continue;
+    // 被折叠文件夹隐藏的子轨: 布局占位但完全不绘制(折叠是纯视图状态)。
+    if (hidden.has(track.id)) continue;
     // Tracks at/after the ghost gap shift down to open a placeholder row for the dragged new track.
     const y = yOffsets[i]! - scrollY + (ghostGap && i >= ghostGap.index ? ghostGap.height : 0);
     const trackH = computeTrackHeight(track, scale);
@@ -1958,7 +2017,16 @@ function drawStaticContent(
     ctx.strokeStyle = rgba(SEPARATOR_RGB, 0.8); ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(0, y + trackH); ctx.lineTo(width, y + trackH); ctx.stroke();
 
-    const c = trackRgb(track.trackType);
+    // 文件夹分组轨: 画一条淡色整行带, 提示这是容器行(无内容)。
+    if (track.isFolder) {
+      ctx.fillStyle = rgba(SEPARATOR_RGB, 0.18);
+      ctx.fillRect(0, y, width, trackH - 1);
+      ctx.fillStyle = rgba(SEPARATOR_RGB, 0.5);
+      ctx.fillRect(0, y + 1, width, 1);
+      continue;
+    }
+
+    const c = trackDrawRgb(track);
 
     // Shared per-track lane geometry (rows + group bars) — the header column uses the SAME layout,
     // so canvas rows and header rows stay pixel-aligned by construction.

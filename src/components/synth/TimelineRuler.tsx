@@ -5,7 +5,7 @@ import { useAudioStore } from "../../store/audio";
 import { PIXELS_PER_TICK } from "../../lib/constants";
 import { ticksToMs } from "../../lib/audio/laneOps";
 import { collectSnapTicks, snapTick, SNAP_PX } from "../../lib/snapping";
-import { drawBeatGrid, drawPlayhead, CANVAS_BORDER } from "../../lib/canvasDraw";
+import { drawBeatGrid, canvasThemeVars, drawPlayhead } from "../../lib/canvasDraw";
 import "./TimelineRuler.css";
 
 // Edge auto-scroll while dragging the playhead near the ruler's left/right edge (mirrors Arrangement).
@@ -19,6 +19,8 @@ export function TimelineRuler() {
   const tempo = useProjectStore((s) => s.tempo);
   const timeAxis = useTimeAxis();
   const setPlayhead = useProjectStore((s) => s.setPlayhead);
+  const skin = useAppStore((s) => s.skin);
+  const theme = useAppStore((s) => s.theme);
   const dragging = useRef(false);
   const mouseClientXRef = useRef(0); // latest pointer X, so the auto-scroll tick can re-seek while held still
   const autoScrollRef = useRef(0);
@@ -163,7 +165,8 @@ export function TimelineRuler() {
     const ppt = pptRef.current;
     const playheadTick = playheadRef.current;
 
-    ctx.fillStyle = "#1a2236";
+    const colors = canvasThemeVars();
+    ctx.fillStyle = colors.bgSurface;
     ctx.fillRect(0, 0, width, height);
 
     const startTick = Math.floor(scrollX / ppt);
@@ -179,10 +182,10 @@ export function TimelineRuler() {
       const tick = timeAxis.tickAtBar(bar);
       const x = tick * ppt - scrollX;
       if (x > width) break; // past the right edge — every later bar is further right
-      ctx.fillStyle = "#e8ecf4";
+      ctx.fillStyle = colors.textPrimary;
       ctx.font = "bold 10px monospace";
       ctx.fillText(String(bar + 1), x + 3, 10);
-      ctx.fillStyle = "#556b94";
+      ctx.fillStyle = colors.textMuted;
       ctx.font = "9px monospace";
       ctx.fillText(formatTime(ticksToMs(tick, tempo) / 1000), x + 3, 20);
     }
@@ -193,13 +196,11 @@ export function TimelineRuler() {
       drawPlayhead(ctx, { x: phx, height, cap: "bottom", capHalfWidth: 5, capDepth: 6 });
     }
 
-    ctx.strokeStyle = CANVAS_BORDER;
+    // 绘制清晰的四周边框线
+    ctx.strokeStyle = colors.borderDefault;
     ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, height - 0.5);
-    ctx.lineTo(width, height - 0.5);
-    ctx.stroke();
-  }, [tempo, timeAxis]);
+    ctx.strokeRect(0.5, 0.5, width - 1, height - 1);
+  }, [tempo, timeAxis, skin, theme]);
 
   drawRef.current = draw;
 

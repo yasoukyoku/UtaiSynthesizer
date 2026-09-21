@@ -1,4 +1,4 @@
-//! Drive the §F2⒝ batch-2 RUN migration (slot layout 2 → 3) against a REAL project on disk.
+﻿//! Drive the §F2⒝ batch-2 RUN migration (slot layout 2 → 3) against a REAL project on disk.
 //!
 //! The twin of `tests/tpool_migrate.rs`, and it exists for the same reason: `trun`'s unit tests
 //! build their own fixtures, so on their own they only prove the migrator correct on shapes I
@@ -27,7 +27,7 @@
 //! ```
 use std::path::Path;
 
-use utai_lib::training::{tpool, tproject, trun};
+use muno_lib::training::{tpool, tproject, trun};
 
 /// `<data>/training/<project_id>` split back into the two arguments `migrate_slot_runs` takes.
 ///

@@ -1,0 +1,248 @@
+﻿cargo : [1m[92m    Checking[0m muno v0.12.2 (E:\软件开发\UtaiSynthesizer-main\UtaiSynthesizer-main\src-tauri)
+At line:15 char:2596
++ ... vscode\ripgrep\bin'; Set-Location src-tauri; cargo check 2>&1 | Out-F ...
++                                                  ~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([1m[92m    Ch...main\src-tauri):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[1m[91merror[0m[1m[97m: unknown start of token: `[0m
+   [1m[96m--> [0msrc\commands\song.rs:313:48
+    [1m[96m|[0m
+[1m[96m313[0m [1m[96m|[0m #[derive(Debug, Clone, Serialize, Deserialize)]`npub struct SongOutput {
+    [1m[96m|[0m                                                [1m[91m^[0m
+    [1m[96m|[0m
+[1m[96mhelp[0m: Unicode character '`' (Grave Accent) looks like ''' (Single Quote), but it is not
+    [1m[96m|[0m
+[1m[96m313[0m [91m- [0m#[derive(Debug, Clone, Serialize, Deserialize)][91m`[0mnpub struct SongOutput {
+[1m[96m313[0m [92m+ [0m#[derive(Debug, Clone, Serialize, Deserialize)][92m'[0mnpub struct SongOutput {
+    [1m[96m|[0m
+
+[1m[91merror[0m[1m[97m: expected one of `!` or `::`, found keyword `struct`[0m
+   [1m[96m--> [0msrc\commands\song.rs:313:54
+    [1m[96m|[0m
+[1m[96m313[0m [1m[96m|[0m #[derive(Debug, Clone, Serialize, Deserialize)]`npub struct SongOutput {
+    [1m[96m|[0m                                                      [1m[91m^^^^^^[0m [1m[91mexpected one of `!
+` or `::`[0m
+    [1m[96m|[0m
+[1m[96mhelp[0m: there is a keyword `pub` with a similar name
+    [1m[96m|[0m
+[1m[96m313[0m [91m- [0m#[derive(Debug, Clone, Serialize, Deserialize)]`[91mnpub[0m struct SongOutput {
+[1m[96m313[0m [92m+ [0m#[derive(Debug, Clone, Serialize, Deserialize)]`[92mpub[0m struct SongOutput {
+    [1m[96m|[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__tauri_command_name_get_song_models_dir` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1306:25
+     [1m[96m|[0m
+[1m[96m1306[0m [1m[96m|[0m           .invoke_handler(tauri::generate_handler![
+     [1m[96m|[0m [1m[91m _________________________^[0m
+[1m[96m1307[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_rvc,
+[1m[96m1308[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_sovits,
+[1m[96m1309[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::render_vocal_segment,
+[1m[96m...[0m    [1m[91m|[0m
+[1m[96m1491[0m [1m[96m|[0m [1m[91m|[0m             commands::amt_lyrics::amt_read_lyrics_from_midi,
+[1m[96m1492[0m [1m[96m|[0m [1m[91m|[0m         ])
+     [1m[96m|[0m [1m[91m|_________^[0m [1m[91mcould not find `__tauri_command_name_get_song_models_dir` in `son
+g`[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: this error originates in the macro `tauri::generate_handler` (in Nightly builds,
+ run with -Z macro-backtrace for more info)
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__cmd__get_song_models_dir` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1412:29
+     [1m[96m|[0m
+[1m[96m1412[0m [1m[96m|[0m             commands::song::get_song_models_dir,
+     [1m[96m|[0m                             [1m[91m^^^^^^^^^^^^^^^^^^^[0m [1m[91mcould not find `__cmd__get_so
+ng_models_dir` in `song`[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__tauri_command_name_list_song_models` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1306:25
+     [1m[96m|[0m
+[1m[96m1306[0m [1m[96m|[0m           .invoke_handler(tauri::generate_handler![
+     [1m[96m|[0m [1m[91m _________________________^[0m
+[1m[96m1307[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_rvc,
+[1m[96m1308[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_sovits,
+[1m[96m1309[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::render_vocal_segment,
+[1m[96m...[0m    [1m[91m|[0m
+[1m[96m1491[0m [1m[96m|[0m [1m[91m|[0m             commands::amt_lyrics::amt_read_lyrics_from_midi,
+[1m[96m1492[0m [1m[96m|[0m [1m[91m|[0m         ])
+     [1m[96m|[0m [1m[91m|_________^[0m [1m[91mcould not find `__tauri_command_name_list_song_models` in `song`
+[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: this error originates in the macro `tauri::generate_handler` (in Nightly builds,
+ run with -Z macro-backtrace for more info)
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__cmd__list_song_models` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1413:29
+     [1m[96m|[0m
+[1m[96m1413[0m [1m[96m|[0m             commands::song::list_song_models,
+     [1m[96m|[0m                             [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91mcould not find `__cmd__list_song
+_models` in `song`[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__tauri_command_name_download_song_model` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1306:25
+     [1m[96m|[0m
+[1m[96m1306[0m [1m[96m|[0m           .invoke_handler(tauri::generate_handler![
+     [1m[96m|[0m [1m[91m _________________________^[0m
+[1m[96m1307[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_rvc,
+[1m[96m1308[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_sovits,
+[1m[96m1309[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::render_vocal_segment,
+[1m[96m...[0m    [1m[91m|[0m
+[1m[96m1491[0m [1m[96m|[0m [1m[91m|[0m             commands::amt_lyrics::amt_read_lyrics_from_midi,
+[1m[96m1492[0m [1m[96m|[0m [1m[91m|[0m         ])
+     [1m[96m|[0m [1m[91m|_________^[0m [1m[91mcould not find `__tauri_command_name_download_song_model` in `son
+g`[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: this error originates in the macro `tauri::generate_handler` (in Nightly builds,
+ run with -Z macro-backtrace for more info)
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__cmd__download_song_model` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1414:29
+     [1m[96m|[0m
+[1m[96m1414[0m [1m[96m|[0m             commands::song::download_song_model,
+     [1m[96m|[0m                             [1m[91m^^^^^^^^^^^^^^^^^^^[0m [1m[91mcould not find `__cmd__downlo
+ad_song_model` in `song`[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__tauri_command_name_delete_song_model` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1306:25
+     [1m[96m|[0m
+[1m[96m1306[0m [1m[96m|[0m           .invoke_handler(tauri::generate_handler![
+     [1m[96m|[0m [1m[91m _________________________^[0m
+[1m[96m1307[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_rvc,
+[1m[96m1308[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_sovits,
+[1m[96m1309[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::render_vocal_segment,
+[1m[96m...[0m    [1m[91m|[0m
+[1m[96m1491[0m [1m[96m|[0m [1m[91m|[0m             commands::amt_lyrics::amt_read_lyrics_from_midi,
+[1m[96m1492[0m [1m[96m|[0m [1m[91m|[0m         ])
+     [1m[96m|[0m [1m[91m|_________^[0m [1m[91mcould not find `__tauri_command_name_delete_song_model` in `song`
+[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: this error originates in the macro `tauri::generate_handler` (in Nightly builds,
+ run with -Z macro-backtrace for more info)
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__cmd__delete_song_model` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1415:29
+     [1m[96m|[0m
+[1m[96m1415[0m [1m[96m|[0m             commands::song::delete_song_model,
+     [1m[96m|[0m                             [1m[91m^^^^^^^^^^^^^^^^^[0m [1m[91mcould not find `__cmd__delete_s
+ong_model` in `song`[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__tauri_command_name_load_song_history` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1306:25
+     [1m[96m|[0m
+[1m[96m1306[0m [1m[96m|[0m           .invoke_handler(tauri::generate_handler![
+     [1m[96m|[0m [1m[91m _________________________^[0m
+[1m[96m1307[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_rvc,
+[1m[96m1308[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_sovits,
+[1m[96m1309[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::render_vocal_segment,
+[1m[96m...[0m    [1m[91m|[0m
+[1m[96m1491[0m [1m[96m|[0m [1m[91m|[0m             commands::amt_lyrics::amt_read_lyrics_from_midi,
+[1m[96m1492[0m [1m[96m|[0m [1m[91m|[0m         ])
+     [1m[96m|[0m [1m[91m|_________^[0m [1m[91mcould not find `__tauri_command_name_load_song_history` in `song`
+[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: this error originates in the macro `tauri::generate_handler` (in Nightly builds,
+ run with -Z macro-backtrace for more info)
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__cmd__load_song_history` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1416:29
+     [1m[96m|[0m
+[1m[96m1416[0m [1m[96m|[0m             commands::song::load_song_history,
+     [1m[96m|[0m                             [1m[91m^^^^^^^^^^^^^^^^^[0m [1m[91mcould not find `__cmd__load_son
+g_history` in `song`[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__tauri_command_name_save_song_history` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1306:25
+     [1m[96m|[0m
+[1m[96m1306[0m [1m[96m|[0m           .invoke_handler(tauri::generate_handler![
+     [1m[96m|[0m [1m[91m _________________________^[0m
+[1m[96m1307[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_rvc,
+[1m[96m1308[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_sovits,
+[1m[96m1309[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::render_vocal_segment,
+[1m[96m...[0m    [1m[91m|[0m
+[1m[96m1491[0m [1m[96m|[0m [1m[91m|[0m             commands::amt_lyrics::amt_read_lyrics_from_midi,
+[1m[96m1492[0m [1m[96m|[0m [1m[91m|[0m         ])
+     [1m[96m|[0m [1m[91m|_________^[0m [1m[91mcould not find `__tauri_command_name_save_song_history` in `song`
+[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: this error originates in the macro `tauri::generate_handler` (in Nightly builds,
+ run with -Z macro-backtrace for more info)
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__cmd__save_song_history` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1417:29
+     [1m[96m|[0m
+[1m[96m1417[0m [1m[96m|[0m             commands::song::save_song_history,
+     [1m[96m|[0m                             [1m[91m^^^^^^^^^^^^^^^^^[0m [1m[91mcould not find `__cmd__save_son
+g_history` in `song`[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__tauri_command_name_song_service_probe` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1306:25
+     [1m[96m|[0m
+[1m[96m1306[0m [1m[96m|[0m           .invoke_handler(tauri::generate_handler![
+     [1m[96m|[0m [1m[91m _________________________^[0m
+[1m[96m1307[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_rvc,
+[1m[96m1308[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_sovits,
+[1m[96m1309[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::render_vocal_segment,
+[1m[96m...[0m    [1m[91m|[0m
+[1m[96m1491[0m [1m[96m|[0m [1m[91m|[0m             commands::amt_lyrics::amt_read_lyrics_from_midi,
+[1m[96m1492[0m [1m[96m|[0m [1m[91m|[0m         ])
+     [1m[96m|[0m [1m[91m|_________^[0m [1m[91mcould not find `__tauri_command_name_song_service_probe` in `song
+`[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: this error originates in the macro `tauri::generate_handler` (in Nightly builds,
+ run with -Z macro-backtrace for more info)
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__cmd__song_service_probe` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1418:29
+     [1m[96m|[0m
+[1m[96m1418[0m [1m[96m|[0m             commands::song::song_service_probe,
+     [1m[96m|[0m                             [1m[91m^^^^^^^^^^^^^^^^^^[0m [1m[91mcould not find `__cmd__song_se
+rvice_probe` in `song`[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__tauri_command_name_song_generate` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1306:25
+     [1m[96m|[0m
+[1m[96m1306[0m [1m[96m|[0m           .invoke_handler(tauri::generate_handler![
+     [1m[96m|[0m [1m[91m _________________________^[0m
+[1m[96m1307[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_rvc,
+[1m[96m1308[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_sovits,
+[1m[96m1309[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::render_vocal_segment,
+[1m[96m...[0m    [1m[91m|[0m
+[1m[96m1491[0m [1m[96m|[0m [1m[91m|[0m             commands::amt_lyrics::amt_read_lyrics_from_midi,
+[1m[96m1492[0m [1m[96m|[0m [1m[91m|[0m         ])
+     [1m[96m|[0m [1m[91m|_________^[0m [1m[91mcould not find `__tauri_command_name_song_generate` in `song`[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: this error originates in the macro `tauri::generate_handler` (in Nightly builds,
+ run with -Z macro-backtrace for more info)
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__cmd__song_generate` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1419:29
+     [1m[96m|[0m
+[1m[96m1419[0m [1m[96m|[0m             commands::song::song_generate,
+     [1m[96m|[0m                             [1m[91m^^^^^^^^^^^^^[0m [1m[91mcould not find `__cmd__song_generat
+e` in `song`[0m
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__tauri_command_name_abc_to_midi` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1306:25
+     [1m[96m|[0m
+[1m[96m1306[0m [1m[96m|[0m           .invoke_handler(tauri::generate_handler![
+     [1m[96m|[0m [1m[91m _________________________^[0m
+[1m[96m1307[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_rvc,
+[1m[96m1308[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::run_sovits,
+[1m[96m1309[0m [1m[96m|[0m [1m[91m|[0m             commands::inference::render_vocal_segment,
+[1m[96m...[0m    [1m[91m|[0m
+[1m[96m1491[0m [1m[96m|[0m [1m[91m|[0m             commands::amt_lyrics::amt_read_lyrics_from_midi,
+[1m[96m1492[0m [1m[96m|[0m [1m[91m|[0m         ])
+     [1m[96m|[0m [1m[91m|_________^[0m [1m[91mcould not find `__tauri_command_name_abc_to_midi` in `song`[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: this error originates in the macro `tauri::generate_handler` (in Nightly builds,
+ run with -Z macro-backtrace for more info)
+
+[1m[91merror[E0433][0m[1m[97m: cannot find `__cmd__abc_to_midi` in `song`[0m
+    [1m[96m--> [0msrc\lib.rs:1420:29
+     [1m[96m|[0m
+[1m[96m1420[0m [1m[96m|[0m             commands::song::abc_to_midi,
+     [1m[96m|[0m                             [1m[91m^^^^^^^^^^^[0m [1m[91mcould not find `__cmd__abc_to_midi` i
+n `song`[0m
+
+[1m[97mFor more information about this error, try `rustc --explain E0433`.[0m
+[1m[91merror[0m: could not compile `muno` (lib) due to 20 previous errors

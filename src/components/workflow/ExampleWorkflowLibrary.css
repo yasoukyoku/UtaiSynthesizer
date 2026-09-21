@@ -1,0 +1,228 @@
+.example-library-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  backdrop-filter: blur(4px);
+}
+
+.example-library-panel {
+  background: #0F131C;
+  border: 1px solid #1E2636;
+  border-radius: 12px;
+  width: 90vw;
+  max-width: 1200px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.example-library-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border-bottom: 1px solid #1E2636;
+}
+
+.example-library-header h2 {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 600;
+  color: #E9EEF5;
+}
+
+.example-library-close {
+  background: transparent;
+  border: none;
+  color: #8B92A0;
+  font-size: 24px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.example-library-close:hover {
+  background: #1E2636;
+  color: #E9EEF5;
+}
+
+.example-library-filters {
+  display: flex;
+  gap: 20px;
+  padding: 20px 24px;
+  border-bottom: 1px solid #1E2636;
+  background: #0A0D12;
+}
+
+.example-library-filter-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.example-library-filter-group label {
+  font-size: 14px;
+  color: #B0B8C5;
+  white-space: nowrap;
+}
+
+.example-library-filter-group select {
+  background: #161D2B;
+  border: 1px solid #1E2636;
+  border-radius: 6px;
+  padding: 6px 12px;
+  color: #E9EEF5;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+  min-width: 150px;
+}
+
+.example-library-filter-group select:hover {
+  border-color: #38BDF8;
+}
+
+.example-library-filter-group select:focus {
+  outline: none;
+  border-color: #38BDF8;
+  box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.1);
+}
+
+.example-library-grid {
+  padding: 24px;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 20px;
+  flex: 1;
+}
+
+.example-library-card {
+  background: #161D2B;
+  border: 1px solid #1E2636;
+  border-radius: 8px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: all 0.2s;
+  cursor: default;
+}
+
+.example-library-card:hover {
+  border-color: #38BDF8;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 16px rgba(56, 189, 248, 0.15);
+}
+
+.example-library-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.example-library-card-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #E9EEF5;
+  line-height: 1.4;
+  flex: 1;
+}
+
+.example-library-difficulty {
+  font-size: 20px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.example-library-description {
+  margin: 0;
+  font-size: 13px;
+  color: #8B92A0;
+  line-height: 1.6;
+  flex: 1;
+}
+
+.example-library-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 8px;
+  border-top: 1px solid #1E2636;
+}
+
+.example-library-node-count {
+  font-size: 12px;
+  color: #6B7280;
+}
+
+.example-library-load-btn {
+  background: linear-gradient(135deg, #38BDF8 0%, #3B82F6 100%);
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  color: white;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.example-library-load-btn:hover {
+  transform: scale(1.05);
+  box-shadow: 0 4px 12px rgba(56, 189, 248, 0.4);
+}
+
+.example-library-load-btn:active {
+  transform: scale(0.98);
+}
+
+.example-library-empty {
+  grid-column: 1 / -1;
+  text-align: center;
+  padding: 60px 20px;
+  color: #6B7280;
+}
+
+.example-library-empty p {
+  margin: 0;
+  font-size: 16px;
+}
+
+@media (max-width: 768px) {
+  .example-library-panel {
+    width: 95vw;
+    max-height: 90vh;
+  }
+
+  .example-library-filters {
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .example-library-filter-group {
+    width: 100%;
+  }
+
+  .example-library-filter-group select {
+    flex: 1;
+  }
+
+  .example-library-grid {
+    grid-template-columns: 1fr;
+    padding: 16px;
+  }
+}

@@ -42,10 +42,6 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // Separation single-slot guard (separation/mod.rs) — the TOCTOU backstop behind the pre-flight.
   SEPARATION_BUSY: { key: "workflow.separationBusy", busy: true },
   MSST_MODEL_NOT_CONVERTED: { key: "workflow.errSeparationNotConverted" },
-  // S170: the device preference is CPU and only the fp16 variant of the model is installed. The CPU
-  // provider has no fp16 kernels (it casts every op back to fp32), so separation/mod.rs refuses
-  // instead of starting a run that is pure downside — on 2026-09-09 such a run died silently.
-  MSST_FP16_ON_CPU: { key: "backend.MSST_FP16_ON_CPU" },
   // Transpose node (utai-stretch wrapper) codes.
   TRANSPOSE_INPUT_MISSING: { key: "workflow.errTransposeInput" },
   TRANSPOSE_RANGE: { key: "workflow.errTransposeRange" },
@@ -53,11 +49,31 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // ── Generated from the S62 full-sweep manifests (4 conversion clusters) — one entry per stable
   // Rust CODE; texts live under backend.* in src/i18n/{zh,en,ja}.json (TRAINING_NO_DATA reuses the
   // pre-existing training.needData key). Keep alphabetical; busy flags mark interlock rejections. ──
+  // ── P0 AMT fusion (commands/amt.rs): audio→MIDI sidecar lifecycle failures. ──
+  AMT_CONFIG_ERROR: { key: "backend.AMT_CONFIG_ERROR" },
+  AMT_CONFIG_WRITE_FAILED: { key: "backend.AMT_CONFIG_WRITE_FAILED" },
+  AMT_DELETE_FAILED: { key: "backend.AMT_DELETE_FAILED" },
+  AMT_INVALID_MODE: { key: "backend.AMT_INVALID_MODE" },
+  AMT_KILL_FAILED: { key: "backend.AMT_KILL_FAILED" },
+  AMT_META_PARSE_FAILED: { key: "backend.AMT_META_PARSE_FAILED" },
+  AMT_META_READ_FAILED: { key: "backend.AMT_META_READ_FAILED" },
+  AMT_NO_RESULT: { key: "backend.AMT_NO_RESULT" },
+  AMT_OUTPUT_DIR_FAILED: { key: "backend.AMT_OUTPUT_DIR_FAILED" },
+  AMT_OUTPUT_NOT_FOUND: { key: "backend.AMT_OUTPUT_NOT_FOUND" },
+  AMT_PLAYBACK_PREP_FAILED: { key: "backend.AMT_PLAYBACK_PREP_FAILED" },
+  AMT_READ_FAILED: { key: "backend.AMT_READ_FAILED" },
+  AMT_SHA_FAILED: { key: "backend.AMT_SHA_FAILED" },
+  AMT_SIDECAR_NOT_FOUND: { key: "backend.AMT_SIDECAR_NOT_FOUND" },
+  AMT_SPAWN_FAILED: { key: "backend.AMT_SPAWN_FAILED" },
+  AMT_TRANSCRIPTION_FAILED: { key: "backend.AMT_TRANSCRIPTION_FAILED" },
+  AMT_WAIT_FAILED: { key: "backend.AMT_WAIT_FAILED" },
   ASSET_DL_BUSY: { key: "backend.ASSET_DL_BUSY", busy: true },
   ASSET_DL_FAILED: { key: "backend.ASSET_DL_FAILED" },
   // S74b asset-pack reclamation.
   ASSET_DELETE_FAILED: { key: "backend.ASSET_DELETE_FAILED" },
   ASSET_PACK_UNKNOWN: { key: "backend.ASSET_PACK_UNKNOWN" },
+  // P0 AMT fusion: asset-protocol scope grant for the freshly created output folder.
+  ASSET_SCOPE_FAILED: { key: "backend.ASSET_SCOPE_FAILED" },
   // S74b CUDA-runtime reclamation. IN_USE is a modal: its remedy is a two-step procedure
   // (change the device preference, restart) that must not be truncated into a toast.
   CUDA_DELETE_FAILED: { key: "backend.CUDA_DELETE_FAILED" },
@@ -73,27 +89,18 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // process that loaded the CUDA build (registering the DML EP there access-violates), so the
   // engine refuses instead of probing. Blocking (explicit pick) → modal.
   DML_NEEDS_RESTART: { key: "backend.DML_NEEDS_RESTART", modal: true },
-  // S170: the graphics device was lost mid-run (DXGI 0x887A0005/6/7/20 — hung, removed, reset,
-  // driver internal error). Modal: the remedy is user action outside the app (change the inference
-  // device, or install the CUDA runtime), and the text is too long for a toast. The detail the
-  // Rust side attaches is ONLY the HRESULT — the raw ORT C++ exception (build-machine path +
-  // lossily-decoded OS bytes) is deliberately kept out of the user's view and logged instead.
-  // ⚠ S170: this reaches the user on EVERY device pick, Auto included — the transparent Auto
-  // degrade was specified in the same round and deliberately not landed (it would have had zero
-  // executions). The 2026-09-09 community box had picked DirectML explicitly, so it is that box's
-  // message either way.
-  DML_DEVICE_HUNG: { key: "backend.DML_DEVICE_HUNG", modal: true },
   // S66 poisoned-proxy guard (download.rs): a GH proxy answered a download with an HTML page.
   DOWNLOAD_HTML_RESPONSE: { key: "backend.DOWNLOAD_HTML_RESPONSE" },
   // S66 CUDA local-file install (settings.rs install_cuda_runtime_local).
   CUDA_LOCAL_NO_FILES: { key: "backend.CUDA_LOCAL_NO_FILES" },
   CUDA_LOCAL_UNRECOGNIZED: { key: "backend.CUDA_LOCAL_UNRECOGNIZED" },
   CUDA_LOCAL_BAD_FILE: { key: "backend.CUDA_LOCAL_BAD_FILE" },
-  // ⛔S170 config.json integrity (commands/settings.rs). QUARANTINED is a startup fact (App.tsx
-  // toasts it from get_config_issue); LOCKED also rides out of `save_config` through every settings
-  // command, and is a modal because its remedy is outside the app — move the file by hand, restart.
-  CONFIG_UNREADABLE_QUARANTINED: { key: "backend.CONFIG_UNREADABLE_QUARANTINED" },
-  CONFIG_UNREADABLE_LOCKED: { key: "backend.CONFIG_UNREADABLE_LOCKED", modal: true },
+  // P0-A AMT result workbench: "Download → MIDI (ZIP)" bundle (amt_export_zip).
+  CREATE_ZIP_FAILED: { key: "backend.CREATE_ZIP_FAILED" },
+  READ_MIDI_FAILED: { key: "backend.READ_MIDI_FAILED" },
+  ZIP_ENTRY_FAILED: { key: "backend.ZIP_ENTRY_FAILED" },
+  WRITE_ZIP_FAILED: { key: "backend.WRITE_ZIP_FAILED" },
+  FINALIZE_ZIP_FAILED: { key: "backend.FINALIZE_ZIP_FAILED" },
   // S66 conversion single-flight + heavy-job interlock (lib.rs acquire_convert_slot).
   CONVERT_BUSY: { key: "backend.CONVERT_BUSY", busy: true },
   CONVERT_RENDER_BUSY: { key: "backend.CONVERT_RENDER_BUSY", busy: true },
@@ -109,7 +116,33 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   MSST_FILE_NOT_FOUND: { key: "backend.MSST_FILE_NOT_FOUND" },
   // S66/O5: the render commands write the wav Rust-side; disk write failure is its own code.
   RENDER_WRITE_FAILED: { key: "backend.RENDER_WRITE_FAILED" },
+  // Song Studio (commands/song.rs) — external inference service + model management.
+  SONG_ABC_WRITE_FAIL: { key: "backend.SONG_ABC_WRITE_FAIL" },
+  SONG_CACHE_DIR_ERROR: { key: "backend.SONG_CACHE_DIR_ERROR" },
+  SONG_CONFIG_ERROR: { key: "backend.SONG_CONFIG_ERROR" },
+  SONG_CONFIG_WRITE_FAILED: { key: "backend.SONG_CONFIG_WRITE_FAILED" },
+  // 常驻模式专属:守护进程起不来 / 起来了但迟迟不出结果。两者都会自动退回一次性模式重试,
+  // 所以文案要说清「已自动降级」,否则用户会以为这次生成整体失败了。
+  SONG_DAEMON_SPAWN_FAILED: { key: "backend.SONG_DAEMON_SPAWN_FAILED" },
+  SONG_DAEMON_TIMEOUT: { key: "backend.SONG_DAEMON_TIMEOUT", modal: true },
+  SONG_DELETE_FAILED: { key: "backend.SONG_DELETE_FAILED" },
+  SONG_DELETE_REJECTED: { key: "backend.SONG_DELETE_REJECTED" },
+  SONG_GENERATION_FAILED: { key: "backend.SONG_GENERATION_FAILED" },
+  SONG_KILL_FAILED: { key: "backend.SONG_KILL_FAILED" },
+  SONG_NO_DATA: { key: "backend.SONG_NO_DATA" },
+  SONG_NO_RESULT: { key: "backend.SONG_NO_RESULT" },
+  SONG_READ_FAILED: { key: "backend.SONG_READ_FAILED" },
+  SONG_SERVICE_BAD_RESPONSE: { key: "backend.SONG_SERVICE_BAD_RESPONSE" },
+  SONG_SERVICE_ERROR: { key: "backend.SONG_SERVICE_ERROR" },
+  SONG_SERVICE_UNAVAILABLE: { key: "backend.SONG_SERVICE_UNAVAILABLE" },
+  SONG_SERVICE_URL_EMPTY: { key: "backend.SONG_SERVICE_URL_EMPTY" },
+  SONG_SIDECAR_NOT_FOUND: { key: "backend.SONG_SIDECAR_NOT_FOUND" },
+  SONG_SPAWN_FAILED: { key: "backend.SONG_SPAWN_FAILED" },
+  SONG_WAIT_FAILED: { key: "backend.SONG_WAIT_FAILED" },
   AUDIO_EMPTY_INPUT: { key: "backend.AUDIO_EMPTY_INPUT" },
+  // Slim installer: ffmpeg is a resource-manager on-demand download now; loading a
+  // compressed format without it points the user at the resource manager's 必备/essential tab.
+  AUDIO_FFMPEG_MISSING: { key: "backend.AUDIO_FFMPEG_MISSING", modal: true },
   AUDIO_TOO_SHORT_HIGHPASS: { key: "backend.AUDIO_TOO_SHORT_HIGHPASS" },
   AUDITION_BACKEND_UNSUPPORTED: { key: "backend.AUDITION_BACKEND_UNSUPPORTED" },
   AUDITION_BAD_CANDIDATE_PATH: { key: "backend.AUDITION_BAD_CANDIDATE_PATH" },
@@ -144,6 +177,10 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   AUX_FILE_MISSING: { key: "backend.AUX_FILE_MISSING" },
   AUX_VOCODER_MEL_MISSING: { key: "backend.AUX_VOCODER_MEL_MISSING" },
   CONTENTVEC_INPUT_TOO_SHORT: { key: "backend.CONTENTVEC_INPUT_TOO_SHORT" },
+  // S21 cache audit: the per-entry cleanup refuses to touch usp_work — the open project's
+  // extracted media (deleting it would destroy the session). Reached only if a future UI
+  // forgets the same rule; the audit list still SHOWS the row, so the text must say why.
+  CLEANUP_USP_WORK: { key: "backend.CLEANUP_USP_WORK" },
   CONTENTVEC_NO_OUTPUT: { key: "backend.CONTENTVEC_NO_OUTPUT" },
   CONTENTVEC_RESHAPE_FAILED: { key: "backend.CONTENTVEC_RESHAPE_FAILED" },
   CONTENTVEC_SHAPE: { key: "backend.CONTENTVEC_SHAPE" },
@@ -207,18 +244,39 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   ENVTEST_SPAWN_FAILED: { key: "backend.ENVTEST_SPAWN_FAILED" },
   ENVTEST_TIMEOUT: { key: "backend.ENVTEST_TIMEOUT" },
   ENVTEST_WAIT_FAILED: { key: "backend.ENVTEST_WAIT_FAILED" },
+  // P0 MIDI editor save-back (commands/amt.rs amt_write_edited_midi).
+  EDIT_WRITE_BAD_BPM: { key: "backend.EDIT_WRITE_BAD_BPM" },
+  EDIT_WRITE_DIR_FAILED: { key: "backend.EDIT_WRITE_DIR_FAILED" },
+  EDIT_WRITE_FAILED: { key: "backend.EDIT_WRITE_FAILED" },
+  EDIT_WRITE_NO_TRACKS: { key: "backend.EDIT_WRITE_NO_TRACKS" },
   // S63 audio/score export (commands/export_audio.rs + export_score.rs). Longest-code-first matching
   // keeps EXPORT_FFMPEG_MISSING ahead of the training-side FFMPEG_MISSING, and EXPORT_SCORE_WRITE_FAIL
   // ahead of EXPORT_WRITE_FAIL. The score codes reuse the export.* dialog keys (one text, two funnels).
   EXPORT_BAD_PCM: { key: "backend.EXPORT_BAD_PCM" },
+  // P0-A AMT result workbench download-menu exports (amt_export.rs).
+  EXPORT_DIR_FAILED: { key: "backend.EXPORT_DIR_FAILED" },
+  EXPORT_DIR_NOT_FOUND: { key: "backend.EXPORT_DIR_NOT_FOUND" },
   EXPORT_ENCODE_FAIL: { key: "backend.EXPORT_ENCODE_FAIL" },
   EXPORT_FFMPEG_MISSING: { key: "backend.EXPORT_FFMPEG_MISSING" },
   EXPORT_FORMAT_UNSUPPORTED: { key: "backend.EXPORT_FORMAT_UNSUPPORTED" },
+  EXPORT_NO_FILES: { key: "backend.EXPORT_NO_FILES" },
   EXPORT_NO_PCM: { key: "backend.EXPORT_NO_PCM" },
+  EXPORT_PARSE_FAILED: { key: "backend.EXPORT_PARSE_FAILED" },
+  EXPORT_PERMISSION_DENIED: { key: "backend.EXPORT_PERMISSION_DENIED" },
+  EXPORT_READ_FAILED: { key: "backend.EXPORT_READ_FAILED" },
+  EXPORT_RENDER_FAILED: { key: "backend.EXPORT_RENDER_FAILED" },
   EXPORT_SCORE_EMPTY: { key: "export.errScoreEmpty" },
   EXPORT_SCORE_UNSUPPORTED: { key: "backend.EXPORT_FORMAT_UNSUPPORTED" },
   EXPORT_SCORE_WRITE_FAIL: { key: "export.errScoreWrite" },
+  EXPORT_SHEET_FAILED: { key: "backend.EXPORT_SHEET_FAILED" },
+  EXPORT_SOUNDFONT_BAD_NAME: { key: "backend.EXPORT_SOUNDFONT_BAD_NAME" },
+  EXPORT_SOUNDFONT_BAD_TYPE: { key: "backend.EXPORT_SOUNDFONT_BAD_TYPE" },
+  EXPORT_SOUNDFONT_BUILTIN: { key: "backend.EXPORT_SOUNDFONT_BUILTIN" },
+  EXPORT_SOUNDFONT_NOT_FOUND: { key: "backend.EXPORT_SOUNDFONT_NOT_FOUND" },
+  EXPORT_SOUNDFONT_WRITE_FAILED: { key: "backend.EXPORT_SOUNDFONT_WRITE_FAILED" },
+  EXPORT_SRC_NOT_FOUND: { key: "backend.EXPORT_SRC_NOT_FOUND" },
   EXPORT_WRITE_FAIL: { key: "backend.EXPORT_WRITE_FAIL" },
+  EXPORT_WRITE_FAILED: { key: "backend.EXPORT_WRITE_FAILED" },
   EXTRACT_FAILED: { key: "backend.EXTRACT_FAILED" },
   EXTRACT_TASK_FAILED: { key: "backend.EXTRACT_TASK_FAILED" },
   F0_EMPTY_INPUT: { key: "backend.F0_EMPTY_INPUT" },
@@ -244,6 +302,26 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   INTERNAL_UNIPC_SINGULAR: { key: "backend.INTERNAL_UNIPC_SINGULAR" },
   INTERP_MODE_UNSUPPORTED: { key: "backend.INTERP_MODE_UNSUPPORTED" },
   JSON_PARSE_FAILED: { key: "backend.JSON_PARSE_FAILED" },
+  // P0-B lyrics extraction / MIDI lyric write-back (amt_lyrics.rs). The five
+  // user-actionable ones reuse the amt.* lyrics-panel texts; the rest are
+  // infrastructural failures whose cause rides in the detail suffix.
+  LYRICS_AUDIO_NOT_FOUND: { key: "amt.lyricsNoAudio" },
+  LYRICS_CONFIG_ERROR: { key: "backend.LYRICS_CONFIG_ERROR" },
+  LYRICS_CONFIG_WRITE_FAILED: { key: "backend.LYRICS_CONFIG_WRITE_FAILED" },
+  LYRICS_DEP_MISSING: { key: "amt.lyricsDepMissing" },
+  LYRICS_EXTRACT_FAILED: { key: "backend.LYRICS_EXTRACT_FAILED" },
+  LYRICS_MIDI_BAD_TIMING: { key: "backend.LYRICS_MIDI_BAD_TIMING" },
+  LYRICS_MIDI_PARSE_FAILED: { key: "backend.LYRICS_MIDI_PARSE_FAILED" },
+  LYRICS_MIDI_READ_FAILED: { key: "backend.LYRICS_MIDI_READ_FAILED" },
+  LYRICS_MODEL_NOT_INSTALLED: { key: "amt.lyricsModelMissing" },
+  LYRICS_NO_RESULT: { key: "backend.LYRICS_NO_RESULT" },
+  LYRICS_OUTDIR_FAILED: { key: "backend.LYRICS_OUTDIR_FAILED" },
+  LYRICS_READ_FAILED: { key: "backend.LYRICS_READ_FAILED" },
+  LYRICS_SPAWN_FAILED: { key: "amt.lyricsSpawnFailed" },
+  LYRICS_WAIT_FAILED: { key: "backend.LYRICS_WAIT_FAILED" },
+  LYRICS_WRITE_DIR_FAILED: { key: "backend.LYRICS_WRITE_DIR_FAILED" },
+  LYRICS_WRITE_EMPTY: { key: "amt.lyricsWriteEmpty" },
+  LYRICS_WRITE_FAILED: { key: "backend.LYRICS_WRITE_FAILED" },
   LOCAL_FILE_BAD_DIR: { key: "backend.LOCAL_FILE_BAD_DIR" },
   LOCAL_FILE_BAD_NAME: { key: "backend.LOCAL_FILE_BAD_NAME" },
   LOCAL_FILE_BAD_TYPE: { key: "backend.LOCAL_FILE_BAD_TYPE" },
@@ -305,10 +383,14 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   PART_MISSING: { key: "backend.PART_MISSING" },
   PART_SHA256_MISMATCH: { key: "backend.PART_SHA256_MISMATCH" },
   PART_SIZE_MISMATCH: { key: "backend.PART_SIZE_MISMATCH" },
+  // 工作流预设导入：所选文件不是合法的 JSON 预设数组（storage.rs import_workflow_presets）。
+  PRESET_PARSE: { key: "backend.PRESET_PARSE" },
   PROBE_CONNECT_FAILED: { key: "backend.PROBE_CONNECT_FAILED" },
   PROBE_CONNECT_TIMEOUT: { key: "backend.PROBE_CONNECT_TIMEOUT" },
   PROBE_HTTP_ERROR: { key: "backend.PROBE_HTTP_ERROR" },
   PROBE_TIMEOUT: { key: "backend.PROBE_TIMEOUT" },
+  // AMT fusion: preview_notes_render (乐器轨音符试听) refused on an empty note set.
+  PREVIEW_NO_NOTES: { key: "backend.PREVIEW_NO_NOTES" },
   RENAME_FAILED: { key: "backend.RENAME_FAILED" },
   // S68f: nv-cu130 download gate — CUDA 13 needs an r580+ NVIDIA driver.
   RUNTIME_DRIVER_TOO_OLD: { key: "backend.RUNTIME_DRIVER_TOO_OLD" },
@@ -343,6 +425,9 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   SCORE2CV_SHAPE: { key: "backend.SCORE2CV_SHAPE" },
   SCORE2SVC_ZERO_FRAMES: { key: "backend.SCORE2SVC_ZERO_FRAMES" },
   SHARED_POOL_REUSED: { key: "backend.SHARED_POOL_REUSED" },
+  // P3 3-9 FluidSynth 通用化：render_soundfont_notes 的 backend="fluidsynth" 守门。
+  SOUNDFONT_BACKEND_LAYERS_UNSUPPORTED: { key: "backend.SOUNDFONT_BACKEND_LAYERS_UNSUPPORTED" },
+  SOUNDFONT_BACKEND_UNSUPPORTED: { key: "backend.SOUNDFONT_BACKEND_UNSUPPORTED" },
   SOVITS_NO_OUTPUT: { key: "backend.SOVITS_NO_OUTPUT" },
   SOVITS_VOL_FRAMES_MISMATCH: { key: "backend.SOVITS_VOL_FRAMES_MISMATCH" },
   // S146: the range-extension inverse is TD-PSOLA, which cannot place a single grain without
@@ -389,57 +474,6 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // carries kernels for none of this machine's GPUs — the remedy is a NEWER pack, not a
   // reinstall, so it must not fall to the generic "reinstall this pack" fallback lane.
   ENVTEST_AMD_NO_COVERED_GPU: { key: "backend.ENVTEST_AMD_NO_COVERED_GPU" },
-  // S172 self-test items for the AMD kernel-compiler hole. Each has a DIFFERENT
-  // remedy, and none of them is the generic "reinstall this pack" the unmapped
-  // lane would have shown: headers missing -> update Utai; payload incomplete ->
-  // our packaging bug, send us the report; probe could not start -> reinstall the
-  // pack; RNN broken -> read the headers item first.
-  ENVTEST_HIPRTC_CXX_HEADERS_MISSING: { key: "backend.ENVTEST_HIPRTC_CXX_HEADERS_MISSING" },
-  ENVTEST_HIPRTC_CXX_HEADERS_NOT_SHIPPED: { key: "backend.ENVTEST_HIPRTC_CXX_HEADERS_NOT_SHIPPED" },
-  ENVTEST_HIPRTC_PROBE_FAILED: { key: "backend.ENVTEST_HIPRTC_PROBE_FAILED" },
-  ENVTEST_GPU_RNN_BROKEN: { key: "backend.ENVTEST_GPU_RNN_BROKEN" },
-  // S172 sweep: the last two trainer CODEs that had no mapping. Both are
-  // internal invariants from the S120 pool layout that should be unreachable
-  // — which is why they were missed, and why their remedy is "send us the
-  // log" rather than anything the user could usefully do to their install.
-  // training/utai_train is 25/25 with these.
-  POOL_IDENTITY_EMPTY: { key: "backend.POOL_IDENTITY_EMPTY" },
-  POOL_ID_EXHAUSTED: { key: "backend.POOL_ID_EXHAUSTED" },
-  // S172: training PROGRESS messages. Not errors -- TrainingPage renders the stage
-  // message through this same table, and until now it had only Chinese literals to
-  // render, so every non-Chinese user watched Chinese text for the whole run.
-  // Defined in training/utai_train/stage_codes.py; two carry a ": <count>" detail.
-  TRAINING_STAGE_NO_AUGMENT: { key: "backend.TRAINING_STAGE_NO_AUGMENT" },
-  TRAINING_STAGE_FILELIST: { key: "backend.TRAINING_STAGE_FILELIST" },
-  TRAINING_STAGE_BUILD_INDEX: { key: "backend.TRAINING_STAGE_BUILD_INDEX" },
-  TRAINING_STAGE_LOADING: { key: "backend.TRAINING_STAGE_LOADING" },
-  TRAINING_STAGE_KMEANS: { key: "backend.TRAINING_STAGE_KMEANS" },
-  TRAINING_STAGE_DIFF_PREP: { key: "backend.TRAINING_STAGE_DIFF_PREP" },
-  TRAINING_STAGE_DIFF_LOADING: { key: "backend.TRAINING_STAGE_DIFF_LOADING" },
-  TRAINING_STAGE_DIFF_NO_PRETRAIN: { key: "backend.TRAINING_STAGE_DIFF_NO_PRETRAIN" },
-  TRAINING_STAGE_CACHING: { key: "backend.TRAINING_STAGE_CACHING" },
-  TRAINING_STAGE_VOCODER_LOADING: { key: "backend.TRAINING_STAGE_VOCODER_LOADING" },
-  TRAINING_STAGE_DROPPED_AUG: { key: "backend.TRAINING_STAGE_DROPPED_AUG" },
-  TRAINING_STAGE_SPLIT: { key: "backend.TRAINING_STAGE_SPLIT" },
-  TRAINING_STAGE_DROPPED_SHORT: { key: "backend.TRAINING_STAGE_DROPPED_SHORT" },
-  // S172: the trainer's config- and material-refusals. These used to raise hardcoded
-  // Chinese, so a non-Chinese user met a Chinese sentence at the moment their run died.
-  // Defined in training/utai_train/{config_codes,prep_codes}.py. Four more codes that
-  // those modules emit are NOT listed again here -- TRAINING_BACKEND_UNSUPPORTED,
-  // TRAINING_BAD_SAMPLE_RATE, TRAINING_BAD_SOVITS_VERSION and TRAINING_ASSET_MISSING
-  // are already in this table because Rust emits them for the same predicate.
-  TRAINING_PSOLA_OUTPUT_INVALID: { key: "backend.TRAINING_PSOLA_OUTPUT_INVALID" },
-  TRAINING_PREP_PRODUCTS_MISMATCH: { key: "backend.TRAINING_PREP_PRODUCTS_MISMATCH" },
-  TRAINING_FEATURE_DIR_EMPTY: { key: "backend.TRAINING_FEATURE_DIR_EMPTY" },
-  TRAINING_ASSET_PATH_UNSET: { key: "backend.TRAINING_ASSET_PATH_UNSET" },
-  TRAINING_UNKNOWN_SPEECH_ENCODER: { key: "backend.TRAINING_UNKNOWN_SPEECH_ENCODER" },
-  TRAINING_UNKNOWN_F0_METHOD: { key: "backend.TRAINING_UNKNOWN_F0_METHOD" },
-  TRAINING_VOCODER_NOT_BUNDLED: { key: "backend.TRAINING_VOCODER_NOT_BUNDLED" },
-  TRAINING_DIFF_MULTI_SPEAKER: { key: "backend.TRAINING_DIFF_MULTI_SPEAKER" },
-  TRAINING_DIFF_BASE_FORMAT: { key: "backend.TRAINING_DIFF_BASE_FORMAT" },
-  TRAINING_NO_USABLE_SLICES: { key: "backend.TRAINING_NO_USABLE_SLICES" },
-  TRAINING_SOURCE_FILES_ALL_FAILED: { key: "backend.TRAINING_SOURCE_FILES_ALL_FAILED" },
-  TRAINING_SOURCE_SR_TOO_LOW: { key: "backend.TRAINING_SOURCE_SR_TOO_LOW" },
   // S68b loud-degradation guard (training/mod.rs try_start): GPU present but only the
   // CPU runtime pack installed — refuse instead of the old log-file-only warn.
   TRAINING_RUNTIME_CPU_ONLY: { key: "backend.TRAINING_RUNTIME_CPU_ONLY" },
@@ -465,27 +499,6 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // waits forever, so these two are the only thing the UI can say.
   TRAINING_HOST_MEMORY_EXHAUSTED: { key: "backend.TRAINING_HOST_MEMORY_EXHAUSTED" },
   TRAINING_NO_PROGRESS: { key: "backend.TRAINING_NO_PROGRESS" },
-  // S172 AMD lane: MIOpen could not BUILD its RNN kernel (the pack ships no C++ standard
-  // library, so hipRTC cannot resolve <type_traits> on a machine without MSVC headers), and
-  // the run continued on a MIOpen-free path that is still on the GPU. Raised by
-  // training/utai_train/miopen_guard.py — a warning, not an error: the run succeeds.
-  TRAINING_MIOPEN_KERNEL_BYPASSED: { key: "backend.TRAINING_MIOPEN_KERNEL_BYPASSED" },
-  // S172 RVC preprocessing policy (training/utai_train/prep_codes.py). All three stages used
-  // to swallow per-item failures and raise only when EVERY item failed, while filelist.py
-  // builds the training set as a 4-way set INTERSECTION — so 369 of 370 f0 slices failing
-  // trained on the remainder and reported "completed". Now: a BASE slice is fatal on the
-  // first one, an _aug copy is dropped loudly, and a source file that yields no slices at
-  // all is skipped loudly.
-  TRAINING_SLICE_PREP_FAILED: { key: "backend.TRAINING_SLICE_PREP_FAILED" },
-  TRAINING_AUG_SLICES_DROPPED: { key: "backend.TRAINING_AUG_SLICES_DROPPED" },
-  // …and the one that must NOT be a warning: the gate itself could not run, so its
-  // "reject" verdict would delete 100%% of the augmentation on no evidence at all.
-  TRAINING_AUG_GATE_UNUSABLE: { key: "backend.TRAINING_AUG_GATE_UNUSABLE" },
-  TRAINING_SOURCE_FILES_SKIPPED: { key: "backend.TRAINING_SOURCE_FILES_SKIPPED" },
-  // S172 classifier over the sidecar's stderr: MIOpen could not BUILD a kernel (hipRTC
-  // returned HIPRTC_ERROR_COMPILATION). The reason only ever appears on stderr, never in
-  // the exception, so mod.rs sniffs for it the way it already does for the 1455 hang.
-  TRAINING_ROCM_KERNEL_BUILD_FAILED: { key: "backend.TRAINING_ROCM_KERNEL_BUILD_FAILED" },
   TRAINING_NAME_EMPTY: { key: "backend.TRAINING_NAME_EMPTY" },
   // ★S143 §E2E-M25 笔 5 —— 同槽两个 run 同名 ⇒ 同 slug ⇒ `plan_cleanup` 会把另一个 run 的
   // 快照永久保留。改名那条路此前前后端都只判空,而「再训一个」那条早有闸。

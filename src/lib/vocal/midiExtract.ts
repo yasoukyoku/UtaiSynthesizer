@@ -34,12 +34,20 @@ import {
 } from "../../store/history";
 import { getLoadEpoch } from "../project/projectFile";
 import { flushAutosaveNow } from "../project/autosave";
-import { laneGroupId, laneVisiblePieces, msToTicks, segStretch, ticksToMs } from "../audio/laneOps";
+import { laneGroupId, laneLabelParts, laneVisiblePieces, msToTicks, segStretch, ticksToMs } from "../audio/laneOps";
 import { DEFAULT_LANG_ID, langById } from "./languages";
 import { loadSetting, saveSetting } from "../settings";
 import { quantizeSpans, QUANTIZE_IMPORT_KEY, type QuantSpan } from "./quantize";
 
 const t = (k: string, vars?: Record<string, unknown>) => i18n.t(k, vars ?? {}) as string;
+
+/** S92 中文轨道名：提取轨的 laneLabel（如 "Main · vocals"）里的常见 stem 词按界面语言翻译
+ *  （i18n stemNames 表；未收录的词原样保留）—— "Main MIDI" → 「主声道 MIDI」。 */
+function localizedLaneLabel(label: string): string {
+  const tr = (s: string) => t(`midiExtract.stemNames.${s.toLowerCase()}`, { defaultValue: s });
+  const parts = laneLabelParts(label);
+  return parts.stem ? `${tr(parts.base)} · ${tr(parts.stem)}` : tr(parts.base);
+}
 
 /** Mirror of the Rust ExtractedNote (serde snake_case comes through invoke verbatim). */
 interface ExtractedNote {
@@ -365,7 +373,7 @@ export async function extractMidiForLaneGroup(trackId: string, segId: string, gr
         if (!notes.length) continue;
         const lastEnd = notes.reduce((m, n) => Math.max(m, n.tick + n.duration), 0);
         const newTrackId = crypto.randomUUID();
-        p2.addTrack(blankTrack(newTrackId, `${o.laneLabel} MIDI`, "vocal"), insertAt++);
+        p2.addTrack(blankTrack(newTrackId, `${localizedLaneLabel(o.laneLabel)} MIDI`, "vocal"), insertAt++);
         const partId = p2.createVocalPart(newTrackId, partStart, Math.max(segEnd - partStart, lastEnd));
         p2.applyNoteEdits(newTrackId, partId, { add: notes });
         made++;

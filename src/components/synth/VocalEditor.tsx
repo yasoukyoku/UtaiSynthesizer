@@ -33,6 +33,13 @@ import {
 } from "../../lib/vocalGeometry";
 import type { Note } from "../../types/project";
 import { langById, aliasDefaultLyric, DEFAULT_LANG_ID } from "../../lib/vocal/languages";
+import { smartCleanStems, cleanChangedTotal } from "../../lib/midiCleanup";
+import { matchGmName, translateGmName, isDrumLikeName, gmDrumShort, GM_INSTRUMENTS } from "../../lib/gmInstruments";
+import { playSoundfontAudition } from "../../lib/soundfont/instrumentRender";
+// Muno 阶段3:简谱标尺 —— 音高 → 唱名(1-7+变化音+八度点);主音优先取本轨和弦分析的调性。
+import { jianpuForPitch } from "../../lib/jianpu";
+import { estimateKey } from "../../lib/analysis/chordAnalysis";
+import { useChordTrackStore } from "../../store/chordTrack";
 import { VocalSidebar } from "./VocalSidebar";
 import { HScrollbarView } from "./HScrollbar";
 import "./VocalEditor.css";
@@ -122,6 +129,8 @@ interface DragState {
    *  commit sends THESE, so Rust's redistribution reproduces the preview bit-for-bit. */
   phoneScale?: Map<number, number>;
   previewNotes?: () => Note[]; // off-ref draw source during the gesture (attached by withPreview)
+  /** Muno 阶段2:乐器轨移动拖拽中最近一次试听的目标音高(半音阶变化才重触发,乐器轨选音色时)。 */
+  audPitch?: number;
 }
 
 interface Props {
@@ -131,7 +140,7 @@ interface Props {
 }
 
 export function VocalEditor({ segmentId, onClose, style }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const tracks = useProjectStore((s) => s.tracks);
   const tempo = useProjectStore((s) => s.tempo);
   const timeSignature = useProjectStore((s) => s.timeSignature);
@@ -153,7 +162,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       const sg = tr.segments.find((s) => s.id === segmentId);
       if (sg && sg.content.type === "notes") {
         return {
-          trackId: tr.id, trackName: tr.name, seg: sg, notes: sg.content.notes, start: sg.startTick, dur: sg.durationTicks,
+          trackId: tr.id, trackName: tr.name, trackType: tr.trackType, soundfont: tr.soundfont, seg: sg, notes: sg.content.notes, start: sg.startTick, dur: sg.durationTicks,
           pitchDev: sg.content.pitchDev, paramCurves: sg.content.paramCurves,
           transition: tr.vocalParams?.transition ?? DEFAULT_TRANSITION,
           vocalParams: tr.vocalParams ?? DEFAULT_VOCAL_PARAMS, voiceModel: tr.voiceModel,
@@ -162,6 +171,62 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     }
     return null;
   }, [tracks, segmentId]);
+
+  // ── 乐器轨模式 ──
+  // MIDI 转写导入的 instrument 轨没有真实歌词：编辑器改以「音名」（C4 / D#3…）呈现音符、
+  // 隐藏人声专属控件（歌手侧栏/自动化泳道/音素视图），改挂「音源试听 + 一键修复」。
+  // 带真实歌词的轨（人声轨或歌词 MIDI 导入）保持完整的人声编辑形态——用户点开就是
+  // 对应歌词。"あ"（无词占位）与 "La"（导入兜底）不算真实歌词。
+  const PLACEHOLDER_LYRICS = new Set(["啊", "あ", "la"]);
+  const hasRealLyrics = (part?.notes ?? []).some((n) => {
+    const l = (n.lyric ?? "").trim();
+    return l !== "" && !PLACEHOLDER_LYRICS.has(l.toLowerCase());
+  });
+  const instrumentMode = !!part && part.trackType === "instrument" && !hasRealLyrics;
+  // 乐器轨标题：GM 名翻译成当前语言（"Electric Guitar (clean)" → 「清音电吉他」）。
+  // matchGmName 同时给出试听用的 GM program；鼓名轨走 channel 9。
+  const gmMatch = useMemo(
+    () => (part ? matchGmName(part.trackName, i18n.language) : null),
+    [part, i18n.language],
+  );
+  const instrumentRef = useRef(instrumentMode);
+  instrumentRef.current = instrumentMode;
+  // Muno 阶段2:乐器轨当前选中的音源音色(轨道头选择)。有它 → 交互发声用真实音色
+  // (playSoundfontAudition);没有 → 维持振荡器占位音(与旧行为一致)。
+  const trackSf = instrumentMode ? part?.soundfont : undefined;
+  const trackSfRef = useRef(trackSf);
+  trackSfRef.current = trackSf;
+  // ── 鼓轨模式（§建议3）：键列 / 音符标签显示鼓件名（底鼓/军鼓/闭镲…），比音名直观。 ──
+  const isDrumTrack = instrumentMode && isDrumLikeName(part?.trackName ?? "");
+  const drumTrackRef = useRef(isDrumTrack);
+  drumTrackRef.current = isDrumTrack;
+  // ── Muno 阶段3「简谱标尺」主音（1 = tonic）——两层来源 ──
+  // ① 和弦轨道的会话分析来自本轨（用户跑过「识别和弦」）→ 直接用它的调性；
+  // ② 否则用当前段音符 estimateKey 即时估计（KK 模板，O(n)+12×12，够便宜可挂在每次编辑上），
+  //    空段默认 C。绘制闭包每帧读 ref，计算用 useMemo 挂 notes —— 不会逐帧重算。
+  const chordKey = useChordTrackStore((s) => (s.sourceTrackId === part?.trackId ? s.key : null));
+  const segKey = useMemo(() => {
+    if (!part || chordKey) return null;
+    if (part.notes.length === 0) return null;
+    return estimateKey(part.notes.map((n) => ({ tick: n.tick, duration: n.duration, pitch: n.pitch, velocity: n.velocity })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chordKey, part?.notes]);
+  const jianpuTonicRef = useRef(0);
+  jianpuTonicRef.current = chordKey?.tonic ?? segKey?.tonic ?? 0;
+  // ── GM 音色下拉（§建议2）：null = 按轨道名反猜；选中后试听/渲染都用它。鼓轨固定 channel 9 无需选。 ──
+  const [selectedProgram, setSelectedProgram] = useState<number | null>(null);
+  // ── 一键修复差异高亮（§建议1）：被修过且留存的音符 id，6 秒内描琥珀边。 ──
+  const [repairIds, setRepairIds] = useState<Set<string>>(new Set());
+  const repairIdsRef = useRef(repairIds);
+  repairIdsRef.current = repairIds;
+  const repairTimerRef = useRef<number | null>(null);
+  // ── 快捷键速查卡（§建议4）：「?」按钮弹出。 ──
+  const [helpOpen, setHelpOpen] = useState(false);
+  const helpOpenRef = useRef(helpOpen);
+  helpOpenRef.current = helpOpen;
+  // ── 歌词总编辑面板（§用户）：「歌词」按钮打开整轨歌词文本框，粘贴/修改后逐音符分配。 ──
+  const [lyricsOpen, setLyricsOpen] = useState(false);
+  const [lyricsText, setLyricsText] = useState("");
 
   const [tool, setTool] = useState<Tool>("arrow");
   const [gridDiv, setGridDiv] = useState(2); // 1/8 default
@@ -380,6 +445,144 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     };
     playRafRef.current = requestAnimationFrame(tick);
   }, [part, stopPreviewPlay, requestRedraw]);
+
+  // ── 乐器轨：音源试听 + 一键修复 ─────────────────────────────────────────────
+  // 音源下拉读 amt_list_soundfonts（与转换结果工作台同一份资源管理数据），选择即
+  // amt_set_active_soundfont 全局生效；试听 = preview_notes_render（音符→临时 MIDI→
+  // FluidSynth→WAV）后用共享 AudioContext 播放。一键修复复用 midiCleanup 的
+  // smartCleanStems（与转换结果工作台同一套 7 步算法），提交为一个 undo 步。
+  const [soundfonts, setSoundfonts] = useState<{ name: string; filename: string; active: boolean }[]>([]);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const wavSrcRef = useRef<AudioBufferSourceNode | null>(null);
+  useEffect(() => {
+    if (!instrumentMode) return;
+    invoke<any[]>("amt_list_soundfonts")
+      .then((list) => setSoundfonts(
+        (list ?? []).map((s: any) => ({ name: String(s.name ?? s.filename), filename: String(s.filename), active: !!s.active })),
+      ))
+      .catch(() => {});
+  }, [instrumentMode]);
+  const pickSoundfont = useCallback((filename: string) => {
+    invoke("amt_set_active_soundfont", { filename })
+      .then(() => invoke<any[]>("amt_list_soundfonts"))
+      .then((list) => setSoundfonts(
+        (list ?? []).map((s: any) => ({ name: String(s.name ?? s.filename), filename: String(s.filename), active: !!s.active })),
+      ))
+      .catch((e) => useAppStore.getState().showToast(String(e), "error"));
+  }, []);
+  const stopWavPreview = useCallback(() => {
+    if (wavSrcRef.current) {
+      try { wavSrcRef.current.stop(); } catch { /* already ended */ }
+      wavSrcRef.current = null;
+    }
+    setPlaying(false);
+    requestRedraw();
+  }, [requestRedraw]);
+  const startInstrumentPreview = useCallback(async () => {
+    if (!part) return;
+    if (wavSrcRef.current) { stopWavPreview(); return; } // 播放中再点 = 停止
+    if (playRafRef.current) stopPreviewPlay(); // 人声占位音预览先停
+    if (part.notes.length === 0) {
+      useAppStore.getState().showToast(t("vocalEditor.nothingToPreview"), "info");
+      return;
+    }
+    setPreviewBusy(true);
+    try {
+      const bpm = tempoRef.current > 0 ? tempoRef.current : 120;
+      // Muno 阶段2:轨道头选了音源音色 → 原生 SFZ/SF2 合成(render_soundfont_notes,
+      // 无 FluidSynth 外部依赖,与 Play/导出烘焙同一引擎);没选 → 旧的 GM/FluidSynth
+      // 试听路径(转换结果工作台同一套,兼容未选音色的老工程)。
+      const sf = trackSfRef.current;
+      let wavPath: string;
+      if (sf) {
+        const msPerTick = 60000 / bpm / TICKS_PER_BEAT;
+        wavPath = await invoke<string>("render_soundfont_notes", {
+          fontId: sf.fontId,
+          presetId: sf.presetId,
+          notes: notesRef.current.map((n) => ({
+            start: (n.tick * msPerTick) / 1000,
+            dur: (Math.max(1, n.duration) * msPerTick) / 1000,
+            key: n.pitch,
+            vel: n.velocity ?? 100,
+          })),
+          sampleRate: 44100,
+        });
+      } else {
+        const drums = isDrumLikeName(part.trackName);
+        wavPath = await invoke<string>("preview_notes_render", {
+          bpm,
+          // 鼓轨走 channel 9（GM 打击乐组）；旋律轨优先用用户在 GM 下拉里选的音色，未选则按轨道名反猜。
+          program: drums ? 0 : (selectedProgram ?? (gmMatch && gmMatch.matched ? gmMatch.program : 0)),
+          channel: drums ? 9 : 0,
+          notes: notesRef.current.map((n) => ({
+            tick: Math.round(n.tick),
+            duration: Math.round(n.duration),
+            pitch: n.pitch,
+            velocity: n.velocity ?? 100,
+          })),
+        });
+      }
+      const ctx = playback.getPreviewContext();
+      const buf = await playback.loadAudioBuffer(wavPath);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.onended = () => {
+        if (wavSrcRef.current === src) {
+          wavSrcRef.current = null;
+          setPlaying(false);
+          requestRedraw();
+        }
+      };
+      wavSrcRef.current = src;
+      src.start();
+      setPlaying(true);
+    } catch (e) {
+      const raw = String(e);
+      const display =
+        raw.includes("EXPORT_FLUIDSYNTH_NOT_FOUND") ? t("amt.exportErrFluidsynth") || "FluidSynth 未安装，请先在资源管理中下载"
+        : raw.includes("EXPORT_SOUNDFONT_NOT_FOUND") ? t("amt.exportErrSoundfont") || "音源缺失，请先在资源管理中下载音源"
+        : raw.includes("PREVIEW_NO_NOTES") ? t("vocalEditor.nothingToPreview") || "没有可试听的音符"
+        : raw;
+      useAppStore.getState().showToast(display, "error");
+    } finally {
+      setPreviewBusy(false);
+    }
+  }, [part, gmMatch, selectedProgram, t, stopPreviewPlay, stopWavPreview, requestRedraw]);
+  /** 一键修复（乐器轨）：midiCleanup.smartCleanStems 的 7 步全自动修补——删除伪音/幻觉/
+   *  域外音、合并重叠、修力度、按重复规律补漏小节——记为一个 undo 步，可整体撤销。 */
+  const oneClickRepair = useCallback(() => {
+    if (!part) return;
+    const stems = [{ notes: part.notes.map((n) => ({ ...n })) }];
+    const stats = smartCleanStems(stems, {
+      bpm: tempoRef.current > 0 ? tempoRef.current : 120,
+      ppq: TICKS_PER_BEAT,
+      durationTicks: Math.max(1, part.dur),
+    });
+    if (cleanChangedTotal(stats) === 0) {
+      useAppStore.getState().showToast(t("amt.editorCleanNoChange") || "已经非常干净，没有需要修复的音符", "success");
+      return;
+    }
+    commitNotes(stems[0]?.notes ?? [], []);
+    // 差异高亮（§建议1）：被修过且留存的音符 → 琥珀描边 6 秒，让用户看清修复动了哪里。
+    if (stats.touched.length > 0) {
+      setRepairIds(new Set(stats.touched));
+      if (repairTimerRef.current) window.clearTimeout(repairTimerRef.current);
+      repairTimerRef.current = window.setTimeout(() => setRepairIds(new Set()), 6000);
+    }
+    const removedExtra = stats.removedShort + stats.removedRange + stats.removedGhost + stats.removedKey;
+    useAppStore.getState().showToast(
+      t("amt.editorCleanReport", {
+        removed: removedExtra,
+        merged: stats.mergedOverlap,
+        velocity: stats.fixedVelocity,
+        filled: stats.filledNotes,
+        trimmed: stats.trimmedHang,
+        snapped: stats.snapped,
+      }) || "一键修复完成",
+      "success",
+    );
+  }, [part, t]);
 
   // marquee edge auto-scroll (§9.4): while the cursor is held at a border during a marquee, scroll the view
   // and PIN the box's anchor to the content (its screen origin shifts opposite the scroll) so the box grows
@@ -660,18 +863,33 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
               : "rgba(0,0,0,0.4)";
         ctx.lineWidth = selected ? 1.5 : 1;
         ctx.strokeRect(Math.round(cx0) + 0.5, Math.round(y + 1) + 0.5, Math.max(2, x1 - cx0) - 1, Math.max(2, v.rowH - 2) - 1);
+        // 一键修复差异高亮（§建议1）：被修过且留存的音符 → 琥珀描边 + 柔光，6 秒自动消退。
+        if (repairIdsRef.current.has(n.id)) {
+          ctx.save();
+          ctx.strokeStyle = "#ffb300";
+          ctx.lineWidth = 2;
+          ctx.shadowBlur = 6;
+          ctx.shadowColor = "rgba(255, 179, 0, 0.9)";
+          ctx.strokeRect(Math.round(cx0) - 1 + 0.5, Math.round(y) + 0.5, Math.max(2, x1 - cx0) + 2, Math.max(2, v.rowH) + 1);
+          ctx.restore();
+        }
         // S73b 调教所有权:用户调教的音符左缘竖条(金;SV1 Manual 标记同构)——机器调教/未调教不标。
         // 只在真实左缘可见时画(裁剪态不画,免得贴屏幕边出现假标记)。
         if (x0 >= noteAreaX && userTunedRef.current.has(n.id)) {
           ctx.fillStyle = TUNED_MARKER;
           ctx.fillRect(Math.round(x0) + 1, y + 2, 3, Math.max(2, v.rowH - 4));
         }
-        // lyric
+        // lyric — 乐器轨模式显示「音名」（C4 / D#3…），鼓轨显示「鼓件名」（底鼓/军鼓/闭镲…），人声轨显示歌词。
         if (x1 - cx0 > 14 && v.rowH >= 11) {
           ctx.fillStyle = "#0a0f18";
           ctx.save();
           ctx.beginPath(); ctx.rect(cx0 + 2, y, x1 - cx0 - 3, v.rowH); ctx.clip();
-          ctx.fillText(n.lyric, cx0 + 4, y + v.rowH / 2 + 0.5);
+          ctx.fillText(
+            instrumentRef.current
+              ? (drumTrackRef.current ? (gmDrumShort(n.pitch, i18n.language) || pitchName(n.pitch)) : pitchName(n.pitch))
+              : n.lyric,
+            cx0 + 4, y + v.rowH / 2 + 0.5,
+          );
           ctx.restore();
         }
       }
@@ -739,12 +957,15 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       ctx.fillStyle = col("--piano-white") || "#c8d0e0";
       ctx.fillRect(0, 0, KEY_COL_W, h);
       const blackW = Math.round(KEY_COL_W * 0.6);
-      // black keys: dark, short (inset from the right) → white front stays visible to their right
-      for (let p = botPitch; p <= topPitch; p++) {
-        if (!isBlackKey(p)) continue;
-        const y = pitchToY(p, v);
-        ctx.fillStyle = "#10192c";
-        ctx.fillRect(0, Math.round(y), blackW, Math.max(1, Math.round(v.rowH)));
+      // black keys: dark, short (inset from the right) → white front stays visible to their right.
+      // 鼓轨不画黑白键（对鼓没有意义）——整列平铺，腾出位置给鼓件名。
+      if (!drumTrackRef.current) {
+        for (let p = botPitch; p <= topPitch; p++) {
+          if (!isBlackKey(p)) continue;
+          const y = pitchToY(p, v);
+          ctx.fillStyle = "#10192c";
+          ctx.fillRect(0, Math.round(y), blackW, Math.max(1, Math.round(v.rowH)));
+        }
       }
       // thin separator at EVERY row boundary so each key (white or black) is framed
       ctx.strokeStyle = "rgba(10,15,24,0.4)"; ctx.lineWidth = 1;
@@ -752,13 +973,36 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         const y = Math.round(pitchToY(p, v)) + 0.5;
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(KEY_COL_W, y); ctx.stroke();
       }
-      // C labels (dark text on the white front, right side — always visible even on a black-key neighbour)
       if (v.rowH >= 10) {
         ctx.font = "10px system-ui, sans-serif"; ctx.textBaseline = "middle"; ctx.textAlign = "left";
         ctx.fillStyle = "#0a0f18";
-        for (let p = botPitch; p <= topPitch; p++) {
-          if (p % 12 !== 0) continue;
-          ctx.fillText(pitchName(p), KEY_COL_W - 20, pitchToY(p, v) + v.rowH / 2 + 0.5);
+        if (drumTrackRef.current) {
+          // 鼓轨（§建议3）：每一行左边标鼓件名（底鼓/军鼓/闭镲/吊镲…），按 GM 分组序读起来
+          // 就是「一套鼓」，比 C4/D#3 音名直观得多。无映射的行不标（留空）。
+          for (let p = botPitch; p <= topPitch; p++) {
+            const lbl = gmDrumShort(p, i18n.language);
+            if (lbl) ctx.fillText(lbl, 4, pitchToY(p, v) + v.rowH / 2 + 0.5);
+          }
+        } else {
+          // Muno 阶段3「简谱标尺·双显示」：每行左侧标简谱唱名（1-7 + 变化音 + 八度点），
+          // 与右侧 C 音名并列（规划第五部分 5.1）。主音取当前段音符的 estimateKey
+          // （空段默认 C 调）。八度点画在数字上/下方（自绘 2px 点，组合字符跨字体不稳）。
+          const tonic = jianpuTonicRef.current;
+          for (let p = botPitch; p <= topPitch; p++) {
+            const j = jianpuForPitch(p, tonic);
+            const black = isBlackKey(p);
+            const yC = pitchToY(p, v) + v.rowH / 2 + 0.5;
+            ctx.fillStyle = black ? "rgba(226,232,244,0.8)" : "#0a0f18";
+            ctx.fillText(j.text, 4, yC);
+            ctx.fillStyle = black ? "rgba(226,232,244,0.8)" : "#0a0f18";
+            for (let d = 0; d < j.dotsAbove; d++) ctx.fillRect(5, yC - v.rowH / 2 + 1 + d * 3, 2, 2);
+            for (let d = 0; d < j.dotsBelow; d++) ctx.fillRect(5, yC + v.rowH / 2 - 3 - d * 3, 2, 2);
+          }
+          // C labels (dark text on the white front, right side — always visible even on a black-key neighbour)
+          for (let p = botPitch; p <= topPitch; p++) {
+            if (p % 12 !== 0) continue;
+            ctx.fillText(pitchName(p), KEY_COL_W - 20, pitchToY(p, v) + v.rowH / 2 + 0.5);
+          }
         }
       }
       ctx.strokeStyle = col("--border-default") || "#2a3a5c";
@@ -1066,6 +1310,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       if (dragRef.current) { dragRef.current = null; requestRedraw(); }
       if (edgeRafRef.current) { cancelAnimationFrame(edgeRafRef.current); edgeRafRef.current = 0; }
       if (playRafRef.current) { cancelAnimationFrame(playRafRef.current); playRafRef.current = 0; setPlaying(false); }
+      if (wavSrcRef.current) { try { wavSrcRef.current.stop(); } catch { /* already ended */ } wavSrcRef.current = null; setPlaying(false); }
       playback.stopPreviewTone();
     };
     window.addEventListener("blur", release);
@@ -1075,6 +1320,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       document.removeEventListener("visibilitychange", release);
       if (playRafRef.current) cancelAnimationFrame(playRafRef.current);
       if (edgeRafRef.current) cancelAnimationFrame(edgeRafRef.current);
+      if (wavSrcRef.current) { try { wavSrcRef.current.stop(); } catch { /* already ended */ } wavSrcRef.current = null; }
       playback.stopPreviewTone();
     };
   }, [requestRedraw]);
@@ -1089,6 +1335,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // ② S58 OOV marking: async verdicts from the oovWatch watcher (app store) → ref + redraw (the draw
   // closure reads the ref — the standard三处同步: ref sync here + this dedicated redraw effect).
   useEffect(() => { requestRedraw(); }, [oovIds, droppedIds, shortIds, aliasHintIds, requestRedraw]);
+  // Muno 阶段3:简谱主音变化(和弦分析结果更新 / 段音符编辑后重估) → 重画键列唱名。
+  useEffect(() => { requestRedraw(); }, [chordKey, segKey, requestRedraw]);
   // (laneParam/laneOpen repaints ride the draw-closure rebuild effect above — laneParam is in its dep
   // array and it ends in requestRedraw(); a second dedicated effect here would be a duplicate
   // invalidation path. S83 review #7.)
@@ -1284,6 +1532,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   };
 
   // ── pointer handlers ──
+  // Muno 阶段2:乐器轨交互发声。轨道选了音源音色 → 真实音色试听(audition WAV 按键缓存,
+  // 重复触发零渲染);没选 → 振荡器占位音(人声轨/旧乐器轨行为不变)。audition 内部静默
+  // 失败,绝不打断手势。
+  const audibleTone = useCallback((pitch: number, durMs: number) => {
+    const sf = trackSfRef.current;
+    if (sf) void playSoundfontAudition(sf, pitch);
+    else playback.playPreviewTone(pitchToHz(pitch), durMs);
+  }, []);
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0) return;
     // Commit any focused-field edit session (BPM box) before this gesture mutates notes — its store
@@ -1295,7 +1551,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
     const { x, y } = localXY(e.clientX, e.clientY);
     if (x < KEY_COL_W) { // left column: a piano key (note area) → preview tone; the lane's scale column → INERT
-      if (y < noteBottom()) playback.playPreviewTone(pitchToHz(pitchAt(e.clientY)), 220);
+      if (y < noteBottom()) audibleTone(pitchAt(e.clientY), 220);
       return; // never fall through to the note-area marquee (which would clear the selection)
     }
     // ② TOP RULER → seek the global transport playhead (§user: re-listen after an edit WITHOUT going to the main
@@ -1413,7 +1669,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       if (toolRef.current === "pen") {
         selectNotes([hit.note.id]);
         const o = notesRef.current.find((n) => n.id === hit.note.id)!;
-        playback.playPreviewTone(pitchToHz(o.pitch), 160);
+        audibleTone(o.pitch, 160);
         dragRef.current = withPreview({
           kind: "resize", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
           activeIds: [o.id], orig: new Map([[o.id, o]]), newNote: null, anchorRelTick: o.tick, moved: false, additive: false,
@@ -1437,7 +1693,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       const orig = new Map(notesRef.current.filter((n) => ids.includes(n.id)).map((n) => [n.id, n]));
       // A MOVE gets a SUSTAINED tone that retunes along the drag (audition the pitch the whole way, §user);
       // a resize (edge) just gets a brief click. Stopped on pointerup/cancel/Esc/unmount (all wired).
-      playback.playPreviewTone(pitchToHz(hit.note.pitch), hit.onEdge ? 160 : 0);
+      // 乐器轨选了音色 → 真实音色试听替代占位音;拖拽变调时按半音阶重触发(见 onPointerMove)。
+      audibleTone(hit.note.pitch, hit.onEdge ? 160 : 0);
       dragRef.current = withPreview({
         kind: hit.onEdge ? "resize" : "move",
         clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
@@ -1457,7 +1714,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       // inaudible sub-floor note. S87: the grid CELL stays the default/min length even with snapping OFF —
       // continuous mode frees the note's POSITION, it must not let a click-with-jitter draw a 1-tick note.
       const newNote: Note = { id: crypto.randomUUID(), tick: relStart, duration: Math.max(1, snap), pitch: p, lyric: defaultLyricRef.current, velocity: 100 };
-      playback.playPreviewTone(pitchToHz(p), 0); // sustained while drawing; stops on pointerup
+      audibleTone(p, 0); // sustained while drawing; stops on pointerup (乐器轨选音色时为 0.6s 真实音色)
       dragRef.current = withPreview({
         kind: "create", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
         activeIds: [newNote.id], orig: new Map(), newNote, anchorRelTick: relStart, moved: false, additive: false,
@@ -1472,7 +1729,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const p0 = localXY(e.clientX, e.clientY);
     dragRef.current = withPreview({ kind: "marquee", clientX0: p0.x, clientY0: p0.y, curX: p0.x, curY: p0.y, activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive });
     requestRedraw();
-  }, [setActivePane, selectNotes, applyNoteEdits, part, segmentId]);
+  }, [setActivePane, selectNotes, applyNoteEdits, part, segmentId, audibleTone]);
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const p = localXY(e.clientX, e.clientY);
@@ -1521,7 +1778,20 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         const dPitch = d.activeY ? pitchAt(e.clientY) - (d.startPitch ?? 0) : 0; // CONTENT origin (scroll-safe, matches computePreview)
         const anyId = d.activeIds[0];
         const o = anyId ? d.orig.get(anyId) : undefined;
-        if (o) playback.setPreviewToneHz(pitchToHz(clampPitch(o.pitch + dPitch)));
+        if (o) {
+          // 乐器轨选了音色 → 拖拽变调按半音阶重触发真实音色试听(试听按键有 WAV 缓存,
+          // 跟得上拖拽);未选/人声轨 → 振荡器连续变调(旧行为)。
+          const sf = trackSfRef.current;
+          if (sf) {
+            const np = clampPitch(o.pitch + dPitch);
+            if (d.audPitch === undefined || Math.abs(np - d.audPitch) >= 1) {
+              d.audPitch = np;
+              void playSoundfontAudition(sf, np);
+            }
+          } else {
+            playback.setPreviewToneHz(pitchToHz(clampPitch(o.pitch + dPitch)));
+          }
+        }
       } else if (d.kind === "pitch-paint" && d.paint) {
         const cy = Math.round(centsAt(e.clientY)); // quantize (see pointerdown) — kills sub-pixel line shiver
         d.paint.xs.push(Math.max(0, Math.round(relTickAt(e.clientX))));
@@ -1801,6 +2071,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   };
 
   const onDoubleClick = useCallback((e: React.MouseEvent) => {
+    if (instrumentRef.current) return; // 乐器轨无歌词可编辑——双击不弹输入框
     if (toolRef.current === "pitch" || toolRef.current === "delete") return; // lyric editing lives in Arrow/Pen only (§user)
     // ② lane guard (mirror onPointerDown:818 / onContextMenu:1055): never open a lyric editor inside the bottom
     // automation lane — a note can scroll behind the band, and the <input> would render overlaying the lane.
@@ -1840,6 +2111,27 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     setLyricEdit(null);
   };
 
+  // ── 歌词总编辑（§用户）：整轨歌词一次性粘贴/修改，逐音符顺序分配（跳过休止/气声），
+  // 与双击改词共用 splitLyricTokens 的分词规则（中文一字一音符、英文按空格）。
+  const singableOrderedNotes = () =>
+    orderedNotes().filter((n) => !isSilentLyric(n.lyric, tokensRef.current));
+  const openLyricsPanel = () => {
+    setLyricsText(singableOrderedNotes().map((n) => n.lyric).join(" "));
+    setLyricsOpen(true);
+  };
+  const applyBulkLyrics = (text: string, preview = false) => {
+    if (!part) { setLyricsOpen(false); return; }
+    const toks = splitLyricTokens(text.trim(), defaultLyricRef.current);
+    const ordered = singableOrderedNotes();
+    if (toks.length && ordered.length) {
+      const update: Record<string, Partial<Note>> = {};
+      for (let i = 0; i < toks.length && i < ordered.length; i++) update[ordered[i]!.id] = { lyric: toks[i]! };
+      applyNoteEdits(part.trackId, segmentId, { update });
+    }
+    setLyricsOpen(false);
+    if (preview) startPreviewPlay();
+  };
+
   // Tab (dir +1) / Shift+Tab (dir −1) while editing a lyric: commit the current note, then open the
   // adjacent note's lyric input (SynthV/OpenUTAU convention). At the ends, just commit + close.
   const navLyric = (fromId: string, value: string, dir: 1 | -1) => {
@@ -1861,6 +2153,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable)) return;
       const p = part;
       if (!p) return;
+      // 「?」切换快捷键速查卡（§建议4）；Esc 关闭。
+      if (e.key === "?" || (e.shiftKey && e.key === "/")) { e.preventDefault(); setHelpOpen((o) => !o); return; }
       const sel = [...selRef.current];
       if (e.key === "Delete" || e.key === "Backspace") {
         if (sel.length) { e.preventDefault(); commitNotes(p.notes.filter((n) => !selRef.current.has(n.id)), []); selectNotes([]); }
@@ -1878,8 +2172,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       } else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key) && sel.length) {
         e.preventDefault(); nudge(e.key);
       } else if (e.key === "Escape") {
+        if (helpOpenRef.current) { setHelpOpen(false); return; }
         // Cancel a live gesture / stop preview playback — MUST also stop the sustained tone (else it rings).
-        if (playRafRef.current) { cancelAnimationFrame(playRafRef.current); playRafRef.current = 0; playback.stopPreviewTone(); setPlaying(false); }
+        if (wavSrcRef.current) { try { wavSrcRef.current.stop(); } catch { /* already ended */ } wavSrcRef.current = null; setPlaying(false); }
+        else if (playRafRef.current) { cancelAnimationFrame(playRafRef.current); playRafRef.current = 0; playback.stopPreviewTone(); setPlaying(false); }
         else if (dragRef.current) { dragRef.current = null; playback.stopPreviewTone(); requestRedraw(); } else selectNotes([]);
       }
     };
@@ -1966,10 +2262,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   if (!part) return null;
 
+  // 乐器轨模式隐藏「音高（调教）」工具——那是人声 pitchDev 手绘层，乐器音符用不到。
   const TOOLS: { id: Tool; label: string; icon: ReactElement }[] = [
     { id: "arrow", label: t("vocalEditor.toolArrow"), icon: <path d="M5 3l14 8-6 1.5L10 19 8 12 5 3z" /> },
     { id: "pen", label: t("vocalEditor.toolPen"), icon: <path d="M4 20l3-1 10-10-2-2L5 17l-1 3zM15 5l2 2 2-2-2-2-2 2z" /> },
-    { id: "pitch", label: t("vocalEditor.toolPitch"), icon: <path d="M3 17c4 0 4-10 8-10s4 10 9 4" fill="none" stroke="currentColor" strokeWidth="2" /> },
+    ...(instrumentMode ? [] : [{ id: "pitch" as Tool, label: t("vocalEditor.toolPitch"), icon: <path d="M3 17c4 0 4-10 8-10s4 10 9 4" fill="none" stroke="currentColor" strokeWidth="2" /> }]),
     { id: "delete", label: t("vocalEditor.toolDelete"), icon: <path d="M6 7h12l-1 13H7L6 7zm3-3h6l1 2H8l1-2z" /> },
   ];
 
@@ -1981,10 +2278,53 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       onFocusCapture={() => setActivePane("vocal")}
     >
       <div className="vocal-editor-header">
-        <span className="vocal-editor-title">{part.trackName || t("vocalEditor.title")}</span>
-        {/* ② loudness / formant automation — two labels sitting DIRECTLY next to the track title (§user: no
+        {/* 乐器轨标题：GM 名翻译（"Guitar (clean)" → 「清音电吉他」）+ 音符数概览。 */}
+        <span className="vocal-editor-title" title={part.trackName}>
+          {instrumentMode
+            ? `${translateGmName(part.trackName, i18n.language) || t("vocalEditor.title")} · ${part.notes.length} ${t("vocalEditor.notesCount")}`
+            : part.trackName || t("vocalEditor.title")}
+        </span>
+        {instrumentMode ? (
+          /* 乐器轨专属控件：GM 音色下拉（试听即用）+ 音源文件 + 一键修复。 */
+          <div className="vocal-lane-ctl">
+            <label className="vocal-grid-label">{t("vocalEditor.gmProgram")}</label>
+            <select
+              className="vocal-sf-select"
+              value={selectedProgram === null ? "" : String(selectedProgram)}
+              onChange={(e) => setSelectedProgram(e.target.value === "" ? null : Number(e.target.value))}
+              disabled={drumTrackRef.current}
+              title={drumTrackRef.current ? t("vocalEditor.gmDrumHint") : t("vocalEditor.gmProgramTip")}
+            >
+              <option value="">
+                {gmMatch?.matched ? `${t("vocalEditor.gmAuto")} · ${gmMatch.display}` : t("vocalEditor.gmAuto")}
+              </option>
+              {GM_INSTRUMENTS.map((inst) => (
+                <option key={inst.program} value={inst.program}>
+                  {i18n.language.startsWith("zh") ? inst.zh : i18n.language.startsWith("ja") ? inst.ja : inst.en}
+                </option>
+              ))}
+            </select>
+            <label className="vocal-grid-label">{t("vocalEditor.soundfont")}</label>
+            <select
+              className="vocal-sf-select"
+              value={soundfonts.find((s) => s.active)?.filename ?? ""}
+              onChange={(e) => pickSoundfont(e.target.value)}
+            >
+              {soundfonts.length === 0 && <option value="">{t("vocalEditor.soundfontNone")}</option>}
+              {soundfonts.map((s) => (
+                <option key={s.filename} value={s.filename}>{s.name}</option>
+              ))}
+            </select>
+            <button
+              className="snap-toggle vocal-grid-btn"
+              title={t("amt.editorCleanTooltip")}
+              onClick={oneClickRepair}
+            >{t("amt.editorClean")}</button>
+          </div>
+        ) : (
+        /* ② loudness / formant automation — two labels sitting DIRECTLY next to the track title (§user: no
             "lane" jargon, no extra open step). Each is a self-toggle: click opens + selects that param's bottom
-            editor; click the active one again closes it; clicking the other switches param with it staying open. */}
+            editor; click the active one again closes it; clicking the other switches param with it staying open. */
         <div className="vocal-lane-ctl">
           {LANE_PARAMS.map((lp) => (
             <button
@@ -2005,6 +2345,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             }}
           >{t("vocalEditor.lane.phoneme")}</button>
         </div>
+        )}
         <div className="vocal-editor-header-spacer" />
         {/* S87 grid-snap ON/OFF. The 1/12 lines are drawn either way — with snapping off they are a
             REFERENCE, not a magnet, so an imported UTAU CVVC score (whose note starts are the author's
@@ -2027,9 +2368,92 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             <button key={g.div} className={`snap-toggle vocal-grid-btn${gridDiv === g.div ? " active" : ""}`} onClick={() => setGridDiv(g.div)}>{g.key}</button>
           ))}
         </div>
-        <button className="vocal-icon-btn" title={playing ? t("vocalEditor.stop") : t("vocalEditor.preview")} onClick={() => (playing ? stopPreviewPlay() : startPreviewPlay())}>
+        {/* 歌词总编辑（§用户）：人声轨一键打开整轨歌词文本框。 */}
+        {!instrumentMode && (
+          <button
+            className={`vocal-icon-btn${lyricsOpen ? " active" : ""}`}
+            title={t("vocalEditor.lyricsTitle")}
+            onClick={() => (lyricsOpen ? setLyricsOpen(false) : openLyricsPanel())}
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z" /></svg>
+          </button>
+        )}
+        <button
+          className="vocal-icon-btn"
+          disabled={instrumentMode && previewBusy}
+          title={playing ? t("vocalEditor.stop") : instrumentMode ? t("vocalEditor.previewInstrument") : t("vocalEditor.preview")}
+          onClick={() => {
+            if (instrumentMode) { if (playing) stopWavPreview(); else void startInstrumentPreview(); }
+            else if (playing) stopPreviewPlay();
+            else startPreviewPlay();
+          }}
+        >
           <svg viewBox="0 0 24 24" width="13" height="13"><path fill="currentColor" d={playing ? "M6 5h4v14H6zM14 5h4v14h-4z" : "M7 5l12 7-12 7z"} /></svg>
         </button>
+        {/* 快捷键速查卡（§建议4）：「?」按钮弹出，Esc / 再点关闭。 */}
+        <button
+          className={`vocal-icon-btn${helpOpen ? " active" : ""}`}
+          title={t("vocalEditor.helpTitle")}
+          onClick={() => setHelpOpen((o) => !o)}
+        >
+          <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zm.9 14.3h-1.8v-1.8h1.8v1.8zm1.6-5.2-.8.8c-.6.6-.9 1.1-.9 2.1h-1.6v-.4c0-.8.3-1.5.9-2.1l1.1-1.1c.3-.3.5-.7.5-1.2a1.8 1.8 0 0 0-3.6 0H8.5a3.5 3.5 0 0 1 7 0c0 .7-.3 1.4-1 1.9z" /></svg>
+        </button>
+        {lyricsOpen && (
+          <div className="vocal-help-card vocal-lyrics-card" role="dialog" aria-label={t("vocalEditor.lyricsTitle")}>
+            <div className="vocal-help-card-head">
+              <span>{t("vocalEditor.lyricsTitle")}</span>
+              <button className="vocal-icon-btn" title={t("vocalEditor.close")} onClick={() => setLyricsOpen(false)}>
+                <svg viewBox="0 0 24 24" width="12" height="12"><path fill="none" d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeWidth="2" /></svg>
+              </button>
+            </div>
+            <textarea
+              className="vocal-lyrics-textarea"
+              value={lyricsText}
+              onChange={(e) => setLyricsText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") { e.preventDefault(); setLyricsOpen(false); }
+                else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); applyBulkLyrics(lyricsText); }
+              }}
+              placeholder={t("vocalEditor.lyricsPlaceholder")}
+            />
+            <div className="vocal-lyrics-hint">{t("vocalEditor.lyricsHint")}</div>
+            <div className="vocal-lyrics-actions">
+              <button className="vocal-lyrics-btn" onClick={() => setLyricsOpen(false)}>{t("common.cancel")}</button>
+              <button className="vocal-lyrics-btn" onClick={() => applyBulkLyrics(lyricsText, true)}>{t("vocalEditor.lyricsApplyPreview")}</button>
+              <button className="vocal-lyrics-btn primary" onClick={() => applyBulkLyrics(lyricsText)}>{t("common.confirm")}</button>
+            </div>
+          </div>
+        )}
+        {helpOpen && (
+          <div className="vocal-help-card" role="dialog" aria-label={t("vocalEditor.helpTitle")}>
+            <div className="vocal-help-card-head">
+              <span>{t("vocalEditor.helpTitle")}</span>
+              <button className="vocal-icon-btn" title={t("vocalEditor.close")} onClick={() => setHelpOpen(false)}>
+                <svg viewBox="0 0 24 24" width="12" height="12"><path fill="none" d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeWidth="2" /></svg>
+              </button>
+            </div>
+            <table className="vocal-help-table">
+              <tbody>
+                {([
+                  ["vocalEditor.helpSelect", "vocalEditor.helpSelectKey"],
+                  ["vocalEditor.helpEditLyric", "vocalEditor.helpEditLyricKey"],
+                  ["vocalEditor.helpDelete", "vocalEditor.helpDeleteKey"],
+                  ["vocalEditor.helpCopy", "vocalEditor.helpCopyKey"],
+                  ["vocalEditor.helpPaste", "vocalEditor.helpPasteKey"],
+                  ["vocalEditor.helpNudge", "vocalEditor.helpNudgeKey"],
+                  ["vocalEditor.helpZoom", "vocalEditor.helpZoomKey"],
+                  ["vocalEditor.helpScroll", "vocalEditor.helpScrollKey"],
+                  ["vocalEditor.helpEscape", "vocalEditor.helpEscapeKey"],
+                ] as const).map(([k, kk]) => (
+                  <tr key={k}>
+                    <td className="vocal-help-key"><kbd>{t(kk)}</kbd></td>
+                    <td>{t(k)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
         <button className="vocal-icon-btn" title={maximized ? t("vocalEditor.restore") : t("vocalEditor.maximize")} onClick={() => setMaximized((m) => !m)}>
           <svg viewBox="0 0 24 24" width="15" height="15"><path fill="currentColor" d={maximized ? "M8 8h8v8H8V8zM4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4z" : "M4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4zM6 14v4h4v2H4v-6h2zm12 0h2v6h-6v-2h4v-4z"} /></svg>
         </button>
@@ -2096,17 +2520,20 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             onScroll={scrollTo}
           />
         </div>
-        <VocalSidebar
-          trackId={part.trackId}
-          segmentId={segmentId}
-          notes={part.notes}
-          selectedIds={selectedNotes}
-          trackTransition={part.transition}
-          vocalParams={part.vocalParams}
-          voiceModel={part.voiceModel}
-          onRender={render}
-          rendering={vocalRenderActive}
-        />
+        {/* 乐器轨无歌手/调教侧栏（那是人声专属）；音源与修复控件在顶部工具条。 */}
+        {instrumentMode ? null : (
+          <VocalSidebar
+            trackId={part.trackId}
+            segmentId={segmentId}
+            notes={part.notes}
+            selectedIds={selectedNotes}
+            trackTransition={part.transition}
+            vocalParams={part.vocalParams}
+            voiceModel={part.voiceModel}
+            onRender={render}
+            rendering={vocalRenderActive}
+          />
+        )}
       </div>
     </div>
   );

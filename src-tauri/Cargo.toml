@@ -2,10 +2,10 @@
 members = ["crates/utai-dsp", "crates/utai-stretch"]
 
 [package]
-name = "utai"
-version = "0.12.4"
-description = "UtaiSynthesizer — Voice Synthesis DAW"
-authors = ["UtaiSynthesizer Contributors"]
+name = "muno"
+version = "0.12.2"
+description = "Muno — AI Music Workstation"
+authors = ["Muno Contributors"]
 edition = "2021"
 rust-version = "1.77"
 # AGPL is a hard requirement, not a choice: the app vendors so-vits-svc (AGPL-3.0) training
@@ -13,7 +13,7 @@ rust-version = "1.77"
 license = "AGPL-3.0-only"
 
 [lib]
-name = "utai_lib"
+name = "muno_lib"
 crate-type = ["lib", "staticlib", "cdylib"]
 
 [build-dependencies]
@@ -53,9 +53,11 @@ parking_lot = "0.12"
 rustfft = "6.2"
 rayon = "1.10"
 zip = "2"
+walkdir = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
 futures-util = "0.3"
+base64 = "0.22"
 # S42 embedded-runtime packs: sha256 part verification + .tar.zst pack extraction
 sha2 = "0.10"
 tar = "0.4"
@@ -66,9 +68,16 @@ rand_distr = "0.4"
 serde_yaml_ng = "0.10"
 midly = "0.5"
 encoding_rs = "0.8"
+# Muno 阶段2(工程规划第七节):cpal 实时音频输出——音源试听的常驻低延迟流。
+# 时间线播放仍是离线 bake → WAV → WebAudio,cpal 只承担试听发声。
+cpal = "0.15"
 utai-dsp = { path = "crates/utai-dsp" }
+# Phase 1: ITU-R BS.1770 loudness (LUFS) + true-peak for compliance checks.
+ebur128 = "0.1.10"
 # S59 Tempo Slider: offline time-stretch via vendored Signalsmith Stretch (MIT, FFI shim crate)
 utai-stretch = { path = "crates/utai-stretch" }
+# Phase 5-1: spectrogram PNG encoding for the analysis node's inline preview
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Windows-only: disable WebView2 browser-accelerator keys (Ctrl+F/P, F5/F7, zoom, reload…) natively — a
 # page-level keydown preventDefault can't stop them (they're handled by the WebView2 host above the DOM).
@@ -131,3 +140,4 @@ codegen-units = 1
 lto = true
 opt-level = 3
 strip = true
+

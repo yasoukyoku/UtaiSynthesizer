@@ -1648,6 +1648,16 @@ pub struct VocalRenderOptions {
     /// alias scores, whose author already moved the consonants ahead by hand, pre-rolling would apply
     /// that head start twice. Absent (old frontends) → true (the production default).
     pub consonant_preroll: bool,
+    /// Phase 7 ① 高频激励(「气声」): ≥8 kHz 软饱和带按 mix 混回 — the breathy top end.
+    /// 0 = off (exact no-op); clamped to [0, 0.15] render-side. Absent (old frontends) → 0.0.
+    pub voice_realism_mix: f32,
+    /// Phase 7 ② 共振峰微颤: 慢速 LFO 全通级联 — the slow formant wobble of a real throat.
+    /// 0 = off (exact no-op); clamped to [0, 0.08] render-side. Absent (old frontends) → 0.0.
+    pub formant_jitter_depth: f32,
+    /// Phase 7 ③ 气息层: procedural inhales synthesized into ≥520 ms SP-only gaps (an AP is the
+    /// user's own breath sample and is never touched). Absent (old frontends) → true (the S83
+    /// precedent: aesthetic defaults ship ON; `vocalParamsSig` is unaffected, one switch turns it off).
+    pub breath_layer: bool,
     /// S91 「音素约定」: which UTAU alias convention this track's ENGLISH lyrics are written in —
     /// `"arpasing"` | `"xsampa"` | `"vccv"`. Absent/unknown → words through the dictionary (the
     /// default, byte-for-byte the pre-S91 behaviour). A `String` rather than the enum on purpose: an
@@ -1673,13 +1683,16 @@ impl Default for VocalRenderOptions {
         Self {
             backend: "sovits".into(),
             cv_speaker_id: 49,
-            lang_id: 2,
+            lang_id: 0,
             transpose: 0,
             range_extend: false,
             consonant_emphasis_db: crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
             consonant_valley: crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
             vowel_clarity: true,
             consonant_preroll: true,
+            voice_realism_mix: 0.0,
+            formant_jitter_depth: 0.0,
+            breath_layer: true, // S83 先例:审美默认出货即开;sig 不变,不要时一个开关关掉
             es_dialect: None,
             phoneme_set: None,
             sovits: Default::default(),
@@ -2065,6 +2078,18 @@ pub async fn render_vocal_segment(
         },
         vowel_clarity: options.vowel_clarity, // S84 E 刀 toggle (bool — nothing to sanitize)
         consonant_preroll: options.consonant_preroll, // S89 toggle (bool — nothing to sanitize)
+        // Phase 7 ①②③ knob hygiene: non-finite → 0.0;上限 [0, 0.15] / [0, 0.08](越界钳到边)。
+        voice_realism_mix: if options.voice_realism_mix.is_finite() {
+            options.voice_realism_mix.clamp(0.0, 0.15)
+        } else {
+            0.0
+        },
+        formant_jitter_depth: if options.formant_jitter_depth.is_finite() {
+            options.formant_jitter_depth.clamp(0.0, 0.08)
+        } else {
+            0.0
+        },
+        breath_layer: options.breath_layer, // ③ toggle (bool — nothing to sanitize)
     };
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
 

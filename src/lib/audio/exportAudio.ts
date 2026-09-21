@@ -6,6 +6,7 @@ import i18n from "../../i18n";
 import { useProjectStore } from "../../store/project";
 import { useAudioStore } from "../../store/audio";
 import { collectDirtyVocals, renderDirtyVocals } from "../vocal/vocalRender";
+import { collectDirtyInstruments, renderDirtyInstruments } from "../soundfont/instrumentRender";
 import { scoreExportableTracks } from "../vocal/exportScore";
 import { renderMixdown } from "./exportMixdown";
 
@@ -21,10 +22,13 @@ export interface AudioExportParams {
   sampleRate: number;
   bitDepth: "16" | "24" | "32f";
   bitrateKbps: number;
+  /** §user 母带处理：渲染后跑纯 DSP 母带链（EQ→压缩→前瞻限制）。 */
+  mastering?: boolean;
 }
 
 export type ExportPhase =
   | { kind: "vocals"; total: number }
+  | { kind: "instruments"; total: number }
   | { kind: "mix"; frac: number }
   | { kind: "encode" };
 
@@ -68,6 +72,17 @@ export async function runAudioExport(
   }
   if (shouldCancel()) return { cancelled: true, peak: 0, fileBytes: 0, durationSec: 0 };
 
+  // 1b. Bake dirty instrument tracks — same funnel as Play (Muno 阶段2). A failed bake aborts loudly
+  //     for the same reason as vocals: the bounce must contain what the user WOULD hear.
+  const dirtyIns = collectDirtyInstruments(tempo0);
+  if (dirtyIns.length > 0) {
+    onPhase({ kind: "instruments", total: dirtyIns.length });
+    const resIns = await renderDirtyInstruments(dirtyIns, tempo0, { shouldCancel });
+    if (resIns.cancelled || shouldCancel()) return { cancelled: true, peak: 0, fileBytes: 0, durationSec: 0 };
+    if (resIns.failed > 0) throw new Error("EXPORT_INSTRUMENTS_FAILED");
+  }
+  if (shouldCancel()) return { cancelled: true, peak: 0, fileBytes: 0, durationSec: 0 };
+
   // 2. Offline mixdown — read FRESH state (the bakes just deposited; tempo may not change mid-dialog,
   //    but the same fresh-read discipline as Toolbar's post-render play costs nothing).
   const st = useProjectStore.getState();
@@ -80,6 +95,7 @@ export async function runAudioExport(
       st.tempo,
       params.sampleRate,
       (frac) => onPhase({ kind: "mix", frac }),
+      { master: params.mastering !== false },
     );
   } catch (e) {
     // "No audio content" on a project that HAS vocal notes means the notes never became audio (no

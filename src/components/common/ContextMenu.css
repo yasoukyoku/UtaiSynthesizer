@@ -39,6 +39,19 @@
   color: var(--accent-primary-bright);
 }
 
+.ctx-icon {
+  display: inline-block;
+  width: 16px;
+  margin-right: 6px;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+  vertical-align: -1px;
+}
+.ctx-item:hover:not(:disabled) .ctx-icon {
+  color: var(--accent-primary);
+}
+
 .ctx-item:disabled {
   color: var(--text-muted);
   cursor: default;
@@ -60,4 +73,33 @@
 .ctx-shortcut {
   font-size: var(--font-size-xs);
   color: var(--text-muted);
+}
+
+/* ── 分隔线 + 二级子菜单（向后兼容新增）──────────────────────────────── */
+
+.ctx-divider {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--border-default);
+}
+
+/* 子菜单项右侧箭头 */
+.ctx-item .ctx-arrow {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+/* 嵌套面板：覆盖 .ctx-menu 的 fixed 定位，挂在触发项右侧 */
+.ctx-submenu-wrap { position: relative; }
+
+.ctx-submenu-panel {
+  position: absolute;
+  left: 100%;
+  top: -3px;          /* 与触发项上缘平齐（父菜单 padding 2px） */
+  min-width: 200px;
+  max-height: min(340px, 60vh);
+}
+.ctx-submenu-panel.ctx-flip-left {
+  left: auto;
+  right: 100%;
 }

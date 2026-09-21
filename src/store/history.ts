@@ -177,6 +177,12 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   // S167 (§E4): same fold — absent (dictionary default) hashes identically to the pre-S167 string,
   // so adding the setting invalidates no existing bake; switching it must re-render Spanish notes.
   const esd = p.esDialect ? `|esd:${p.esDialect}` : "";
+  // Phase 7 ①② (voice realism): percent knobs, ce/cv fold — absent/0 hashes like the pre-knob string,
+  // so adding the knobs invalidates no existing bake; each non-default is its own re-render.
+  const vr = (p.voiceRealism ?? 0) !== 0 ? `|vr:${p.voiceRealism}` : "";
+  const fj = (p.formantJitter ?? 0) !== 0 ? `|fj:${p.formantJitter}` : "";
+  // Phase 7 ③ breath layer: only OFF enters the sig (absent≡true — vowelClarity pattern).
+  const brl = p.breathLayer === false ? "|brl:0" : "";
   // S88 — the two lyric triggers enter through the CANONICALIZER, not raw. `restTokenKey`/`breathTokenKey`
   // return "" for every spelling that classifies exactly like the default (absent / blank / the canonical
   // token / a padded one), so a bake can only be declared dirty by a token that can really change a note's
@@ -188,7 +194,20 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   const bt = breathTokenKey(p.breathToken);
   const rt = restTokenKey(p.restToken);
   const tok = (bt ? `|bt:${bt}` : "") + (rt ? `|rt:${rt}` : "");
-  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|re:${p.rangeExtend !== false ? 1 : 0}${at}${ce}${cvl}${vcl}${cpr}${ps}${esd}${tok}`;
+  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|re:${p.rangeExtend !== false ? 1 : 0}${at}${ce}${cvl}${vcl}${cpr}${ps}${esd}${vr}${fj}${brl}${tok}`;
+}
+
+/** 乐器轨音源选择的确定性签名(absent ≡ 未选,散列稳定——presetName 不进 sig,只是显示冗余)。
+ *  3-9 渲染引擎 fold-away:仅 "fluidsynth" 追加标记,absent/builtin 的旧散列不变。 */
+function soundfontSig(sf?: { fontId: string; presetId: string; presetName?: string; backend?: string }): string {
+  if (!sf) return "";
+  return `${sf.fontId}/${sf.presetId}${sf.backend === "fluidsynth" ? "@fluidsynth" : ""}`;
+}
+
+/** 3-1 分层音源签名(按序展开;gain/pan 变化 = 混音变化,可撤销)。 */
+function soundfontLayersSig(layers?: { fontId: string; presetId: string; gain: number; pan: number }[]): string {
+  if (!layers || layers.length === 0) return "";
+  return layers.map((l) => `${l.fontId}/${l.presetId}@${l.gain},${l.pan}`).join("|");
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {
@@ -214,6 +233,9 @@ function meaningfulSig(tracks: Track[], tempo: number, timeSig: [number, number]
           `${t.id}~${t.name}~${t.trackType}~${t.volumeDb}~${t.pan}~${t.muted ? 1 : 0}~${t.solo ? 1 : 0}~` +
           `${t.playOriginal ? 1 : 0}~` +
           `${t.voiceModel ?? ""}~${t.voiceModelAvatar ?? ""}~${vocalParamsSig(t.vocalParams)}~${laneSig(t.laneControls, t.laneMutes)}~` +
+          `${soundfontSig(t.soundfont)}~${soundfontLayersSig(t.soundfontLayers)}~` +
+          // S12 FX sends — fold-away at 0 (absent ≡ 0), so old/untouched tracks hashes unchanged.
+          `${t.reverbSend ?? 0}~${t.delaySend ?? 0}~` +
           t.segments
             // S59b laneLoudness rides the sig like laneOps (an ARRANGEMENT edit, undoable);
             // paramCurvesSig gives it the same sorted-key stability as the content curves.
@@ -780,4 +802,40 @@ export function installHistory(): () => void {
       unsubscribe = null;
     }
   };
+}
+
+// ── S9/S10 撤销/重做面板：把私有栈暴露为一个「状态列表 + 跳到任意一步」的只读 API ──
+// 状态线性序列：S0..S_{n-1}（past），S_n = 当前。面板按最新在上列出；点击某行即跳到该状态
+//（对 past 直接重建 past/future 并 applySnapshot，等价于一次「撤到那一步」）。描述复用
+// describeDelta，因此行内标签与撤销横幅语言完全一致。
+
+export interface HistoryStep {
+  /** 绝对步进序号，0 = 最旧状态，n = 当前状态。 */
+  idx: number;
+  /** describeDelta 得到的 i18n key；当前行为 "current"。 */
+  labelKey: string;
+  isCurrent: boolean;
+}
+
+export function historyStepList(): HistoryStep[] {
+  const states: Snapshot[] = [...past, snapshotCurrent()];
+  return states.map((s, i) => ({
+    idx: i,
+    labelKey: i < states.length - 1 ? describeDelta(s, states[i + 1]!) : "current",
+    isCurrent: i === states.length - 1,
+  }));
+}
+
+export function jumpToHistoryStep(idx: number): void {
+  if (applying || txnDepth > 0) return;
+  const n = past.length;
+  if (idx === n) return; // already at current
+  if (idx < 0 || idx > n) return;
+  const target = past[idx]!;
+  const cur = snapshotCurrent();
+  // 撤到 S_idx：S_idx 之后的所有状态（含当前 S_n）变成可重做序列。
+  future = [...past.slice(idx + 1), cur];
+  past = past.slice(0, idx);
+  applySnapshot(target);
+  syncFlags();
 }

@@ -99,6 +99,7 @@ pub struct StorageReport {
     pub cache_bytes: u64,
     pub models_bytes: u64,
     pub msst_bytes: u64,
+    pub amt_bytes: u64,
     pub runtimes_bytes: u64,
     /// S74b: the CUDA inference runtime (~1.6 GB across `<app>/runtime/ort/cuda` + `<app>/runtime/
     /// cuda`). It lives next to the PROGRAM, not under the data root, so every earlier version of
@@ -281,11 +282,19 @@ pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<Stora
             }
         }
         workspaces.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        let mut amt_bytes = dir_size(&models_dir.join("amt"));
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            let home_path = PathBuf::from(home);
+            amt_bytes += dir_size(&home_path.join(".cache").join("music_ai_models"));
+            amt_bytes += dir_size(&home_path.join(".music-to-midi").join("models"));
+        }
+
         Ok(StorageReport {
             data_dir: root.to_string_lossy().to_string(),
             cache_bytes: dir_size(&root.join("cache")),
             models_bytes: dir_size(&models_dir),
             msst_bytes: dir_size(&models_dir.join("msst")),
+            amt_bytes,
             runtimes_bytes: dir_size(&root.join("runtimes")),
             cuda_runtime_bytes: cuda_dirs.iter().map(|d| dir_size(d)).sum(),
             dictionaries_bytes: dir_size(&root.join("dictionaries")),
@@ -395,6 +404,250 @@ fn sweep_cache_tree(cache_dir: &Path, protected: &[String]) -> u64 {
 // nothing else. Its one good idea — refuse a path-like id — is now `checked_project_id` in
 // `commands::training`, applied to every id-taking command instead of just this one.
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #21 音频缓存管理 — 逐条占用明细 + 一键清理超大文件。
+// 语义与 cleanup_render_cache 同一保护集:usp_work(打开的工程媒体)与 protected(当前工程仍引用的
+// 路径)永不触碰;只有「清得安全」的文件才进统计/被删。CLEANUP_BUSY 护栏与渲染缓存清扫完全一致。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One top-level cache entry's usage, for the per-entry audit (folder or loose file).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEntryDetail {
+    pub name: String,
+    /// "dir" | "file"
+    pub kind: &'static str,
+    pub bytes: u64,
+    pub file_count: u64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheAudit {
+    pub cache_dir: String,
+    pub total_bytes: u64,
+    pub entries: Vec<CacheEntryDetail>,
+}
+
+fn count_files(dir: &Path) -> u64 {
+    let mut n = 0u64;
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            n += count_files(&p);
+        } else {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Walk a top-level cache entry and build its usage detail. Never fails the whole audit.
+fn describe_entry(entry: &std::fs::DirEntry) -> Option<CacheEntryDetail> {
+    let name = entry.file_name().to_string_lossy().to_string();
+    let md = entry.metadata().ok()?;
+    let (bytes, file_count, kind) = if md.is_dir() {
+        (dir_size(&entry.path()), count_files(&entry.path()), "dir")
+    } else {
+        (md.len(), 1, "file")
+    };
+    Some(CacheEntryDetail { name, kind, bytes, file_count })
+}
+
+/// Per-entry cache usage report (#21). Sync walk; runs on the blocking pool because a multi-GB
+/// cache tree with thousands of files takes a moment — never blocks the async UI thread.
+#[tauri::command]
+pub async fn cache_audit(state: State<'_, Arc<AppState>>) -> Result<CacheAudit, String> {
+    let cache_dir = state.cache_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut entries: Vec<CacheEntryDetail> = Vec::new();
+        let mut total = 0u64;
+        if let Ok(rd) = std::fs::read_dir(&cache_dir) {
+            for entry in rd.flatten() {
+                if let Some(d) = describe_entry(&entry) {
+                    total += d.bytes;
+                    entries.push(d);
+                }
+            }
+        }
+        entries.sort_by(|a, b| b.bytes.cmp(&a.bytes)); // biggest first
+        Ok(CacheAudit { cache_dir: cache_dir.to_string_lossy().to_string(), total_bytes: total, entries })
+    })
+    .await
+    .map_err(|e| format!("STORAGE_JOIN: {e}"))?
+}
+
+/// Shared recursion: delete files matching `should_delete`, honouring the protected set. When
+/// `prune_empty` the now-empty dirs are removed (writers create_dir_all on demand).
+fn delete_cache_files(
+    dir: &Path,
+    is_protected: &dyn Fn(&Path) -> bool,
+    should_delete: &dyn Fn(u64) -> bool,
+    prune_empty: bool,
+    freed: &mut u64,
+    count: &mut u64,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Ok(md) = entry.metadata() else { continue };
+        if md.is_dir() {
+            delete_cache_files(&p, is_protected, should_delete, prune_empty, freed, count);
+            if prune_empty {
+                let _ = std::fs::remove_dir(&p);
+            }
+        } else if !is_protected(&p) {
+            let len = md.len();
+            if should_delete(len) && std::fs::remove_file(&p).is_ok() {
+                *freed += len;
+                *count += 1;
+            }
+        }
+    }
+}
+
+/// Build the protected predicate for a given protected-set (mirrors sweep_cache_tree): a protected
+/// path AND a protected file's `<key>.json` completion-marker sidecar both survive.
+fn make_is_protected(protected: &[String]) -> impl Fn(&Path) -> bool {
+    let prot: std::collections::HashSet<String> =
+        protected.iter().map(|p| norm_key(Path::new(p))).collect();
+    move |p: &Path| {
+        if prot.contains(&norm_key(p)) {
+            return true;
+        }
+        if p.extension().map(|e| e == "json").unwrap_or(false) {
+            return prot.contains(&norm_key(&p.with_extension("wav")));
+        }
+        false
+    }
+}
+
+/// The CLEANUP_BUSY flight gate for the #21 commands — mirrors cleanup_render_cache so a live
+/// render/separation file is never deleted out from under its writer (audit S61). The returned
+/// guard MUST be held across the whole delete (the `.await` on spawn_blocking), or a render could
+/// start writing mid-sweep.
+struct CacheCleanupGuard {
+    _flight: crate::commands::audition::FlightGuard,
+}
+
+fn begin_cache_cleanup(state: &tauri::State<'_, Arc<AppState>>) -> Result<CacheCleanupGuard, String> {
+    // ORDER MATTERS (audit M1): acquire the flight flag FIRST, then check the renderers. The
+    // renderer's VoiceRunGuard::acquire refuses while AUDITION_IN_FLIGHT is set, so holding the
+    // flag here makes "check then start" atomic — a render cannot slip in between the check and
+    // the sweep. Checking renderers first would leave that window (cleanup sees nothing running,
+    // a render starts, then the sweep deletes its output mid-write).
+    let _flight = crate::commands::audition::FlightGuard::acquire("CLEANUP_BUSY")
+        .map_err(|e| format!("{e}"))?;
+    if crate::commands::inference::voice_render_active() {
+        return Err("CLEANUP_BUSY".into());
+    }
+    if matches!(
+        state.separation.status().state,
+        crate::separation::SeparationState::LoadingModel | crate::separation::SeparationState::Separating
+    ) {
+        return Err("CLEANUP_BUSY".into());
+    }
+    Ok(CacheCleanupGuard { _flight })
+}
+
+/// Delete ONE top-level cache entry (a subfolder or a loose file) by name, honouring the protected
+/// set. `name` must be a single path element — anything with a separator is refused (no traversal).
+#[tauri::command]
+pub async fn cleanup_cache_entry(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    protected: Vec<String>,
+) -> Result<u64, String> {
+    // Path-traversal guard: refuse separators / relative escapes. A cache entry name is a bare
+    // element ("audio_cache", "<segment_id>", "<hash>.wav"…). Anything else is a caller bug.
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name == ".."
+        || name == "."
+    {
+        return Err("BAD_CACHE_NAME".into());
+    }
+    // usp_work is the OPEN project's extracted media — deleting it destroys the session. The
+    // other cache cleanups sweep it only through the frontend-protected set; a per-entry delete
+    // must not be able to remove it whole (audit H1).
+    if name == "usp_work" {
+        return Err("CLEANUP_USP_WORK".into());
+    }
+    let _guard = begin_cache_cleanup(&state)?;
+    let cache_dir = state.cache_dir.clone();
+    let prot = protected.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = cache_dir.join(&name);
+        if !target.starts_with(&cache_dir) || !target.exists() {
+            return Ok(0u64);
+        }
+        if target.file_name().map(|f| f.to_string_lossy().to_string()) != Some(name) {
+            return Ok(0u64); // belt-and-suspenders: target is not exactly the named element
+        }
+        let is_protected = make_is_protected(&prot);
+        let mut freed = 0u64;
+        let mut count = 0u64;
+        if target.is_dir() {
+            delete_cache_files(&target, &is_protected, &|_| true, true, &mut freed, &mut count);
+            let _ = std::fs::remove_dir(&target); // remove dir if now empty
+            // remove_dir_all would ignore the protected set — never use it here.
+        } else if !is_protected(&target) {
+            if let Ok(len) = target.metadata().map(|m| m.len()) {
+                if std::fs::remove_file(&target).is_ok() {
+                    freed += len;
+                }
+            }
+            let _ = std::fs::remove_file(target.with_extension("json")); // stray sidecar
+        }
+        Ok(freed)
+    })
+    .await
+    .map_err(|e| format!("STORAGE_JOIN: {e}"))?
+}
+
+/// "一键清理超大文件": delete files exceeding `threshold_bytes` anywhere under the cache tree
+/// (except usp_work + the protected set), returning bytes freed. Small files are left in place.
+#[tauri::command]
+pub async fn cleanup_oversized_cache(
+    state: State<'_, Arc<AppState>>,
+    threshold_bytes: u64,
+    protected: Vec<String>,
+) -> Result<u64, String> {
+    let _guard = begin_cache_cleanup(&state)?;
+    let cache_dir = state.cache_dir.clone();
+    let prot = protected.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let is_protected = make_is_protected(&prot);
+        let mut freed = 0u64;
+        let mut count = 0u64;
+        if let Ok(rd) = std::fs::read_dir(&cache_dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.file_name().map(|f| f.to_string_lossy().to_string()).as_deref() == Some("usp_work") {
+                    continue; // the OPEN project's extracted media — its own lifecycle prunes it
+                }
+                if p.is_dir() {
+                    delete_cache_files(&p, &is_protected, &|len| len > threshold_bytes, true, &mut freed, &mut count);
+                    let _ = std::fs::remove_dir(&p);
+                } else if !is_protected(&p) {
+                    if let Ok(md) = p.metadata() {
+                        let len = md.len();
+                        if len > threshold_bytes && std::fs::remove_file(&p).is_ok() {
+                            freed += len;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = count;
+        Ok(freed)
+    })
+    .await
+    .map_err(|e| format!("STORAGE_JOIN: {e}"))?
+}
+
 /// Delete all audition caches: every workspace's `audition/` dir + every model-side
 /// `<stem>.audition_spk*.wav`. Pure caches — re-auditioning regenerates them.
 #[tauri::command]
@@ -465,6 +718,34 @@ mod tests {
     fn write(p: &Path, bytes: usize) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, vec![0u8; bytes]).unwrap();
+    }
+
+    #[test]
+    fn merge_presets_upserts_and_skips_invalid() {
+        let mut arr = vec![
+            serde_json::json!({ "name": "A", "workflow": { "nodes": [1] } }),
+            serde_json::json!({ "name": "B", "workflow": { "nodes": [] } }),
+        ];
+        let incoming = vec![
+            // 同名覆盖
+            serde_json::json!({ "name": "A", "workflow": { "nodes": [9] } }),
+            // 新名追加
+            serde_json::json!({ "name": "C", "workflow": { "nodes": [3] } }),
+            // 残缺条目逐类跳过:空白名 / 缺名 / workflow 非对象 / workflow 缺失
+            serde_json::json!({ "name": "   ", "workflow": {} }),
+            serde_json::json!({ "workflow": {} }),
+            serde_json::json!({ "name": "D", "workflow": [1, 2] }),
+            serde_json::json!({ "name": "E" }),
+        ];
+        let imported = merge_presets(&mut arr, incoming);
+        assert_eq!(imported, 2);
+        assert_eq!(arr.len(), 3);
+        assert_eq!(
+            arr[0].get("workflow").unwrap().get("nodes").unwrap().get(0).unwrap(),
+            &serde_json::json!(9),
+            "同名条目被覆盖"
+        );
+        assert_eq!(arr[2].get("name").unwrap(), "C");
     }
 
     #[test]
@@ -567,10 +848,19 @@ pub async fn cleanup_logs() -> Result<u64, String> {
         let mut files: Vec<(String, PathBuf, u64)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                // Only rolled DAILY LOG files are candidates. This directory also holds the crash
+                // sentinels (`session.<pid>.alive`, crashlog.rs) for THIS session and any live
+                // sibling instance — deleting our own sentinel would silently skip the next crash
+                // autopsy after a hard kill, and deleting a sibling's would break
+                // `other_instance_alive` (destructive-delete guard). Never touch non-log files.
+                if !name.starts_with(crate::logging::LOG_PREFIX) {
+                    continue;
+                }
                 let p = entry.path();
                 if let Ok(md) = entry.metadata() {
                     if md.is_file() {
-                        files.push((entry.file_name().to_string_lossy().to_string(), p, md.len()));
+                        files.push((name, p, md.len()));
                     }
                 }
             }
@@ -587,4 +877,109 @@ pub async fn cleanup_logs() -> Result<u64, String> {
     })
     .await
     .map_err(|e| format!("STORAGE_JOIN: {e}"))?
+}
+
+// ─── 工作流预设 · 全局保存/加载 ─────────────────────────────────────────────────────────
+// 保存到 <data_root>/workflow_presets.json(与模型/缓存同数据根,跨工程共享)。内容为
+// 一个对象数组,每项 { name, workflow },workflow 是前端序列化好的整张工作流图。
+fn preset_file(state: &AppState) -> PathBuf {
+    data_root(state).join("workflow_presets.json")
+}
+
+/// 读预设文件为条目数组(文件缺失或损坏时返回 `[]`,与保存路径的容错口径一致)。
+fn read_preset_array(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 把一批导入条目合并进 `arr`(同名覆盖、新名追加),返回实际合并的条数。
+/// 残缺条目(名字为空/缺失,或 workflow 不是对象)整条跳过,不中断整批 ——
+/// 用户手改的导出文件不应把预设库写坏(规划 6-7)。
+fn merge_presets(arr: &mut Vec<serde_json::Value>, incoming: Vec<serde_json::Value>) -> u32 {
+    let mut imported = 0u32;
+    for entry in incoming {
+        let name = entry
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.trim().is_empty() || !entry.get("workflow").map_or(false, |w| w.is_object()) {
+            continue;
+        }
+        if let Some(ix) = arr
+            .iter()
+            .position(|v| v.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+        {
+            arr[ix] = entry;
+        } else {
+            arr.push(entry);
+        }
+        imported += 1;
+    }
+    imported
+}
+
+/// 返回所有已保存的工作流预设(JSON 数组字符串;首次使用尚无文件时返回 `[]`)。
+#[tauri::command]
+pub fn load_workflow_presets(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let path = preset_file(&state);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(s),
+        Err(_) => Ok("[]".into()),
+    }
+}
+
+/// 按名字保存一个工作流预设(同名则覆盖)。workflow 为前端序列化好的工作流对象。
+#[tauri::command]
+pub fn save_workflow_preset(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    workflow: serde_json::Value,
+) -> Result<(), String> {
+    let root = data_root(&state);
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let path = preset_file(&state);
+    let mut arr = read_preset_array(&path);
+    let entry = serde_json::json!({ "name": name, "workflow": workflow });
+    if let Some(ix) = arr.iter().position(|v| v.get("name").and_then(|n| n.as_str()) == Some(name.as_str())) {
+        arr[ix] = entry;
+    } else {
+        arr.push(entry);
+    }
+    let out = serde_json::to_string_pretty(&arr).map_err(|e| e.to_string())?;
+    std::fs::write(&path, out).map_err(|e| e.to_string())
+}
+
+/// 导出全部工作流预设到用户选定的 JSON 文件,返回导出的预设条数(规划 6-7)。
+#[tauri::command]
+pub fn export_workflow_presets(
+    state: State<'_, Arc<AppState>>,
+    dest: String,
+) -> Result<u32, String> {
+    let arr = read_preset_array(&preset_file(&state));
+    let out = serde_json::to_string_pretty(&arr).map_err(|e| e.to_string())?;
+    std::fs::write(&dest, out).map_err(|e| e.to_string())?;
+    Ok(arr.len() as u32)
+}
+
+/// 从用户选定的 JSON 文件导入工作流预设:同名覆盖、新名追加、残缺条目跳过,
+/// 返回实际导入的条数(规划 6-7)。
+#[tauri::command]
+pub fn import_workflow_presets(
+    state: State<'_, Arc<AppState>>,
+    src: String,
+) -> Result<u32, String> {
+    let raw = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
+    let incoming: Vec<serde_json::Value> =
+        serde_json::from_str(&raw).map_err(|e| format!("PRESET_PARSE: {e}"))?;
+    let root = data_root(&state);
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let path = preset_file(&state);
+    let mut arr = read_preset_array(&path);
+    let imported = merge_presets(&mut arr, incoming);
+    let out = serde_json::to_string_pretty(&arr).map_err(|e| e.to_string())?;
+    std::fs::write(&path, out).map_err(|e| e.to_string())?;
+    Ok(imported)
 }

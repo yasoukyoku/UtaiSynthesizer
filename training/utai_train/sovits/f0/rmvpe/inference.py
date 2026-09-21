@@ -1,12 +1,9 @@
 # Vendored verbatim from so-vits-svc 4.1-Stable (modules/F0Predictor/rmvpe/inference.py @ 730930d).
-# Changes vs upstream: package-relative imports only; S172 routes the network forward through
-# the MIOpen guard (see mel2hidden) — a no-op off ROCm, and on ROCm it is what keeps this lane
-# alive when the run-time kernel compiler cannot build MIOpen's BatchNorm/RNN kernels.
+# Changes vs upstream: package-relative imports only.
 import torch
 import torch.nn.functional as F
 from torchaudio.transforms import Resample
 
-from .... import miopen_guard
 from .constants import *  # noqa: F403
 from .model import E2E0
 from .spec import MelSpectrogram
@@ -34,13 +31,7 @@ class RMVPE:
         with torch.no_grad():
             n_frames = mel.shape[-1]
             mel = F.pad(mel, (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode='constant')
-            # S172 deviation: the WHOLE network forward goes through the MIOpen guard, not
-            # just the BiGRU inside it. This lane runs fp32 (sovits/extract.py passes
-            # dtype=torch.float32), and in fp32 torch hands BatchNorm to MIOpen too — so on a
-            # machine whose run-time kernel compiler has no C++ headers this dies in
-            # deepunet.py's `self.bn(x)`, BEFORE it ever reaches the RNN. Guarding only the
-            # RNN leaves this lane completely unprotected (measured: identical traceback).
-            hidden = miopen_guard.run(lambda: self.model(mel))
+            hidden = self.model(mel)
             return hidden[:, :n_frames]
 
     def decode(self, hidden, thred=0.03, use_viterbi=False):

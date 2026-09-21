@@ -1,4 +1,4 @@
-//! Drive the §F2⒝ pool migration against a REAL training project on disk.
+﻿//! Drive the §F2⒝ pool migration against a REAL training project on disk.
 //!
 //! ## Why an `#[ignore]`d integration test and not a unit test
 //!
@@ -26,7 +26,7 @@
 //! ```
 use std::path::Path;
 
-use utai_lib::training::{tpool, tproject};
+use muno_lib::training::{tpool, tproject};
 
 /// Print the layout contract as JSON. The verifier and the cross-language gate consume this so
 /// there is exactly ONE definition of "where does a pool live and what goes in it".

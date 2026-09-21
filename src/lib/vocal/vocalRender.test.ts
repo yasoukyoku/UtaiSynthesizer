@@ -610,7 +610,7 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // WIRING: the two tokens are actually IN the signature, with their current values. Robust against
   // unrelated additions to vocalParamsSig — it is not this test's job to notice those.
   it("carries the g2p + timing tokens", () => {
-    expect(vocalTrackSig(track, 120)).toContain("|g2p:s170|st:s97c");
+    expect(vocalTrackSig(track, 120)).toContain("|g2p:s113b|st:s97c");
     // s113b §C25: a sustain after `ん` holds the moraic nasal instead of re-opening the previous
     // vowel. Its own letter because s113 shipped one commit earlier — a bake stamped s113 has the
     // troncamento rung but NOT this. One note changes across the 180 real Japanese scores on disk.
@@ -630,7 +630,7 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
     // (s108 = the onset inventory stopping at word-initial attestation, 46031 word types;
     //  s107 = the French mute ⟨e⟩, which also carried S106's compound-seam round — that one had
     //  shipped without bumping. See the version log next to the constant.)
-    expect(G2P_ALGO_VERSION).toBe("s170");
+    expect(G2P_ALGO_VERSION).toBe("s113b");
     expect(SCORE_TIMING_VERSION).toBe("s97c"); // S97b: + phrase-final sonorant coda restore (render side, upstream level target)
   });
 
@@ -640,7 +640,7 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // move together); that failure mode has no cheap test, only the review checklist.
   it("has exactly this shape — a change here invalidates every stored bake", () => {
     expect(vocalTrackSig(track, 120)).toBe(
-      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:1|vm:V|bpm:120|rr:|g2p:s170|st:s97c|dict:d0",
+      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:1|vm:V|bpm:120|rr:|g2p:s113b|st:s97c|dict:d0",
     );
   });
 
@@ -748,7 +748,9 @@ describe("vocalRenderOptions — every per-track knob must actually reach the wi
     expect({ ...o, sovits: "…", rvc: "…" }).toEqual({
       backend: "sovits", cv_speaker_id: 49, lang_id: 2, transpose: 0,
       range_extend: true, consonant_emphasis_db: 2.5, consonant_valley: 1,
-      vowel_clarity: true, consonant_preroll: true, phoneme_set: null, es_dialect: null,
+      vowel_clarity: true, consonant_preroll: true,
+      voice_realism_mix: 0, formant_jitter_depth: 0, breath_layer: true,
+      phoneme_set: null, es_dialect: null,
       sovits: "…", rvc: "…",
     });
   });
@@ -763,6 +765,10 @@ describe("vocalRenderOptions — every per-track knob must actually reach the wi
       [{ consonantValley: 0 }, "consonant_valley", 0],
       [{ vowelClarity: false }, "vowel_clarity", false],
       [{ consonantPreroll: false }, "consonant_preroll", false],
+      // Phase 7 ①②:UI 存百分数,线上是 /100 后的小数(一律测非默认侧,同上 ⛔)。
+      [{ voiceRealism: 5 }, "voice_realism_mix", 0.05],
+      [{ formantJitter: 4 }, "formant_jitter_depth", 0.04],
+      [{ breathLayer: false }, "breath_layer", false],
       [{ phonemeSet: "vccv" }, "phoneme_set", "vccv"],
       [{ esDialect: "latam" }, "es_dialect", "latam"],
       [{ transpose: -3 }, "transpose", -3],

@@ -1,0 +1,104 @@
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { useEffect, useRef, useState } from "react";
+import { useAppStore } from "../../store/app";
+import i18n from "../../i18n";
+import "./ConfirmDialog.css";
+/**
+ * App-styled modal confirm dialog — replaces the native `ask()` popup (which looked out of place). Driven
+ * by the app-store `confirm` request (set via `showConfirm(...)`, which resolves with the chosen button
+ * id, or "" on Esc/backdrop dismiss). The keyboard is OWNED while open (capture + stopPropagation) so
+ * background shortcuts (Ctrl+S/Z/…) don't fire underneath. Enter triggers the `primary` button if there
+ * is one (never a `danger` button — destructive actions require an explicit click).
+ *
+ * CHECKBOX mode (`confirm.check` set, S87 — the import / MIDI-extract grid-rounding option): one option row
+ * renders between body and buttons. Its value is reported through `check.onChange` (the caller keeps it in
+ * its own variable); the promise still resolves the BUTTON id, so the Promise<string> contract is unchanged.
+ *
+ * TEXT-INPUT mode (`confirm.input` set, e.g. the "new group" prompt): an input renders between body and
+ * buttons; the primary button / Enter resolves with the TRIMMED VALUE instead of the button id, blocked
+ * (with an inline error) while empty or `input.invalid(value)` returns a message. Typing still works
+ * despite the capture-phase stopPropagation — text insertion is a browser DEFAULT ACTION (only
+ * preventDefault would block it), and the controlled value updates via the `input` event.
+ */
+export function ConfirmDialog() {
+    const confirm = useAppStore((s) => s.confirm);
+    const [value, setValue] = useState("");
+    const [error, setError] = useState(null);
+    const [checked, setChecked] = useState(false);
+    const inputRef = useRef(null);
+    // Fresh input state per dialog (seq bumps on every showConfirm). The S87 checkbox MUST join this reset —
+    // otherwise a second dialog opened while one is up (showConfirm settles the first) inherits stale state.
+    useEffect(() => {
+        setValue(confirm?.input?.initial ?? "");
+        setChecked(confirm?.check?.initial ?? false);
+        setError(null);
+    }, [confirm?.seq, confirm?.input?.initial, confirm?.check?.initial]);
+    // Attempt to commit the input value via the primary action; returns the resolution or null if blocked.
+    const commitInput = () => {
+        if (!confirm?.input)
+            return null;
+        const v = value.trim();
+        const err = v === "" ? "" : confirm.input.invalid?.(v) ?? null; // "" = silently blocked (empty)
+        if (v === "" || err !== null) {
+            setError(err || null);
+            inputRef.current?.focus();
+            return null;
+        }
+        return v;
+    };
+    const commitRef = useRef(commitInput);
+    commitRef.current = commitInput;
+    useEffect(() => {
+        if (!confirm)
+            return;
+        const onKey = (e) => {
+            e.stopPropagation(); // the dialog owns the keyboard while open
+            if (e.key === "Escape") {
+                e.preventDefault();
+                confirm.resolve("");
+            }
+            else if (e.key === "Enter") {
+                e.preventDefault();
+                const primary = confirm.buttons.find((b) => b.kind === "primary");
+                if (!primary)
+                    return;
+                if (confirm.input) {
+                    const v = commitRef.current();
+                    if (v !== null)
+                        confirm.resolve(v);
+                }
+                else {
+                    confirm.resolve(primary.id);
+                }
+            }
+        };
+        window.addEventListener("keydown", onKey, true); // capture: intercept before App's global handlers
+        return () => window.removeEventListener("keydown", onKey, true);
+    }, [confirm]);
+    if (!confirm)
+        return null;
+    return (_jsx("div", { className: "confirm-overlay", onMouseDown: () => confirm.resolve(""), children: _jsxs("div", { className: confirm.scrollable ? "confirm-dialog error-modal" : "confirm-dialog", role: "dialog", "aria-modal": "true", onMouseDown: (e) => e.stopPropagation(), children: [_jsx("div", { className: "confirm-title", children: confirm.title }), confirm.body && (_jsx("div", { className: confirm.scrollable ? "confirm-body scrollable selectable" : "confirm-body", children: confirm.body })), confirm.input && (_jsxs("div", { className: "confirm-input-row", children: [_jsx("input", { ref: inputRef, className: "confirm-input", type: "text", autoFocus: true, value: value, placeholder: confirm.input.placeholder, onChange: (e) => {
+                                setValue(e.target.value);
+                                setError(null);
+                            } }), error && _jsx("div", { className: "confirm-input-error", children: error })] })), confirm.check && (
+                // S87 option row (import / MIDI-extract grid rounding). The house checkbox style is the
+                // single-source `.training-check-row` (TrainingPage.css — "do not restyle per-site"), the same
+                // one ExportScoreDialog uses. The value is reported through onChange; the promise still
+                // resolves the BUTTON id, so `showConfirm`'s Promise<string> contract is untouched.
+                _jsxs("label", { className: "training-check-row confirm-check-row", children: [_jsx("input", { type: "checkbox", checked: checked, onChange: (e) => {
+                                setChecked(e.target.checked);
+                                confirm.check?.onChange(e.target.checked);
+                            } }), _jsx("span", { children: confirm.check.label })] })), _jsxs("div", { className: "confirm-buttons", children: [confirm.scrollable && (_jsx("button", { className: "confirm-btn", onClick: () => { void navigator.clipboard.writeText(confirm.body); }, children: i18n.t("common.copy") })), confirm.buttons.map((b) => (_jsx("button", { className: `confirm-btn ${b.kind ?? "neutral"}`, onClick: () => {
+                                if (confirm.input && b.kind === "primary") {
+                                    const v = commitRef.current();
+                                    if (v !== null)
+                                        confirm.resolve(v);
+                                }
+                                else if (confirm.input && b.kind !== "danger") {
+                                    confirm.resolve(""); // input mode: non-primary neutral buttons read as cancel
+                                }
+                                else {
+                                    confirm.resolve(b.id);
+                                }
+                            }, children: b.label }, b.id)))] })] }, confirm.seq) }));
+}

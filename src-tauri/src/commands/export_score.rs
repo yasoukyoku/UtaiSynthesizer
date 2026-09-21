@@ -369,7 +369,7 @@ fn export_ustx(path: &str, bpm: f64, time_sig: [u32; 2], tracks: &[ExportTrack])
         .map(|t| t.name.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "UtaiSynthesizer Export".to_string());
+        .unwrap_or_else(|| "Muno Export".to_string());
     let root = UstxOutRoot {
         name: project_name,
         ustx_version: "0.6".to_string(),

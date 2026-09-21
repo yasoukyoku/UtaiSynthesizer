@@ -1470,7 +1470,7 @@ pub(crate) fn write_model_package(
     let manifest = serde_json::json!({
         "format": PACKAGE_FORMAT,
         "version": 1,
-        "app": "UtaiSynthesizer",
+        "app": "Muno",
         "name": entry.name,
         "model_type": model_type_str,
         "stem": stem,

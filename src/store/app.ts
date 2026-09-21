@@ -1,5 +1,25 @@
 import { create } from "zustand";
 import { loadSetting, saveSetting } from "../lib/settings";
+import type { SongTaskId } from "../lib/models/song-tasks";
+import type { SongSource } from "../lib/song/types";
+
+/** 规划 13.2：全局"待启动歌曲任务"——DAW 右键发起，歌曲制作弹窗挂载时消费（带参打开）。 */
+export interface PendingSongTask {
+  task: SongTaskId;
+  source: SongSource;
+  sourceLabel?: string;
+  /** repaint 选区（源音频秒区间） */
+  range?: [number, number];
+  /** lego/extract 单轨种 */
+  trackClass?: string;
+  /** complete/extract 多选轨种 */
+  trackClasses?: string[];
+  presetPrompt?: string;
+  presetLyrics?: string;
+  /** 回流目标：任务完成后结果可"发送回原轨道位置" */
+  returnTarget?: { kind: "track"; trackId: string; segmentId?: string; align: boolean };
+  tool?: "multiTrack" | "creative" | "cover" | "midi";
+}
 
 interface SegmentSelection {
   trackId: string;
@@ -18,7 +38,7 @@ interface LaneSelection {
 
 interface ToastState {
   message: string;
-  type: "error" | "info" | "success";
+  type: "error" | "info" | "success" | "warning";
   id: number;
 }
 
@@ -75,9 +95,36 @@ export interface MissingModelItem {
   architecture?: string;
 }
 
+export interface AmtResult {
+  trackId: string;
+  outputDir: string;
+  midiPaths: string[];
+  audioPreview?: string;
+  originalAudio?: string;
+  /** The raw source audio the conversion ran on — lets the result panel lazily
+   *  re-run FluidSynth playback prep when audioPreview/originalAudio are empty. */
+  sourceAudioPath?: string;
+  /** 人声分离出的干音 WAV（vocal_split / six_stem 模式）—— 自动歌词提取最准的源。 */
+  vocalAudioPath?: string;
+  stems?: Record<string, { midi: string; audio?: string }>;
+  /** True for separation-only results (vocal/six-stem): audio stems, no MIDI yet. */
+  separationOnly?: boolean;
+}
+
 interface AppState {
+  /** "dark" | "light" — 全局主题, 持久化到 localStorage, 首帧前注入防 FOUC */
+  theme: "dark" | "light";
+  setTheme: (t: "dark" | "light") => void;
   trainingPageOpen: boolean;
   modelManagerOpen: boolean;
+  /** Muno 音源管理器(阶段1)是否打开——SoundfontManager 弹窗的宿主开关。 */
+  soundfontManagerOpen: boolean;
+  /** Song Studio (歌曲制作)主面板开关。 */
+  songStudioOpen: boolean;
+  /** 规划 13.2：待启动歌曲任务（DAW 右键 → 歌曲弹窗带参打开），弹窗消费即清。 */
+  pendingSongTask: PendingSongTask | null;
+  setPendingSongTask: (p: PendingSongTask) => void;
+  clearPendingSongTask: () => void;
   logViewerOpen: boolean;
   settingsOpen: boolean;
   toggleSettings: () => void;
@@ -93,17 +140,33 @@ interface AppState {
    *  exclusive with workflowSegmentId — the bottom dock shows one editor at a time (a segment is either a
    *  notes part or an audioClip). Mirrors workflowSegmentId (§9.6). */
   vocalSegmentId: string | null;
+  /** AMT conversion result to show in the bottom panel. */
+  amtResult: AmtResult | null;
   /** A requested Output-group DETACH ("ungroup") waiting for that segment's workflow editor to perform
    *  it — the editor is the ONE code path (its graph state + local undo own the op); a timeline
    *  right-click first opens the editor, then this hands the request over. Consumed on mount/change. */
   pendingLaneDetach: { segmentId: string; outputNodeId: string } | null;
+  /** 超级原创向导：新导入片段的「挂载即自动执行」请求。一键向导建轨→写模板工作流→openWorkflow
+   *  后置此标志；WorkflowEditor 挂载时消费并触发 handleExecute（复用全部 preflight/进度/取消
+   *  逻辑），避免向导旁路执行引擎。一次性，消费即清。 */
+  workflowAutoRun: string | null;
+  clearWorkflowAutoRun: () => void;
   /** Which pane owns Ctrl+Z and the Delete/Ctrl+K edit keys: the track timeline, the bottom-docked
-   *  workflow editor, or the bottom-docked vocal (piano-roll) editor. Set on pointer/focus into each pane. */
-  activePane: "timeline" | "workflow" | "vocal";
+   *  workflow editor, the bottom-docked vocal (piano-roll) editor, or the AMT result panel. Set on
+   *  pointer/focus into each pane. */
+  activePane: "timeline" | "workflow" | "vocal" | "amt";
+  /** Right-side track-inspector drawer: which track's properties are shown (null = closed).
+   *  Studio Pro-style "click the icon → side panel pops out" UX. */
+  inspectorTrackId: string | null;
+  openInspector: (trackId: string) => void;
+  closeInspector: () => void;
+  toggleInspector: (trackId: string) => void;
   /** Height (px) of the bottom workflow panel when open; persisted across sessions. */
   workflowPanelHeight: number;
   /** ② Height (px) of the bottom vocal-editor panel when open; persisted (own value, §9.0). */
   vocalPanelHeight: number;
+  /** Height (px) of the AMT result panel. */
+  amtPanelHeight: number;
   zoom: number;
   /** Vertical zoom — scales track display height (header + lanes). */
   vZoom: number;
@@ -198,9 +261,21 @@ interface AppState {
   /** S66 pre-run model check: unconverted/missing models found by the workflow/vocal preflight,
    *  shown by MissingModelsDialog with per-item one-click actions. null = closed. */
   missingModels: MissingModelItem[] | null;
+  /** Track ID for the AMT (Audio-to-MIDI) conversion dialog. null = closed. */
+  amtConversionTrackId: string | null;
+  /** Segment ID for the AMT (Audio-to-MIDI) conversion dialog. null = not specified. */
+  amtConversionSegmentId: string | null;
+  /** Forced source audio path + track/segment name captured AT right-click time (as a hard
+   *  guarantee the "音乐转MIDI" dialog always shows the source + playable waveform). */
+  amtSourceAudioPath: string | null;
+  amtSourceTrackName: string | null;
 
   toggleTrainingPage: () => void;
   toggleModelManager: () => void;
+  /** Muno 音源管理器(阶段1):打开/关闭音源管理弹窗。 */
+  toggleSoundfontManager: () => void;
+  /** Song Studio (歌曲制作)主面板:打开/关闭。 */
+  toggleSongStudio: () => void;
   toggleLogViewer: () => void;
   setActiveTrack: (id: string | null) => void;
   selectSegment: (trackId: string, segmentId: string) => void;
@@ -215,13 +290,19 @@ interface AppState {
   /** ② Open the vocal (piano-roll) editor on a notes segment; closes any open workflow editor (§9.6). */
   openVocalEditor: (segmentId: string) => void;
   closeVocalEditor: () => void;
+  openAmtResult: (result: AmtResult) => void;
+  closeAmtResult: () => void;
   requestLaneDetach: (segmentId: string, outputNodeId: string) => void;
   clearLaneDetach: () => void;
-  setActivePane: (pane: "timeline" | "workflow" | "vocal") => void;
+  setActivePane: (pane: "timeline" | "workflow" | "vocal" | "amt") => void;
   setWorkflowPanelHeight: (h: number) => void;
   setVocalPanelHeight: (h: number) => void;
+  setAmtPanelHeight: (h: number) => void;
   setZoom: (zoom: number) => void;
   setVZoom: (vZoom: number) => void;
+  /** 轨头列宽(px) — DawView 里轨头列与排列画布之间的竖向分隔条可拖拽调整,持久化。 */
+  trackHeaderWidth: number;
+  setTrackHeaderWidth: (w: number) => void;
   setScroll: (x: number, y: number) => void;
   setCanvasWidth: (w: number) => void;
   setCanvasHeight: (h: number) => void;
@@ -229,8 +310,14 @@ interface AppState {
   toggleSnapSegments: () => void;
   toggleSnapPlayhead: () => void;
   toggleSnapNotes: () => void;
+  /** ③ B8: 吸附步长（栅格量化步进，单位 ticks）。0 = 关闭栅格吸附（仅保留片段边缘/播放头磁吸）。 */
+  snapGridStep: number;
+  setSnapGridStep: (v: number) => void;
   setVocalRenderActive: (v: boolean) => void;
   setRenderingVocalTrackId: (id: string | null) => void;
+  /** 内置皮肤 id（对应 theme.css 的 [data-skin="…"]）。"junzi" = 君子·紫（品牌默认）。持久化于 utai.skin。 */
+  skin: string;
+  setSkin: (skin: string) => void;
   /** ② S58: publish one segment's OOV verdict (null = clear the entry). No-op-guarded (identical
    *  verdicts don't re-render subscribers). Written ONLY by the oovWatch validation watcher. */
   setVocalOov: (segmentId: string, noteIds: string[] | null) => void;
@@ -249,8 +336,12 @@ interface AppState {
   closeUpdateDialog: () => void;
   openMissingModels: (items: MissingModelItem[]) => void;
   closeMissingModels: () => void;
+  openAmtConversion: (trackId: string, segmentId?: string) => void;
+  closeAmtConversion: () => void;
+  /** Cache the resolved source (name + audio path) so the dialog shows it reliably. */
+  setAmtSource: (audioPath: string | null, trackName: string | null) => void;
   setUpdateBusy: (v: boolean) => void;
-  showToast: (message: string, type?: "error" | "info" | "success") => void;
+  showToast: (message: string, type?: "error" | "info" | "success" | "warning") => void;
   dismissToast: (id: number) => void;
   showBanner: (message: string, kind: BannerKind) => void;
   /** Show a styled confirm dialog; resolves with the chosen button id, or "" if dismissed (Esc/backdrop).
@@ -281,8 +372,16 @@ function verdictMapUpdate(
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
+  theme: (typeof localStorage !== "undefined" && localStorage.getItem("utai.theme") === "light") ? "light" : "dark",
+  setTheme: (t) => {
+    if (typeof document !== "undefined") document.documentElement.setAttribute("data-theme", t);
+    if (typeof localStorage !== "undefined") localStorage.setItem("utai.theme", t);
+    set({ theme: t });
+  },
   trainingPageOpen: false,
   modelManagerOpen: false,
+  soundfontManagerOpen: false,
+  songStudioOpen: false,
   logViewerOpen: false,
   settingsOpen: false,
   activeTrackId: null,
@@ -291,12 +390,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedLane: null,
   workflowSegmentId: null,
   vocalSegmentId: null,
+  amtResult: null,
   pendingLaneDetach: null,
+  workflowAutoRun: null,
   activePane: "timeline",
+  inspectorTrackId: null,
   workflowPanelHeight: loadSetting("utai.workflowPanelHeight", 460),
   vocalPanelHeight: loadSetting("utai.vocalPanelHeight", 460),
+  amtPanelHeight: loadSetting("utai.amtPanelHeight", 460),
   zoom: 1.0,
   vZoom: 1.0,
+  trackHeaderWidth: loadSetting("utai.trackHeaderWidth", 220),
   scrollX: 0,
   scrollY: 0,
   canvasWidth: 800,
@@ -305,8 +409,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   snapSegments: loadSetting("utai.snapSegments", true),
   snapPlayhead: loadSetting("utai.snapPlayhead", true),
   snapNotes: loadSetting("utai.snapNotes", true),
+  snapGridStep: loadSetting("utai.snapGridStep", 120),
   vocalRenderActive: false,
   renderingVocalTrackId: null,
+  skin: loadSetting("utai.skin", "junzi"),
   vocalOov: {},
   vocalUnknownPhone: {},
   vocalDropped: {},
@@ -318,12 +424,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   confirm: null,
   updateDialog: null,
   missingModels: null,
+  amtConversionTrackId: null,
+  amtConversionSegmentId: null,
+  amtSourceAudioPath: null,
+  amtSourceTrackName: null,
   updateBusy: false,
 
   toggleTrainingPage: () =>
     set((s) => ({ trainingPageOpen: !s.trainingPageOpen })),
   toggleModelManager: () =>
     set((s) => ({ modelManagerOpen: !s.modelManagerOpen })),
+  toggleSoundfontManager: () =>
+    set((s) => ({ soundfontManagerOpen: !s.soundfontManagerOpen })),
+  toggleSongStudio: () =>
+    set((s) => ({ songStudioOpen: !s.songStudioOpen })),
+  pendingSongTask: null,
+  setPendingSongTask: (p) => set({ pendingSongTask: p }),
+  clearPendingSongTask: () => set({ pendingSongTask: null }),
   toggleLogViewer: () =>
     set((s) => ({ logViewerOpen: !s.logViewerOpen })),
   toggleSettings: () =>
@@ -374,13 +491,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   closeWorkflow: () => set({ workflowSegmentId: null, activePane: "timeline" }),
   openVocalEditor: (segmentId) => set({ vocalSegmentId: segmentId, workflowSegmentId: null, activePane: "vocal" }),
   closeVocalEditor: () => set({ vocalSegmentId: null, activePane: "timeline" }),
+  openAmtResult: (result) => set({ amtResult: result, workflowSegmentId: null, vocalSegmentId: null, activePane: "amt" }),
+  closeAmtResult: () => set({ amtResult: null, activePane: "timeline" }),
   requestLaneDetach: (segmentId, outputNodeId) => set({ pendingLaneDetach: { segmentId, outputNodeId } }),
   clearLaneDetach: () => set({ pendingLaneDetach: null }),
+  clearWorkflowAutoRun: () => set({ workflowAutoRun: null }),
   setActivePane: (pane) => set((s) => (s.activePane === pane ? s : { activePane: pane })),
+  openInspector: (trackId) => set({ inspectorTrackId: trackId }),
+  closeInspector: () => set({ inspectorTrackId: null }),
+  toggleInspector: (trackId) =>
+    set((s) => ({ inspectorTrackId: s.inspectorTrackId === trackId ? null : trackId })),
   setWorkflowPanelHeight: (h) => set({ workflowPanelHeight: h }),
   setVocalPanelHeight: (h) => set({ vocalPanelHeight: h }),
+  setAmtPanelHeight: (h) => set({ amtPanelHeight: h }),
   setZoom: (zoom) => set({ zoom: Math.max(0.1, Math.min(10, zoom)) }),
   setVZoom: (vZoom) => set({ vZoom: Math.max(0.6, Math.min(3, vZoom)) }),
+  // 拖拽结束时才 saveSetting(拖动过程中每帧 set,不写 localStorage —— 与面板高度 resize 的纪律一致)
+  setTrackHeaderWidth: (w) => set({ trackHeaderWidth: Math.max(140, Math.min(420, Math.round(w))) }),
   setScroll: (x, y) => set({ scrollX: x, scrollY: y }),
   setCanvasWidth: (w) => set({ canvasWidth: w }),
   setCanvasHeight: (h) => set({ canvasHeight: h }),
@@ -403,8 +530,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       saveSetting("utai.snapNotes", v);
       return { snapNotes: v };
     }),
+  setSnapGridStep: (v) => {
+    saveSetting("utai.snapGridStep", v);
+    set({ snapGridStep: v });
+  },
   setVocalRenderActive: (v) => set({ vocalRenderActive: v }),
   setRenderingVocalTrackId: (id) => set({ renderingVocalTrackId: id }),
+  setSkin: (skin) => {
+    saveSetting("utai.skin", skin);
+    // 同步写 DOM:画布类组件(排列/钢琴等)在 useEffect 里同步重绘并读取 --bg-base 等 CSS 变量,
+    // 而 React 的 effect 是子组件先于父组件执行 —— 若仅靠 App.tsx 的 useEffect 改 data-skin,
+    // 画布烘焙时读到的仍是旧皮肤变量,且 staticKey 已写入新 skin id,之后永不再重烘焙
+    // (画布背景滞后一个皮肤的根因)。在 store 动作里同步更新属性,保证任何 effect 执行前
+    // CSS 变量已是新值。App.tsx 的 effect 保留,负责首挂载时应用持久化的皮肤。
+    document.documentElement.dataset.skin = skin;
+    set({ skin });
+  },
   setVocalOov: (segmentId, noteIds) =>
     set((s) => {
       const next = verdictMapUpdate(s.vocalOov, segmentId, noteIds);
@@ -445,15 +586,20 @@ export const useAppStore = create<AppState>((set, get) => ({
   closeUpdateDialog: () => set({ updateDialog: null }),
   openMissingModels: (items) => set({ missingModels: items }),
   closeMissingModels: () => set({ missingModels: null }),
+  openAmtConversion: (trackId, segmentId) => set({ amtConversionTrackId: trackId, amtConversionSegmentId: segmentId ?? null }),
+  closeAmtConversion: () => set({ amtConversionTrackId: null, amtConversionSegmentId: null, amtSourceAudioPath: null, amtSourceTrackName: null }),
+  setAmtSource: (audioPath, trackName) => set({ amtSourceAudioPath: audioPath, amtSourceTrackName: trackName }),
   setUpdateBusy: (v) => set({ updateBusy: v }),
   showToast: (message, type = "error") => {
     // monotonic id — Date.now() collides when two toasts fire in the same millisecond (e.g. the
     // auto-render batch reporting several failures back-to-back), making the first timeout dismiss both.
     const id = ++toastSeq;
     set((s) => ({ toasts: [...s.toasts, { message, type, id }] }));
+    // 按类型差异化时长: error 8s (看清错误), warning 6s, info/success 4s
+    const duration = type === "error" ? 8000 : type === "warning" ? 6000 : 4000;
     setTimeout(() => {
       set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
-    }, 5000);
+    }, duration);
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
   showBanner: (message, kind) =>

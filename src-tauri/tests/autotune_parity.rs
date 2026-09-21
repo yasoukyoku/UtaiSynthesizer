@@ -1,4 +1,4 @@
-//! ② 自动音高调教 parity gate(S73)——Rust 特征构造 + ONNX θ 对拍 SVC2SVS Python 真值。
+﻿//! ② 自动音高调教 parity gate(S73)——Rust 特征构造 + ONNX θ 对拍 SVC2SVS Python 真值。
 //!
 //! 夹具 = tests/fixtures/autotune_parity.json,由 SVC2SVS `pitch/export_onnx.py` 生成
 //! (E1 verse/chorus 实谱 + 合成 snap 边界序列;期望值 = python build_note_arrays/
@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use utai_lib::inference::autotune::{self, NoteIn};
+use muno_lib::inference::autotune::{self, NoteIn};
 
 fn app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
@@ -103,18 +103,18 @@ fn theta_parity_onnx() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("muno_lib=warn")),
         )
         .try_init();
-    utai_lib::suppress_windows_dll_error_dialogs();
-    utai_lib::init_ort_runtime(&app_root());
+    muno_lib::suppress_windows_dll_error_dialogs();
+    muno_lib::init_ort_runtime(&app_root());
 
     let fx = load_fixture();
     let model_path = app_root().join("data").join("models").join("auxiliary").join(&fx.model);
     assert!(model_path.exists(), "缺 {model_path:?}(pitch/export_onnx.py 产物拷入 auxiliary)");
-    let engine = utai_lib::inference::engine::OnnxEngine::new();
+    let engine = muno_lib::inference::engine::OnnxEngine::new();
     let sid = engine
-        .load_model_on(&model_path, false, utai_lib::inference::engine::DeviceConfig::Cpu)
+        .load_model_on(&model_path, false, muno_lib::inference::engine::DeviceConfig::Cpu)
         .expect("load autotune onnx");
 
     let mut worst = 0.0f64;

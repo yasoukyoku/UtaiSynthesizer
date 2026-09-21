@@ -1,21 +1,20 @@
-# UtaiSynthesizer
+# MunoAI
 
 [English](README.md) | [简体中文](README.zh-CN.md) | **日本語**
 
-[![Release](https://img.shields.io/github/v/release/yasoukyoku/UtaiSynthesizer)](https://github.com/yasoukyoku/UtaiSynthesizer/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-informational)
-[![QQ グループ](https://img.shields.io/badge/QQ-1058227212-1EBAFC)](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2)](https://discord.com/invite/p3fGh942fJ)
-[![Website](https://img.shields.io/badge/Website-utaisynthesizer.net-2B6D51?labelColor=202321)](https://utaisynthesizer.net)
 
-Windows 向けの歌声合成 DAW。ピアノロールに書いた譜面を **SVC ボイスモデルが直接歌います**
+**MunoAI(造乐之地 — 「音楽創造の地」)** は Windows 向けのオールインワン AI 音楽
+ワークステーションです:歌声合成 DAW、ローカル AI ソングスタジオ、マスタリングを
+1 つのアプリに統合。ピアノロールに書いた譜面を **SVC ボイスモデルが直接歌います**
 (譜面 → [Score2ConVec](https://github.com/yasoukyoku/Score2ConVec) → SVC デコード。
 ガイドとなる人間の歌声は不要)。クリップごとのノードワークフローで AI カバーを
-レンダリングし、ボーカル抽出もネイティブ実装、自分のボイスモデルのオンデバイス学習まで
-——すべてを 1 つのアプリで。推論時に Python は一切不要です。
+レンダリングし、ボーカル抽出もネイティブ実装、**オンデバイスで曲を丸ごと生成**し、
+ミックス後のマスタリングもそのまま。自分のボイスモデルの学習まで——すべてローカルで。
+推論時に Python は一切不要です。
 
-![UtaiSynthesizer——アレンジビュー](docs/images/overview-arrangement.png)
+![MunoAI——アレンジビュー](docs/images/overview-arrangement.png)
 
 ## 機能
 
@@ -29,9 +28,18 @@ Windows 向けの歌声合成 DAW。ピアノロールに書いた譜面を **SV
   すべて Rust でネイティブ再実装)→ RVC / So-VITS-SVC 4.0・4.1 の声変換
   (浅い拡散、NSF-HiFiGAN エンハンサー/ボコーダー、複数話者ブレンド)→
   スペクトル移調 → 非破壊のサブレーンとしてトラックへ配置。
+- **ソングスタジオ(歌曲制作)**——曲の丸ごと生成をローカルで完結:内蔵 **GGUF 大規模
+  言語モデルエンジン**(Yue2 ほか GGUF モデル、アプリ内ダウンロード)が歌詞・創作を
+  アシストし、ローカル音楽生成モデル(ACE-Step / HeartMuLa 系)が曲全体をレンダリング。
+  クラウド API は一切不要。
 - **オンデバイス学習**——RVC、SoVITS 4.1/4.0/4.0-v2、浅い拡散、ボコーダー微調整。**データセット・
   複数話者構成・アーカイブをプロジェクト単位で管理**。組み込みポータブル Python ランタイム(NVIDIA / AMD / Intel / CPU の 4 種、アプリ内
   ダウンロード)で動作。CUDA ランタイムは完全自己完結——**CUDA Toolkit 不要**。
+- **マスタリング&ラウドネススイート**——トゥルーピーク / ラウドネス計測(LUFS)、
+  クリップ検出、DC オフセット除去、ステレオ幅・位相相関メーター、そして
+  バス EQ・サチュレーション・ディザリングを備えたマスタリングチェーン。
+- **SoundFont / MIDI 合成**——FluidSynth ベースの **SF2 / SFZ** 音源再生で
+  楽器トラックや伴奏を鳴らし、歌声→MIDI 書き起こし(GAME エンジン)にも対応。
 - **DAW の基本**——マルチトラックタイムライン、スマート配置つきドラッグ&ドロップ
   読み込み、クロスフェード、クリップ/トラックのクリップボード、BPM・拍グリッド検出、
   ピッチ保持タイムストレッチ(Signalsmith)、ラウドネスエンベロープ、ミニマップ、
@@ -39,15 +47,15 @@ Windows 向けの歌声合成 DAW。ピアノロールに書いた譜面を **SV
 - **音域ツール**——ボイスモデルの自動音域テスト、快適音域の微調整、オプトインの
   音域拡張(音域外のフレーズをモデルの快適音域内で合成し、Signalsmith エンジンで
   元のキーへ戻します)。
-- **歌声→MIDI**——分離したボーカルのサブレーンを編集可能なノートに書き起こし
-  (GAME エンジン)。
+- **コンプライアンスガード**——書き出し前に、権利侵害の可能性がある・ラベル不備の
+  AI 生成コンテンツを検出して警告。公開するものを常にコントロールできます。
 - 書き出し:オーディオ(wav / flac / mp3 / ogg / opus / m4a、再生と完全一致の
   オフラインミックスダウン)、譜面(ust / ustx / midi)、**ボイスモデルパッケージ(.zip、別マシンへ
   移して無損で再取り込み)**。読み込み:ustx / ust / midi、9 種のオーディオ形式、モデルパッケージ。
 - 3 言語 UI(简体中文 / English / 日本語)、sha256 検証つきダウンロードとミラー設定、
   minisign 署名つき自動アップデート。
 
-**アプリを使いたいだけの方へ**:[Releases](https://github.com/yasoukyoku/UtaiSynthesizer/releases)
+**アプリを使いたいだけの方へ**:[Releases](https://github.com/junziai/munoai/releases)
 からインストーラをダウンロードし、**[ユーザーガイド](docs/user-guide.ja.md)** をどうぞ。
 開発環境は不要です。インストール先フォルダは丸ごとコピーすればポータブル版として
 動きます(データもフォルダに付いて移動します)。
@@ -66,140 +74,132 @@ Windows 向けの歌声合成 DAW。ピアノロールに書いた譜面を **SV
 | Node.js | 18+(20 LTS 推奨) | npm 7+(lockfile v3) |
 | Rust | 1.77+ stable、**MSVC** ツールチェーン | `rustup default stable-x86_64-pc-windows-msvc` |
 
-C++ タイムストレッチは `cc` crate + MSVC でビルドされ、libclang/bindgen は不要です。
+C++ タイムストレッチクレートは `cc` クレート経由で MSVC ビルドします。libclang/bindgen は不要です。
 
-### 新規 clone に無い資産
+### 新規 clone で不足しているアセット
 
 | パス | 内容 | 入手先 |
 | --- | --- | --- |
-| `bin/ffmpeg.exe` | デコードのフォールバック + wav 以外の全書き出しエンコード | [gyan.dev "essentials"](https://www.gyan.dev/ffmpeg/builds/) GPL ビルド(ミラー:[GyanD/codexffmpeg](https://github.com/GyanD/codexffmpeg/releases))。`libmp3lame/libvorbis/libopus/aac/flac` エンコーダ必須 |
-| `runtime/ort/*.dll` | ONNX Runtime **1.24.4 DirectML ビルド**(`onnxruntime.dll`、`onnxruntime_providers_shared.dll`、`DirectML.dll`) | NuGet [Microsoft.ML.OnnxRuntime.DirectML 1.24.4](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.DirectML/1.24.4)(+ DirectML 再頒布 DLL)。`ort` crate の API レベルと一致必須——不一致は初期化デッドロック |
-| `data/dictionaries/*.tsv` | 中/英/独/仏/西/伊歌詞用 G2P 辞書(8 ファイル) | 現状はリリース版をインストールし、その `data\dictionaries` をコピーするのが最短(ソースからのビルドスクリプトは既知の未整備) |
-| `data/models/` | ボイス/分離/補助モデル | アプリ内ダウンロード(設定 → モデルアセット、リソース管理) |
-| `converter/.venv` | `.pth` ボイスモデル取り込み用 Python 環境 | 任意——アプリ内「CPU ランタイム」パック(設定 → トレーニング環境)で代替可 |
+| `bin/ffmpeg.exe` | デコードフォールバック + 非 wav 書き出しの全エンコード | [gyan.dev "essentials"](https://www.gyan.dev/ffmpeg/builds/) GPL ビルド(ミラー:[GyanD/codexffmpeg](https://github.com/GyanD/codexffmpeg/releases));`libmp3lame/libvorbis/libopus/aac/flac` エンコーダ必須 |
+| `runtime/ort/*.dll` | ONNX Runtime **1.24.4 DirectML ビルド**(`onnxruntime.dll`、`onnxruntime_providers_shared.dll`、`DirectML.dll`) | NuGet の [Microsoft.ML.OnnxRuntime.DirectML 1.24.4](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.DirectML/1.24.4)(DirectML 再配布 DLL 付き)。`ort` クレートの API レベルと一致必須——不一致は初期化時にデッドロック |
+| `data/dictionaries/*.tsv` | 中/英/独/仏/西/伊の G2P 辞書(8 ファイル) | 現状最も簡単:release ビルドを入れて `data\dictionaries` をコピー(ソースビルド用スクリプトは既知のギャップ) |
+| `data/models/` | 声/分離/補助/曲生成モデル | アプリ内ダウンロード(設定 → モデルアセット、リソースマネージャー) |
+| `converter/.venv` | `.pth` ボイスモデル取込用の Python 環境 | 任意——アプリ内「CPU ランタイム」パック(設定 → 学習ランタイム)で代替可 |
 
-それ以外(アイコン、インストーラ画像、vendored C++/Python)はリポジトリに含まれます。
+それ以外(アイコン、インストーラ用アート、vendored C++/Python)はリポジトリに含まれます。
 
 ### 実行 / テスト / ビルド
 
 ```powershell
 npm install
-npm run tauri dev      # 実ウィンドウでフル起動(Vite :1420 + Rust バックエンド)
+npm run tauri dev      # 実ウィンドウでアプリ全体(Vite :1420 + Rust バックエンド)
 
-npm run build          # フロントエンドゲート:tsc -b && vite build
+npm run build          # フロントエンド gate: tsc -b && vite build
 npm test               # vitest スイート
 cd src-tauri; cargo test --workspace   # Rust スイート(重い E2E は #[ignore])
 
-pwsh -File scripts/release.ps1          # ゲートつき署名インストーラビルド(下記参照)
+pwsh -File scripts/release.ps1          # ゲート付き署名インストーラビルド(下記)
 pwsh -File scripts/verify-install.ps1   # インストール済みツリーの 39 項目監査
 ```
 
-補足:
+注意:
 
-- debug ビルドはデータルートをリポジトリ直下(`<repo>/data`)に固定するため、開発データが
-  インストール版と混ざることはありません。
-- `scripts/release.ps1` は 3 箇所のバージョン一致(`package.json` / `Cargo.toml` /
-  `tauri.conf.json`)、厳格 semver、全ゲート(tsc / vitest / cargo test)、minisign
-  署名を強制します。署名鍵はリポジトリに**ありません**——fork は `npm run tauri build`
-  で未署名のローカルバンドルをビルドできますが、既存インストールへの更新配信は
-  できません。
-- 開発時の落とし穴やサブシステム設計メモは該当モジュール付近のコードコメントに
-  あります——レンダリングライフサイクル、undo、ORT セッション周りを触る前に一読を。
+- debug ビルドはデータルートをリポジトリ(`<repo>/data`)に固定するため、開発データが
+  インストール版と混ざりません。
+- `scripts/release.ps1` は `package.json` / `Cargo.toml` / `tauri.conf.json` の
+  バージョン同期、厳密 semver、全 gate(tsc / vitest / cargo test)、minisign 更新署名を
+  強制します。署名キーは**リポジトリにありません**——fork は `npm run tauri build` で
+  未署名のローカルバンドルを作れますが、既存インストールへの更新配信はできません。
+- 開発ループの落とし穴・サブシステム設計メモ・検証プレイブックは各モジュール近くの
+  コードコメントにあります。レンダーライフサイクル、undo、ORT session を触る前に読んでください。
 
 ## アーキテクチャ
 
-| レイヤ | 技術 |
+| 層 | 技術 |
 | --- | --- |
 | シェル | Tauri 2 + システム WebView2(ブラウザ同梱なし) |
 | フロントエンド | React 19 + TypeScript + zustand + Canvas 2D(ピアノロール/アレンジは React 外キャンバス)、ノードエディタは @xyflow/react |
-| バックエンド | 単一 Rust プロセス;DSP・推論はすべてプロセス内 |
-| 推論 | `ort`(load-dynamic)経由の ONNX Runtime:標準同梱は **DirectML**、任意でアプリ内ダウンロードの自己完結 **CUDA** ランタイム、CPU フォールバック |
-| 学習 | vendored した学習コード移植(RVC / so-vits-svc / SingingVocoders)を組み込みポータブル Python ランタイムパックで実行 |
+| バックエンド | 単一 Rust プロセス;すべての DSP と推論をプロセス内で実行 |
+| 推論 | `ort`(load-dynamic)駆動の ONNX Runtime:既定で **DirectML**、任意でアプリ内ダウンロードの自己完結 **CUDA** ランタイム、CPU フォールバック |
+| 曲生成 | ローカル GGUF LLM エンジン(Yue2)による歌詞・アシスト + ACE-Step / HeartMuLa 音楽モデルによる全体レンダリング |
+| 音源 | FluidSynth(FFI)による SF2 / SFZ 楽器再生 |
+| 学習 | vendored 学習移植(RVC / so-vits-svc / SingingVocoders)を組み込みポータブル Python ランタイムパック上で実行 |
 
 **歌声合成チェーン**(ピアノロール経路):
 
 ```
 譜面(ノート + 歌詞)
-  → Rust 二段 G2P            (言語別辞書 → 共有 IPA 音素表)
-  → Score2ConVec(ONNX)      (音素 + パラメトリック f0 → ContentVec 空間のコンテンツベクトル)
-  → SVC デコード(ONNX)      (SoVITS 4.0/4.1 または RVC net_g;任意で浅い拡散 + NSF-HiFiGAN)
+  → Rust 2 段階 G2P          (言語別辞書 → 共通 IPA 音素ボキャブラリ)
+  → Score2ConVec(ONNX)    (音素 + パラメータ化 f0 → ContentVec 空間のコンテンツベクトル)
+  → SVC デコード(ONNX)     (SoVITS 4.0/4.1 または RVC net_g;任意で浅い拡散 + NSF-HiFiGAN)
   → トラック上のオーディオ
 ```
 
-[**Score2ConVec**](https://github.com/yasoukyoku/Score2ConVec) は、この仕組みを可能にする
-「譜面→コンテンツベクトル」モデルです。シンボリックな譜面を SVC モデルが消費する
-ContentVec 特徴空間へ直接写像するため、ごく普通の SVC ボイスモデルが人間のガイドなしで
-*譜面どおりに歌えます*。本プロジェクトのために学習されたモデルで、モデル・学習コード・
-詳細は同リポジトリにあります。
+[**Score2ConVec**](https://github.com/yasoukyoku/Score2ConVec) はこれを可能にする
+「譜面→コンテンツベクトル」モデルです:記号譜を SVC モデルが消費する ContentVec
+特徴空間へ直接マッピングするため、通常の SVC ボイスモデルがガイドボーカルなしで
+*譜面を歌えます*。元の UtaiSynthesizer プロジェクトのために特訓されたモデルで、
+モデル・学習コード・詳細は同リポジトリにあります。
 
-カバーモードは同じ SVC デコーダを使い、特徴抽出に ContentVec、ピッチに RMVPE を
-使用します。ボーカル分離は MSST/UVR モデルファミリーの Rust ネイティブ再実装で、
-Python コンバータが生成するモデル別 JSON 設定で駆動されます。
+カバーモードは同じ SVC デコーダーを使い、特徴抽出は ContentVec、ピッチは RMVPE です。
+ボーカル分離は MSST/UVR モデル群の Rust ネイティブ再実装で、Python コンバーターが
+生成するモデル別 config JSON によって駆動されます。
 
-リポジトリ構成(トップレベル):`src/` フロントエンド · `src-tauri/` Rust バックエンド
+リポジトリマップ(トップレベル):`src/` フロントエンド · `src-tauri/` Rust バックエンド
 (`crates/utai-dsp` DSP ホットループ、`crates/utai-stretch` vendored Signalsmith Stretch)·
-`converter/` Python ONNX エクスポート · `training/` vendored 学習パッケージ +
+`converter/` Python ONNX エクスポートスクリプト · `training/` vendored 学習パッケージ +
 ランタイムパックビルダー · `scripts/` リリースツール · `docs/` ユーザーガイド。
 
 ## 責任ある利用と免責事項
 
-UtaiSynthesizer は創作ツールです。**制作物への責任はすべて利用者にあります。**
+MunoAI は創作ツールです。**あなたが作った内容の責任はすべてあなたにあります。**
 
-- **声の権利。** ボイスモデルの学習・使用は、権利がある場合に限ってください:
-  自分自身の声、明確に同意した人の声、あるいはライセンスが許諾する
-  キャラクター/データセット。実在の人物へのなりすましは禁止です。混同のおそれが
-  ある場面では、AI 生成の歌声であることを明示してください。
-- **楽曲の権利。** 著作権のある楽曲のカバーや派生音源は、特に収益化・公開配布の際、
-  権利者の許諾が必要な場合があります。お住まいの地域の法律と各プラットフォームの
-  規約に従ってください。
-- **モデル同梱なし。** 本リポジトリと公式インストーラには**歌手ボイスモデルを一切
-  同梱していません**。アプリがダウンロードできる補助ウェイト(コミュニティ版
-  NSF-HiFiGAN ボコーダー、GAME 歌声→MIDI ウェイトなど)にはそれぞれのライセンスが
-  あり——一部は **CC BY-NC-SA(非商用)** です——アプリは該当ファイルとともに
-  その通知を表示・同梱します。取り込み/学習したボイスモデルは、その元データの
-  ライセンスと許諾に従います。
-- 声の権利・著作権・適用法に反する本ソフトウェアの利用を、開発者は容認せず、
-  一切の責任を負いません。サードパーティの帰属表示は [NOTICE.md](NOTICE.md) を
-  参照してください。
+- **声の権利。** ボイスモデルの学習・利用は権利がある場合のみ:自分の声、同意を得た
+  人の声、ライセンスが許すキャラクター/データセット。実在人物へのなりすましは禁止。
+  混乱が生じうる場面では AI 生成であることを明示してください。
+- **楽曲の権利。** 著作権のある楽曲のカバーや派生音声は、特に商用・公開配信では
+  権利者の許可が必要な場合があります。適用される法律とプラットフォームのルールを
+  守ってください。
+- **モデルは同梱されません。** 本リポジトリと公式インストーラは**歌手ボイスモデルを
+  一切含みません**。アプリがダウンロードする補助ウェイト(コミュニティ NSF-HiFiGAN
+  ボコーダー、GAME 歌声→MIDI ウェイトなど)には独自ライセンスがあり、複数は
+  **CC BY-NC-SA(非商用)** です——アプリはそれらの通知をファイルとともに表示します。
+  あなたが取り込む・学習するボイスモデルは、その元データのライセンス/許諾に従います。
+- 声の権利・著作権・適用法律を侵害する利用について、開発者は推奨せず、責任も負いません。
+  サードパーティの帰属は [NOTICE.md](NOTICE.md) を参照してください。
 
-## 既知の制限と未解決の課題
+## 既知の制限とオープンな課題
 
-以下は**把握したうえで意図的に開いたままにしている**項目で、協力していただけると
-本当に助かる部分です。誰も見ていないからではなく、**手元のハードウェアでは答えが出せない**
-から開いています。
+私たちが**把握しており、意図的に残している**問題です。ぜひ一緒に取り組みたい部分でもあります。
 
-- **大きなマシンでの学習スループットを使い切れていません。** データローダーは固定値では
-  なくマシンの**利用可能なコミットメモリ**に応じて worker / prefetch の規模を決めるように
-  なりましたが、**減らす方向にしか働きません** —— 余裕のあるマシンは上流のデフォルトを
-  そのまま受け取り、いかなる場合も引き上げられません。大きなマシンで**さらに上げる**のは
-  性能に関する主張であり、責任を持って言えません（worker 数は速度に対して単調ではなく、
-  結論を出すには RAM / CPU の異なる複数台で実データセットを回す必要があります）。
-  開発機は 1 台のみ（RAM 32GB、RTX 3080 Ti 12GB）で、**変曲点を見つける手段がありません**。
-  **より良いハードウェアをお持ちの方へ**：実測（実データセットでの step 時間 vs worker 数）、
-  issue、PR のいずれも大歓迎です。ノブと根拠は
-  `training/utai_train/loader_budget.py` にあります。
-- **AMD ランタイムパックは現在 gfx1103 系の内蔵 GPU のみ対応です**
-  （Radeon 780M / 760M / 740M）。パックに入っている汎用計算カーネルがその 1 ターゲット
-  だけなので、ダウンロードのゲートはパックに忠実に従い、それ以外では自身を隠します
-  —— **ゲートは正直で、狭いのはパックの方です**。RDNA3 / RDNA4 のディスクリート GPU や
-  他世代の内蔵 GPU はまだ対象外です。対応を広げるにはアーキテクチャごとのカーネル
-  ホイール（各 100MB 前後）を追加し、**かつ**能力ゲートを同じ厳格さで保つ必要があり、
-  広げた部分は所有していないハードウェアでは検証できません。
-- **Intel XPU 対応は実験的で、実機での検証はできていません** —— Intel GPU がありません。
-  正しさは構成上の担保とアプリ内のランタイム自己診断（`envtest`）によるもので、
-  コミュニティからの自己診断レポートが集まるまで「実験的」の表記は外しません。
+- **大きなマシンでは学習スループットを引き出しきれていません。** データローダーは
+  固定数ではなくマシンの**利用可能コミットメモリ**で worker/プリフェッチ数を決めますが、
+  これは**減らす方向のみ**:余裕のあるマシンでも既定値のまま上がりません。大きいマシンで
+  **上げる**のはパフォーマンス主張であり、責任を持って結論できません——worker 数と
+  速度は単調ではなく、実データセットを異なる RAM/CPU の複数マシンで回して初めて
+  決まります。
+  **より良いハードウェアをお持ちの方**:実測(実データセットでの step 時間 vs worker 数)、
+  issue、PR を歓迎します。ノブと論拠は `training/utai_train/loader_budget.py` にあります。
+- **AMD ランタイムパックは現在 gfx1103 系 iGPU のみ対応**(Radeon 780M / 760M / 740M)。
+  パックの汎用コンピュートカーネルはその 1 ターゲット専用のため、ダウンロードゲートも
+  それに合わせて誠実に隠れます——**ゲートは正直、パックが狭い**のです。RDNA3/RDNA4
+  ディスクリートや他世代 iGPU は未対応。拡張にはアーキテクチャ別カーネルホイール
+  (~100MB/個)追加**と**能力ゲートの厳格さ維持が必須で、手元にないハードウェアでは
+  検証できません。
+- **Intel XPU サポートは実験的で、実機未検証です** —— Intel GPU を持っていません。
+  正しさは構成とアプリ内ランタイム自己テスト(`envtest`)に依拠。コミュニティの
+  自己テスト報告が届くまで「実験的」ラベルは外しません。
 
 ## コミュニティ
 
-- **QQ グループ**:[1058227212](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
-- **Discord**:<https://discord.com/invite/p3fGh942fJ>
-- **バグ報告 / 機能要望**:[GitHub Issues](https://github.com/yasoukyoku/UtaiSynthesizer/issues)
-  (アプリのバージョンとログを添付してください——アプリ内「ログ」ページ参照)
-- セキュリティ関連:[SECURITY.md](SECURITY.md)
+- **QQ グループ**:4446804
+- **バグ / 機能要望**:[GitHub Issues](https://github.com/junziai/munoai/issues)
+  (アプリバージョンとログを添付してください——アプリ内「ログ」ページ参照)
+- セキュリティ問題:[SECURITY.md](SECURITY.md) を参照
 
 ## ライセンス
 
-[AGPL-3.0](LICENSE)。本リポジトリは
-[so-vits-svc](https://github.com/svc-develop-team/so-vits-svc) の AGPL-3.0 コードを
-vendored しています(プロジェクト全体が AGPL である理由)。MIT コンポーネントも
-含まれます——サードパーティ帰属の全文は [NOTICE.md](NOTICE.md) を参照。
+[AGPL-3.0](LICENSE)。リポジトリは [so-vits-svc](https://github.com/svc-develop-team/so-vits-svc)
+の AGPL-3.0 コードを vendored しており(そのためプロジェクト全体が AGPL)、
+MIT コンポーネントも併用しています——完全なサードパーティ帰属は
+[NOTICE.md](NOTICE.md) にあります。

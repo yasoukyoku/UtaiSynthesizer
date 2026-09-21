@@ -32,6 +32,7 @@ function exportErrorMessage(e: unknown, t: (k: string) => string): string {
   const msg = e instanceof Error ? e.message : String(e);
   const local: Record<string, string> = {
     EXPORT_VOCALS_FAILED: "export.errVocals",
+    EXPORT_INSTRUMENTS_FAILED: "export.errInstruments",
     EXPORT_VOCALS_UNRENDERED: "export.errUnrendered",
     EXPORT_SOURCE_LOADING: "export.errLoading",
     EXPORT_SOURCE_MISSING: "export.errMissing",
@@ -53,6 +54,8 @@ export function ExportAudioDialog({ onClose }: { onClose: () => void }) {
   const [rate, setRate] = useState<number>(44100);
   const [depth, setDepth] = useState<string>("16");
   const [bitrate, setBitrate] = useState<number>(320);
+  /** §user 母带处理：EQ 打磨 + 温和压缩 + -1dBFS 前瞻限制，导出即发行级响度。 */
+  const [mastering, setMastering] = useState(true);
   const [phase, setPhase] = useState<ExportPhase | null>(null);
   const [busy, setBusy] = useState(false);
   const abortRef = useRef(false);
@@ -104,6 +107,7 @@ export function ExportAudioDialog({ onClose }: { onClose: () => void }) {
         format,
         sampleRate: rate,
         bitDepth: depth as AudioExportParams["bitDepth"],
+        mastering,
         bitrateKbps: bitrate,
       };
       const res = await runAudioExport(params, setPhase, () => abortRef.current);
@@ -136,9 +140,11 @@ export function ExportAudioDialog({ onClose }: { onClose: () => void }) {
     ? null
     : phase.kind === "vocals"
       ? `${t("export.phaseVocals")} (${phase.total})`
-      : phase.kind === "mix"
-        ? t("export.phaseMix")
-        : t("export.phaseEncode");
+      : phase.kind === "instruments"
+        ? `${t("export.phaseInstruments")} (${phase.total})`
+        : phase.kind === "mix"
+          ? t("export.phaseMix")
+          : t("export.phaseEncode");
   const mixFrac = phase?.kind === "mix" ? phase.frac : phase?.kind === "encode" ? 1 : 0;
 
   const optRow = (label: string, children: ReactNode) => (
@@ -167,6 +173,22 @@ export function ExportAudioDialog({ onClose }: { onClose: () => void }) {
           optRow(t("export.bitDepth"), depths.map((d) => pill("exp-depth", depth === d, d === "32f" ? "32-bit float" : `${d}-bit`, () => setDepth(d))))}
         {isLossy(format) &&
           optRow(t("export.bitrate"), BITRATES.map((b) => pill("exp-rate-k", bitrate === b, `${b} kbps`, () => setBitrate(b))))}
+
+        {/* §user 母带处理开关：三段 EQ 打磨 + 立体声联动压缩 + 前瞻限制器（-1 dBFS）。 */}
+        <label
+          className={`settings-source-opt ${mastering ? "active" : ""}`}
+          style={{ display: "inline-flex", marginBottom: 12, cursor: "pointer" }}
+          title={t("export.masteringTip") || "三段 EQ 打磨 + 温和压缩 + 前瞻限制器（-1 dBFS 天花板）：导出即发行级响度，不再需要外部母带软件"}
+        >
+          <input
+            type="checkbox"
+            checked={mastering}
+            disabled={busy}
+            onChange={(e) => setMastering(e.target.checked)}
+            style={{ marginRight: 6 }}
+          />
+          <span>🎚 {t("export.mastering") || "母带处理（EQ + 压缩 + 限制器）"}</span>
+        </label>
 
         {blocked && !busy && (
           <div className="confirm-body" style={{ marginBottom: 12, color: "var(--accent-tertiary)" }}>

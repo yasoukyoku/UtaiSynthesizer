@@ -1,0 +1,226 @@
+/* 参数教程弹窗样式 */
+
+.pt-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.8);
+  backdrop-filter: blur(8px);
+  animation: fadeIn 0.2s ease-out;
+}
+
+.pt-dialog {
+  width: min(720px, 90vw);
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(135deg, #0f0f17 0%, #1a1a28 100%);
+  border: 1px solid rgba(106, 139, 255, 0.2);
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8);
+  overflow: hidden;
+  animation: slideUpIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.pt-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  background: rgba(30, 30, 40, 0.6);
+  border-bottom: 1px solid rgba(106, 139, 255, 0.15);
+  backdrop-filter: blur(10px);
+  flex-shrink: 0;
+}
+
+.pt-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #e6e6eb;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pt-title-icon {
+  font-size: 20px;
+}
+
+.pt-close {
+  background: rgba(226, 88, 88, 0.1);
+  border: 1px solid rgba(226, 88, 88, 0.3);
+  color: #e25858;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 600;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pt-close:hover {
+  background: rgba(226, 88, 88, 0.2);
+  transform: scale(1.05);
+}
+
+.pt-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  min-height: 0;
+}
+
+.pt-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.pt-body::-webkit-scrollbar-track {
+  background: rgba(20, 20, 25, 0.5);
+  border-radius: 4px;
+}
+
+.pt-body::-webkit-scrollbar-thumb {
+  background: rgba(106, 139, 255, 0.3);
+  border-radius: 4px;
+}
+
+.pt-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(106, 139, 255, 0.5);
+}
+
+/* 模型介绍 */
+.pt-model-intro {
+  background: linear-gradient(135deg, rgba(106, 139, 255, 0.15), rgba(106, 139, 255, 0.05));
+  border: 1px solid rgba(106, 139, 255, 0.3);
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 24px;
+}
+
+.pt-model-intro-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #6a8bff;
+  margin-bottom: 8px;
+}
+
+.pt-model-intro-text {
+  font-size: 13px;
+  line-height: 1.6;
+  color: #c8c8d0;
+}
+
+/* 参数列表 */
+.pt-params-list {
+  display: grid;
+  gap: 16px;
+}
+
+.pt-param-card {
+  background: rgba(20, 20, 28, 0.8);
+  border: 1px solid rgba(106, 139, 255, 0.15);
+  border-radius: 12px;
+  padding: 16px;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.pt-param-card:hover {
+  border-color: rgba(106, 139, 255, 0.4);
+  transform: translateX(4px);
+  box-shadow: 0 4px 20px rgba(106, 139, 255, 0.15);
+}
+
+.pt-param-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.pt-param-icon {
+  font-size: 20px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(106, 139, 255, 0.1);
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.pt-param-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: #e6e6eb;
+}
+
+.pt-param-desc {
+  font-size: 13px;
+  line-height: 1.6;
+  color: #b8b8c0;
+  margin-bottom: 10px;
+  padding-left: 42px;
+}
+
+.pt-param-tips {
+  background: rgba(255, 193, 7, 0.08);
+  border-left: 3px solid rgba(255, 193, 7, 0.5);
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #ffc107;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.pt-tips-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+/* 底部提示 */
+.pt-footer-tip {
+  margin-top: 24px;
+  padding: 14px 16px;
+  background: rgba(61, 186, 107, 0.08);
+  border: 1px solid rgba(61, 186, 107, 0.2);
+  border-radius: 10px;
+  font-size: 12px;
+  color: #3dba6b;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+}
+
+.pt-footer-tip-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideUpIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
