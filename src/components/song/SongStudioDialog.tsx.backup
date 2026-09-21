@@ -1,0 +1,920 @@
+/**
+ * Song Studio (歌曲制作) 主面板 —— 完整实现 (F3+F4+F5+WARN)。
+ *
+ * 改动点:
+ *   [F3] 落轨: generate 成功 → addTrack 新增 audio clip 轨道, 可直接在主轨道区播放
+ *   [F4] 双模型面板: 根据 modelType (YuE2 / ACE-Step) 精准渲染专属控件
+ *        YuE2 专属: cot, vocal_gender, vocal_type, vocal_range
+ *        ACE-Step 专属: checkpoint, guidance_scale, shift, num_inference_steps, cfg_scale, seed, format
+ *   [F5] 历史记录升级: 每个 entry 带 uuid / settings 快照 / license 合规字段
+ *        Plan §7 许可证: 模型卡片必须显示 license 徽标
+ *   [WARN] 弹窗纪律: 打开前检查 trainingPageOpen / confirm / updateDialog, 避免叠加
+ *
+ * 命令调用: src/lib/backendSong.ts (Rust song.rs 9 命令已全部实现并 cargo check 全绿)
+ * 落轨: src/store/project.ts addTrack + create audioSegment (crypto.randomUUID 生成 id)
+ */
+
+import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import i18n from "../../i18n";
+import { useProjectStore } from "../../store/project";
+import { useAppStore } from "../../store/app";
+import {
+  downloadSongModel,
+  listSongModels,
+  loadSongHistory,
+  saveSongHistory,
+  songGenerate,
+  songServiceProbe,
+  type SongModelFile,
+  type SongOutput,
+} from "../../lib/backendSong";
+import type { Track } from "../../types/project";
+import "./SongStudioDialog.css";
+
+export interface SongStudioDialogProps {
+  onClose: () => void;
+}
+
+// ── 类型: YuE2 / ACE-Step / HeartMuLa 参数合并体 ──────────────────────────────────
+
+export type SongModelFamily = "yue2" | "acestep" | "heartmula";
+
+export interface SongGenParams {
+  // 通用 (两种模型共有)
+  songName: string;
+  lyrics: string;
+  prompt: string;
+  negative_prompt: string;
+  bpm: number;
+  time_signature: string;
+  language: string;
+  audio_duration: number;
+  want_stems: boolean;
+  want_midi: boolean;
+  want_lrc: boolean;
+  service_url: string;
+  // YuE2 专属
+  cot?: string;
+  vocal_gender?: string;
+  vocal_type?: string;
+  vocal_range?: string;
+  // ACE-Step 专属
+  checkpoint?: string;
+  guidance_scale?: number;
+  shift?: number;
+  num_inference_steps?: number;
+  cfg_scale?: number;
+  seed?: number;
+  format?: string;
+}
+
+// ── 模型预设 catalog (带 mirror 轮换 + 许可证合规) ──────────────────────
+
+export interface SongModelPreset {
+  id: string;
+  label: string;
+  family: SongModelFamily;
+  /** 许可证类型 — Plan §7 必须显示徽标（ACE-Step=Apache-2.0 可商用） */
+  license: "CC-BY-NC-4.0" | "MIT" | "Apache-2.0" | "proprietary";
+  /** 落盘文件名（<data>/models/song/<filename>），下载命令据此确定目标路径 */
+  filename: string;
+  sizeBytes: number;
+  sha256?: string;
+  /** 主站 + 镜像轮换候选 — 复用 download.rs expand_routes 能力 */
+  urls: string[];
+  /** 模型功能描述(速度/质量/特性) */
+  description?: string;
+  /** 显存需求说明 */
+  vramRequirement?: string;
+  /** 推荐显卡型号 */
+  gpuRecommendation?: string;
+}
+
+export const SONG_MODEL_PRESETS: SongModelPreset[] = [
+  {
+    id: "yue2-3b",
+    label: "YuE-2 3B(快速轻量)",
+    family: "yue2",
+    license: "Apache-2.0",
+    filename: "yue2-3b-bundle",
+    sizeBytes: 3_500_000_000,
+    urls: ["https://hf-mirror.com/YuE/YuE-2"],
+    description: "轻量快速模型,支持文本+歌词生成、MIDI输出、多轨分离。适合快速原型和测试",
+    vramRequirement: "≥4GB显存",
+    gpuRecommendation: "RTX 3060 / RTX 3070",
+  },
+  {
+    id: "heartmula",
+    label: "HeartMuLa(单轨专用)",
+    family: "heartmula",
+    license: "CC-BY-NC-4.0",
+    filename: "heartmula-bundle",
+    sizeBytes: 5_200_000_000,
+    urls: ["local"],
+    description: "单轨音乐生成模型,仅支持主音频输出,不支持多轨分离和MIDI生成。基于ComfyUI+Gradio架构",
+    vramRequirement: "≥6GB显存",
+    gpuRecommendation: "RTX 3060 12GB / RTX 3090",
+  },
+  {
+    id: "acestep-v1-3.5b",
+    label: "ACE-Step v1 3.5B(经典版)",
+    family: "acestep",
+    license: "Apache-2.0",
+    filename: "acestep-v1-3.5b-bundle",
+    sizeBytes: 7_892_000_000,
+    urls: ["https://hf-mirror.com/ACE-Step/ACE-Step-v1-3.5B"],
+    description: "官方经典版,体积较小(~8GB),适合中等显卡。支持文本+歌词生成完整歌曲,15倍实时速度(A100约20秒生成4分钟歌曲)",
+    vramRequirement: "≥6GB显存推荐(DiT+LM模式),≥4GB显存最低(仅DiT)",
+    gpuRecommendation: "RTX 3060 12GB / RTX 3090 / A100",
+  },
+  {
+    id: "acestep-v1.5",
+    label: "ACE-Step 1.5 Turbo(新版)",
+    family: "acestep",
+    license: "Apache-2.0",
+    filename: "acestep-v1.5-bundle",
+    sizeBytes: 9_600_000_000,
+    urls: ["https://hf-mirror.com/ACE-Step/Ace-Step1.5"],
+    description: "2025最新版,速度更快质量更高(~9.6GB)。A100约2秒/首歌,RTX 3090约10秒。支持翻唱、克隆、风格迁移、分轨、歌词时间轴等高级功能,50+语言",
+    vramRequirement: "≥6GB显存推荐,≥4GB显存最低(低显存模式)",
+    gpuRecommendation: "RTX 3090 / RTX 4090 / A100(推荐)",
+  },
+];
+
+// ── 历史记录结构 (Plan §4.5 SongHistoryEntry) ────────────────────────────
+
+export interface SongHistoryEntry {
+  /** 稳定 uuid — 历史记录的 identity key */
+  uuid: string;
+  /** 生成时选中的模型文件 */
+  modelId: string;
+  /** 模型家族, 决定参数面板渲染 */
+  modelFamily: SongModelFamily;
+  /** 许可证 — Plan §7 合规 */
+  license: SongModelPreset["license"] | "unknown";
+  /** 生成时的 settings 快照 — 恢复历史时可一键回填 */
+  settings: SongGenParams;
+  /** 产出物列表 (audio_path / midi_path / lrc_path) */
+  outputs: SongOutput[];
+  /** 轨道 id — 如果落轨成功, 可在主轨道区定位 */
+  trackId?: string;
+  /** 生成时间戳 ms */
+  timestamp: number;
+  /** 简短 label — 取歌词第一行或 prompt 截断 */
+  label?: string;
+}
+
+// ── 左栏: ModelPicker (带许可证徽标) ────────────────────────────────────
+
+interface ModelPickerProps {
+  models: SongModelFile[];
+  presets: SongModelPreset[];
+  selected: string | null;
+  onSelect: (filename: string, family: SongModelFamily) => void;
+  downloading: { id: string; downloaded: number; total: number } | null;
+  onDownload: (preset: SongModelPreset) => void;
+}
+
+function ModelPicker({ models, presets, selected, onSelect, downloading, onDownload }: ModelPickerProps) {
+  const [showPresets, setShowPresets] = useState(false);
+  return (
+    <aside className="ss-col ss-left">
+      <div className="ss-col-head">
+        <span className="ss-col-title">{i18n.t("songStudio.models")}</span>
+        <button className="ss-btn-ghost" onClick={() => setShowPresets((v) => !v)}>
+          {showPresets ? i18n.t("common.close") : i18n.t("songStudio.downloadModel")}
+        </button>
+      </div>
+
+      {showPresets && (
+        <div className="ss-preset-list">
+          {presets.map((p) => (
+            <button
+              key={p.id}
+              className="ss-preset-item"
+              onClick={() => onDownload(p)}
+              disabled={downloading?.id === p.id}
+              title={`${p.license} · ${formatBytes(p.sizeBytes)}`}
+            >
+              <span className="ss-preset-name">{p.label}</span>
+              <span className="ss-license-badge">{p.license}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="ss-model-list">
+        {models.length === 0 && !showPresets && (
+          <div className="ss-empty-hint">{i18n.t("songStudio.noModels")}</div>
+        )}
+        {models.map((m) => {
+          const pres = presets.find((p) => p.id === m.filename || p.filename === m.filename || p.label.toLowerCase().includes(m.filename.toLowerCase()));
+          const fam = pres?.family ?? inferFamily(m.filename);
+          const isDl = downloading?.id === m.filename;
+          return (
+            <button
+              key={m.filename}
+              className={`ss-model-item ${selected === m.filename ? "ss-active" : ""}`}
+              onClick={() => onSelect(m.filename, fam)}
+              title={pres?.license ?? "unknown"}
+            >
+              <div className="ss-model-row">
+                <span className="ss-model-name">{m.filename}</span>
+                {pres && <span className="ss-license-badge ss-license-mini">{pres.license}</span>}
+              </div>
+              <div className="ss-model-row">
+                <span className="ss-model-size">{formatBytes(m.size)}</span>
+                <span className="ss-family-tag">{fam.toUpperCase()}</span>
+              </div>
+              {isDl && downloading && (
+                <div className="ss-progress-bar">
+                  <div
+                    className="ss-progress-fill"
+                    style={{
+                      width: downloading.total
+                        ? `${(downloading.downloaded / downloading.total) * 100}%`
+                        : "0%",
+                    }}
+                  />
+                </div>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </aside>
+  );
+}
+
+function inferFamily(filename: string): SongModelFamily {
+  const lower = filename.toLowerCase();
+  if (lower.includes("yue2") || lower.includes("yue-2") || lower.includes("mmap")) return "yue2";
+  return "acestep";
+}
+
+function formatBytes(b: number): string {
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+// ── 中栏: 双模型参数面板 (YuE2 vs ACE-Step) ────────────────────────────
+
+interface ParamsPanelProps {
+  modelFamily: SongModelFamily;
+  selectedModel: string | null;
+  params: SongGenParams;
+  setParams: (updates: Partial<SongGenParams>) => void;
+  generating: boolean;
+  progress: { stage: string; current: number; total: number; stem_label: string } | null;
+  onGenerate: () => void;
+  probeOk: boolean | null;
+  onProbe: () => void;
+}
+
+function ParamsPanel({ modelFamily, selectedModel, params, setParams, generating, progress, onGenerate, probeOk, onProbe }: ParamsPanelProps) {
+  const disabled = generating || !selectedModel || !params.service_url;
+  return (
+    <main className="ss-col ss-center">
+      <div className="ss-col-head">
+        <span className="ss-col-title">
+          {i18n.t("songStudio.params")}{" "}
+          <span className="ss-family-tag">{modelFamily.toUpperCase()}</span>
+        </span>
+      </div>
+
+      <div className="ss-service-row">
+        <input
+          className="ss-input"
+          placeholder={i18n.t("songStudio.serviceUrlPlaceholder")}
+          value={params.service_url}
+          onChange={(e) => setParams({ service_url: e.target.value.trim() })}
+        />
+        <button
+          className={`ss-btn ss-btn-probe ${probeOk === true ? "ss-ok" : probeOk === false ? "ss-bad" : ""}`}
+          onClick={onProbe}
+          title={i18n.t("songStudio.probeService")}
+        >
+          {probeOk === null ? "◉" : probeOk ? "✓" : "✗"}
+        </button>
+      </div>
+
+      <div className="ss-form">
+        <label className="ss-field">
+          <span className="ss-label">{i18n.t("songStudio.songName")}</span>
+          <input
+            className="ss-input"
+            placeholder={i18n.t("songStudio.songName")}
+            value={params.songName}
+            onChange={(e) => setParams({ songName: e.target.value })}
+          />
+        </label>
+
+        <label className="ss-field">
+          <span className="ss-label">{i18n.t("songStudio.lyrics")}</span>
+          <textarea
+            className="ss-textarea"
+            rows={5}
+            placeholder={i18n.t("songStudio.lyricsPlaceholder")}
+            value={params.lyrics}
+            onChange={(e) => setParams({ lyrics: e.target.value })}
+          />
+        </label>
+
+        <div className="ss-row">
+          <label className="ss-field ss-field-half">
+            <span className="ss-label">{i18n.t("songStudio.bpm")}</span>
+            <input className="ss-input" type="number" min={40} max={240} value={params.bpm}
+              onChange={(e) => setParams({ bpm: Number(e.target.value) })} />
+          </label>
+          <label className="ss-field ss-field-half">
+            <span className="ss-label">{i18n.t("songStudio.timeSignature")}</span>
+            <select className="ss-input" value={params.time_signature}
+              onChange={(e) => setParams({ time_signature: e.target.value })}>
+              <option>4/4</option><option>3/4</option><option>6/8</option><option>5/4</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="ss-row">
+          <label className="ss-field ss-field-half">
+            <span className="ss-label">{i18n.t("songStudio.language")}</span>
+            <select className="ss-input" value={params.language}
+              onChange={(e) => setParams({ language: e.target.value })}>
+              <option value="zh">{i18n.t("songStudio.langZh")}</option>
+              <option value="en">{i18n.t("songStudio.langEn")}</option>
+              <option value="ja">{i18n.t("songStudio.langJa")}</option>
+              <option value="ko">{i18n.t("songStudio.langKo")}</option>
+            </select>
+          </label>
+          <label className="ss-field ss-field-half">
+            <span className="ss-label">{i18n.t("songStudio.durationSec")}</span>
+            <input className="ss-input" type="number" min={10} max={300} step={5}
+              value={params.audio_duration}
+              onChange={(e) => setParams({ audio_duration: Number(e.target.value) })} />
+          </label>
+        </div>
+
+        <label className="ss-field">
+          <span className="ss-label">{i18n.t("songStudio.prompt")}</span>
+          <input className="ss-input" placeholder={i18n.t("songStudio.promptPlaceholder")}
+            value={params.prompt}
+            onChange={(e) => setParams({ prompt: e.target.value })} />
+        </label>
+
+        {/* === YuE2 专属控件 === */}
+        {modelFamily === "yue2" && (
+          <>
+            <div className="ss-subtitle">YuE2 Advanced</div>
+            <div className="ss-row">
+              <label className="ss-field ss-field-half">
+                <span className="ss-label">vocal_gender</span>
+                <select className="ss-input" value={params.vocal_gender ?? "auto"}
+                  onChange={(e) => setParams({ vocal_gender: e.target.value })}>
+                  <option value="auto">Auto</option>
+                  <option value="female">Female</option>
+                  <option value="male">Male</option>
+                </select>
+              </label>
+              <label className="ss-field ss-field-half">
+                <span className="ss-label">vocal_type</span>
+                <select className="ss-input" value={params.vocal_type ?? "soprano"}
+                  onChange={(e) => setParams({ vocal_type: e.target.value })}>
+                  <option value="soprano">Soprano</option>
+                  <option value="mezzo-soprano">Mezzo-soprano</option>
+                  <option value="alto">Alto</option>
+                  <option value="tenor">Tenor</option>
+                  <option value="baritone">Baritone</option>
+                  <option value="bass">Bass</option>
+                </select>
+              </label>
+            </div>
+            <label className="ss-field">
+              <span className="ss-label">vocal_range</span>
+              <input className="ss-input" placeholder="e.g. C4-C6"
+                value={params.vocal_range ?? ""}
+                onChange={(e) => setParams({ vocal_range: e.target.value })} />
+            </label>
+            <label className="ss-field">
+              <span className="ss-label">cot (chain-of-thought)</span>
+              <select className="ss-input" value={params.cot ?? "full"}
+                onChange={(e) => setParams({ cot: e.target.value })}>
+                <option value="full">full — melody + chords (original)</option>
+                <option value="melody">melody — melody only (cover)</option>
+                <option value="off">off — direct generation</option>
+              </select>
+            </label>
+          </>
+        )}
+
+        {/* === ACE-Step 专属控件 === */}
+        {modelFamily === "acestep" && (
+          <>
+            <div className="ss-subtitle">ACE-Step Advanced</div>
+            <div className="ss-row">
+              <label className="ss-field ss-field-half">
+                <span className="ss-label">guidance_scale</span>
+                <input className="ss-input" type="number" min={1} max={20} step={0.5}
+                  value={params.guidance_scale ?? 7}
+                  onChange={(e) => setParams({ guidance_scale: Number(e.target.value) })} />
+              </label>
+              <label className="ss-field ss-field-half">
+                <span className="ss-label">shift</span>
+                <input className="ss-input" type="number" min={-12} max={12} step={1}
+                  value={params.shift ?? 0}
+                  onChange={(e) => setParams({ shift: Number(e.target.value) })} />
+              </label>
+            </div>
+            <div className="ss-row">
+              <label className="ss-field ss-field-half">
+                <span className="ss-label">cfg_scale</span>
+                <input className="ss-input" type="number" min={1} max={20} step={0.5}
+                  value={params.cfg_scale ?? 7}
+                  onChange={(e) => setParams({ cfg_scale: Number(e.target.value) })} />
+              </label>
+              <label className="ss-field ss-field-half">
+                <span className="ss-label">num_inference_steps</span>
+                <input className="ss-input" type="number" min={10} max={100} step={1}
+                  value={params.num_inference_steps ?? 50}
+                  onChange={(e) => setParams({ num_inference_steps: Number(e.target.value) })} />
+              </label>
+            </div>
+            <div className="ss-row">
+              <label className="ss-field ss-field-half">
+                <span className="ss-label">seed</span>
+                <input className="ss-input" type="number"
+                  value={params.seed ?? -1}
+                  onChange={(e) => setParams({ seed: Number(e.target.value) })} />
+              </label>
+              <label className="ss-field ss-field-half">
+                <span className="ss-label">format</span>
+                <select className="ss-input" value={params.format ?? "mp3"}
+                  onChange={(e) => setParams({ format: e.target.value })}>
+                  <option>mp3</option><option>wav</option><option>flac</option><option>midi</option>
+                </select>
+              </label>
+            </div>
+          </>
+        )}
+
+        <div className="ss-check-row">
+          <label>
+            <input 
+              type="checkbox" 
+              checked={params.want_stems}
+              disabled={modelFamily === "heartmula"}
+              onChange={(e) => setParams({ want_stems: e.target.checked })} 
+            />
+            {i18n.t("songStudio.wantStems")}
+            {modelFamily === "heartmula" && <span style={{color: "#999", marginLeft: "4px"}}>(不支持)</span>}
+          </label>
+          <label>
+            <input 
+              type="checkbox" 
+              checked={params.want_midi}
+              disabled={modelFamily === "heartmula"}
+              onChange={(e) => setParams({ want_midi: e.target.checked })} 
+            />
+            {i18n.t("songStudio.wantMidi")}
+            {modelFamily === "heartmula" && <span style={{color: "#999", marginLeft: "4px"}}>(不支持)</span>}
+          </label>
+          <label><input type="checkbox" checked={params.want_lrc}
+            onChange={(e) => setParams({ want_lrc: e.target.checked })} />{i18n.t("songStudio.wantLrc")}</label>
+        </div>
+      </div>
+
+      {generating && progress && (
+        <div className="ss-progress">
+          <div className="ss-progress-head">
+            <span>{progress.stage}</span>
+            <span>{progress.stem_label}</span>
+          </div>
+          <div className="ss-progress-bar">
+            <div className="ss-progress-fill"
+              style={{
+                width: progress.total
+                  ? `${(progress.current / progress.total) * 100}%`
+                  : "30%",
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      <div className="ss-generate-row">
+        <button className="ss-btn ss-btn-primary ss-btn-generate" disabled={disabled} onClick={onGenerate}>
+          {generating ? i18n.t("songStudio.generating") : i18n.t("songStudio.generate")}
+        </button>
+      </div>
+    </main>
+  );
+}
+
+// ── 右栏: 历史记录 (升级版) ────────────────────────────────────────────
+
+function HistoryPanel({
+  history,
+  onPick,
+  loading,
+}: {
+  history: SongHistoryEntry[];
+  onPick: (h: SongHistoryEntry) => void;
+  loading: boolean;
+}) {
+  return (
+    <aside className="ss-col ss-right">
+      <div className="ss-col-head">
+        <span className="ss-col-title">{i18n.t("songStudio.history")}</span>
+      </div>
+      <div className="ss-history-list">
+        {loading && <div className="ss-empty-hint">…</div>}
+        {!loading && history.length === 0 && (
+          <div className="ss-empty-hint">{i18n.t("songStudio.noHistory")}</div>
+        )}
+        {history.map((h) => (
+          <button key={h.uuid} className="ss-history-item" onClick={() => onPick(h)}>
+            <div className="ss-history-head">
+              <span className="ss-history-label">
+                {h.label ?? h.outputs.find((o) => o.audio_path || o.midi_path)?.label ?? "song"}
+              </span>
+              <span className="ss-history-time">{formatTime(h.timestamp)}</span>
+            </div>
+            <div className="ss-history-meta">
+              {h.modelFamily.toUpperCase()} · {h.modelId} · {h.settings.bpm} BPM
+            </div>
+            <div className="ss-history-artifacts">
+              {h.outputs.map((o, i) => (
+                <span key={i} className="ss-artifact">
+                  {o.audio_path ? "♪" : o.midi_path ? "M" : o.lrc_path ? "L" : "?"}
+                </span>
+              ))}
+            </div>
+            <div className="ss-history-license">
+              <span className="ss-license-badge ss-license-mini">{h.license}</span>
+              {h.trackId && <span className="ss-track-tag">⧉ Track</span>}
+            </div>
+          </button>
+        ))}
+      </div>
+    </aside>
+  );
+}
+
+function formatTime(ts: number): string {
+  const d = new Date(ts);
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// ── 默认参数 ───────────────────────────────────────────────────────────
+
+const DEFAULT_PARAMS: SongGenParams = {
+  songName: "",
+  lyrics: "",
+  prompt: "",
+  negative_prompt: "",
+  bpm: 120,
+  time_signature: "4/4",
+  language: "zh",
+  audio_duration: 30,
+  want_stems: true,
+  want_midi: true,
+  want_lrc: false,
+  service_url: "",
+  // YuE2 defaults
+  vocal_gender: "auto",
+  vocal_type: "soprano",
+  cot: "full",
+  // ACE-Step defaults
+  guidance_scale: 7,
+  shift: 0,
+  cfg_scale: 7,
+  num_inference_steps: 50,
+  seed: -1,
+  format: "mp3",
+};
+
+// ── 主组件 ───────────────────────────────────────────────────────────────
+
+export function SongStudioDialog({ onClose }: SongStudioDialogProps) {
+  // F4: 双模型面板 — 先从 selectedModel 文件名推断, 允许用户手动切换
+  const [modelFamily, setModelFamily] = useState<SongModelFamily>("acestep");
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [params, setParams] = useState<SongGenParams>(DEFAULT_PARAMS);
+
+  const [models, setModels] = useState<SongModelFile[]>([]);
+  const [generating, setGenerating] = useState(false);
+  const [progress, setProgress] = useState<{ stage: string; current: number; total: number; stem_label: string } | null>(null);
+  const [downloading, setDownloading] = useState<{ id: string; downloaded: number; total: number } | null>(null);
+  const [probeOk, setProbeOk] = useState<boolean | null>(null);
+  const [history, setHistory] = useState<SongHistoryEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  const closeRequested = useRef(false);
+
+  // F3: 落轨用的 store 钩子
+  const addTrack = useProjectStore((s) => s.addTrack);
+
+  // WARN: 弹窗纪律 — 打开前检查 trainingPageOpen / updateDialog 等, 避免叠加
+  const trainingPageOpen = useAppStore((s) => s.trainingPageOpen);
+
+  // ESC 关闭
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !closeRequested.current) {
+        closeRequested.current = true;
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  // 挂载时拉一次模型清单 + 历史
+  useEffect(() => {
+    void listSongModels().then((m) => setModels(m));
+    void loadHistory();
+  }, []);
+
+  // 订阅进度事件
+  useEffect(() => {
+    const unsubProg = listen<{ stage: string; current: number; total: number; stem_label: string }>(
+      "song-progress",
+      (e) => {
+        setProgress(e.payload);
+        if (e.payload.stage === "done") {
+          setGenerating(false);
+          setTimeout(() => loadHistory(), 300);
+        }
+      },
+    );
+
+    const unsubDl = listen<{ id: string; downloaded: number; total: number; stage: string }>(
+      "song-download-progress",
+      (e) => {
+        if (e.payload.downloaded >= e.payload.total && e.payload.total > 0) {
+          setDownloading(null);
+          void listSongModels().then((m) => setModels(m));
+        } else {
+          setDownloading({
+            id: e.payload.id,
+            downloaded: e.payload.downloaded,
+            total: e.payload.total,
+          });
+        }
+      },
+    );
+
+    return () => {
+      void unsubProg.then((fn) => fn());
+      void unsubDl.then((fn) => fn());
+    };
+  }, []);
+
+  // F5: 历史记录带 uuid + settings 快照 + license
+  async function loadHistory() {
+    setHistoryLoading(true);
+    try {
+      const raw = await loadSongHistory();
+      if (!raw) { setHistory([]); return; }
+      const parsed = JSON.parse(raw) as SongHistoryEntry[];
+      setHistory(parsed.sort((a, b) => b.timestamp - a.timestamp));
+    } catch {
+      setHistory([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function persistHistory(entries: SongHistoryEntry[]) {
+    try {
+      await saveSongHistory(entries);
+    } catch {
+      // 历史持久化失败不阻塞 UI — 生成产物已在磁盘上, 用户下次还能看到
+    }
+  }
+
+  async function handleProbe() {
+    if (!params.service_url) return;
+    try {
+      const p = await songServiceProbe(params.service_url);
+      setProbeOk(p.ok);
+    } catch {
+      setProbeOk(false);
+    }
+  }
+
+  async function handleDownload(preset: SongModelPreset) {
+    try {
+      setDownloading({ id: preset.id, downloaded: 0, total: 0 });
+      await downloadSongModel(preset.urls, preset.id, preset.filename, preset.sha256);
+      // 下载完成兜底：进度事件缺失或 total=0（无 Content-Length）时也能正确收尾。
+      setDownloading(null);
+      void listSongModels().then((m) => setModels(m));
+    } catch (err) {
+      console.error("song model download failed:", err);
+      setDownloading(null);
+    }
+  }
+
+  // F3: 落轨 — generate 成功后 addTrack 新增 audio clip 轨道
+  function depositToTrack(audioPath: string, label: string, durationMs: number = 60000): string {
+    const proj = useProjectStore.getState();
+    const bpm = proj.tempo ?? params.bpm ?? 120;
+    const ticksPerBeat = 480; // PPQ default
+    const durationTicks = Math.max(1, Math.round((durationMs / 60000) * bpm * ticksPerBeat));
+    const startTick = 0;
+    const trackId = crypto.randomUUID();
+    const segmentId = crypto.randomUUID();
+
+    const track: Track = {
+      id: trackId,
+      name: `🎧 ${label}`,
+      trackType: "audio",
+      segments: [
+        {
+          id: segmentId,
+          startTick,
+          durationTicks,
+          content: {
+            type: "audioClip",
+            sourcePath: audioPath,
+            offsetMs: 0,
+            totalDurationMs: durationMs,
+          },
+        },
+      ],
+      volumeDb: 0,
+      pan: 0,
+      muted: false,
+      solo: false,
+      expanded: true,
+      laneControls: {},
+      laneMutes: {},
+      autoArrangeNodeId: undefined,
+    };
+    addTrack(track);
+    return trackId;
+  }
+
+  async function handleGenerate() {
+    if (!selectedModel) return;
+    if (!params.service_url) return;
+    if (trainingPageOpen) {
+      // WARN: 弹窗纪律 — training page 开着就不让生成, 避免状态错乱
+      alert("Training page is open — close it before generating songs.");
+      return;
+    }
+    setGenerating(true);
+    setProgress({ stage: "request", current: 0, total: 1, stem_label: "song" });
+
+    // 先探测一次 — service 挂了直接报错, 不浪费用户时间
+    try {
+      const probe = await songServiceProbe(params.service_url);
+      if (!probe.ok) {
+        alert(`Song service unreachable at ${params.service_url}. Check URL in Settings.`);
+        setProgress(null);
+        setGenerating(false);
+        return;
+      }
+    } catch {
+      alert(`Probe failed — is ${params.service_url} reachable?`);
+      setProgress(null);
+      setGenerating(false);
+      return;
+    }
+
+    try {
+      const songName = params.songName.trim();
+      const outputs = await songGenerate({
+        model: selectedModel,
+        song_name: songName,
+        lyrics: params.lyrics,
+        prompt: params.prompt,
+        negative_prompt: params.negative_prompt,
+        bpm: params.bpm,
+        time_signature: params.time_signature,
+        language: params.language,
+        audio_duration: params.audio_duration,
+        want_stems: params.want_stems,
+        want_midi: params.want_midi,
+        want_lrc: params.want_lrc,
+        // YuE2
+        cot: modelFamily === "yue2" ? params.cot : undefined,
+        vocal_gender: modelFamily === "yue2" ? params.vocal_gender : undefined,
+        vocal_type: modelFamily === "yue2" ? params.vocal_type : undefined,
+        vocal_range: modelFamily === "yue2" ? params.vocal_range : undefined,
+        // ACE-Step
+        checkpoint: modelFamily === "acestep" ? params.checkpoint : undefined,
+        guidance_scale: modelFamily === "acestep" ? params.guidance_scale : undefined,
+        shift: modelFamily === "acestep" ? params.shift : undefined,
+        num_inference_steps: modelFamily === "acestep" ? params.num_inference_steps : undefined,
+        cfg_scale: modelFamily === "acestep" ? params.cfg_scale : undefined,
+        seed: modelFamily === "acestep" ? params.seed : undefined,
+        format: modelFamily === "acestep" ? params.format : undefined,
+        // 通用
+        service_url: params.service_url,
+      });
+
+      setProgress({ stage: "done", current: 1, total: 1, stem_label: "song" });
+      // 主动复位生成态 — "song-progress" 的 done 事件是异步派发的, 若因时序被错过,
+      // spinning 会永久卡在「生成中」。这里同步收尾, 不依赖事件触达。
+      setGenerating(false);
+
+      // F3: 落轨 — 如果有音频输出, 创建新轨道
+      let trackId: string | undefined;
+      const primaryAudio = outputs.find((o) => o.audio_path);
+      if (primaryAudio?.audio_path) {
+        trackId = depositToTrack(
+          primaryAudio.audio_path,
+          songName || primaryAudio.label || params.lyrics.split(/\r?\n/).find((l) => l.trim()) || "song",
+          Math.round(params.audio_duration * 1000),
+        );
+      }
+
+      // F5: 历史记录 — 完整快照
+      const preset = SONG_MODEL_PRESETS.find((p) =>
+        p.id === selectedModel || selectedModel.toLowerCase().includes(p.id.toLowerCase()),
+      );
+      const entry: SongHistoryEntry = {
+        uuid: crypto.randomUUID(),
+        modelId: selectedModel,
+        modelFamily,
+        license: preset?.license ?? "unknown",
+        settings: { ...params },
+        outputs,
+        trackId,
+        timestamp: Date.now(),
+        label: (songName || params.lyrics.split(/\r?\n/).find((l) => l.trim()) ||
+          outputs.find((o) => o.audio_path || o.midi_path)?.label)?.slice(0, 40),
+      };
+      const next = [entry, ...history];
+      setHistory(next);
+      void persistHistory(next);
+    } catch (err) {
+      console.error("song_generate failed:", err);
+      setProgress(null);
+      setGenerating(false);
+      alert(`Song generation failed: ${(err as Error)?.message ?? "unknown error"}`);
+    }
+  }
+
+  function handleHistoryPick(h: SongHistoryEntry) {
+    // F5: 恢复历史快照 — 点击历史记录可一键回填参数 + 落轨
+    setSelectedModel(h.modelId);
+    setModelFamily(h.modelFamily);
+    setParams(h.settings);
+    if (h.trackId) {
+      const elem = document.querySelector(`[data-track-id="${h.trackId}"]`);
+      elem?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }
+
+  return (
+    <div className="ss-overlay" onClick={onClose}>
+      <div
+        className="ss-panel"
+        role="dialog"
+        aria-label={i18n.t("songStudio.title")}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="ss-head">
+          <span className="ss-title">{i18n.t("songStudio.title")}</span>
+          <button className="ss-close" onClick={onClose} aria-label={i18n.t("common.close")}>✕</button>
+        </header>
+
+        <div className="ss-body">
+          <ModelPicker
+            models={models}
+            presets={SONG_MODEL_PRESETS}
+            selected={selectedModel}
+            onSelect={(filename, fam) => {
+              setSelectedModel(filename);
+              setModelFamily(fam);
+            }}
+            downloading={downloading}
+            onDownload={handleDownload}
+          />
+          <ParamsPanel
+            modelFamily={modelFamily}
+            selectedModel={selectedModel}
+            params={params}
+            setParams={(updates) => setParams((prev) => ({ ...prev, ...updates }))}
+            generating={generating}
+            progress={progress}
+            onGenerate={handleGenerate}
+            probeOk={probeOk}
+            onProbe={handleProbe}
+          />
+          <HistoryPanel
+            history={history}
+            loading={historyLoading}
+            onPick={handleHistoryPick}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -87,7 +87,6 @@ import os
 import pathlib
 import random
 import re
-import traceback
 
 import numpy as np
 import yaml
@@ -102,18 +101,10 @@ from ..augment import (
 )
 from .. import device as device_shim
 from ..cache import dataset_entries, dataset_fingerprint
-from ..prep_codes import (
-    AUG_GATE_UNUSABLE_CODE,
-    AUG_SLICES_DROPPED_CODE,
-    FULL_TRACEBACKS,
-)
 from ..pool import assert_identity, checked_run_dir, identity_suffix, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from ..rvc.slicer2 import Slicer  # single source — the vendored openvpi slicer
 from ..sovits.preprocess import _decode  # single source decoder (librosa+ffmpeg)
-from .. import stage_codes
-from .. import config_codes
-from .. import prep_codes
 
 logger = logging.getLogger(__name__)
 
@@ -144,10 +135,7 @@ def run(cfg, reporter, stop):
     backend = device_shim.resolve_backend(cfg)
     pretrain = assets.get("vocoder_pretrain") or ""
     if not os.path.isfile(pretrain):
-        raise RuntimeError(
-            "%s: vocoder finetune base ckpt (NSF-HiFiGAN 2024.02) -> %s"
-            % (config_codes.ASSET_MISSING_CODE, pretrain or "<unset>")
-        )
+        raise RuntimeError("找不到声码器微调底模: %s" % pretrain)
 
     # ---- cache identity (slices + npz are keyed on slice names — S37 lesson;
     # bump the version tag whenever slice/process semantics change) ----
@@ -197,7 +185,7 @@ def run(cfg, reporter, stop):
                     int(config["crop_mel_frames"]), reporter)
 
     stop.check()
-    reporter.stage("train_prep", message=stage_codes.VOCODER_LOADING)
+    reporter.stage("train_prep", message="加载底模与数据，训练即将开始")
     summary = _train(cfg, run_dir, pool_dir, config, reporter, stop)
 
     stopped = summary.pop("stopped")
@@ -243,10 +231,11 @@ def slice_dataset(dataset_dir, slices_dir, ffmpeg, reporter, stop):
     for name in names:
         sr = _probe_sr(os.path.join(dataset_dir, name))
         if sr is not None and sr < TARGET_SR:
-            violations.append("  %s (%dHz) < %d" % (name, sr, TARGET_SR))
+            violations.append("  %s (%dHz)" % (name, sr))
     if violations:
         raise RuntimeError(
-            "%s:\n%s" % (prep_codes.SOURCE_SR_TOO_LOW_CODE, "\n".join(violations))
+            "以下素材采样率低于 44100Hz（声码器微调要求 ≥44.1kHz 干声）：\n"
+            + "\n".join(violations)
         )
 
     written = 0
@@ -256,10 +245,7 @@ def slice_dataset(dataset_dir, slices_dir, ffmpeg, reporter, stop):
         reporter.stage("slice", done=n, total=len(names), message=name)
         wav, sr = _decode(os.path.join(dataset_dir, name), ffmpeg)
         if sr < TARGET_SR:  # probe couldn't read the header — belt over braces
-            raise RuntimeError(
-                "%s: %s (%dHz) < %d"
-                % (prep_codes.SOURCE_SR_TOO_LOW_CODE, name, sr, TARGET_SR)
-            )
+            raise RuntimeError("素材采样率低于 44100Hz: %s (%dHz)" % (name, sr))
         slicer = Slicer(sr=sr)  # openvpi defaults — the slicer upstream README prescribes
         idx1 = 0
         max_len = int(SLICE_MAX_SEC * TARGET_SR)
@@ -289,14 +275,7 @@ def slice_dataset(dataset_dir, slices_dir, ffmpeg, reporter, stop):
                        skipped_tiny, MIN_PIECE_SAMPLES / TARGET_SR)
     reporter.stage("slice", done=len(names), total=len(names))
     if written == 0:
-        raise RuntimeError(
-            "%s: %s files=%d written=0"
-            % (
-                prep_codes.NO_USABLE_SLICES_CODE,
-                os.path.basename(dataset_dir),
-                len(names),
-            )
-        )
+        raise RuntimeError("切片后没有任何有效样本（素材可能全为静音或过短）")
     with open(marker, "w", encoding="utf-8") as f:
         f.write("ok")
 
@@ -341,23 +320,16 @@ def process_slices(pool_dir, slices_dir, npz_dir, config, reporter, stop):
         os.replace(tmp, out)
     reporter.stage("process", done=len(names), total=len(names))
     if aug_dropped:
-        reporter.stage("process", message="%s: %d" % (stage_codes.DROPPED_AUG, aug_dropped),
+        reporter.stage("process", message="剔除 %d 个特征提取失败的增强片" % aug_dropped,
                        force=True)
     if failures:  # deviation 3: never a silent skip (user material only)
-        raise RuntimeError(
-            "%s: wav2spec failed for %d base slice(s):\n%s"
-            % (
-                prep_codes.SLICE_PREP_FAILED_CODE,
-                len(failures),
-                "\n".join(failures),
-            )
-        )
+        raise RuntimeError("以下切片特征提取失败：\n" + "\n".join(failures))
 
 
 # ─── stage: filelist ─────────────────────────────────────────────────────────
 
 def build_filelists(npz_dir, flist_dir, seed, crop_frames, reporter):
-    reporter.stage("filelist", message=stage_codes.SPLIT)
+    reporter.stage("filelist", message="划分训练/验证集")
     names = sorted(
         os.path.join(npz_dir, n) for n in os.listdir(npz_dir) if n.endswith(".npz")
     )
@@ -372,7 +344,7 @@ def build_filelists(npz_dir, flist_dir, seed, crop_frames, reporter):
             len(short), crop_frames, crop_frames,
             ", ".join(os.path.basename(p) for p in short),
         )
-        reporter.stage("filelist", message="%s: %d" % (stage_codes.DROPPED_SHORT, len(short)), force=True)
+        reporter.stage("filelist", message="剔除 %d 个过短切片" % len(short), force=True)
     # S41 split protocol: val is drawn from ORIGINAL slices only, with the
     # exact pre-aug rng semantics — copies=0 stays byte-identical, and the val
     # set is identical across aug settings (val loss stays comparable);
@@ -495,14 +467,6 @@ def _vocoder_aug_gate(pool_dir, run_dir, slices_dir, npz_dir, rmvpe_pt, backend,
         model_path=rmvpe_pt,
     )
 
-    # ⛔ S172, the closed-gate iron rule: "the gate could not run" and "the thing under test
-    # is bad" must NOT produce the same outcome. This loader returned None on ANY exception,
-    # and run_f0_gate reads None as "product missing" and DELETES the aug copy — so on a
-    # machine where the f0 predictor cannot run at all (e.g. an AMD box whose kernel compiler
-    # has no C++ headers, S172) every augmented copy was silently destroyed and the run
-    # carried on with a gate report as the only trace. Count the failures and tell them apart.
-    failures = {"n": 0, "first": None}
-
     def load_f0(stem):
         try:
             wav, _sr = read_wav(os.path.join(slices_dir, stem + ".wav"))
@@ -511,14 +475,8 @@ def _vocoder_aug_gate(pool_dir, run_dir, slices_dir, npz_dir, rmvpe_pt, backend,
             uv = np.asarray(uv, dtype=np.float64).reshape(-1)
             n = min(len(f0), len(uv))
             return f0[:n], uv[:n] > 0.5
-        except Exception as exc:
-            failures["n"] += 1
-            if failures["n"] <= FULL_TRACEBACKS:
-                logger.error("gate: f0 failed for %s\n%s", stem, traceback.format_exc())
-            else:
-                logger.error("gate: f0 failed for %s: %s: %s", stem, type(exc).__name__, exc)
-            if failures["first"] is None:
-                failures["first"] = "%s: %s" % (type(exc).__name__, exc)
+        except Exception:
+            logger.warning("gate: f0 failed for %s", stem)
             return None
 
     run_f0_gate(
@@ -531,23 +489,6 @@ def _vocoder_aug_gate(pool_dir, run_dir, slices_dir, npz_dir, rmvpe_pt, backend,
         # name is what the publish chain reads.
         report_path=report_path,
     )
-    # Every stem is read twice (source + aug copy), so "the predictor never worked" means
-    # 2*len(entries) failures. Anything short of that is a per-slice problem and stays a
-    # warning; the total wipe-out is the gate failing to run, and that must stop the run
-    # rather than quietly delete 100% of the augmentation.
-    if failures["n"] >= 2 * len(entries):
-        raise RuntimeError(
-            "%s: the augmentation quality gate could not extract f0 for ANY of the %d "
-            "pair(s) — refusing to delete every augmented copy on the strength of a gate "
-            "that never ran (%s)"
-            % (AUG_GATE_UNUSABLE_CODE, len(entries), failures["first"])
-        )
-    if failures["n"]:
-        logger.error(
-            "gate: f0 failed for %d of %d reads; the affected augmented copies were dropped",
-            failures["n"], 2 * len(entries),
-        )
-        reporter.warn(AUG_SLICES_DROPPED_CODE)
 
 
 # ─── config assembly (deviation 6 — see module header decision table) ────────

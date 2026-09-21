@@ -427,10 +427,31 @@ export function computeTrackHeight(track: Track, scale = 1): number {
   return (TRACK_HEADER_HEIGHT + lanesH + loudnessBandH(track)) * scale;
 }
 
+/** 被折叠文件夹隐藏的子轨 id 集合: folderCollapsed 的文件夹轨道, 其 folderId 指向它的子轨全部隐藏。
+ *  折叠是纯视图状态 — 隐藏只影响布局/绘制, 不影响播放与混音。 */
+export function hiddenTrackIds(tracks: Track[]): Set<string> {
+  const collapsed = new Set(
+    tracks.filter((t) => t.isFolder && t.folderCollapsed).map((t) => t.id),
+  );
+  if (collapsed.size === 0) return new Set();
+  const hidden = new Set<string>();
+  for (const t of tracks) {
+    if (t.folderId && collapsed.has(t.folderId)) hidden.add(t.id);
+  }
+  return hidden;
+}
+
 export function computeTrackYOffsets(tracks: Track[], scale = 1): number[] {
+  const hidden = hiddenTrackIds(tracks);
   const offsets: number[] = [];
   let y = 0;
   for (const track of tracks) {
+    // 隐藏子轨保留占位偏移(复用当前 y, 不推进) — offsets 必须与 tracks 索引对齐
+    // (Arrangement 到处按 offsets[i] 取), 由绘制/渲染层跳过这些条目。
+    if (hidden.has(track.id)) {
+      offsets.push(y);
+      continue;
+    }
     offsets.push(y);
     y += computeTrackHeight(track, scale);
   }
@@ -438,16 +459,22 @@ export function computeTrackYOffsets(tracks: Track[], scale = 1): number[] {
 }
 
 export function computeTotalTracksHeight(tracks: Track[], scale = 1): number {
+  const hidden = hiddenTrackIds(tracks);
   let h = 0;
   for (const track of tracks) {
+    if (hidden.has(track.id)) continue;
     h += computeTrackHeight(track, scale);
   }
   return h;
 }
 
-export function findTrackAtY(offsets: number[], y: number): number {
+export function findTrackAtY(offsets: number[], y: number, tracks?: Track[]): number {
+  const hidden = tracks ? hiddenTrackIds(tracks) : null;
   for (let i = offsets.length - 1; i >= 0; i--) {
-    if (y >= offsets[i]!) return i;
+    if (y >= offsets[i]!) {
+      if (hidden && tracks && hidden.has(tracks[i]?.id ?? "")) continue;
+      return i;
+    }
   }
   return -1;
 }

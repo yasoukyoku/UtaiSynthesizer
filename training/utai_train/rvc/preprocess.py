@@ -15,11 +15,6 @@ from scipy.io import wavfile
 
 from ..audio import load_audio
 from ..cache import dataset_entries
-from ..prep_codes import (
-    FULL_TRACEBACKS,
-    SLICE_PREP_FAILED_CODE,
-    SOURCE_FILES_SKIPPED_CODE,
-)
 from .slicer2 import Slicer
 
 logger = logging.getLogger(__name__)
@@ -134,28 +129,9 @@ def preprocess_trainset(inp_root, sr, pool_dir, per, ffmpeg, reporter, stop,
         reporter.stage("slice", done=n, total=len(infos), message=os.path.basename(path))
         try:
             pp.pipeline(path, idx0)
-        except Exception as exc:
+        except Exception:
             failed += 1
-            if failed <= FULL_TRACEBACKS:
-                logger.error("preprocess failed for %s\n%s", path, traceback.format_exc())
-            else:
-                logger.error("preprocess failed for %s: %s: %s", path, type(exc).__name__, exc)
+            logger.error("preprocess failed for %s\n%s", path, traceback.format_exc())
     reporter.stage("slice", done=len(infos), total=len(infos))
     if infos and failed == len(infos):
-        # S172 round 4: this is SOURCE_FILES_ALL_FAILED, not SLICE_PREP_FAILED. The latter
-        # means one base slice died inside a stage; this means not a single source file
-        # could even be decoded, which has a different cause and a different remedy.
-        raise RuntimeError(
-            "%s: none of the %d source file(s) could be decoded/sliced "
-            "(see the log for the first few tracebacks)"
-            % (SOURCE_FILES_ALL_FAILED_CODE, len(infos))
-        )
-    if failed:
-        # ⛔ S172: unlike a slice, ONE unreadable source file is a legitimate thing to skip —
-        # killing the run over it would be a UX regression. But the user then trains on less
-        # audio than they imported, and that used to be said nowhere at all.
-        logger.error(
-            "preprocess: %d of %d source file(s) produced no slices and were skipped",
-            failed, len(infos),
-        )
-        reporter.warn(SOURCE_FILES_SKIPPED_CODE)
+        raise RuntimeError("所有音频文件预处理均失败（详见日志）")

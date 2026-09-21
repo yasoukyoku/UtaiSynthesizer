@@ -1,4 +1,4 @@
-//! S41 audition-render integration legs (design B5 试听侧; red-team V15/V16/V17).
+﻿//! S41 audition-render integration legs (design B5 试听侧; red-team V15/V16/V17).
 //!
 //! Drives the LIB-LEVEL core of the audition commands (candidate conversion →
 //! sidecar facts → run_pipeline / vocoder self-loop) against the smoke-run
@@ -26,8 +26,8 @@
 
 use std::path::PathBuf;
 
-use utai_lib::inference::engine::{DeviceConfig, OnnxEngine};
-use utai_lib::inference::{RvcOptions, SovitsOptions};
+use muno_lib::inference::engine::{DeviceConfig, OnnxEngine};
+use muno_lib::inference::{RvcOptions, SovitsOptions};
 
 fn app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
@@ -37,16 +37,16 @@ fn init_ort() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("muno_lib=info")),
         )
         .try_init();
-    utai_lib::suppress_windows_dll_error_dialogs();
-    utai_lib::setup_cuda_dll_paths(&app_root());
-    utai_lib::init_ort_runtime(&app_root());
+    muno_lib::suppress_windows_dll_error_dialogs();
+    muno_lib::setup_cuda_dll_paths(&app_root());
+    muno_lib::init_ort_runtime(&app_root());
 }
 
 fn aux_dir() -> PathBuf {
-    app_root().join("data").join("models").join(utai_lib::models::AUX_DIR_NAME)
+    app_root().join("data").join("models").join(muno_lib::models::AUX_DIR_NAME)
 }
 
 fn audition_wav() -> PathBuf {
@@ -91,13 +91,13 @@ fn pitch_kit(engine: &OnnxEngine) -> PitchKit {
 
 fn f0_of(engine: &OnnxEngine, kit: &PitchKit, samples: &[f32], sr: u32) -> Vec<f32> {
     let wav16k =
-        utai_lib::inference::features::resample(samples, sr, utai_lib::inference::f0::RMVPE_SR);
-    utai_lib::inference::f0::rmvpe_detect(
+        muno_lib::inference::features::resample(samples, sr, muno_lib::inference::f0::RMVPE_SR);
+    muno_lib::inference::f0::rmvpe_detect(
         engine,
         &kit.rmvpe_sid,
         &kit.mel,
         &wav16k,
-        utai_lib::inference::f0::SOVITS_RMVPE_THRESHOLD,
+        muno_lib::inference::f0::SOVITS_RMVPE_THRESHOLD,
     )
     .expect("rmvpe detect")
 }
@@ -174,18 +174,18 @@ fn read_sidecar(model: &PathBuf) -> serde_json::Value {
 fn convert_candidate_cached(
     ckpt: &PathBuf,
     out_onnx: &PathBuf,
-    mtype: &utai_lib::models::ModelType,
+    mtype: &muno_lib::models::ModelType,
 ) {
     if out_onnx.is_file() {
         return; // conversion cache — mirrors the production short-circuit
     }
-    utai_lib::models::convert::convert_pth_to_onnx(ckpt, out_onnx, mtype, &app_root())
+    muno_lib::models::convert::convert_pth_to_onnx(ckpt, out_onnx, mtype, &app_root())
         .expect("convert candidate");
 }
 
 fn load_source() -> (Vec<f32>, u32) {
-    let buf = utai_lib::audio::load_audio(&audition_wav()).expect("load audition clip");
-    let mono = utai_lib::audio::resample::to_mono(&buf);
+    let buf = muno_lib::audio::load_audio(&audition_wav()).expect("load audition clip");
+    let mono = muno_lib::audio::resample::to_mono(&buf);
     (mono.samples.clone(), mono.sample_rate)
 }
 
@@ -203,7 +203,7 @@ fn audition_rvc_candidate() {
     set_device(&engine);
 
     let onnx = work_dir().join("rvc_best.onnx");
-    convert_candidate_cached(&ckpt, &onnx, &utai_lib::models::ModelType::Rvc);
+    convert_candidate_cached(&ckpt, &onnx, &muno_lib::models::ModelType::Rvc);
     let sc = read_sidecar(&onnx);
     let dim = sc["features_dim"].as_u64().expect("features_dim") as usize;
     let sample_rate = sc["sample_rate"].as_u64().expect("sample_rate") as u32;
@@ -217,9 +217,9 @@ fn audition_rvc_candidate() {
         .expect("contentvec");
     let kit = pitch_kit(&engine);
     let voice = engine.load_model_with(&onnx, false).expect("candidate session");
-    let audio = utai_lib::audio::load_audio(&clip).expect("clip");
+    let audio = muno_lib::audio::load_audio(&clip).expect("clip");
 
-    let m = utai_lib::inference::rvc::RvcModel {
+    let m = muno_lib::inference::rvc::RvcModel {
         engine: &engine,
         voice_session: &voice,
         contentvec_session: &cv,
@@ -233,7 +233,7 @@ fn audition_rvc_candidate() {
         min_frames: sc["min_frames"].as_u64().unwrap_or(12) as usize,
     };
     let options = RvcOptions { index_ratio: 0.0, ..Default::default() };
-    let r = utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, None, &|_| {}, &|| false)
+    let r = muno_lib::inference::rvc::run_pipeline(&m, &audio, &options, None, &|_| {}, &|| false)
         .expect("pipeline");
     let src = load_source();
     assert_render("rvc", &engine, &kit, &src, &r.audio, r.sample_rate, sample_rate);
@@ -254,7 +254,7 @@ fn audition_sovits_candidate() {
     set_device(&engine);
 
     let onnx = work_dir().join("sovits_best.onnx");
-    convert_candidate_cached(&ckpt, &onnx, &utai_lib::models::ModelType::SoVits);
+    convert_candidate_cached(&ckpt, &onnx, &muno_lib::models::ModelType::SoVits);
     let sc = read_sidecar(&onnx);
     let dim = if sc["speech_encoder"].as_str() == Some("vec256l9") { 256 } else { 768 };
     let sample_rate = sc["sample_rate"].as_u64().expect("sample_rate") as u32;
@@ -269,13 +269,13 @@ fn audition_sovits_candidate() {
         .expect("contentvec");
     let kit = pitch_kit(&engine);
     let voice = engine.load_model_with(&onnx, false).expect("candidate session");
-    let audio = utai_lib::audio::load_audio(&clip).expect("clip");
+    let audio = muno_lib::audio::load_audio(&clip).expect("clip");
 
     let vol_embedding = sc["inputs"]
         .as_array()
         .map(|l| l.iter().any(|v| v.as_str() == Some("vol")))
         .unwrap_or(false);
-    let m = utai_lib::inference::sovits::SovitsModel {
+    let m = muno_lib::inference::sovits::SovitsModel {
         engine: &engine,
         voice_session: &voice,
         contentvec_session: &cv,
@@ -298,7 +298,7 @@ fn audition_sovits_candidate() {
         min_frames: sc["min_frames"].as_u64().unwrap_or(6) as usize,
     };
     let options = SovitsOptions { cluster_ratio: 0.0, ..Default::default() };
-    let r = utai_lib::inference::sovits::run_pipeline(&m, &audio, &options, None, &|_| {}, &|| false)
+    let r = muno_lib::inference::sovits::run_pipeline(&m, &audio, &options, None, &|_| {}, &|| false)
         .expect("pipeline");
     let src = load_source();
     assert_render("sovits", &engine, &kit, &src, &r.audio, r.sample_rate, sample_rate);
@@ -322,25 +322,25 @@ fn audition_vocoder_ab() {
     let vdir = work_dir().join("voc_best");
     if !vdir.join("vocoder.onnx").is_file() {
         std::fs::create_dir_all(&vdir).unwrap();
-        utai_lib::models::convert::convert_vocoder_to_onnx(&ckpt, None, &vdir, "vocoder", &app_root())
+        muno_lib::models::convert::convert_vocoder_to_onnx(&ckpt, None, &vdir, "vocoder", &app_root())
             .expect("convert vocoder candidate");
     }
 
     // shared self-loop front half: 16k → f0, 44.1k → source samples
-    let buf = utai_lib::audio::load_audio(&clip).expect("clip");
-    let mono = utai_lib::audio::resample::to_mono(&buf);
-    let x44 = utai_lib::inference::features::resample(&mono.samples, mono.sample_rate, 44100);
-    let wav16k = utai_lib::inference::features::resample(
+    let buf = muno_lib::audio::load_audio(&clip).expect("clip");
+    let mono = muno_lib::audio::resample::to_mono(&buf);
+    let x44 = muno_lib::inference::features::resample(&mono.samples, mono.sample_rate, 44100);
+    let wav16k = muno_lib::inference::features::resample(
         &mono.samples,
         mono.sample_rate,
-        utai_lib::inference::f0::RMVPE_SR,
+        muno_lib::inference::f0::RMVPE_SR,
     );
-    let f0_raw = utai_lib::inference::f0::rmvpe_detect(
+    let f0_raw = muno_lib::inference::f0::rmvpe_detect(
         &engine,
         &kit.rmvpe_sid,
         &kit.mel,
         &wav16k,
-        utai_lib::inference::f0::SOVITS_RMVPE_THRESHOLD,
+        muno_lib::inference::f0::SOVITS_RMVPE_THRESHOLD,
     )
     .expect("f0");
 
@@ -351,10 +351,10 @@ fn audition_vocoder_ab() {
     ] {
         let filters: ndarray::Array2<f32> = ndarray_npy::read_npy(&mel_npy).expect("filterbank");
         let sid = engine.load_model_with(&onnx, false).expect("vocoder session");
-        let mel = utai_lib::inference::mel::nsf_mel(&x44, &filters);
+        let mel = muno_lib::inference::mel::nsf_mel(&x44, &filters);
         let (f0, _uv) =
-            utai_lib::inference::f0::sovits_f0_postprocess(&f0_raw, mel.ncols(), 512, 44100);
-        let out = utai_lib::inference::nsf_hifigan::vocode(&engine, &sid, &mel, &f0)
+            muno_lib::inference::f0::sovits_f0_postprocess(&f0_raw, mel.ncols(), 512, 44100);
+        let out = muno_lib::inference::nsf_hifigan::vocode(&engine, &sid, &mel, &f0)
             .expect("vocode");
         let src = (x44.clone(), 44100u32);
         assert_render(label, &engine, &kit, &src, &out, 44100, 44100);

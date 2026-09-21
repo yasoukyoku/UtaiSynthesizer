@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { useProjectStore } from "./project";
+import type { Track } from "../types/project";
 
 export interface AudioTrackData {
   filePath: string;
@@ -7,6 +9,9 @@ export interface AudioTrackData {
   durationMs: number;
   sampleRate: number;
   peaks: number[];
+  /** 左/右通道峰值包络(与 peaks 同帧率同对齐)。旧解码缓存/单声道 → 回退为混音 peaks。 */
+  peaksL: number[];
+  peaksR: number[];
 }
 
 interface AudioState {
@@ -33,6 +38,7 @@ interface AudioState {
   setPreparing: (preparing: boolean) => void;
   setSeeking: (seeking: boolean) => void;
   bumpSchedule: () => void;
+  pruneUnusedAudioCache: () => void;
 }
 
 export const useAudioStore = create<AudioState>((set, get) => ({
@@ -56,6 +62,8 @@ export const useAudioStore = create<AudioState>((set, get) => ({
         sample_rate: number;
         channels: number;
         peaks: number[];
+        peaks_l?: number[];
+        peaks_r?: number[];
         playback_path: string;
       }>("load_audio_file", { path: filePath });
 
@@ -65,6 +73,8 @@ export const useAudioStore = create<AudioState>((set, get) => ({
         durationMs: info.duration_ms,
         sampleRate: info.sample_rate,
         peaks: info.peaks,
+        peaksL: info.peaks_l && info.peaks_l.length > 0 ? info.peaks_l : info.peaks,
+        peaksR: info.peaks_r && info.peaks_r.length > 0 ? info.peaks_r : info.peaks,
       };
 
       set((s) => ({
@@ -83,4 +93,40 @@ export const useAudioStore = create<AudioState>((set, get) => ({
   setPreparing: (preparing) => set({ preparing }),
   setSeeking: (seeking) => set({ seeking }),
   bumpSchedule: () => set((s) => ({ scheduleVersion: s.scheduleVersion + 1 })),
+
+  pruneUnusedAudioCache: () => {
+    const projectStore = useProjectStore.getState();
+    const currentTracks: Track[] = projectStore.tracks;
+    
+    const usedPaths = new Set<string>();
+    currentTracks.forEach((track: Track) => {
+      track.segments?.forEach((segment) => {
+        if (segment.content.type === 'audioClip') {
+          usedPaths.add(segment.content.sourcePath);
+        }
+        segment.processedOutputs?.forEach((output) => {
+          usedPaths.add(output.audioPath);
+        });
+      });
+    });
+
+    set((s) => {
+      const newAudioFiles: Record<string, AudioTrackData> = {};
+      let prunedCount = 0;
+      
+      Object.entries(s.audioFiles).forEach(([path, data]) => {
+        if (usedPaths.has(path)) {
+          newAudioFiles[path] = data;
+        } else {
+          prunedCount++;
+        }
+      });
+
+      if (prunedCount > 0) {
+        console.log(`[AudioCache] Pruned ${prunedCount} unused audio file(s) from cache`);
+      }
+
+      return { audioFiles: newAudioFiles };
+    });
+  },
 }));

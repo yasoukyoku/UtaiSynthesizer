@@ -627,12 +627,6 @@ async fn run_envtest_inner(
     let device = envtest_device_for_variant(&pack.meta.variant);
 
     let mut cmd = tokio::process::Command::from(crate::util::python_command(&python));
-    // S172: same as the training spawn — the self-test has to run against the SAME compiler
-    // environment the real run gets, or it would green-light a machine that then cannot build
-    // a single MIOpen kernel. Relative, resolved against `current_dir` below.
-    let hiprtc_opts = crate::util::hiprtc_cxx_include_options();
-    crate::util::log_hiprtc_cxx_provenance(&training_dir, &hiprtc_opts);
-    cmd.env("HIPRTC_COMPILE_OPTIONS_APPEND", &hiprtc_opts);
     cmd.current_dir(&training_dir)
         .arg("-m")
         .arg("utai_train.envtest")
@@ -762,58 +756,6 @@ async fn run_envtest_inner(
                 ));
             }
             if overall == "pass" {
-                // S172: a PASS used to log nothing at all. The per-check details go out on
-                // STDOUT as protocol items straight to the UI and only stderr is logged, so the
-                // one compiler-verified statement that this machine's kernel compiler works —
-                // check_hiprtc_cxx_headers' detail — was thrown away precisely when it held.
-                // A user who sends their log after a green self-test then hands us nothing, and
-                // we are back to mailing them a probe.
-                //
-                // `warn` items are logged individually because a PASSING report can still carry
-                // them (overall is "fail" only when `failed` is non-empty): ENVTEST_OP_FALLBACK_HOT
-                // names a hot aten op that silently ran on CPU, which is a real degradation
-                // hiding inside a green verdict.
-                let items: Vec<_> = rep
-                    .get("items")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.as_slice())
-                    .unwrap_or(&[])
-                    .iter()
-                    .collect();
-                let get = |it: &serde_json::Value, k: &str| {
-                    it.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
-                };
-                tracing::info!(
-                    "envtest PASSED [{}]: {} checks — {}",
-                    id,
-                    items.len(),
-                    items
-                        .iter()
-                        .map(|it| format!("{}={}", get(it, "name"), get(it, "status")))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-                for it in &items {
-                    let status = get(it, "status");
-                    if status == "warn" {
-                        tracing::warn!(
-                            "envtest WARN [{}] check={} detail={}",
-                            id,
-                            get(it, "name"),
-                            get(it, "detail")
-                        );
-                    } else if status == "pass" && !get(it, "detail").is_empty() {
-                        // The detail is the evidence, not decoration: "hiprtc0715.dll resolves
-                        // <type_traits> for gfx1103; 2 shipped dir(s) self-sufficient under
-                        // -nostdinc" is the sentence that closes an AMD triage on the spot.
-                        tracing::debug!(
-                            "envtest ok [{}] check={} detail={}",
-                            id,
-                            get(it, "name"),
-                            get(it, "detail")
-                        );
-                    }
-                }
                 Ok(rep)
             } else {
                 // S74b: log the RAW verdict, uncapped, one line per failed check — in LOG format,

@@ -12,18 +12,34 @@
 //! (same float op order = bit-exact) and is covered by the unit tests here plus the
 //! app-side bitwise A/B gate (converter/verify/README.md).
 
+pub mod bus_eq;
+pub mod clip_detect;
+pub mod dc_offset;
 pub mod demucs;
+pub mod dither;
+pub mod dtw;
 pub mod formant;
 pub mod harmonicity;
 pub mod mdx;
+pub mod phase_correlation;
+pub mod phase_rotate;
+pub mod pitch;
 pub mod psola;
+pub mod saturate;
 pub mod shelf;
+pub mod silence;
+pub mod spectrogram;
+pub mod stereo_width;
 pub mod stft;
 pub mod tempo;
+pub mod timbre;
+pub mod true_peak;
+pub mod voice_realism;
 pub mod vr;
 
 pub use demucs::{demucs_ispec, demucs_spec};
 pub use formant::formant_warp;
+pub use voice_realism::{add_into, apply_formant_jitter, apply_hf_excitation, synth_breath};
 
 use ndarray::Array3;
 

@@ -1,0 +1,5 @@
+# 这些目录由 Python 运行时写入（.pyc 字节码、.cache 缓存、模型 junction）。
+# tauri dev 监视 src-tauri/ 内的文件变化，检测到写入会杀掉应用重启
+# （"生成歌曲时软件自动退出"的根因），必须从监视中排除。
+python_sidecar/
+runtime/

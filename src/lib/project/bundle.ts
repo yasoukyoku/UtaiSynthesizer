@@ -80,6 +80,10 @@ function serializeProject(
     // that as unsaved work vs a pre-toggle baseline where the key is absent). Unconditional — full
     // saves, autosaves, and the savedJson baseline must all agree.
     if (!track.playOriginal) delete (track as { playOriginal?: boolean }).playOriginal;
+    // S12 FX sends — fold-away at 0 (absent ≡ 0) so an on→off cycle returns to the byte-identical
+    // baseline (playOriginal precedent), keeping autosave/hasUnsavedWork compares clean.
+    if (!(track as { reverbSend?: number }).reverbSend) delete (track as { reverbSend?: number }).reverbSend;
+    if (!(track as { delaySend?: number }).delaySend) delete (track as { delaySend?: number }).delaySend;
     // Same normalization for `laneMutes` — drop false entries (and the whole key when empty), or a
     // row-mute on→off cycle never returns to the byte-identical baseline (spurious "unsaved changes"
     // close prompt + endless autosave churn). EXCEPTION: keep an explicit false that MASKS a legacy
@@ -204,6 +208,22 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
             const rawSemis = fx.length > 0 ? legacySum : Number(n.params?.semitones ?? 0);
             const semitones = Number.isFinite(rawSemis) ? Math.max(-24, Math.min(24, rawSemis)) : 0;
             return { ...n, nodeType: "transpose" as const, params: { semitones } };
+          }),
+        };
+      }
+      // P2-14 MIGRATION: 旧歌曲生成节点 songGenYue2/songGenAceStep → 统一的 songGen（模型写入
+      // params.model；旧 service_url 依赖废弃）。旧类型从未注册 UI（半成品），无真实用户数据，
+      // 这里兜底迁移保证旧工程打开不报错。与上方 S61 迁移共用同一加载咽喉点。
+      if (rest.workflow?.nodes.some((n) => ["songGenYue2", "songGenAceStep"].includes(n.nodeType as string))) {
+        rest.workflow = {
+          ...rest.workflow,
+          nodes: rest.workflow.nodes.map((n) => {
+            if (!["songGenYue2", "songGenAceStep"].includes(n.nodeType as string)) return n;
+            return {
+              ...n,
+              nodeType: "songGen" as const,
+              params: { ...n.params, model: n.nodeType === "songGenYue2" ? "yue2-3b" : "acestep-v1.5" },
+            };
           }),
         };
       }
@@ -423,9 +443,36 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
     // Untrusted load boundary for the track's vocal params (§9.8.1): coerce backend enum, clamp
     // speaker/lang/transpose. Absent (non-vocal track) → stays absent.
     const track: Track = { ...t, segments, laneControls };
+    // S12 untrusted load boundary: hostile/out-of-range FX sends clamp to 0..1; 0 folds away.
+    const rs = typeof track.reverbSend === "number" && Number.isFinite(track.reverbSend) ? Math.max(0, Math.min(1, track.reverbSend)) : undefined;
+    const ds = typeof track.delaySend === "number" && Number.isFinite(track.delaySend) ? Math.max(0, Math.min(1, track.delaySend)) : undefined;
+    if (rs && rs > 0) track.reverbSend = Math.round(rs * 100) / 100;
+    else delete (track as { reverbSend?: number }).reverbSend;
+    if (ds && ds > 0) track.delaySend = Math.round(ds * 100) / 100;
+    else delete (track as { delaySend?: number }).delaySend;
     const vp = sanitizeVocalParams(t.vocalParams);
     if (vp) track.vocalParams = vp;
     else delete (track as { vocalParams?: unknown }).vocalParams;
+    // 音源选择(Muno 阶段1)加载边界:fontId/presetId 必须是非空字符串,否则丢弃(防手工编辑/
+    // 损坏文件把非法值带进渲染调度)。presetName 冗余显示名同样仅接受字符串。
+    if (track.soundfont !== undefined) {
+      const sf = track.soundfont as unknown as Record<string, unknown> | null | undefined;
+      const sfFontId = sf && typeof sf === "object" ? sf.fontId : undefined;
+      const sfPresetId = sf && typeof sf === "object" ? sf.presetId : undefined;
+      if (typeof sfFontId === "string" && sfFontId && typeof sfPresetId === "string" && sfPresetId) {
+        const pn = sf && typeof sf === "object" ? sf.presetName : undefined;
+        // 3-9 渲染引擎:仅接受 "fluidsynth",其余值(含 absent)折叠回内置后端。
+        const bk = sf && typeof sf === "object" ? sf.backend : undefined;
+        track.soundfont = {
+          fontId: sfFontId,
+          presetId: sfPresetId,
+          ...(typeof pn === "string" && pn ? { presetName: pn } : {}),
+          ...(bk === "fluidsynth" ? { backend: "fluidsynth" as const } : {}),
+        };
+      } else {
+        delete (track as { soundfont?: unknown }).soundfont;
+      }
+    }
     return track;
   });
 

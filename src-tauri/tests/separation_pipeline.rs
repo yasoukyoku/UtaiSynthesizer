@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use utai_lib::inference::engine::{DeviceConfig, OnnxEngine};
-use utai_lib::separation::pipeline::{self, NativePipeline};
-use utai_lib::separation::stft::{self, StftConfig};
+﻿use std::path::PathBuf;
+use muno_lib::inference::engine::{DeviceConfig, OnnxEngine};
+use muno_lib::separation::pipeline::{self, NativePipeline};
+use muno_lib::separation::stft::{self, StftConfig};
 
 fn app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
@@ -11,19 +11,19 @@ fn app_root() -> PathBuf {
 /// 0 CPU on the first session build (invisible modal DLL dialog + uninitialized load-dynamic ORT).
 fn init_ort() {
     // Tests have no tracing subscriber by default, so the [perf] probes in pipeline.rs are
-    // invisible without this. RUST_LOG overrides; default surfaces utai_lib debug (= all probes).
+    // invisible without this. RUST_LOG overrides; default surfaces muno_lib debug (= all probes).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=debug")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("muno_lib=debug")),
         )
         .try_init();
-    utai_lib::suppress_windows_dll_error_dialogs();
+    muno_lib::suppress_windows_dll_error_dialogs();
     // cudnn 9's shim resolves its sub-DLLs via PATH at graph-build time — the
     // app sets this up in run(); a bare harness without it fails the first
     // CUDA Conv with CUDNN_BACKEND_API_FAILED (looks like environment drift).
-    utai_lib::setup_cuda_dll_paths(&app_root());
-    utai_lib::init_ort_runtime(&app_root());
+    muno_lib::setup_cuda_dll_paths(&app_root());
+    muno_lib::init_ort_runtime(&app_root());
 }
 
 fn bs_roformer_onnx_path() -> PathBuf {

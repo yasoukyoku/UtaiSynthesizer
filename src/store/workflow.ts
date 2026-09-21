@@ -1,6 +1,9 @@
 import { create } from "zustand";
 
-export type NodeStatus = "idle" | "waiting" | "running" | "completed" | "error";
+/** "degraded": 节点跑完但内部有步骤走了兜底（如变速失败透传原图继续）——任务算完成，
+ *  但用户必须知道输出不是原始参数的产物。细节通过 toast 告知，节点只挂警示徽标。
+ *  "bypassed": 节点被用户旁通（Phase 6 节点级 bypass 开关）——引擎跳过该节点，把输入原样接到输出。 */
+export type NodeStatus = "idle" | "waiting" | "running" | "completed" | "degraded" | "bypassed" | "error";
 
 export interface ExecutionState {
   status: "idle" | "running" | "completed" | "error";
@@ -38,8 +41,12 @@ interface WorkflowStore {
    *  S25 render-lifecycle map). */
   renderLinks: Record<string, string>;
   singleNodeRunner: ((nodeId: string) => void) | null;
+  /** 节点注释编辑器的打开口。注释徽标画在 NodeShell 里（每个节点内部），而编辑器挂在
+   *  WorkflowEditor 上 —— 与 singleNodeRunner 同一口径，由编辑器挂载时注册、卸载时清空。 */
+  annotationEditor: ((nodeId: string) => void) | null;
 
   registerSingleNodeRunner: (fn: ((nodeId: string) => void) | null) => void;
+  registerAnnotationEditor: (fn: ((nodeId: string) => void) | null) => void;
   startExecution: (segmentId: string, participants: string[]) => void;
   updateProgress: (segmentId: string, nodeId: string, progress: number) => void;
   completeExecution: (segmentId: string) => void;
@@ -86,8 +93,10 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
   nodeErrors: {},
   renderLinks: {},
   singleNodeRunner: null,
+  annotationEditor: null,
 
   registerSingleNodeRunner: (fn) => set({ singleNodeRunner: fn }),
+  registerAnnotationEditor: (fn) => set({ annotationEditor: fn }),
   startExecution: (segmentId, participants) =>
     set((s) => ({
       executions: {
@@ -101,7 +110,18 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
       executions: {
         ...s.executions,
         // Preserve the dispatch snapshot — progress ticks rebuild the entry wholesale.
-        [segmentId]: { status: "running", currentNodeId: nodeId, progress, participants: s.executions[segmentId]?.participants },
+        // `cancelled` MUST ride along: the engine loop calls updateProgress at the TOP of every node
+        // and polls isCancelled() a few lines later with no await in between, so dropping the flag here
+        // erased every Stop that landed while a node was running. Purely-frontend nodes (the symbolic
+        // family / autoArrange / split / dsp) never re-check it themselves, so the run drove to the end
+        // and settled as "completed" — a Stop the user watched do nothing.
+        [segmentId]: {
+          status: "running",
+          currentNodeId: nodeId,
+          progress,
+          participants: s.executions[segmentId]?.participants,
+          ...(s.executions[segmentId]?.cancelled ? { cancelled: true as const } : {}),
+        },
       },
     })),
 
@@ -146,6 +166,10 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
     }),
 
   cloneSegmentState: (fromId, toId) => {
+    if (!fromId || !toId) {
+      console.warn('[Workflow] cloneSegmentState called with invalid id', { fromId, toId });
+      return;
+    }
     const snap = get().snapshotSegmentState(fromId);
     if (snap) get().installSegmentState(toId, snap);
   },
@@ -177,14 +201,22 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
     return Object.keys(snap).length > 0 ? snap : null;
   },
 
-  installSegmentState: (segmentId, snap) =>
-    set((s) => ({
-      nodeOutputs: snap.nodeOutputs ? { ...s.nodeOutputs, [segmentId]: { ...snap.nodeOutputs } } : s.nodeOutputs,
-      nodeStatuses: snap.nodeStatuses ? { ...s.nodeStatuses, [segmentId]: { ...snap.nodeStatuses } } : s.nodeStatuses,
-      nodeProgress: snap.nodeProgress ? { ...s.nodeProgress, [segmentId]: { ...snap.nodeProgress } } : s.nodeProgress,
-      nodeErrors: snap.nodeErrors ? { ...s.nodeErrors, [segmentId]: { ...snap.nodeErrors } } : s.nodeErrors,
-      executions: snap.execution ? { ...s.executions, [segmentId]: { ...snap.execution } } : s.executions,
-    })),
+  installSegmentState: (segmentId, snap) => {
+    if (!segmentId) {
+      console.warn('[Workflow] installSegmentState called with invalid segmentId');
+      return;
+    }
+    if (!snap) return;
+    set((s) => {
+      const updates: Partial<WorkflowStore> = {};
+      if (snap.nodeOutputs) updates.nodeOutputs = { ...s.nodeOutputs, [segmentId]: snap.nodeOutputs };
+      if (snap.nodeStatuses) updates.nodeStatuses = { ...s.nodeStatuses, [segmentId]: snap.nodeStatuses };
+      if (snap.nodeProgress) updates.nodeProgress = { ...s.nodeProgress, [segmentId]: snap.nodeProgress };
+      if (snap.nodeErrors) updates.nodeErrors = { ...s.nodeErrors, [segmentId]: snap.nodeErrors };
+      if (snap.execution) updates.executions = { ...s.executions, [segmentId]: snap.execution };
+      return updates;
+    });
+  },
 
   hydrateRenderState: (segmentId, nodeOutputs, completedNodeIds) =>
     set((s) => {
@@ -259,7 +291,9 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
       if (!cur) return {};
       const next: Record<string, NodeStatus> = {};
       for (const [id, st] of Object.entries(cur)) {
-        if (st === "completed" || st === "error") next[id] = st;
+        // 规划 6-3: degraded（兜底透传）与 bypassed（用户旁通）都是「终态事实」，
+        // 与 completed/error 一样要在失败/取消清扫中幸存，否则旁通徽标一闪即逝。
+        if (st === "completed" || st === "error" || st === "degraded" || st === "bypassed") next[id] = st;
       }
       return { nodeStatuses: { ...s.nodeStatuses, [segmentId]: next } };
     }),

@@ -1,0 +1,545 @@
+/* Muno 音源管理器 — Tab 式布局 */
+.soundfont-manager {
+  position: fixed;
+  min-width: 520px;
+  min-height: 360px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: calc(var(--z-overlay, 100) + 10);
+}
+
+.soundfont-manager .panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-lg);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
+  cursor: move;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.soundfont-manager .panel-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--accent-secondary);
+}
+
+.soundfont-manager .panel-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.soundfont-manager .panel-close:hover {
+  color: var(--text-primary);
+}
+
+/* ===== 顶部标签页 ===== */
+.sfm-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
+  flex-shrink: 0;
+}
+
+.sfm-tab {
+  flex: 1;
+  padding: 10px var(--space-md);
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-weight: 500;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.sfm-tab:hover {
+  color: var(--text-secondary);
+}
+
+.sfm-tab.active {
+  color: var(--accent-secondary);
+  border-bottom-color: var(--accent-primary);
+}
+
+.sfm-tab-count {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  background: var(--bg-base);
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-family: var(--font-mono);
+  min-width: 18px;
+  text-align: center;
+}
+
+.sfm-tab-primary {
+  color: var(--accent-primary);
+  background: rgba(0, 229, 255, 0.08);
+}
+
+.sfm-tab.active .sfm-tab-count {
+  color: var(--accent-secondary);
+}
+
+/* ===== 主体容器 ===== */
+.sfm-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.sfm-tab-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.sfm-download-pane {
+  overflow-y: auto;
+  padding: var(--space-md);
+  gap: var(--space-lg);
+}
+
+/* ===== 工具栏 ===== */
+.sfm-toolbar {
+  display: flex;
+  gap: var(--space-sm);
+  padding: var(--space-md);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  background: var(--bg-surface);
+}
+
+.sfm-btn {
+  padding: 5px 14px;
+  font-size: var(--font-size-sm);
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  cursor: pointer;
+  border-radius: 3px;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.sfm-btn:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.sfm-btn.primary {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: #fff;
+}
+
+.sfm-btn.primary:hover:not(:disabled) {
+  filter: brightness(1.1);
+  color: #fff;
+}
+
+.sfm-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ===== 已安装列表 ===== */
+.sfm-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  min-height: 80px;
+}
+
+.sfm-empty {
+  color: var(--text-muted);
+  text-align: center;
+  padding: var(--space-xl) 0;
+  font-size: var(--font-size-sm);
+}
+
+.sfm-empty .sfm-hint {
+  font-size: var(--font-size-xs);
+  opacity: 0.75;
+  margin-top: 6px;
+}
+
+/* ===== 已安装音源卡片 ===== */
+.sfm-font-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-sm) var(--space-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: 3px;
+}
+
+.sfm-font-card.confirming {
+  border-color: var(--color-error);
+}
+
+.sfm-font-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
+.sfm-font-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+}
+
+.sfm-font-sub {
+  padding-left: 2px;
+}
+
+.sfm-size {
+  flex: none;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+}
+
+.sfm-presets {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.sfm-presets.none {
+  color: var(--color-warning);
+}
+
+.sfm-delete {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 20px;
+  height: 20px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.sfm-delete:hover {
+  color: var(--color-error);
+}
+
+.sfm-format {
+  flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  letter-spacing: 0.5px;
+}
+
+.sfm-format.sfz {
+  color: #4cc38a;
+  border: 1px solid #4cc38a;
+}
+
+.sfm-format.sf2 {
+  color: #5ea1ef;
+  border: 1px solid #5ea1ef;
+}
+
+/* ===== 下载区 Section ===== */
+.sfm-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sfm-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--accent-secondary);
+}
+
+.sfm-section-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-primary);
+}
+
+.sfm-section-dot-sfz {
+  background: #4cc38a;
+}
+
+.sfm-section-hint {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.sfm-section-sfz {
+  border-top: 1px dashed var(--border-subtle);
+  padding-top: var(--space-md);
+}
+
+/* ===== 推荐音源卡片网格 ===== */
+.sfm-rec-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--space-sm);
+}
+
+.sfm-rec-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: var(--space-sm) var(--space-md);
+  background: linear-gradient(180deg, var(--bg-surface) 0%, var(--bg-base) 100%);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.sfm-rec-card:hover {
+  border-color: var(--accent-secondary);
+}
+
+.sfm-rec-card.installed {
+  border-color: var(--accent-primary-dim);
+  background: linear-gradient(180deg, var(--bg-surface) 0%, rgba(0, 229, 255, 0.04) 100%);
+}
+
+.sfm-rec-card.downloading {
+  border-color: var(--accent-primary);
+}
+
+.sfm-rec-card.sfz {
+  border-color: rgba(76, 195, 138, 0.3);
+}
+
+.sfm-rec-card.sfz:hover {
+  border-color: rgba(76, 195, 138, 0.6);
+}
+
+.sfm-rec-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.sfm-rec-name {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sfm-rec-format {
+  flex: none;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  background: rgba(0, 229, 255, 0.05);
+  padding: 0 5px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 229, 255, 0.15);
+}
+
+.sfm-rec-format.sfz {
+  color: #4cc38a;
+  background: rgba(76, 195, 138, 0.08);
+  border-color: rgba(76, 195, 138, 0.25);
+}
+
+.sfm-rec-desc {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  margin: 0;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.sfm-rec-tip {
+  font-size: 11px;
+  color: var(--accent-secondary);
+  background: rgba(255, 184, 108, 0.08);
+  padding: 3px 8px;
+  border-radius: 4px;
+  line-height: 1.4;
+}
+
+.sfm-rec-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.sfm-rec-rating {
+  color: #f5b841;
+  letter-spacing: 0.5px;
+}
+
+/* ===== 下载进度条 ===== */
+.sfm-rec-progress {
+  position: relative;
+  height: 16px;
+  background: var(--bg-base);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-top: 2px;
+}
+
+.sfm-rec-progress-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-primary-dim), var(--accent-primary));
+  transition: width 0.3s ease;
+}
+
+.sfm-rec-progress-text {
+  position: relative;
+  z-index: 1;
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  padding: 0 var(--space-sm);
+  line-height: 16px;
+}
+
+/* ===== 下载按钮 ===== */
+.sfm-rec-btn {
+  align-self: flex-start;
+  padding: 5px 16px;
+  font-size: var(--font-size-xs);
+  color: #fff;
+  background: var(--accent-primary);
+  border: 1px solid var(--accent-primary);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+
+.sfm-rec-btn:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
+.sfm-rec-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* ===== SFZ 卡片特化 ===== */
+.sfz-desc {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  -webkit-line-clamp: 1;
+}
+
+.sfz-purpose-badge {
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 3px;
+  background: rgba(76, 195, 138, 0.12);
+  color: #4cc38a;
+  border: 1px solid rgba(76, 195, 138, 0.25);
+  letter-spacing: 0.5px;
+}
+
+.sfz-meta-text {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.sfm-rec-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.sfz-download {
+  background: #4cc38a;
+  border-color: #4cc38a;
+}
+
+.sfz-download:hover:not(:disabled) {
+  background: #3cb37a;
+  border-color: #3cb37a;
+}
+
+.sfz-import {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-default);
+}
+
+.sfz-import:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--border-default);
+  background: var(--bg-panel);
+}
+
+.sfm-rec-installed-tag {
+  color: #4cc38a;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  padding: 3px 10px;
+  background: rgba(76, 195, 138, 0.1);
+  border: 1px solid rgba(76, 195, 138, 0.3);
+  border-radius: 4px;
+}

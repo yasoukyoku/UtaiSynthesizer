@@ -1038,6 +1038,11 @@ fn mg_render_rvc() {
             consonant_valley_scale: valley,
             vowel_clarity: clarity,
             consonant_preroll: mg_timing_env() == ArticulationTiming::Auto,
+            // Phase 7 ①②③: 探针量的是各自的刀——真实化层保持 OFF(SP 缝里多一口气会挪动所有
+            // 贴着 SP 的测量)。
+            voice_realism_mix: 0.0,
+            formant_jitter_depth: 0.0,
+            breath_layer: false,
         },
         tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog, None,
@@ -1304,6 +1309,10 @@ fn mg_render_sovits() {
             consonant_valley_scale: valley,
             vowel_clarity: clarity,
             consonant_preroll: mg_timing_env() == ArticulationTiming::Auto,
+            // Phase 7 ①②③: 同上——探针量的是各自的刀,真实化层保持 OFF。
+            voice_realism_mix: 0.0,
+            formant_jitter_depth: 0.0,
+            breath_layer: false,
         },
         tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog, donor_ctx,
@@ -1640,6 +1649,10 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
         consonant_valley_scale: valley,
         vowel_clarity: clarity,
         consonant_preroll: mg_timing_env() == ArticulationTiming::Auto,
+        // Phase 7 ①②③: 同上——探针量的是各自的刀,真实化层保持 OFF。
+        voice_realism_mix: 0.0,
+        formant_jitter_depth: 0.0,
+        breath_layer: false,
     };
     let cvspk = mg_cvspk_env();
     let t0 = Instant::now();

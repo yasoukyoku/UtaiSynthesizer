@@ -66,10 +66,15 @@ pub struct AppState {
     pub cache_dir: std::path::PathBuf,
     pub app_dir: std::path::PathBuf,
     pub msst_models_dir: std::path::PathBuf,
+    pub amt_models_dir: std::path::PathBuf,
+    pub song_models_dir: std::path::PathBuf,
     /// Long tasks currently running (stable ids → `close.task_<id>` labels), so the close-flow's
     /// in-progress warning can LIST what's running. Registered via `begin_task` (RAII). Training +
     /// separation are queried directly in `running_tasks`, not stored here.
     pub active_tasks: Arc<parking_lot::Mutex<std::collections::HashMap<String, usize>>>,
+    /// Running AMT sidecar processes: (node_id →  child pid). Used by `cancel_amt_midi` to
+    /// force-stop a workflow MIDI conversion even while the Python sidecar is busy.
+    pub active_amt: Arc<parking_lot::Mutex<std::collections::HashMap<String, u32>>>,
 }
 
 impl AppState {
@@ -80,6 +85,8 @@ impl AppState {
         log_buffer: Arc<logging::LogBuffer>,
     ) -> Self {
         let msst_models_dir = models_dir.join("msst");
+        let amt_models_dir = models_dir.join("amt");
+        let song_models_dir = models_dir.join("song");
         Self {
             inference: inference::InferenceManager::new(),
             training: training::TrainingManager::new(app_dir.clone()),
@@ -89,7 +96,10 @@ impl AppState {
             cache_dir,
             app_dir,
             msst_models_dir,
+            amt_models_dir,
+            song_models_dir,
             active_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            active_amt: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -700,7 +710,7 @@ pub fn window_state_flags() -> tauri_plugin_window_state::StateFlags {
 /// src-tauri/target/debug walks up to the repo root), with the old CWD probe as fallback. The
 /// final fallback is the exe dir — NOT the CWD — so the data/models root can never silently move
 /// with whatever directory the app happened to be launched from.
-fn resolve_app_dir() -> std::path::PathBuf {
+pub(crate) fn resolve_app_dir() -> std::path::PathBuf {
     let has_converter = |d: &std::path::Path| d.join("converter").join("convert.py").exists();
 
     // Dev builds pin to the repo root (compile-time known). S64: bundle.resources now copies
@@ -930,13 +940,6 @@ pub fn run() {
     let tz_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
     let mut file_appender =
         logging::LocalDailyFile::new(log_dir.clone(), logging::LOG_PREFIX, tz_offset);
-    // S172: rolled logs had no retention at all — the writer appends forever and nothing
-    // ever removed one. AFTER the current file is opened, so today's is never a candidate.
-    logging::prune_old_logs(
-        &log_dir,
-        logging::LOG_PREFIX,
-        time::OffsetDateTime::now_utc().to_offset(tz_offset).date(),
-    );
     // S67c: process-start divider, FILE ONLY. Same-day launches APPEND to one file, so a
     // crashed process's last line and the next launch's first line were visually
     // indistinguishable (the 07-16 community log interleaves six runs across three app
@@ -949,7 +952,7 @@ pub fn run() {
         use std::io::Write;
         let _ = writeln!(
             file_appender,
-            "\n======================== process start: UtaiSynthesizer {} (pid {}) ========================",
+            "\n======================== process start: Muno {} (pid {}) ========================",
             env!("CARGO_PKG_VERSION"),
             std::process::id()
         );
@@ -962,7 +965,7 @@ pub fn run() {
     let log_buffer = Arc::new(logging::LogBuffer::new(2000));
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "utai=info".into());
+        .unwrap_or_else(|_| "muno=info".into());
 
     // The FILE log MUST be filtered too. Without a filter it captures EVERY target at EVERY
     // level — including ORT's per-tensor-allocation VERBOSE/TRACE (`execution_frame.cc` "block
@@ -972,7 +975,7 @@ pub fn run() {
     // for post-crash forensics; ort/symphonia/everything else only surfaces WARN+ (real problems,
     // never the per-op spam). RUST_LOG overrides both layers for deep debugging.
     let file_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "warn,utai=debug".into());
+        .unwrap_or_else(|_| "warn,muno=debug".into());
 
     // S67: file/stdout timestamps in LOCAL time with the UTC offset printed on every
     // line — users could never match the log PANEL's local times against the file's
@@ -1008,7 +1011,7 @@ pub fn run() {
         tz_offset.minutes_past_hour().abs()
     );
     tracing::info!(
-        "UtaiSynthesizer {} starting (pid {}) — logs: {} (timestamps local, UTC{})",
+        "Muno {} starting (pid {}) — logs: {} (timestamps local, UTC{})",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         log_dir.display(),
@@ -1111,6 +1114,7 @@ pub fn run() {
             let models_dir = data_dir.join("models");
             let _ = std::fs::create_dir_all(&cache_dir);
             let _ = std::fs::create_dir_all(&models_dir);
+            let _ = std::fs::create_dir_all(models_dir.join("amt"));
             // S64b migration: the shared-model dir used to be `models/aux` — a reserved Windows
             // device name most systems can't even create (beta testers: os error 267/1200); only
             // relaxed Win11 builds (the dev machine) ever had one. Rename it where it exists.
@@ -1180,6 +1184,14 @@ pub fn run() {
             if let Err(e) = app.asset_protocol_scope().allow_directory(&models_dir, true) {
                 tracing::warn!("Failed to add models dir to asset protocol scope: {}", e);
             }
+            // AMT/preview PLAYBACK: separation stems, content-addressed playback WAVs
+            // (audio_cache), and run-dir artifacts all live under the DATA ROOT, which is
+            // user-movable exactly like models_dir — the static scope (AppData only) can't
+            // know it. Without this, every convertFileSrc() <audio> preview of a cache file
+            // is silently blocked by the protocol (no error toast — it just never plays).
+            if let Err(e) = app.asset_protocol_scope().allow_directory(&data_dir, true) {
+                tracing::warn!("Failed to add data dir to asset protocol scope: {}", e);
+            }
             let state = Arc::new(AppState::new(app_dir_early, cache_dir, models_dir, Arc::clone(&log_buffer)));
             commands::settings::load_and_apply_config(&state);
             // Idle-release sweeper: free GPU sessions (+ the resident ORT CUDA arena) after a stretch of
@@ -1207,18 +1219,31 @@ pub fn run() {
             {
                 let build_main = |data_dir: Option<std::path::PathBuf>| {
                     let wb =
-                        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
-                            .title("UtaiSynthesizer")
-                            .inner_size(1400.0, 900.0)
-                            .min_inner_size(1024.0, 700.0)
-                            .resizable(true)
-                            .decorations(true)
-                            .visible(false);
+                    tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+                        .title("MunoAI · 造乐之地")
+                        .inner_size(1400.0, 900.0)
+                        .min_inner_size(1024.0, 700.0)
+                        .resizable(true)
+                        .decorations(false)
+                        .transparent(true)
+                        .visible(false)
+                        .devtools(true);
                     let wb = match data_dir {
                         Some(dir) => wb.data_directory(dir),
                         None => wb,
                     };
-                    wb.build()
+                    wb.build().map(|w| {
+                        // 强制关闭所有 Windows DWM 边框和阴影（decorations(false) + transparent(true) 不够）
+                        let _ = w.set_decorations(false);
+                        let _ = w.set_shadow(false);
+                        let _ = w.set_always_on_top(false);
+                        // 开发模式下启动时自动打开 DevTools
+                        #[cfg(debug_assertions)]
+                        {
+                            w.open_devtools();
+                        }
+                        w
+                    })
                 };
                 match webview_data_dir() {
                     Some(dir) => {
@@ -1246,7 +1271,7 @@ pub fn run() {
             let tray_menu = tauri::menu::Menu::with_items(app, &[&show_i, &quit_i])?;
             tauri::tray::TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("UtaiSynthesizer")
+                .tooltip("Muno")
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -1308,6 +1333,22 @@ pub fn run() {
             commands::export_audio::export_audio_pcm_chunk,
             commands::export_audio::export_audio_encode,
             commands::export_audio::export_audio_discard,
+            commands::loudness::measure_loudness,
+            commands::loudness::normalize_to_lufs,
+            commands::compliance::compliance_check,
+            commands::compliance::mix_audio_files,
+            commands::compliance::apply_dither,
+            commands::mastering::apply_bus_eq,
+            commands::mastering::apply_stereo_width,
+            commands::mastering::apply_saturate,
+            commands::mastering::apply_phase_rotate,
+            commands::mastering::remove_dc,
+            commands::analysis::analyze_harmonicity,
+            commands::analysis::track_f0,
+            commands::analysis::analyze_spectrogram,
+            commands::analysis::analyze_timbre,
+            commands::analysis::compare_spectra,
+            commands::analysis::dtw_compare,
             commands::project::save_project_archive,
             commands::project::open_project_archive,
             commands::project::prune_usp_work,
@@ -1361,12 +1402,27 @@ pub fn run() {
             commands::audio::transpose_audio,
             commands::audio::ensure_cache_dir,
             commands::audio::save_binary_file,
+            commands::audio::save_recording,
+            commands::audio::copy_audio_file_to,
             commands::audio::analyze_segment_tempo,
             commands::audio::stretch_segment_audio,
+            commands::soundfont::list_soundfonts,
+            commands::soundfont::import_soundfont,
+            commands::soundfont::delete_soundfont,
+            commands::soundfont::open_soundfonts_dir,
+            commands::soundfont::render_soundfont_notes,
+            commands::soundfont::audition_soundfont_note,
             commands::storage::get_storage_report,
             commands::storage::cleanup_render_cache,
             commands::storage::cleanup_audition_caches,
+            commands::storage::cleanup_cache_entry,
+            commands::storage::cleanup_oversized_cache,
+            commands::storage::cache_audit,
             commands::storage::cleanup_logs,
+            commands::storage::load_workflow_presets,
+            commands::storage::save_workflow_preset,
+            commands::storage::export_workflow_presets,
+            commands::storage::import_workflow_presets,
             commands::midi_extract::extract_midi_from_audio,
             commands::midi_extract::cancel_midi_extract,
             commands::midi_extract::midi_extract_status,
@@ -1381,6 +1437,22 @@ pub fn run() {
             commands::msst_models::delete_msst_model,
             commands::msst_models::import_local_msst_model,
             commands::msst_models::convert_msst_model,
+            commands::amt_models::get_amt_models_dir,
+            commands::amt_models::list_amt_models,
+            commands::amt_models::download_amt_model,
+            commands::amt_models::delete_amt_model,
+            commands::song::get_song_models_dir,
+            commands::song::list_song_models,
+            commands::song::download_song_model,
+            commands::song::delete_song_model,
+            commands::song::load_song_history,
+            commands::song::save_song_history,
+            commands::song::song_service_probe,
+            commands::song::song_generate,
+            commands::song::song_cancel,
+            commands::song::abc_to_midi,
+            commands::song::zip_files,
+            commands::song_service::auto_start_service,
             commands::logs::get_recent_logs,
             commands::logs::get_logs_since,
             commands::logs::log_message,
@@ -1392,7 +1464,6 @@ pub fn run() {
             commands::settings::get_device_preference,
             commands::settings::get_data_dir,
             commands::settings::get_data_dir_issue,
-            commands::settings::get_config_issue,
             commands::settings::migrate_data_dir,
             commands::settings::is_cuda_runtime_ready,
             commands::settings::download_cuda_runtime,
@@ -1401,6 +1472,12 @@ pub fn run() {
             commands::settings::set_cuda_mem_limit,
             commands::settings::get_diagnostic_mode,
             commands::settings::set_diagnostic_mode,
+            commands::settings::get_song_resident_mode,
+            commands::settings::set_song_resident_mode,
+            commands::settings::get_song_resident_idle_timeout,
+            commands::settings::set_song_resident_idle_timeout,
+            commands::song::song_resident_status,
+            commands::song::song_resident_shutdown,
             commands::settings::install_cuda_runtime_local,
             commands::settings::cuda_runtime_paths,
             commands::settings::delete_cuda_runtime,
@@ -1429,11 +1506,35 @@ pub fn run() {
             commands::window::restart_app,
             commands::window::running_tasks,
             commands::window::set_tray_labels,
+            commands::amt::run_amt_midi,
+            commands::amt::amt_prepare_playback,
+            commands::amt::amt_export_zip,
+            commands::amt::export_midi_tracks_to_folder,
+            commands::amt::amt_sidecar_installed,
+            commands::amt::amt_sidecar_path,
+            commands::amt::amt_midi_metadata,
+            commands::amt::amt_write_edited_midi,
+            commands::amt::cancel_amt_midi,
+            commands::amt::cancel_amt_all,
+            commands::amt::allow_asset_dir,
+            commands::amt_export::amt_list_soundfonts,
+            commands::amt_export::amt_set_active_soundfont,
+            commands::amt_export::amt_import_soundfont,
+            commands::amt_export::amt_delete_soundfont,
+            commands::amt_export::amt_export_tools_status,
+            commands::amt_export::amt_export_midi_audio,
+            commands::amt_export::amt_export_stems_audio,
+            commands::amt_export::amt_export_stereo_wav,
+            commands::amt_export::amt_export_sheet_music,
+            commands::amt_export::preview_notes_render,
+            commands::amt_lyrics::amt_extract_lyrics,
+            commands::amt_lyrics::amt_write_lyrics_to_midi,
+            commands::amt_lyrics::amt_read_lyrics_from_midi,
         ])
         // Window close + app exit are driven ENTIRELY by the frontend now (App.tsx onCloseRequested →
         // minimize-to-tray / quit decision → in-progress + unsaved prompts → invoke("quit_app")). No
         // Rust-side close/exit guard: the frontend confirms before quit_app, which exits unconditionally.
         .build(tauri::generate_context!())
-        .expect("Failed to build UtaiSynthesizer")
+        .expect("Failed to build Muno")
         .run(|_app, _event| {});
 }

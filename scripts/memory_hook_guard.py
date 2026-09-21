@@ -129,36 +129,12 @@ def _rel(path):
     return p.replace("\\", "/").lstrip("./").lower()
 
 
-def _matcher_hits(rel, m):
-    """⛔ S170 —— 一条不带 `/` 的匹配器是【文件名】,不是前缀。
-
-    这之前所有匹配器都按 `rel.startswith(m)` 比,而 range-extend 区里登记着
-    `score2cv.rs` / `score2svc.rs` / `score2svc_mg.rs` / `rangeTest.ts` /
-    `RangeBoundsEditor.tsx` / `MsstModelManager.tsx` / `rangeBounds.ts` 七条**裸文件名** ——
-    它们**结构上永远不可能**是一个仓库相对路径的前缀 ⇒ 改这几个文件时那 600 多条钩子
-    **一条都没弹过**,而自检照样 ALL OK(它只测了几条手挑的路径)。S170 改 score2cv.rs 的
-    假名代码时当场撞见:一个钩子都没出现。
-    """
-    m = m.lower()
-    if "/" not in m:
-        return rel.rsplit("/", 1)[-1] == m
-    return rel.startswith(m)
-
-
-def match_areas(rel, areas):
-    """⛔ S170 —— 返回【全部】命中的区,不是第一个。
-
-    同一个文件可以同时属于两条工作线(score2cv.rs 既是音域扩展/分配器的地盘,也是
-    G2P/假名表的地盘)。只返回第一个 ⇒ 排在后面的那个区对这个文件**永远沉默**,
-    而且从外面看不出来。
-    """
-    return [a for a in areas if any(_matcher_hits(rel, m) for m in a.get("match", []))]
-
-
 def match_area(rel, areas):
-    """兼容旧调用:第一个命中区(或 None)。新代码用 `match_areas`。"""
-    hits = match_areas(rel, areas)
-    return hits[0] if hits else None
+    for a in areas:
+        for m in a.get("match", []):
+            if rel.startswith(m.lower()):
+                return a
+    return None
 
 
 # ── S157:在途渲染闸 ──────────────────────────────────────────────────────────
@@ -415,32 +391,26 @@ def main():
     if not fp:
         _emit()
 
-    areas = match_areas(_rel(fp), conf.get("areas", []))
-    if not areas:
+    area = match_area(_rel(fp), conf.get("areas", []))
+    if area is None:
         _emit()
 
-    # 每个 session × 每个区只打一次(S170 起:一个文件命中几个区,没打过的就都打)
+    # 每个 session × 每个区只打一次
     sid = str(payload.get("session_id") or "nosession")
     safe = "".join(c for c in sid if c.isalnum() or c in "-_")[:64] or "nosession"
     d = os.path.join(STATE_ROOT, safe)
-    fresh = []
-    for area in areas:
-        marker = os.path.join(d, area["id"] + ".fired")
-        try:
-            if os.path.isfile(marker):
-                continue
-            os.makedirs(d, exist_ok=True)
-            with open(marker, "w") as f:
-                f.write(fp)
-        except Exception:                               # noqa: BLE001
-            pass    # 写不了标记就每次都打 —— 宁可吵,不可漏
-        fresh.append(area)
-    if not fresh:
-        _emit()
+    marker = os.path.join(d, area["id"] + ".fired")
+    try:
+        if os.path.isfile(marker):
+            _emit()
+        os.makedirs(d, exist_ok=True)
+        with open(marker, "w") as f:
+            f.write(fp)
+    except Exception:                                   # noqa: BLE001
+        pass    # 写不了标记就每次都打 —— 宁可吵,不可漏
 
-    md = conf.get("memory_dir", "")
-    _emit(context="\n\n".join(render(a, md) for a in fresh),
-          note="⛔ 记忆钩子 [%s]:动这块之前有必读项" % " + ".join(a["id"] for a in fresh))
+    _emit(context=render(area, conf.get("memory_dir", "")),
+          note="⛔ 记忆钩子 [%s]:动这块之前有必读项" % area["id"])
 
 
 def _selftest():
@@ -450,53 +420,23 @@ def _selftest():
     fails = []
 
     cases = [
-        ("converter/verify/training/gate0_compare.py", {"gate"}),
-        (os.path.join(REPO, "converter", "verify", "training", "x.py"), {"gate"}),
-        ("training/utai_train/rvc/train.py", {"training-py"}),
-        ("src-tauri/src/training/trun.rs", {"training-rs"}),
-        ("src/lib/training/foo.ts", {"training-ui"}),
-        ("scripts/g2p_rulers/de/x.py", {"dictline"}),
-        ("scripts/release.ps1", {"release"}),
-        # ⛔ S170:这几条在修之前全部是 None —— 裸文件名匹配器从没命中过
-        ("src-tauri/src/inference/score2cv.rs", {"dictline", "range-extend"}),
-        ("src-tauri/src/inference/score2svc_mg.rs", {"range-extend"}),
-        ("src/components/common/RangeBoundsEditor.tsx", {"range-extend"}),
-        ("src-tauri/src/inference/g2p.rs", {"dictline"}),
-        ("src-tauri/src/inference/score2cv_tables.rs", {"dictline"}),
-        # 阴性对照:文件名只是「包含」匹配器不算命中
-        ("src/lib/notscore2cv.rs", set()),
-        ("src/components/PianoRoll.tsx", set()),
-        ("README.md", set()),
+        ("converter/verify/training/gate0_compare.py", "gate"),
+        (os.path.join(REPO, "converter", "verify", "training", "x.py"), "gate"),
+        ("training/utai_train/rvc/train.py", "training-py"),
+        ("src-tauri/src/training/trun.rs", "training-rs"),
+        ("src/lib/training/foo.ts", "training-ui"),
+        ("scripts/g2p_rulers/de/x.py", "dictline"),
+        ("scripts/release.ps1", "release"),
+        ("src/components/PianoRoll.tsx", None),
+        ("README.md", None),
     ]
     for path, want in cases:
-        got = {a["id"] for a in match_areas(_rel(path), areas)}
-        if got != want:
-            fails.append("%s -> %s(应为 %s)" % (path, sorted(got), sorted(want)))
+        got = match_area(_rel(path), areas)
+        gid = got["id"] if got else None
+        if gid != want:
+            fails.append("%s -> %s(应为 %s)" % (path, gid, want))
         else:
-            print("  ok   %-46s -> %s" % (path, sorted(got)))
-
-    # ⛔ S170:每一条登记的匹配器必须至少命中一个【受版本控制的】文件。
-    #    上面那张手挑的表看不见死匹配器 —— 7 条裸文件名匹配器躺了好几场,
-    #    这份自检每次都是 ALL OK。名单能静默失效 = 没有名单(与下面必读文件那条同一个理由)。
-    import subprocess as _sp
-    try:
-        tracked = _sp.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace").stdout.splitlines()
-    except Exception as e:                              # noqa: BLE001
-        tracked = []
-        fails.append("git ls-files 跑不起来(%s)—— 死匹配器检查【没有执行】,不是通过" % e)
-    if tracked:
-        rels = [t.replace("\\", "/").lower() for t in tracked]
-        dead = [(a["id"], m) for a in areas for m in a.get("match", [])
-                if not any(_matcher_hits(r, m) for r in rels)]
-        if dead:
-            for aid, m in dead:
-                fails.append("[%s] 匹配器 %r 在仓库里一个文件都命中不了 —— 这条钩子永远不会弹" % (aid, m))
-        else:
-            n = sum(len(a.get("match", [])) for a in areas)
-            print("  ok   全部 %d 条匹配器都至少命中一个受版本控制的文件" % n)
-    elif not any("git ls-files" in x for x in fails):
-        fails.append("git ls-files 返回空 —— 死匹配器检查【没有执行】,不是通过")
+            print("  ok   %-46s -> %s" % (path, gid))
 
     # 每一份登记的必读文件都必须真的在(名单能静默变空 = 没有名单)
     md = conf["memory_dir"]

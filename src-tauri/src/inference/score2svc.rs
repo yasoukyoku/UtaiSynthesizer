@@ -48,6 +48,7 @@ use super::sovits::{apply_cluster_blend, decode_features, SovitsModel};
 use super::{build_spk_mix_dense, RvcOptions, SovitsOptions, SynthesisResult};
 use crate::{Result, UtaiError};
 use utai_dsp::formant_warp;
+use utai_dsp::voice_realism::{add_into, apply_formant_jitter, apply_hf_excitation, synth_breath};
 
 /// ScoreToCV frame rate (score2cv sidecar `fps`). The per-phone `phone_dur` frames are 20 ms.
 /// ⚠ `pub(crate)` since S151: `vocal_range::dead_only_plan` turns a triple's `frames` into
@@ -1338,6 +1339,12 @@ pub struct ScoreShaping {
     /// S89 「自动音素时序」: `true` = S83 onset pre-roll (the nucleus lands on the beat);
     /// `false` = every phone stays inside its own note. See `score2cv::ArticulationTiming`.
     pub consonant_preroll: bool,
+    /// Phase 7 ① 高频激励(「气声」): ≥8 kHz 软饱和带按 mix 混回(0 = 位精确 no-op;建议 0.05–0.15)。
+    pub voice_realism_mix: f32,
+    /// Phase 7 ② 共振峰微颤: 慢速 LFO 全通级联深度(0 = 位精确 no-op;建议 0.03–0.08)。
+    pub formant_jitter_depth: f32,
+    /// Phase 7 ③ 气息层: 在 ≥520 ms 的 SP-only 间隙里合成一口吸气(false = 关闭,回到纯静音)。
+    pub breath_layer: bool,
 }
 
 impl ScoreShaping {
@@ -1359,6 +1366,10 @@ impl Default for ScoreShaping {
             consonant_valley_scale: DEFAULT_CONSONANT_VALLEY_SCALE,
             vowel_clarity: true,
             consonant_preroll: true,
+            voice_realism_mix: 0.0,
+            formant_jitter_depth: 0.0,
+            // S83 先例:审美默认在 Rust 层出货即开;旧烘培不受影响(sig 不变,不要时一个开关关掉)。
+            breath_layer: true,
         }
     }
 }
@@ -1455,6 +1466,9 @@ pub fn render_score_sovits(
     let noop = |_: f32| {}; // decode_features' internal sub-progress is ignored (per-chunk coarse below)
     let mut audio: Vec<f32> = Vec::new();
     let mut cv_cursor = 0usize;
+    // Phase 7 ③:SP-only 气口的帧坐标(渲染前算一次)+ 渲染循环顺手记的「帧→样本」映射。
+    let breath_runs = find_breath_runs(&arr.phon, &arr.phone_dur);
+    let mut chunk_map: ChunkMap = Vec::with_capacity(chunks.len() + 1);
     // S147 秒表(纯 tracing,零行为改动)。⛔ 存在的理由:在此之前 score 渲染这条路上
     // `Instant::now` **一处都没有**,追速度时只能靠外部采样,而每换一个口径读数就不可比了
     // (实测:开/关增强器两个口径下同一笔改动的收益差 1.81 倍)。累加器只在**段边界**取时间,
@@ -1471,7 +1485,9 @@ pub fn render_score_sovits(
             // ⛔ Equal-length ZEROS, sized by `sovits_grid_len` — the splice layer indexes `audio`
             // by absolute sample, so the buffer's length contract is load-bearing. Using
             // `chunk.t * sr / 50` instead is off by 124 samples per chunk on akiko's hop.
-            audio.resize(audio.len() + sovits_grid_len(chunk.t, m.sample_rate, m.hop_size) * m.hop_size, 0.0);
+            let fill = sovits_grid_len(chunk.t, m.sample_rate, m.hop_size) * m.hop_size;
+            chunk_map.push((cv_cursor, audio.len(), fill)); // 零洞的坐标也要闭合(out_len 与真渲同契约)
+            audio.resize(audio.len() + fill, 0.0);
             cv_cursor += chunk.t; // ⚠ must advance even when skipped: note_hz slices are absolute
             skipped += 1;
             progress(p_vits * (ci + 1) as f32 / n_chunks as f32);
@@ -1573,10 +1589,12 @@ pub fn render_score_sovits(
         }
         // S161f —— **每一条接缝都淡化**(以前只 hard_seam;见 `seam_fade` 的 doc)。
         seam_fade(&mut audio, &mut wav, m.sample_rate);
+        chunk_map.push((cv_cursor, audio.len(), wav.len())); // Phase 7 ③:真实出样长度(seam_fade 保长)
         audio.extend_from_slice(&wav);
         cv_cursor += chunk.t;
         progress((ci + 1) as f32 / n_chunks as f32);
     }
+    chunk_map.push((cv_cursor, audio.len(), 0)); // 哨兵:总帧数处闭合右端点(frame_to_sample 依赖它)
     // Post-decode (§M-defer order 响度增益 → 共振腔 → 归一化): a vol_embedding model already got loudness in
     // net_g above, so gain it here ONLY when there's no vol port (4.0); formant warps both. Then normalize.
     if !m.vol_embedding {
@@ -1618,6 +1636,8 @@ pub fn render_score_sovits(
         };
         apply_valley(&mut audio, &cls, valley_scale, emphasis_fade_samples(m.sample_rate), m.sample_rate);
     }
+    // Phase 7 · 配方 G —— ① 高频激励 → ② 共振峰微颤 → ③ 气息层(位置契约见 `apply_voice_realism`)。
+    apply_voice_realism(&mut audio, m.sample_rate, &shaping, &chunk_map, &breath_runs);
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
 
@@ -1759,6 +1779,9 @@ pub fn render_score_rvc(
     let idx_weights = fast_index_weights(&arr);
     let mut audio: Vec<f32> = Vec::new();
     let mut cv_cursor = 0usize;
+    // Phase 7 ③:SP-only 气口的帧坐标(渲染前算一次)+ 渲染循环顺手记的「帧→样本」映射。
+    let breath_runs = find_breath_runs(&arr.phon, &arr.phone_dur);
+    let mut chunk_map: ChunkMap = Vec::with_capacity(chunks.len() + 1);
     // S159b —— **秒表**。RVC 谱面臂到今天为止**一行都没有**,所以「这条臂慢在哪」在日志里
     // 读不出来(S159 那次是按日志时间戳手算出 182 s vs SoVITS 78.6 s 的)。
     // ⛔ 与 SoVITS 臂同款:只在段边界取时间,不进任何逐样本循环,且不打 per-chunk 日志。
@@ -1776,6 +1799,7 @@ pub fn render_score_rvc(
         //    的每一条救援窗都静默滑走)。
         let want = rvc_out_len(chunk.t, m.sample_rate);
         if keep.as_ref().is_some_and(|k| !k[ci]) {
+            chunk_map.push((cv_cursor, audio.len(), want)); // 零洞的坐标也要闭合(out_len 与真渲同契约)
             audio.resize(audio.len() + want, 0.0);
             cv_cursor += chunk.t; // ⚠ 必须照样前进:note_hz / idx_weights 的切片是绝对下标
             skipped += 1;
@@ -1861,10 +1885,12 @@ pub fn render_score_rvc(
         }
         // S161f —— **每一条接缝都淡化**(以前只 hard_seam;见 `seam_fade` 的 doc)。
         seam_fade(&mut audio, &mut wav, m.sample_rate);
+        chunk_map.push((cv_cursor, audio.len(), wav.len())); // Phase 7 ③:真实出样长度(seam_fade 保长)
         audio.extend_from_slice(&wav);
         cv_cursor += chunk.t;
         progress((ci + 1) as f32 / n_chunks as f32);
     }
+    chunk_map.push((cv_cursor, audio.len(), 0)); // 哨兵:总帧数处闭合右端点(frame_to_sample 依赖它)
     // ⛔⛔ S159b —— **整条缓冲的长度必须与「每个 chunk 都渲」时一模一样**,而且要在**循环刚结束**
     // 处量(`apply_formant_env` 之后再量会把它自己的长度变化算进来 = 假警报)。
     // `len!=` 只看**真渲出来的** chunk,铺零那一侧它一个字都看不见 —— 而铺零正是这一刀新加的那条路。
@@ -1918,6 +1944,8 @@ pub fn render_score_rvc(
         };
         apply_valley(&mut audio, &cls, valley_scale, emphasis_fade_samples(m.sample_rate), m.sample_rate);
     }
+    // Phase 7 · 配方 G —— ① 高频激励 → ② 共振峰微颤 → ③ 气息层(位置契约见 `apply_voice_realism`)。
+    apply_voice_realism(&mut audio, m.sample_rate, &shaping, &chunk_map, &breath_runs);
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
 
@@ -2027,6 +2055,116 @@ fn chunk_flag_windows(chunk: &Chunk, out_len: usize, flags: &[bool]) -> Vec<(usi
         cursor += d;
     }
     wins
+}
+
+// ════════════════ Phase 7 · 人声真实化 —— score 级接线(配方 G 的谱面层) ════════════════
+// ① 高频激励与 ② 共振峰微颤是纯样本域操作(`utai_dsp::voice_realism`),不需要谱面信息;
+// ③ 气息层要两样东西:SP-only 连续段的 **50fps 帧坐标**(`find_breath_runs`,渲染前算一次),
+// 和「帧 → 绝对样本」映射(`ChunkMap`,渲染循环里每 chunk 顺手记一条)。两臂共用。
+
+/// 气息层几何参数(单位:50fps 帧,1 帧 = 20 ms)。
+///
+/// ⛔ `BREATH_MIN_RUN_FRAMES` 不是拍脑袋:**检测阈值 = 放置几何**(头跳 + 尾保留 + 最短 usable
+/// = 5 + 11 + 10 = 26)。若小于它,会出现「检测到了却放不下」的死区;若大于它,「放得下却
+/// 检测不到」。两头都必须是 26,一行不多一行不少。
+const BREATH_MIN_RUN_FRAMES: i64 = 26; // 520 ms
+const BREATH_HEAD_SKIP_FRAMES: i64 = 5; // 100 ms:不贴上一句的衰减尾音
+const BREATH_TAIL_RESERVE_FRAMES: i64 = 11; // 220 ms:不贴下一句的起音
+const BREATH_MIN_USABLE_FRAMES: i64 = 10; // 200 ms:再短的吸气听不出「呼吸」
+const BREATH_MAX_LEN_FRAMES: i64 = 25; // 500 ms:一口吸气足够了
+const BREATH_POS_FRAC: f32 = 0.3; // 放在 usable 区间 30% 处(偏前:吸完正好接下一句)
+
+/// Phase 7 ③ —— 找出「两侧都是唱音的 SP-only 连续段」,返回帧坐标 `[(f0, f1)]`。
+/// 规则:⑴ AP 不算 SP(那是用户自己的呼吸采样,不往里加程序化吸气)、也不算唱音(掐断 SP 段);
+/// ⑵ 两侧必须**严格**是唱音 —— DAW 首尾的静音不算(那里吸气没有上下文);
+/// ⑶ 段长 ≥ `BREATH_MIN_RUN_FRAMES`。`phone_dur` 为负的行按 0 记(与 chunk_sp_windows 同款防御)。
+fn find_breath_runs(phon: &[&str], phone_dur: &[i64]) -> Vec<(usize, usize)> {
+    let sung = |p: &str| p != "SP" && p != "AP";
+    let mut runs = Vec::new();
+    let mut frame = 0i64;
+    let mut i = 0usize;
+    while i < phon.len() {
+        if phon[i] == "SP" {
+            let (f0, sp0) = (frame, i);
+            while i < phon.len() && phon[i] == "SP" {
+                frame += phone_dur[i].max(0);
+                i += 1;
+            }
+            let left_ok = sp0 > 0 && sung(phon[sp0 - 1]);
+            let right_ok = i < phon.len() && sung(phon[i]);
+            if left_ok && right_ok && frame - f0 >= BREATH_MIN_RUN_FRAMES {
+                runs.push((f0.max(0) as usize, frame.max(0) as usize));
+            }
+        } else {
+            frame += phone_dur[i].max(0);
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// 「cv 帧 → 绝对样本」映射表:每 chunk 记 `(cv_cursor, base, out_len)`
+/// (`base` = push 时的 `audio.len()`,`out_len` = 该 chunk 的实际出样长度 —— 真渲的记
+/// `wav.len()`,跳过的零洞记铺零长度,两者按各自的长度契约天然一致)。循环结束后再记
+/// 一条 `(总帧数, audio.len(), 0)` 哨兵,把右端点闭合。
+type ChunkMap = Vec<(usize, usize, usize)>;
+
+/// 帧坐标 → 绝对样本:二分找 key ≤ f 的最后一条,段内按比例内插
+/// (与 `chunk_flag_windows` 的 proportional map 同一套数学,只是坐标从 chunk 内扩到全曲)。
+/// f 落在哨兵之后(理论上不可达)→ 返回 `audio.len()`;单条表 → 返回其 base。
+fn frame_to_sample(map: &ChunkMap, f: usize) -> usize {
+    let i = map.partition_point(|e| e.0 <= f).saturating_sub(1);
+    let (start, base, out_len) = map[i];
+    if out_len == 0 || i + 1 >= map.len() {
+        return base;
+    }
+    let span = (map[i + 1].0 - start).max(1);
+    base + (((f - start) as f64 / span as f64 * out_len as f64).round() as usize).min(out_len)
+}
+
+/// Phase 7 · 配方 G —— ① 高频激励 → ② 共振峰微颤 → ③ 气息层,**固定顺序**,全部保长。
+///
+/// ⛔ 调用位置契约(两臂同款):
+/// - 在 `apply_range_inverse` **之后**:TD-PSOLA 会搬样本,绝对下标只有这时才稳(deferred
+///   valley 也在这一步之后刻,同理);
+/// - 在 `pre_norm_peak` **之前**:③ 改变峰值,归一化必须量到最终信号;
+/// - 确定性(donor S147):基础 seed 只取决于 `(sample_rate, audio.len())`,base 遍与 donor 遍
+///   完全一致 ⇒ 每口吸气的相位/包络在拼接两侧相同;② 的 LFO 走绝对样本下标,两遍同相位。
+///
+/// ①② 深度为 0 时位精确 no-op;③ 关闭(`breath_layer = false`)或没有合格 SP 段时不动样本。
+fn apply_voice_realism(
+    audio: &mut [f32],
+    sample_rate: u32,
+    shaping: &ScoreShaping,
+    chunk_map: &ChunkMap,
+    runs: &[(usize, usize)],
+) {
+    apply_hf_excitation(audio, sample_rate, shaping.voice_realism_mix);
+    apply_formant_jitter(audio, sample_rate, shaping.formant_jitter_depth);
+    if !shaping.breath_layer || runs.is_empty() {
+        return;
+    }
+    // 每口吸气独立 seed(基础 seed + 段序号):同曲同参数重渲 = 同一口;不同段互不相关。
+    let seed = (sample_rate as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (audio.len() as u64).rotate_left(17);
+    for (k, &(f0, f1)) in runs.iter().enumerate() {
+        let usable0 = f0 as i64 + BREATH_HEAD_SKIP_FRAMES;
+        let usable1 = f1 as i64 - BREATH_TAIL_RESERVE_FRAMES;
+        let usable = usable1 - usable0;
+        if usable < BREATH_MIN_USABLE_FRAMES {
+            continue; // 检测阈值已保证 ≥ 0;这里是数值防御(run 被手工构造时)
+        }
+        let len = usable.min(BREATH_MAX_LEN_FRAMES);
+        let start_f = usable0 + ((usable - len) as f32 * BREATH_POS_FRAC).round() as i64;
+        let s = frame_to_sample(chunk_map, start_f.max(0) as usize);
+        let e = frame_to_sample(chunk_map, (start_f + len).max(0) as usize);
+        if e <= s || e > audio.len() {
+            continue; // 映射退化 → 宁可少一口,不许越界
+        }
+        let breath = synth_breath(sample_rate, e - s, seed.wrapping_add(k as u64));
+        add_into(&mut audio[s..e], &breath);
+    }
 }
 
 /// ⚙ 出厂默认 = true —— `UTAI_PREROLL_DAMP=0` 关。
@@ -3367,6 +3505,102 @@ mod mg_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Phase 7 · 人声真实化(find_breath_runs / frame_to_sample / apply_voice_realism) ──────
+
+    /// 检测规则三条:⑴ AP 掐断 SP 段(且不算唱音);⑵ 两侧必须**严格**唱音 —— 首尾静音不算;
+    /// ⑶ 长度 ≥ `BREATH_MIN_RUN_FRAMES`(26 帧),且负时长按 0 记。
+    #[test]
+    fn breath_run_detection_rules() {
+        // ⑴ AP 掐断:两个 30 帧的 SP 段被 AP 隔开,各自的一侧都不是唱音 → 一个都不收。
+        let phon = ["a", "SP", "AP", "SP", "b"];
+        let dur = [20i64, 30, 5, 30, 20];
+        assert!(find_breath_runs(&phon, &dur).is_empty());
+        // ⑵ 合格段:两侧唱音、30 帧 ≥ 26 → 收,帧坐标 = 前缀和。
+        let phon = ["a", "SP", "SP", "SP", "b"];
+        let dur = [20i64, 10, 10, 10, 20];
+        assert_eq!(find_breath_runs(&phon, &dur), vec![(20, 50)]);
+        // ⑶ 边界:26 帧收、25 帧不收(检测阈值 = 放置几何,一行不多一行不少)。
+        let phon = ["a", "SP", "SP", "b"];
+        assert_eq!(find_breath_runs(&phon, &[20i64, 13, 13, 20]), vec![(20, 46)]);
+        assert!(find_breath_runs(&phon, &[20i64, 13, 12, 20]).is_empty());
+        // ⑷ DAW 首尾的静音不算(没有上下文):只有中间那段收。
+        let phon = ["SP", "SP", "SP", "a", "SP", "SP", "SP", "b", "SP", "SP", "SP"];
+        let dur = [9i64, 9, 9, 20, 9, 13, 9, 20, 9, 9, 9];
+        // 前缀和:前导静音 0..27(不收)→ "a" 占 27..47 → 中段 SP = [47, 78)。
+        assert_eq!(find_breath_runs(&phon, &dur), vec![(47, 78)]);
+        // ⑸ 负时长防御:SP 的 dur 为负按 0 记 → 段长 0,不收。
+        let phon = ["a", "SP", "b"];
+        assert!(find_breath_runs(&phon, &[10i64, -5, 10]).is_empty());
+    }
+
+    /// 段内按比例内插(与 chunk_flag_windows 同一套数学);哨兵把右端点闭合到 `audio.len()`。
+    #[test]
+    fn frame_to_sample_proportions_and_sentinel() {
+        let map: ChunkMap = vec![(0, 0, 1000), (50, 1000, 500), (120, 1500, 0)];
+        // ⑴ 段内比例:25/70 · 500 = 178.57 → 179(+base 1000 = 1179)。
+        assert_eq!(frame_to_sample(&map, 75), 1179);
+        // ⑵ key 处精确落位;f 落在哨兵上/之后 → 钳到 base(= audio.len())。
+        assert_eq!(frame_to_sample(&map, 0), 0);
+        assert_eq!(frame_to_sample(&map, 50), 1000);
+        assert_eq!(frame_to_sample(&map, 119), 1000 + ((69.0 / 70.0) * 500.0f64).round() as usize);
+        assert_eq!(frame_to_sample(&map, 120), 1500);
+        assert_eq!(frame_to_sample(&map, 999), 1500);
+        // ⑶ 单条表(无哨兵)→ 返回 base。
+        let single: ChunkMap = vec![(0, 42, 0)];
+        assert_eq!(frame_to_sample(&single, 77), 42);
+    }
+
+    /// ①② = 0 + ③ 关(或没有合格 run)= 位精确 no-op —— 配方 G 的默认不碰任何旧烘培。
+    #[test]
+    fn voice_realism_neutral_is_bit_exact() {
+        let mut audio: Vec<f32> = (0..480).map(|i| ((i as f32) * 0.01).sin()).collect();
+        let before = audio.clone();
+        let map: ChunkMap = vec![(0, 0, 480), (100, 480, 0)];
+        let shaping = ScoreShaping { breath_layer: false, ..Default::default() };
+        // ⑴ ①② 深度为 0 且 ③ 关:一个样本都不动。
+        apply_voice_realism(&mut audio, 44100, &shaping, &map, &[(10, 60)]);
+        assert_eq!(audio, before);
+        // ⑵ ③ 开但 runs 为空:同样不动。
+        apply_voice_realism(&mut audio, 44100, &ScoreShaping::default(), &map, &[]);
+        assert_eq!(audio, before);
+    }
+
+    /// 气息只落进几何算出的窗里(窗外位精确为零),保长,且同输入逐位确定。
+    #[test]
+    fn breath_layer_inserts_only_inside_the_window() {
+        // 1 帧 = 1 样本的理想映射:帧坐标直接就是样本下标。
+        let map: ChunkMap = vec![(0, 0, 100), (100, 100, 0)];
+        let runs = [(0usize, 60usize)];
+        let shaping = ScoreShaping::default();
+        let mut audio = vec![0.0f32; 100];
+        apply_voice_realism(&mut audio, 44100, &shaping, &map, &runs);
+        // 几何复核:usable0=5, usable1=49, usable=44, len=25, start_f=5+round(19·0.3)=11 → [11, 36)。
+        let (s, e) = (11usize, 36usize);
+        // ⑴ 窗外严格为零(加法层;窗界 = 位精确边界)。
+        assert!(audio[..s].iter().all(|&v| v == 0.0));
+        assert!(audio[e..].iter().all(|&v| v == 0.0));
+        // ⑵ 窗内真有信号(归一化峰值 0.16,远超底噪)。
+        assert!(audio[s..e].iter().any(|&v| v.abs() > 0.05));
+        // ⑶ 保长;⑷ 确定性:同输入逐位一致(donor 两遍拼接一致性的前提)。
+        assert_eq!(audio.len(), 100);
+        let mut again = vec![0.0f32; 100];
+        apply_voice_realism(&mut again, 44100, &shaping, &map, &runs);
+        assert_eq!(audio, again);
+    }
+
+    /// donor 遍的整段零洞(100 帧全铺零):气息照常落进洞里 —— 坐标闭合,不越界。
+    #[test]
+    fn breath_lands_inside_zero_holes_with_the_same_contract() {
+        let map: ChunkMap = vec![(0, 0, 400), (100, 400, 0)];
+        let mut audio = vec![0.0f32; 400];
+        apply_voice_realism(&mut audio, 44100, &ScoreShaping::default(), &map, &[(0, 100)]);
+        // 几何复核:usable0=5, usable1=89, usable=84, len=25, start_f=5+round(59·0.3)=23;
+        // 本表 1 帧 = 4 样本(400/100)→ 样本窗 [92, 192)。
+        assert!(audio[..92].iter().all(|&v| v == 0.0));
+        assert!(audio[192..].iter().all(|&v| v == 0.0));
+        assert!(audio[92..192].iter().any(|&v| v.abs() > 0.05));
+    }
 
     // ── S165:外部逆变换臂 ──────────────────────────────────────────────────────────
 
@@ -5067,6 +5301,8 @@ mod tests {
             consonant_emphasis_db: DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
             consonant_valley_scale: 0.0,
             vowel_clarity: false,
+            // Phase 7 ③: these baselines predate the breath layer — keep the A/B single-variable.
+            breath_layer: false,
             ..Default::default() // preroll: the baselines were rendered with it ON
         };
 

@@ -8,12 +8,15 @@ import { useWorkflowStore } from "../../store/workflow";
 import { useTranslation } from "react-i18next";
 import * as playback from "../../lib/audio/playback";
 import { collectDirtyVocals, renderDirtyVocals, splitSegmentVocalAware, preflightVocalModels } from "../../lib/vocal/vocalRender";
+import { collectDirtyInstruments, renderDirtyInstruments, instrumentTracksMissingFont } from "../../lib/soundfont/instrumentRender";
 import { copySelectedSegments, cutSelectedSegments, pasteWithFeedback } from "../../lib/clipboard";
 import { formatBarBeat, type TimeAxis } from "../../lib/timeAxis";
 import { contentEndTick } from "../../lib/trackLayout";
 import { sliceLaneGroupAtPlayhead, deleteLanePiece, liveSelectedLane } from "../../lib/laneEdit";
 import { Dropdown } from "../common/Dropdown";
 import { OverviewMap } from "./OverviewMap";
+import { ShortcutsDialog } from "../common/ShortcutsDialog";
+import { HistoryPanel } from "../common/HistoryPanel";
 import "./Toolbar.css";
 
 // Editable time-signature options (house-styled custom Dropdown — no native <select>). Numerator 1–16
@@ -22,24 +25,105 @@ import "./Toolbar.css";
 const TS_NUM_OPTIONS = Array.from({ length: 16 }, (_, i) => ({ value: i + 1, label: String(i + 1) }));
 const TS_DEN_OPTIONS = [2, 4, 8, 16].map((d) => ({ value: d, label: String(d) }));
 
+// ③ B8: 吸附步长选项。value = 栅格步进 tick 数（0 = 关闭栅格吸附，仅保留磁吸）；labelKey 指向 i18n。
+const SNAP_GRID_OPTIONS = [
+  { value: 0, labelKey: "toolbar.snapGridOff" },
+  { value: 480, labelKey: "toolbar.snapGridWhole" }, // 1 拍
+  { value: 240, labelKey: "toolbar.snapGridHalf" }, // 1/2
+  { value: 120, labelKey: "toolbar.snapGridQuarter" }, // 1/4
+  { value: 60, labelKey: "toolbar.snapGridEighth" }, // 1/8
+  { value: 30, labelKey: "toolbar.snapGridSixteenth" }, // 1/16
+];
+
 export function Toolbar() {
   const { t } = useTranslation();
-  const { tempo, setTempo, playheadTick, setPlayhead, timeSignature, setTimeSignature } =
-    useProjectStore();
+  // 整 store 订阅是播放头每帧触发 Toolbar 完整 React 重渲染的元凶 —— 把 playheadTick 单独拆出来
+  // 走 ref + 订阅路径(命令式更新位置显示 DOM,不走 React reconciliation),其他字段保持 selector
+  // 订阅(不会因 playheadTick 变化而重渲染)。
+  const tempo = useProjectStore((s) => s.tempo);
+  const playheadTick = useProjectStore((s) => s.playheadTick);
+  const setTempo = useProjectStore((s) => s.setTempo);
+  const setPlayhead = useProjectStore((s) => s.setPlayhead);
+  const timeSignature = useProjectStore((s) => s.timeSignature);
+  const setTimeSignature = useProjectStore((s) => s.setTimeSignature);
+  const deleteSegments = useProjectStore((s) => s.deleteSegments);
+  
+  // 新增：拍号和调性弹窗状态
+  const [timeSigOpen, setTimeSigOpen] = useState(false);
+  const [keyOpen, setKeyOpen] = useState(false);
+  const [selectedKey, setSelectedKey] = useState<string>(""); // 空字符串表示未检测到调性
   const timeAxis = useTimeAxis();
-  const { isPlaying, setPlaying, seeking, scheduleVersion, preparing } = useAudioStore();
-  const { selectedSegment, clearSelection, snapSegments, snapPlayhead, toggleSnapSegments, toggleSnapPlayhead } = useAppStore();
-  const { deleteSegments } = useProjectStore();
+  const isPlaying = useAudioStore((s) => s.isPlaying);
+  const setPlaying = useAudioStore((s) => s.setPlaying);
+  const seeking = useAudioStore((s) => s.seeking);
+  const scheduleVersion = useAudioStore((s) => s.scheduleVersion);
+  const preparing = useAudioStore((s) => s.preparing);
+  const selectedSegment = useAppStore((s) => s.selectedSegment);
+  const clearSelection = useAppStore((s) => s.clearSelection);
+  const snapSegments = useAppStore((s) => s.snapSegments);
+  const snapPlayhead = useAppStore((s) => s.snapPlayhead);
+  const toggleSnapSegments = useAppStore((s) => s.toggleSnapSegments);
+  const toggleSnapPlayhead = useAppStore((s) => s.toggleSnapPlayhead);
+  const snapGridStep = useAppStore((s) => s.snapGridStep);
+  const setSnapGridStep = useAppStore((s) => s.setSnapGridStep);
+  const skin = useAppStore((s) => s.skin);
+  const setSkin = useAppStore((s) => s.setSkin);
+  const theme = useAppStore((s) => s.theme);
+  const setTheme = useAppStore((s) => s.setTheme);
+
+  // —— 搬来的弹窗 state (撤销历史 / 快捷键 / 主题) ——
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [skinOpen, setSkinOpen] = useState(false);
+  const [skinPos, setSkinPos] = useState<{ top: number; right: number } | null>(null);
+
+  const THEMES: { theme: "dark" | "light"; skin: string; label: string; color: string }[] = [
+    { theme: "light", skin: "default", label: "白天 · 默认", color: "#3B82F6" },
+    { theme: "dark", skin: "default", label: "黑夜 · 默认", color: "#60A5FA" },
+    { theme: "dark", skin: "junzi", label: "黑夜 · 君紫", color: "#A78BFA" },
+    { theme: "dark", skin: "sakura", label: "黑夜 · 樱粉", color: "#F472B6" },
+    { theme: "dark", skin: "mint", label: "黑夜 · 薄荷", color: "#6EE7B7" },
+    { theme: "dark", skin: "sunset", label: "黑夜 · 熔橙", color: "#FB923C" },
+    { theme: "dark", skin: "gray", label: "黑夜 · 灰色", color: "#9CA3AF" },
+  ];
+
+  // playheadTick: ref + imperative subscription — 播放期间每帧变化,走 selector 会触发整 Toolbar 重渲。
+  // 改用 ref 读值 + 命令式更新位置显示 DOM,彻底消除每帧 React reconciliation 开销。
+  const playheadRef = useRef(useProjectStore.getState().playheadTick);
+  const timeAxisRef = useRef(timeAxis);
+  timeAxisRef.current = timeAxis; // 保持 timeAxis 最新(换调性/拍号时需要刷新位置格式)
+  const positionDisplayRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    const unsub = useProjectStore.subscribe((s) => {
+      if (s.playheadTick !== playheadRef.current) {
+        playheadRef.current = s.playheadTick;
+        if (positionDisplayRef.current) {
+          positionDisplayRef.current.textContent = formatPosition(s.playheadTick, timeAxisRef.current);
+        }
+      }
+    });
+    return unsub;
+  }, []);
   const animRef = useRef<number>(0);
   const baseTickRef = useRef(0);
   const baseTimeRef = useRef(0);
   const animatingRef = useRef(false);
   const wasPlayingRef = useRef(false);
+  const seekingRef = useRef(false);
   // Content extent (last segment box end) the playhead runs to — the transport stops when the PLAYHEAD
   // reaches here, NOT when the audio sources end, so a ② vocal stem shorter than its box plays through the
   // silent tail to the segment end instead of pausing mid-segment (the premature-pause ghost). Cached +
   // refreshed at play-start / on a structural (scheduleVersion) edit so the rAF doesn't recompute per frame.
   const contentEndRef = useRef(0);
+
+  // 订阅 seeking 状态变化，避免每帧读取 store
+  useEffect(() => {
+    const unsub = useAudioStore.subscribe((s) => {
+      seekingRef.current = s.seeking;
+    });
+    seekingRef.current = useAudioStore.getState().seeking;
+    return unsub;
+  }, []);
 
   // Playhead advance loop during playback.
   useEffect(() => {
@@ -230,6 +314,32 @@ export function Toolbar() {
         if (autoRenderAbortRef.current) return; // user cancelled the batch → don't start playback
       }
 
+      // Muno 阶段2:乐器轨音源烘焙,与人声同一「Play 前自动渲染」约定(签名判脏,空 ⇒ 零延迟)。
+      // 原生 SFZ/SF2 合成不走 GPU voice 守卫,workflow 运行中也可安全烘焙(与人声块刻意不同)。
+      // 有音符但没选音源的轨只提醒不阻塞——播放继续(该轨静默),用户看到提示后去轨道头选音色。
+      const dirtyIns = collectDirtyInstruments(tempo);
+      if (dirtyIns.length > 0) {
+        const missing = instrumentTracksMissingFont();
+        if (missing.length > 0) {
+          useAppStore
+            .getState()
+            .showToast(t("soundfont.playMissingFont", { names: missing.map((m) => m.name).join("、") }), "info");
+        }
+        autoRenderAbortRef.current = false;
+        autoRenderingRef.current = true;
+        setAutoRendering(true);
+        useAppStore.getState().showToast(t("vocalEditor.render.autoRendering"), "info");
+        try {
+          await renderDirtyInstruments(dirtyIns, tempo, {
+            shouldCancel: () => autoRenderAbortRef.current,
+          });
+        } finally {
+          autoRenderingRef.current = false;
+          setAutoRendering(false);
+        }
+        if (autoRenderAbortRef.current) return; // user cancelled the batch → don't start playback
+      }
+
       // Read FRESH state — a bake just deposited (it changes what plays / the content extent), and the
       // playhead / tempo may have changed during the await. tempo MUST be fresh too: the playhead-advance
       // effect uses the reactive (post-await) tempo, so scheduling with the stale closure tempo would
@@ -281,7 +391,7 @@ export function Toolbar() {
     // playhead, giving fresh ids + rebased ticks, and SNAPS a mid-note split to that note's end (§user). The
     // baked stem is CARRIED + windowed (no re-render) via splitSegmentVocalAware, which also applies the DIRTY
     // guard (a stale bake is never windowed clean — it re-renders). audioClip + notes both go through it.
-    splitSegmentVocalAware(selectedSegment.trackId, selectedSegment.segmentId, playheadTick, tempo);
+    splitSegmentVocalAware(selectedSegment.trackId, selectedSegment.segmentId, playheadRef.current, tempo);
   };
 
   const handleDelete = () => {
@@ -380,120 +490,247 @@ export function Toolbar() {
 
   return (
     <div className="toolbar">
-      <div className="toolbar-section transport">
-        <button
-          className="transport-btn"
-          onClick={handleReturnToStart}
-        >
-          <span className="transport-icon icon-return" />
-        </button>
-        <button
-          className={`transport-btn play ${isPlaying ? "playing" : ""} ${autoRendering ? "rendering" : ""} ${preparing && !autoRendering ? "preparing" : ""}`}
-          onClick={handleTogglePlay}
-          title={autoRendering ? t("vocalEditor.render.autoRenderingCancel") : preparing ? t("transport.preparing") : undefined}
-        >
-          {isPlaying
-            ? <span className="transport-icon icon-pause" />
-            : <span className="transport-icon icon-play" />
-          }
-        </button>
+      {/* 左侧区域：吸附控制 + 新建轨道 */}
+      <div className="toolbar-left">
+        <div className="toolbar-section snap-section">
+          <button
+            className={`snap-toggle ${snapSegments ? "active" : ""}`}
+            onClick={toggleSnapSegments}
+            title={t("toolbar.snapClipTip")}
+          >
+            <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+              <path fill="currentColor" d="M3 7v6a9 9 0 0 0 18 0V7h-4v6a5 5 0 0 1-10 0V7z M3 3h4v4H3z M17 3h4v4h-4z" />
+            </svg>
+          </button>
+          <button
+            className={`snap-toggle ${snapPlayhead ? "active" : ""}`}
+            onClick={toggleSnapPlayhead}
+            title={t("toolbar.snapPlayheadTip")}
+          >
+            <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+              <path fill="currentColor" d="M6 3h12l-6 7z M11 9h2v12h-2z" />
+            </svg>
+          </button>
+          <Dropdown
+            className="snap-grid-dropdown"
+            value={snapGridStep}
+            options={SNAP_GRID_OPTIONS.map(({ value, labelKey }) => ({ value, label: t(labelKey) }))}
+            onChange={setSnapGridStep}
+          />
+        </div>
+
+        <div className="toolbar-divider" />
+
+
       </div>
 
-      <OverviewMap />
+      {/* 中心区域：播放控制 + 概览图（视觉焦点） */}
+      <div className="toolbar-center">
+        <div className="toolbar-section transport">
+          <button className="transport-btn transport-btn-sm" onClick={handleReturnToStart} title="回到开头">
+            <span className="transport-icon icon-return" />
+          </button>
+          <button
+            className={`transport-btn transport-btn-lg play ${isPlaying ? "playing" : ""} ${autoRendering ? "rendering" : ""} ${preparing && !autoRendering ? "preparing" : ""}`}
+            onClick={handleTogglePlay}
+            title={autoRendering ? t("vocalEditor.render.autoRenderingCancel") : preparing ? t("transport.preparing") : isPlaying ? "暂停 (空格)" : "播放 (空格)"}
+          >
+            <span className={`transport-icon ${isPlaying ? "icon-pause" : "icon-play"}`} />
+          </button>
+        </div>
 
-      <div className="toolbar-divider" />
-
-      <div className="toolbar-section tempo-section">
-        <label className="toolbar-label">{t("toolbar.bpm")}</label>
-        <input
-          type="number"
-          className="tempo-input mono"
-          value={tempo}
-          min={20}
-          max={400}
-          step={1}
-          // BPM typing/spinning fires onChange repeatedly and rescales every clip each time — coalesce
-          // the whole edit-session into ONE undo step (focus → begin, blur/Enter → commit), and anchor
-          // the rescale base (beginTempoScale) so intermediate keystrokes ("1"→"12"→"120") scale from
-          // the session-start geometry instead of compounding.
-          onFocus={() => { useHistoryStore.getState().beginTransaction(); useProjectStore.getState().beginTempoScale(); }}
-          onBlur={() => { useProjectStore.getState().endTempoScale(); useHistoryStore.getState().commitTransaction(); }}
-          onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-          onChange={(e) => setTempo(Number(e.target.value))}
-        />
+        <div className="toolbar-overlay">
+          <OverviewMap />
+        </div>
       </div>
 
-      <div className="toolbar-section time-sig">
-        <Dropdown
-          className="timesig-dd"
-          value={timeSignature[0]}
-          options={TS_NUM_OPTIONS}
-          onChange={(n) => setTimeSignature(n, timeSignature[1])}
-        />
-        <span className="mono time-sig-slash">/</span>
-        <Dropdown
-          className="timesig-dd"
-          value={timeSignature[1]}
-          options={TS_DEN_OPTIONS}
-          onChange={(d) => setTimeSignature(timeSignature[0], d)}
-        />
+      {/* 右侧区域：BPM + 拍号 + 调性 + 位置 + 工具按钮 */}
+      <div className="toolbar-right">
+        <div className="toolbar-section tempo-section">
+          <label className="toolbar-label">{t("toolbar.bpm")}</label>
+          <input
+            type="number"
+            className="tempo-input mono"
+            value={tempo}
+            min={20}
+            max={400}
+            step={1}
+            onFocus={() => { useHistoryStore.getState().beginTransaction(); useProjectStore.getState().beginTempoScale(); }}
+            onBlur={() => { useProjectStore.getState().endTempoScale(); useHistoryStore.getState().commitTransaction(); }}
+            onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+            onChange={(e) => setTempo(Number(e.target.value))}
+          />
+        </div>
+
+        <div className="toolbar-section time-sig-clickable" onClick={() => setTimeSigOpen(true)} title={t("toolbar.timeSignature")}>
+          <span className="mono time-sig-display">{timeSignature[0]}/{timeSignature[1]}</span>
+        </div>
+
+        <div className="toolbar-section key-selector" onClick={() => setKeyOpen(true)} title={t("toolbar.key")}>
+          {selectedKey ? (
+            <span className="key-display">{selectedKey}</span>
+          ) : (
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+              <path d="M3 8a5 5 0 0 1 10 0M8 8v5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" fill="none" />
+              <circle cx="8" cy="8" r="1.5" fill="currentColor" />
+            </svg>
+          )}
+        </div>
+
+        <div className="toolbar-divider" />
+
+        <div className="toolbar-section position-section">
+          <label className="toolbar-label">{t("toolbar.position")}</label>
+          <span ref={positionDisplayRef} className="mono position-display">
+            {formatPosition(playheadRef.current, timeAxis)}
+          </span>
+        </div>
+
+        <div className="toolbar-divider" />
+
+        {/* 工具按钮：撤销历史 / 快捷键 / 主题 */}
+        <div className="toolbar-section utility-section">
+          <button className="toolbar-btn icon-btn" title={t("history.panelTitle")} onClick={() => setHistoryOpen(true)}>
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path d="M8 1.5a6.5 6.5 0 1 1-6.5 6.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              <path d="M1.5 8V3.5M1.5 3.5H6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+          <button className="toolbar-btn icon-btn" title={t("titlebar.shortcuts")} onClick={() => setShortcutsOpen(true)}>
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <rect x="1" y="2" width="14" height="11" rx="2" fill="none" stroke="currentColor" strokeWidth="1.2" />
+              <path d="M4 12.5v-2M4 8.5v-1M12 12.5v-6M10 9.5v-1M10 13v-.4M2.5 4.5h3M11.5 4.5h2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+            </svg>
+          </button>
+          <button className="toolbar-btn icon-btn" title={t("titlebar.skin")} onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            setSkinPos({ top: r.bottom + 6, right: window.innerWidth - r.right });
+            setSkinOpen((v) => !v);
+          }}>
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <circle cx="5" cy="4" r="1.6" fill="#fdba74" />
+              <circle cx="9.6" cy="3.2" r="1.6" fill="#4ade80" />
+              <circle cx="12.6" cy="6.4" r="1.6" fill="#60a5fa" />
+              <circle cx="11.6" cy="10.4" r="1.6" fill="#a78bfa" />
+              <circle cx="7.4" cy="11.4" r="1.6" fill="#f87171" />
+            </svg>
+          </button>
+        </div>
       </div>
 
-      <div className="toolbar-divider" />
-
-      <div className="toolbar-section position-section">
-        <label className="toolbar-label">{t("toolbar.position")}</label>
-        <span className="mono position-display">
-          {formatPosition(playheadTick, timeAxis)}
-        </span>
-      </div>
-
-      <div className="toolbar-divider" />
-
-      <div className="toolbar-section snap-section">
-        <label className="toolbar-label">{t("toolbar.snap")}</label>
-        <button
-          className={`snap-toggle ${snapSegments ? "active" : ""}`}
-          onClick={toggleSnapSegments}
-          aria-label={t("toolbar.snapClipTip")}
-        >
-          {/* magnet — clip snapping */}
-          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
-            <path fill="currentColor" d="M3 7v6a9 9 0 0 0 18 0V7h-4v6a5 5 0 0 1-10 0V7z M3 3h4v4H3z M17 3h4v4h-4z" />
-          </svg>
-        </button>
-        <button
-          className={`snap-toggle ${snapPlayhead ? "active" : ""}`}
-          onClick={toggleSnapPlayhead}
-          aria-label={t("toolbar.snapPlayheadTip")}
-        >
-          {/* playhead marker — playhead snapping */}
-          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
-            <path fill="currentColor" d="M6 3h12l-6 7z M11 9h2v12h-2z" />
-          </svg>
-        </button>
-      </div>
-
-      <div className="toolbar-divider" />
-
-      <div className="toolbar-section edit-section">
-        <button
-          className="toolbar-btn"
-          onClick={handleSplit}
-          disabled={!selectedSegment}
-        >
-          {t("toolbar.split")}
-        </button>
-        <button
-          className="toolbar-btn"
-          onClick={handleDelete}
-          disabled={!selectedSegment}
-        >
-          {t("toolbar.delete")}
-        </button>
-      </div>
-
-      <div className="toolbar-spacer" />
+      {/* 弹窗集合 */}
+      {skinOpen && (
+        <div className="skin-popover" style={skinPos ?? undefined}>
+          <div className="skin-popover-title">{t("titlebar.themeTitle")}</div>
+          <div className="theme-grid">
+            {THEMES.map((item, idx) => (
+              <button
+                key={idx}
+                className={`theme-item ${item.theme === theme && item.skin === skin ? "active" : ""}`}
+                onClick={() => {
+                  setTheme(item.theme);
+                  setSkin(item.skin);
+                  setSkinOpen(false);
+                }}
+              >
+                <span className="theme-color-dot" style={{ backgroundColor: item.color }} />
+                <span className="theme-label">{item.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      
+      {timeSigOpen && (
+        <>
+          <div className="popover-backdrop" onClick={() => setTimeSigOpen(false)} />
+          <div className="time-sig-popover">
+            <div className="popover-title">{t("toolbar.timeSignature")}</div>
+            <div className="time-sig-editor">
+              <div className="time-sig-row">
+                <label>分子</label>
+                <div className="time-sig-options">
+                  {TS_NUM_OPTIONS.slice(0, 8).map(opt => (
+                    <button
+                      key={opt.value}
+                      className={`time-sig-option ${timeSignature[0] === opt.value ? "active" : ""}`}
+                      onClick={() => {
+                        setTimeSignature(opt.value, timeSignature[1]);
+                        setTimeSigOpen(false);
+                      }}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="time-sig-row">
+                <label>分母</label>
+                <div className="time-sig-options">
+                  {TS_DEN_OPTIONS.map(opt => (
+                    <button
+                      key={opt.value}
+                      className={`time-sig-option ${timeSignature[1] === opt.value ? "active" : ""}`}
+                      onClick={() => {
+                        setTimeSignature(timeSignature[0], opt.value);
+                        setTimeSigOpen(false);
+                      }}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+      
+      {keyOpen && (
+        <>
+          <div className="popover-backdrop" onClick={() => setKeyOpen(false)} />
+          <div className="key-popover">
+            <div className="popover-title">{t("toolbar.key")}</div>
+            <div className="key-section">
+              <div className="key-section-title">{t("toolbar.keyMajor")}</div>
+              <div className="key-grid">
+                {["C", "G", "D", "A", "E", "B", "F♯", "C♯", "F", "B♭", "E♭", "A♭"].map(key => (
+                  <button
+                    key={key}
+                    className={`key-option ${selectedKey === key ? "active" : ""}`}
+                    onClick={() => {
+                      setSelectedKey(key);
+                      setKeyOpen(false);
+                    }}
+                  >
+                    {key}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="key-section">
+              <div className="key-section-title">{t("toolbar.keyMinor")}</div>
+              <div className="key-grid">
+                {["Am", "Em", "Bm", "F♯m", "C♯m", "G♯m", "D♯m", "A♯m", "Dm", "Gm", "Cm", "Fm"].map(key => (
+                  <button
+                    key={key}
+                    className={`key-option ${selectedKey === key ? "active" : ""}`}
+                    onClick={() => {
+                      setSelectedKey(key);
+                      setKeyOpen(false);
+                    }}
+                  >
+                    {key}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+      
+      {shortcutsOpen && <ShortcutsDialog onClose={() => setShortcutsOpen(false)} />}
+      {historyOpen && <HistoryPanel onClose={() => setHistoryOpen(false)} />}
     </div>
   );
 }

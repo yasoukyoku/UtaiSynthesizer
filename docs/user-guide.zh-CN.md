@@ -69,7 +69,7 @@ UtaiSynthesizer 是一款歌声合成 DAW（数字音频工作站），四件事
 
 ### 2.1 下载与安装
 
-1. 打开发布页下载最新版安装包：<https://github.com/yasoukyoku/UtaiSynthesizer/releases>
+1. 打开发布页下载最新版安装包：<https://github.com/junziai/munoai/releases>
 2. 下载名为 `UtaiSynthesizer_x.y.z_x64-setup.exe` 的安装程序并运行。
 3. 安装程序支持简体中文/English/日本語（这个语言选择只影响安装程序本身，软件内语言另行设置）。
 4. 安装到**当前用户目录**，不需要管理员权限。
@@ -788,7 +788,7 @@ RVC 模型：
 | --- | --- |
 | 模型下拉 | 本类别已安装的模型 |
 | 「重叠次数」 | 2–8，越高越精细越慢（VR 架构没有此项） |
-| 「推理精度」 | fp32 / fp16——仅当两种都已转换时显示；fp16 约快一倍、省一半显存，音质差异听不出来。推理设备为 CPU 时 fp16 没有好处：装有 fp32 就自动改用 fp32，只装了 fp16 会提示你补转 fp32（v0.12.3 起） |
+| 「推理精度」 | fp32 / fp16——仅当两种都已转换时显示；fp16 约快一倍、省一半显存，音质差异听不出来 |
 | 「批大小」 | 1–16，显存不够就调低 |
 | 「归一化」 | 频谱类架构的规范化开关 |
 | 「TTA」 | 测试时增强，约慢 3 倍，换极小的质量提升 |
@@ -1488,14 +1488,6 @@ NVIDIA 用户的推理加速运行时（约 1.6 GB，全自包含、无需 CUDA 
 - 显存不足：分离节点调低「批大小」、下载/使用 fp16 精度的模型；关闭其他占显存的程序；RVC/SoVITS 节点不勾「GPU特征提取」。
 - 训练显存不足：调低「批大小」，开「半精度训练 (fp16)」。
 
-**Q：分离/推理时报「显卡驱动超时并被系统重置」（DirectML 设备丢失）**
-
-这是显卡驱动在一次 GPU 运算中超时、被 Windows 重置了（日志里是 `0x887A0006` 之类的错误码）。它**不是显存不足**。可以这样处理：在「设置」→「硬件」把「推理设备」改成 CPU 再重试（会慢很多，但不依赖显卡驱动）；NVIDIA 显卡建议按 2.4 安装 CUDA 运行时，改用 CUDA 通常更快也更稳；更新显卡驱动也可能有帮助。完整的技术报错会写进日志，反馈问题时附上日志即可。
-
-**Q：设置（推理设备、数据目录等）突然全部回到了默认值**
-
-说明启动时安装目录下的 `config.json` 读不出来（比如被意外损坏）。从 v0.12.3 起，读不出来的文件不会再被默认值覆盖，而是原样保留为同目录下的 `config.json.corrupt-1`（下一次是 `-2`，以此类推），启动时会弹出提示。数据目录的位置也存在这个文件里——如果模型"不见了"，先在「设置」里把数据目录重新指回原来的位置。反馈问题时请附上那份备份文件。另外，用记事本或 PowerShell 以「UTF-8 带 BOM」保存的配置现在可以正常读取。
-
 **Q：渲染很慢**
 
 检查「推理设备」是不是落在了 CPU 上（见上一条）。日志里会记录实际使用的执行设备。NVIDIA 显卡装 CUDA 运行时通常比 DirectML 更快。此外首次播放大工程时的等待是「正在加载音频…」的解码准备，不是渲染慢。
@@ -1513,8 +1505,6 @@ NVIDIA 用户的推理加速运行时（约 1.6 GB，全自包含、无需 CUDA 
 **Q：提示「已有一个分离任务正在进行」/「已有渲染在进行中」**
 
 分离全局同时只能跑一个，人声渲染同时只能跑一个。等当前任务完成，或先 Stop 再启动新的。刚取消的渲染会有一小段"收尾"时间，新任务会排队自动开始。
-
-⚠ v0.12.3 之前有一个 bug：一个分离刚跑完、工作流紧接着的下一个分离节点会被误报这条，整条工作流失败（已完成的分离结果也没被用上）。v0.12.3 已修复——之后如果仍出现，就说明确实还有一个分离在跑。
 
 **Q：工作流跑完提示「运行结束但没有产生轨道输出」**
 
@@ -1589,8 +1579,8 @@ NVIDIA 用户的推理加速运行时（约 1.6 GB，全自包含、无需 CUDA 
 
 - **QQ 群**：[1058227212](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
 - **Discord**：<https://discord.com/invite/p3fGh942fJ>
-- **GitHub 仓库**：<https://github.com/yasoukyoku/UtaiSynthesizer> —— bug 报告请开 [Issue](https://github.com/yasoukyoku/UtaiSynthesizer/issues)，附上版本号、复现步骤和日志（见第 13 章）
-- **下载最新版**：<https://github.com/yasoukyoku/UtaiSynthesizer/releases>
+- **GitHub 仓库**：<https://github.com/junziai/munoai> —— bug 报告请开 [Issue](https://github.com/junziai/munoai/issues)，附上版本号、复现步骤和日志（见第 13 章）
+- **下载最新版**：<https://github.com/junziai/munoai/releases>
 
 以上链接也都在软件内：标题栏「帮助与社区」菜单。
 

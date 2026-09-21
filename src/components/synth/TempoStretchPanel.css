@@ -17,12 +17,21 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
+  /* Hard guarantee: the panel itself can never extend past the viewport —
+   * content taller than the window scrolls INSIDE the panel instead of
+   * being clipped off-screen. */
+  max-height: calc(100vh - 12px);
+  overflow-y: auto;
 }
 
 .stretch-title {
   font-size: var(--font-size-sm);
   color: var(--text-primary);
   font-weight: 600;
+  /* Long track/segment names must not stretch or wrap the panel. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .stretch-readout {
@@ -59,4 +68,19 @@
 .stretch-btn:disabled {
   opacity: 0.4;
   cursor: default;
+}
+
+/* S12 FX send / bus panel — thin section separators above the shared ParamSlider rows. */
+.fx-section-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border-default);
+  padding-top: 6px;
+  margin-top: 2px;
+}
+.fx-section-label:first-of-type {
+  border-top: none;
 }

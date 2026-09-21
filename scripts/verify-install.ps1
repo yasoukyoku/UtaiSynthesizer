@@ -63,20 +63,9 @@ $archCount = (Get-ChildItem (Join-Path $InstallDir "converter\architectures") -F
 Check "converter\architectures\*.py (>=8)" ($archCount -ge 8) "$archCount files"
 
 # 7. training package tree (spawn: python -m utai_train.runner, cwd=<install>\training)
-# S172: rocm_cxx_headers carries the C++ standard headers the AMD runtime's kernel
-# compiler needs (AMD's comgr is supposed to embed them and our pinned nightly ships the
-# payload empty). Without them every MIOpen kernel build fails on a machine that has no
-# MSVC headers, i.e. a silently dead AMD training lane -- so a missing resource is fatal.
-foreach ($f in @("training\utai_train\runner.py", "training\utai_train\rvc", "training\utai_train\sovits", "training\utai_train\vocoder", "training\assets\mute", "training\rocm_cxx_headers\v1\type_traits", "training\rocm_cxx_headers\v1\utility", "training\rocm_cxx_headers\clangres\stddef.h", "training\rocm_cxx_headers\LICENSE.TXT")) {
+foreach ($f in @("training\utai_train\runner.py", "training\utai_train\rvc", "training\utai_train\sovits", "training\utai_train\vocoder", "training\assets\mute")) {
   Check $f (Test-Path (Join-Path $InstallDir $f))
 }
-# S172: spot-checking two files cannot see a HALF-copied header payload, and half a C++
-# standard library is as dead as none of it (the compiler dies on the first missing
-# #include_next). Assert the counts instead.
-$v1 = (Get-ChildItem (Join-Path $InstallDir "training\rocm_cxx_headers\v1") -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
-$cr = (Get-ChildItem (Join-Path $InstallDir "training\rocm_cxx_headers\clangres") -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
-Check "rocm_cxx_headers/v1 >= 189 files (got $v1)" ($v1 -ge 189)
-Check "rocm_cxx_headers/clangres >= 11 files (got $cr)" ($cr -ge 11)
 $pyc = (Get-ChildItem (Join-Path $InstallDir "training") -Recurse -Directory -Filter __pycache__ -ErrorAction SilentlyContinue | Measure-Object).Count
 Check "no __pycache__ shipped" ($pyc -eq 0) "$pyc dirs"
 

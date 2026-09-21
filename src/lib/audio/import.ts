@@ -43,13 +43,18 @@ function msToTicks(ms: number): number {
  *
  * Used by the click-import ("+") menu (appends) and drag-import (`insertIndex` positions the new
  * track at the dragged spot in the track-header column instead of always appending).
+ *
+ * Returns the created { trackId, segId } (the 超级原创 wizard keys its follow-up writes — template
+ * workflow + auto-run — on them); the promise rejects never (finalizeSegment owns errors), but the
+ * ids are only usable after the await settles (decode done / segment removed on failure — check the
+ * store if the user might have deleted it mid-load).
  */
 export async function importAudioToNewTrack(
   filePath: string,
   startTick: number,
   knownDurationMs?: number,
   insertIndex?: number,
-): Promise<void> {
+): Promise<{ trackId: string; segId: string }> {
   const trackId = crypto.randomUUID();
   const segId = crypto.randomUUID();
   const durMs = knownDurationMs ?? (await probeAudioDuration(filePath));
@@ -62,7 +67,15 @@ export async function importAudioToNewTrack(
     content: { type: "audioClip", sourcePath: filePath, offsetMs: 0, totalDurationMs: durMs },
   };
 
-  useProjectStore.getState().addTrack({
+  // 首次上传音频时自动命名工程为音频文件名（去除扩展名）
+  const projectStore = useProjectStore.getState();
+  const currentName = projectStore.name;
+  if (!currentName || currentName === "Untitled" || currentName === "") {
+    const audioFileName = fileName(filePath).replace(/\.[^.]+$/, ""); // 去除扩展名
+    useProjectStore.setState({ name: audioFileName, dirty: true });
+  }
+
+  projectStore.addTrack({
     id: trackId,
     name: fileName(filePath),
     trackType: "audio",
@@ -76,6 +89,7 @@ export async function importAudioToNewTrack(
   }, insertIndex);
 
   await finalizeSegment(filePath, trackId, segId, true);
+  return { trackId, segId };
 }
 
 /**

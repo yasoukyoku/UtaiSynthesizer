@@ -1,0 +1,126 @@
+// S66 — startup missing-component check. The post-download design ships a small installer and
+// fetches the big pieces later; before this, a fresh install only learned about the missing
+// converter runtime / core inference models when something FAILED (RUNTIME_PACK_REQUIRED /
+// AUX_FILE_MISSING toasts). This check turns that into one friendly dialog with a one-click
+// download at first launch. App.tsx runs it AFTER the update-check window with the same
+// confirm-collision discipline; the toggle lives in Settings → Model Assets.
+import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
+import i18n from "../i18n";
+import { loadSetting, saveSetting } from "./settings";
+import { ghTrustedRoutes, hfBaseForMirror } from "./models/msst-catalog";
+import { useAppStore } from "../store/app";
+import { useMsstModelStore } from "../store/msst-models";
+const KEY = "utai.startupComponentCheck";
+export function startupComponentCheckEnabled() {
+    return loadSetting(KEY, true);
+}
+export function setStartupComponentCheckEnabled(v) {
+    saveSetting(KEY, v);
+}
+/** S68c (§user): install-completeness check for the NSIS-bundled files (ORT DLLs / ffmpeg /
+ *  dictionaries / converter scripts…). These are NOT in any downloadable pack — the honest repair
+ *  is re-running the installer (Settings → update, or the release download) — so the dialog says
+ *  that instead of pretending to self-heal. Muted per app VERSION: dismissing stops the nag until
+ *  the next update rewrites the files (when the check matters again). Exported separately and run
+ *  OUTSIDE the component-check master switch (App.tsx): that switch is a permanent opt-out of the
+ *  DOWNLOAD nagging (compNever), and inheriting it would silence integrity forever — against the
+ *  per-version design (S68c review). */
+export async function runBundledIntegrityCheck() {
+    const report = await invoke("bundled_integrity_report").catch(() => ({ missing: [], ort_fallback: false }));
+    if (report.missing.length === 0 && !report.ort_fallback)
+        return;
+    const version = await getVersion().catch(() => "?");
+    if (loadSetting("utai.bundledCheckMuted", "") === version)
+        return;
+    const lines = report.missing.slice(0, 8).map((p) => `· ${p}`);
+    if (report.missing.length > 8)
+        lines.push(`· … +${report.missing.length - 8}`);
+    if (report.ort_fallback)
+        lines.push(`· ${i18n.t("startup.integrityOrt")}`);
+    const c = await useAppStore.getState().showConfirm({
+        title: i18n.t("startup.integrityTitle"),
+        body: `${i18n.t("startup.integrityBody")}\n${lines.join("\n")}\n\n${i18n.t("startup.integrityHint")}`,
+        buttons: [
+            { id: "mute", label: i18n.t("startup.integrityMute") },
+            { id: "ok", label: i18n.t("common.ok"), kind: "primary" },
+        ],
+    });
+    if (c === "mute")
+        saveSetting("utai.bundledCheckMuted", version);
+}
+/** Detect the missing must-have components (converter runtime pack + core inference models)
+ *  and offer the one-click download. The caller guarantees no other modal is open. */
+export async function runStartupComponentCheck() {
+    const [convOk, packs, hw] = await Promise.all([
+        invoke("converter_env_ready"),
+        invoke("asset_pack_status"),
+        invoke("get_hardware_info").catch(() => ({})),
+    ]);
+    const aux = packs.find((p) => p.id === "aux-inference");
+    const auxMissing = (aux?.missing ?? 0) > 0 && !(aux?.downloading ?? false);
+    if (convOk && !auxMissing)
+        return;
+    const lines = [];
+    if (!convOk)
+        lines.push(`· ${i18n.t("startup.compRuntime")}`);
+    if (auxMissing)
+        lines.push(`· ${i18n.t("startup.compAux")}`);
+    const c = await useAppStore.getState().showConfirm({
+        title: i18n.t("startup.compTitle"),
+        body: `${i18n.t("startup.compBody")}\n${lines.join("\n")}\n\n${i18n.t("startup.compHint")}`,
+        buttons: [
+            { id: "never", label: i18n.t("startup.compNever") },
+            { id: "later", label: i18n.t("startup.compLater") },
+            { id: "dl", label: i18n.t("startup.compDl"), kind: "primary" },
+        ],
+    });
+    if (c === "never") {
+        setStartupComponentCheckEnabled(false);
+        return;
+    }
+    if (c !== "dl")
+        return;
+    // Open Settings so the existing progress UIs (Model Assets / Training Runtime sections)
+    // show the downloads the click just started — no new progress surface to maintain.
+    if (!useAppStore.getState().settingsOpen)
+        useAppStore.getState().toggleSettings();
+    const hfBase = hfBaseForMirror(useMsstModelStore.getState().mirror);
+    void (async () => {
+        if (auxMissing) {
+            try {
+                await invoke("download_asset_pack", { id: "aux-inference", hfBase });
+            }
+            catch {
+                /* busy/cancel/fail all surface in the Settings asset section */
+            }
+        }
+        if (!convOk) {
+            try {
+                // The runtime pack matching this machine: hardware-recommended variant first, then any
+                // supported stable pack, then any supported one (mirrors the Settings list's gating).
+                const env = await invoke("get_runtime_env_info");
+                const rec = hw.recommended_variant;
+                const candidates = env.catalog.filter((e) => !e.installed && e.supported && e.downloadable);
+                const pick = candidates.find((e) => e.variant === rec) ??
+                    candidates.find((e) => !e.experimental) ??
+                    candidates[0];
+                if (pick) {
+                    // S168: the startup auto-download was the ONE caller still invoking the pack
+                    // installer with no mirror information (reviewed — a dead verifier nearly buried
+                    // this). Same trusted-routes rule as Settings: explicit choice + direct only,
+                    // because the manifest is the pack's unsigned integrity root.
+                    const ms = useMsstModelStore.getState();
+                    await invoke("download_runtime_pack", {
+                        id: pick.id,
+                        hfBase,
+                        ghRoutes: ghTrustedRoutes(ms.ghMirror, ms.ghPresets),
+                    });
+                }
+            }
+            catch {
+                /* surfaced in the Settings runtime section */
+            }
+        }
+    })();
+}

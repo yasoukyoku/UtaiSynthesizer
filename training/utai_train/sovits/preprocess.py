@@ -25,7 +25,6 @@ from ..audio import load_audio
 from ..augment import is_aug_name
 from ..cache import dataset_entries
 from ..rvc.slicer2 import Slicer  # single source — the vendored openvpi slicer
-from .. import prep_codes
 
 logger = logging.getLogger(__name__)
 
@@ -102,22 +101,7 @@ def slice_and_resample(dataset_dir, out_spk_dir, loudnorm, ffmpeg, reporter, sto
             logger.error("slice failed for %s\n%s", path, traceback.format_exc())
     reporter.stage("slice", done=len(names), total=len(names))
     if names and failed == len(names):
-        raise RuntimeError(
-            "%s: none of the %d source file(s) in %s could be decoded/sliced"
-            % (
-                prep_codes.SOURCE_FILES_ALL_FAILED_CODE,
-                len(names),
-                os.path.basename(dataset_dir),
-            )
-        )
+        raise RuntimeError("所有音频文件切片/重采样均失败（详见日志）")
     if written == 0:
-        raise RuntimeError(
-            "%s: %s files=%d failed=%d written=0"
-            % (
-                prep_codes.NO_USABLE_SLICES_CODE,
-                os.path.basename(dataset_dir),
-                len(names),
-                failed,
-            )
-        )
+        raise RuntimeError("切片后没有任何有效样本（素材可能全为静音或过短）")
     return written

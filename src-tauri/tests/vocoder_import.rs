@@ -1,4 +1,4 @@
-//! S40 vocoder resource import-chain integration test (审查 HIGH 修复的机器验证).
+﻿//! S40 vocoder resource import-chain integration test (审查 HIGH 修复的机器验证).
 //!
 //! Drives the REAL ModelRegistry::import_file against a TEMP models dir with the
 //! real converter venv (spawns export_nsf_hifigan.py — torch runs ~40s per
@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use utai_lib::models::{ModelRegistry, ModelType};
+use muno_lib::models::{ModelRegistry, ModelType};
 
 fn app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
@@ -36,7 +36,7 @@ fn import_vocoder(
     reg: &ModelRegistry,
     name: &str,
     src: &Path,
-) -> utai_lib::Result<utai_lib::models::ImportOutcome> {
+) -> muno_lib::Result<muno_lib::models::ImportOutcome> {
     reg.import_file(
         name,
         src,

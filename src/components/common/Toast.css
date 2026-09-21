@@ -1,4 +1,4 @@
-.toast-container {
+﻿.toast-container {
   position: fixed;
   bottom: var(--space-xl);
   right: var(--space-xl);
@@ -37,7 +37,7 @@
 }
 
 .toast-success {
-  border-left: 3px solid var(--color-success, #4ade80);
+  border-left: 3px solid var(--color-success, var(--color-success));
 }
 
 .toast-icon {
@@ -54,7 +54,7 @@
 
 .toast-error .toast-icon { color: var(--color-error, #ff4466); }
 .toast-info .toast-icon { color: var(--accent-primary); }
-.toast-success .toast-icon { color: var(--color-success, #4ade80); }
+.toast-success .toast-icon { color: var(--color-success, var(--color-success)); }
 
 .toast-msg {
   font-size: var(--font-size-xs);

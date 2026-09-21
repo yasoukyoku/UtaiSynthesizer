@@ -1,0 +1,99 @@
+// S63 — Audio-export orchestration: dirty-vocal pre-render (THE same funnel Play uses) → offline
+// mixdown (exportMixdown.ts) → one raw-body IPC hop → Rust encode. UI-free; the ExportAudioDialog
+// drives it and renders the phases.
+import { invoke } from "@tauri-apps/api/core";
+import i18n from "../../i18n";
+import { useProjectStore } from "../../store/project";
+import { useAudioStore } from "../../store/audio";
+import { collectDirtyVocals, renderDirtyVocals } from "../vocal/vocalRender";
+import { collectDirtyInstruments, renderDirtyInstruments } from "../soundfont/instrumentRender";
+import { scoreExportableTracks } from "../vocal/exportScore";
+import { renderMixdown } from "./exportMixdown";
+/** PCM chunk size for the IPC transfer. DELIBERATELY small (8MB): Tauri's IPC silently falls back
+ *  from the custom-protocol fetch to postMessage on a rejected fetch, and that path Array.from()s
+ *  the bytes into a JS number array + JSON string — for a single ~100MB body that fallback OOM-kills
+ *  the WebView2 renderer (the S63 crash). Per-chunk, a stray fallback costs ~30MB transient, not GBs. */
+const PCM_CHUNK_BYTES = 8 * 1024 * 1024;
+/**
+ * Run the full export. Throws with a stable EXPORT_* message (renderMixdown's own codes, or the Rust
+ * encode codes via backendError mapping) — EXCEPT vocal-render failures, which renderDirtyVocals has
+ * already toasted per-track; those surface here as EXPORT_VOCALS_FAILED so the dialog can show a
+ * summary line without double-toasting details.
+ */
+export async function runAudioExport(params, onPhase, shouldCancel) {
+    // 1. Bake dirty vocal tracks first — the bounce must contain what the user WOULD hear on Play.
+    //    Same collect/render funnel as Toolbar's pre-play batch (single source; sequential, cancellable).
+    const tempo0 = useProjectStore.getState().tempo;
+    const dirty = collectDirtyVocals(tempo0);
+    if (dirty.length > 0) {
+        onPhase({ kind: "vocals", total: dirty.length });
+        const res = await renderDirtyVocals(dirty, tempo0, i18n.t("vocalEditor.render.laneLabel"), {
+            shouldCancel,
+        });
+        if (res.cancelled || shouldCancel())
+            return { cancelled: true, peak: 0, fileBytes: 0, durationSec: 0 };
+        // A failed bake means the bounce would silently diverge from the project — abort loudly.
+        if (res.failed > 0)
+            throw new Error("EXPORT_VOCALS_FAILED");
+    }
+    if (shouldCancel())
+        return { cancelled: true, peak: 0, fileBytes: 0, durationSec: 0 };
+    // 1b. Bake dirty instrument tracks — same funnel as Play (Muno 阶段2). A failed bake aborts loudly
+    //     for the same reason as vocals: the bounce must contain what the user WOULD hear.
+    const dirtyIns = collectDirtyInstruments(tempo0);
+    if (dirtyIns.length > 0) {
+        onPhase({ kind: "instruments", total: dirtyIns.length });
+        const resIns = await renderDirtyInstruments(dirtyIns, tempo0, { shouldCancel });
+        if (resIns.cancelled || shouldCancel())
+            return { cancelled: true, peak: 0, fileBytes: 0, durationSec: 0 };
+        if (resIns.failed > 0)
+            throw new Error("EXPORT_INSTRUMENTS_FAILED");
+    }
+    if (shouldCancel())
+        return { cancelled: true, peak: 0, fileBytes: 0, durationSec: 0 };
+    // 2. Offline mixdown — read FRESH state (the bakes just deposited; tempo may not change mid-dialog,
+    //    but the same fresh-read discipline as Toolbar's post-render play costs nothing).
+    const st = useProjectStore.getState();
+    onPhase({ kind: "mix", frac: 0 });
+    let mix;
+    try {
+        mix = await renderMixdown(st.tracks, useAudioStore.getState().audioFiles, st.tempo, params.sampleRate, (frac) => onPhase({ kind: "mix", frac }), { master: params.mastering !== false });
+    }
+    catch (e) {
+        // "No audio content" on a project that HAS vocal notes means the notes never became audio (no
+        // singer configured / silently skipped by the dirty collector) — point the user at the real cause
+        // instead of the misleading generic empty (audit). Same predicate as the score-export track list.
+        if (String(e).includes("EXPORT_EMPTY") && scoreExportableTracks(st.tracks).length > 0) {
+            throw new Error("EXPORT_VOCALS_UNRENDERED");
+        }
+        throw e;
+    }
+    if (shouldCancel())
+        return { cancelled: true, peak: 0, fileBytes: 0, durationSec: 0 };
+    // 3. Ship the PCM in raw-body CHUNKS (see PCM_CHUNK_BYTES — never one giant body, and never a
+    //    Vec<f32> JSON round trip, the S59 O5 lesson) + encode.
+    onPhase({ kind: "encode" });
+    try {
+        const bytes = new Uint8Array(mix.pcm.buffer, mix.pcm.byteOffset, mix.pcm.byteLength);
+        await invoke("export_audio_pcm_begin", { totalBytes: bytes.byteLength });
+        for (let off = 0; off < bytes.byteLength; off += PCM_CHUNK_BYTES) {
+            // slice() copies the 8MB window into a fresh, offset-0 buffer — a subarray view's byteOffset
+            // is NOT preserved through the raw-body transport, and a stale view would resend the head.
+            const chunk = bytes.slice(off, Math.min(off + PCM_CHUNK_BYTES, bytes.byteLength));
+            await invoke("export_audio_pcm_chunk", chunk);
+        }
+        const res = await invoke("export_audio_encode", {
+            outPath: params.outPath,
+            format: params.format,
+            sampleRate: params.sampleRate,
+            bitDepth: params.bitDepth,
+            bitrateKbps: params.bitrateKbps,
+        });
+        return { cancelled: false, peak: mix.peak, fileBytes: res.file_bytes, durationSec: mix.durationSec };
+    }
+    catch (e) {
+        // Free the Rust-side PCM stash on any failure between the hops (best-effort, idempotent).
+        void invoke("export_audio_discard").catch(() => { });
+        throw e;
+    }
+}

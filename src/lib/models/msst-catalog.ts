@@ -716,6 +716,14 @@ function isGhUrl(url: string): boolean {
   return GH_HOSTS.has(host) || host.endsWith(".github.com") || host.endsWith(".githubusercontent.com");
 }
 
+/** True when a download URL has NO HuggingFace / GitHub mirror route — the bytes must come
+ *  directly from the foreign host (Zenodo, Meta's FB CDN, etc.). The resource-manager UI badges
+ *  these with「需魔法」 because neither the HF mirror nor the GH proxy presets can rewrite them. */
+export function urlNeedsVpn(url: string): boolean {
+  if (url.includes("huggingface.co")) return false;
+  return !isGhUrl(url);
+}
+
 export function applyGhMirror(url: string, gh: GhMirror, presets: GhPreset[] = BUILTIN_GH_PRESETS): string {
   const prefix = ghProxyPrefix(gh, presets);
   if (!prefix || !isGhUrl(url)) return url;

@@ -47,12 +47,16 @@ const CV_SPEAKER: i64 = 49;
 /// would contaminate the stream attribution this probe exists to measure. `0.0` emphasis and `0.0`
 /// valley are bit-exact no-ops; clarity off is the plain `run_score2cv` call. Preroll (S89) stays at
 /// the production default — it is a TIMING fact of the arrays, not an output-domain stage, and the
-/// arms must keep comparing the same phone layout.
+/// arms must keep comparing the same phone layout. Phase 7 ①②③ (voice realism) are output-domain
+/// aesthetics — off (`0.0` / `0.0` / `false`).
 const NEUTRAL_SHAPING: ScoreShaping = ScoreShaping {
     consonant_emphasis_db: 0.0,
     consonant_valley_scale: 0.0,
     vowel_clarity: false,
     consonant_preroll: true, // production default — a TIMING fact, not an output-domain stage
+    voice_realism_mix: 0.0,
+    formant_jitter_depth: 0.0,
+    breath_layer: false,
 };
 
 #[derive(serde::Deserialize)]

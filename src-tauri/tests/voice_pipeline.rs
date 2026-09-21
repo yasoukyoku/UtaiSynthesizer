@@ -1,4 +1,4 @@
-//! 关卡-2 E2E harness for the VOICE pipeline (RVC / SoVITS full chain).
+﻿//! 关卡-2 E2E harness for the VOICE pipeline (RVC / SoVITS full chain).
 //!
 //! Mirrors tests\separation_pipeline.rs's init_ort + env-gated pattern. It constructs
 //! RvcModel/SovitsModel directly (engine + aux sessions), reads the model's sidecar json
@@ -17,8 +17,8 @@
 
 use std::path::PathBuf;
 
-use utai_lib::inference::engine::{DeviceConfig, OnnxEngine};
-use utai_lib::inference::{RvcOptions, SovitsOptions};
+use muno_lib::inference::engine::{DeviceConfig, OnnxEngine};
+use muno_lib::inference::{RvcOptions, SovitsOptions};
 
 fn app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
@@ -49,19 +49,19 @@ fn init_ort() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("muno_lib=info")),
         )
         .try_init();
-    utai_lib::suppress_windows_dll_error_dialogs();
+    muno_lib::suppress_windows_dll_error_dialogs();
     // cudnn 9's shim resolves its sub-DLLs via PATH at graph-build time — the
     // app sets this up in run(); a bare harness without it fails the first
     // CUDA Conv with CUDNN_BACKEND_API_FAILED (looks like environment drift).
-    utai_lib::setup_cuda_dll_paths(&app_root());
-    utai_lib::init_ort_runtime(&app_root());
+    muno_lib::setup_cuda_dll_paths(&app_root());
+    muno_lib::init_ort_runtime(&app_root());
 }
 
 fn aux_dir() -> PathBuf {
-    app_root().join("data").join("models").join(utai_lib::models::AUX_DIR_NAME)
+    app_root().join("data").join("models").join(muno_lib::models::AUX_DIR_NAME)
 }
 
 /// ContentVec variant routing (mirrors commands\inference.rs): 768 → vec768l12, 256 → vec256l9.
@@ -144,7 +144,7 @@ fn voice_env_wav() {
     let sample_rate = sc.get("sample_rate").and_then(|v| v.as_u64()).expect("sample_rate") as u32;
     let nch = noise_channels(&sc);
 
-    let audio = utai_lib::audio::load_audio(&input).expect("load input wav");
+    let audio = muno_lib::audio::load_audio(&input).expect("load input wav");
 
     // S81 音域扩展 A/B: UTAI_VOICE_RANGE=1 resolves the sidecar's tested range exactly like the
     // command layer does, so the harness can render the SAME input with extension off / on.
@@ -157,10 +157,10 @@ fn voice_env_wav() {
         Ok("1") | Ok("true") | Ok("on")
     );
     let range = if range_armed {
-        let cfg: utai_lib::models::ModelConfig =
+        let cfg: muno_lib::models::ModelConfig =
             serde_json::from_value(sc.clone()).expect("parse sidecar as ModelConfig");
         let spk: u32 = std::env::var("UTAI_VOICE_SPK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let r = utai_lib::inference::vocal_range::speaker_range(&cfg, spk);
+        let r = muno_lib::inference::vocal_range::speaker_range(&cfg, spk);
         eprintln!("[harness] range-extend ARMED, speaker {spk}, record = {r:?}");
         assert!(r.is_some(), "UTAI_VOICE_RANGE set but the sidecar carries no usable record for speaker {spk}");
         r
@@ -196,9 +196,9 @@ fn voice_env_wav() {
             eprintln!("[harness] RvcOptions = {:?}", options);
             let min_frames = sc.get("min_frames").and_then(|v| v.as_u64()).unwrap_or(12) as usize;
             let index = std::env::var("UTAI_VOICE_INDEX").ok().map(|p| {
-                utai_lib::inference::rvc::RvcIndex::load(&PathBuf::from(p)).expect("load index npy")
+                muno_lib::inference::rvc::RvcIndex::load(&PathBuf::from(p)).expect("load index npy")
             });
-            let m = utai_lib::inference::rvc::RvcModel {
+            let m = muno_lib::inference::rvc::RvcModel {
                 engine: &engine,
                 voice_session: &voice_sid,
                 contentvec_session: &cv_sid,
@@ -211,7 +211,7 @@ fn voice_env_wav() {
                 noise_channels: nch,
                 min_frames,
             };
-            utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, range, &|_p| {}, &|| false)
+            muno_lib::inference::rvc::run_pipeline(&m, &audio, &options, range, &|_p| {}, &|| false)
                 .expect("rvc pipeline")
         }
         "sovits" => {
@@ -248,10 +248,10 @@ fn voice_env_wav() {
                 let filters: ndarray::Array2<f32> =
                     ndarray_npy::read_npy(dir.join("nsf_hifigan_mel.npy")).expect("vocoder mel npy");
                 let sid = engine.load_model_with(&voc_path, false).expect("load vocoder");
-                utai_lib::inference::sovits::VocoderRuntime {
+                muno_lib::inference::sovits::VocoderRuntime {
                     session: sid,
                     mel_filters: std::sync::Arc::new(filters),
-                    cfg: utai_lib::inference::nsf_hifigan::VocoderConfig {
+                    cfg: muno_lib::inference::nsf_hifigan::VocoderConfig {
                         sample_rate: vj["sample_rate"].as_u64().unwrap_or(44100) as u32,
                         hop_size: vj["hop_size"].as_u64().unwrap_or(512) as usize,
                         num_mels: vj["num_mels"].as_u64().unwrap_or(128) as usize,
@@ -270,7 +270,7 @@ fn voice_env_wav() {
                         .filter(|v: &Vec<f32>| !v.is_empty())
                         .unwrap_or_else(|| vec![dflt])
                 };
-                let schedule = utai_lib::inference::diffusion::DiffusionSchedule::linear(
+                let schedule = muno_lib::inference::diffusion::DiffusionSchedule::linear(
                     dj["timesteps"].as_u64().expect("timesteps") as usize,
                     dj["max_beta"].as_f64().unwrap_or(0.02),
                     &as_f32_vec(&dj["spec_min"], -12.0),
@@ -283,11 +283,11 @@ fn voice_env_wav() {
                 let den = engine
                     .load_model_with(&dir.join("denoiser.onnx"), false)
                     .expect("load diffusion denoiser");
-                utai_lib::inference::sovits::DiffusionRuntime {
+                muno_lib::inference::sovits::DiffusionRuntime {
                     encoder_session: enc,
                     denoiser_session: den,
                     schedule,
-                    method: utai_lib::inference::diffusion::SamplerMethod::parse(
+                    method: muno_lib::inference::diffusion::SamplerMethod::parse(
                         &options.diffusion_method,
                     )
                     .expect("diffusion_method"),
@@ -325,7 +325,7 @@ fn voice_env_wav() {
                 .and_then(|v| v.as_array())
                 .map(|l| l.iter().any(|v| v.as_str() == Some("uv")))
                 .unwrap_or(true);
-            let m = utai_lib::inference::sovits::SovitsModel {
+            let m = muno_lib::inference::sovits::SovitsModel {
                 engine: &engine,
                 voice_session: &voice_sid,
                 contentvec_session: &cv_sid,
@@ -347,7 +347,7 @@ fn voice_env_wav() {
                 noise_channels: nch,
                 min_frames,
             };
-            utai_lib::inference::sovits::run_pipeline(&m, &audio, &options, range, &|_p| {}, &|| false)
+            muno_lib::inference::sovits::run_pipeline(&m, &audio, &options, range, &|_p| {}, &|| false)
                 .expect("sovits pipeline")
         }
         other => panic!("UTAI_VOICE_KIND must be rvc|sovits (got {})", other),

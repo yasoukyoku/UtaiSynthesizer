@@ -5,7 +5,7 @@
  * `.msst-filter` / `.training-btn`),这里不重画。
  *
  * ⚠ 别用 `--font-size-md`:theme.css 里**没有**这个 token(只有 xs/sm/base/lg/xl/2xl)。
- * TrainingPage.css 里现存三处引用它的声明是无效声明,字号其实是继承来的 13px。
+ *   TrainingPage.css 早期三处引用它是无效声明,已统一改为 `--font-size-base`。
  */
 
 /* landing 页要比 `.training-step-body` 的 860px 更宽才放得下卡片墙 —— 那个宽度是给

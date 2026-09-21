@@ -19,6 +19,7 @@
 //   5. Decode failures are FATAL (loud error) instead of playback's skip-and-log: a partial export would
 //      silently drop a stem — the "silent wrong audio" class of bug this project treats as worst-case.
 import { readFile } from "@tauri-apps/plugin-fs";
+import { applyMasterChain } from "./mastering";
 import type { Track } from "../../types/project";
 import type { AudioTrackData } from "../../store/audio";
 import {
@@ -32,6 +33,7 @@ import {
 import { laneGroupId, laneReachesSeam, laneRowKey, laneVisiblePieces, segStretch } from "./laneOps";
 import { ensureStretched } from "./stretchCache";
 import { contentEndTick, isLaneRowMuted, laneControlFor, segmentPlaysLanes } from "../trackLayout";
+import { connectTrackOutput, getFxBusConfig } from "./effectsBus";
 
 export interface MixdownResult {
   /** Interleaved stereo float32 (L R L R …), NOT clamped — the true float sum, like the WebAudio graph. */
@@ -65,6 +67,7 @@ export async function renderMixdown(
   tempo: number,
   sampleRate: number,
   onProgress?: (frac: number) => void,
+  options?: { master?: boolean },
 ): Promise<MixdownResult> {
   const hasSolo = tracks.some((t) => t.solo);
   const trackAudible = (t: Track) => !t.muted && (!hasSolo || t.solo);
@@ -213,7 +216,9 @@ export async function renderMixdown(
             source.buffer = buf;
             const envNode = loudnessEnvNode(ctx, seg, 0, tempo, now, startDelay, playDuration, seg.laneLoudness?.[group]);
             const laneTail = source.connect(fadeInNode).connect(fadeOutNode);
-            (envNode ? laneTail.connect(envNode) : laneTail).connect(laneGainNode).connect(trackGainNode).connect(panner).connect(ctx.destination);
+            (envNode ? laneTail.connect(envNode) : laneTail).connect(laneGainNode).connect(trackGainNode).connect(panner);
+            // S12: mirror playback's FX sends on the offline graph (same track sends, same bus snapshot).
+            connectTrackOutput(ctx, panner, { reverb: track.reverbSend, delay: track.delaySend }, getFxBusConfig());
             source.start(now + startDelay, audioOffset, playDuration);
           }
         }
@@ -261,7 +266,9 @@ export async function renderMixdown(
       source.buffer = buf;
       const envNode = loudnessEnvNode(ctx, seg, 0, tempo, now, startDelay, playDuration);
       const origTail = source.connect(fadeInNode).connect(fadeOutNode);
-      (envNode ? origTail.connect(envNode) : origTail).connect(trackGainNode).connect(panner).connect(ctx.destination);
+      (envNode ? origTail.connect(envNode) : origTail).connect(trackGainNode).connect(panner);
+      // S12: mirror playback's FX sends on the offline graph (same track sends, same bus snapshot).
+      connectTrackOutput(ctx, panner, { reverb: track.reverbSend, delay: track.delaySend }, getFxBusConfig());
       source.start(now + startDelay, audioOffset, playDuration);
     }
   }
@@ -286,6 +293,11 @@ export async function renderMixdown(
 
   const L = rendered.getChannelData(0);
   const R = rendered.getChannelData(1);
+  // §user 母带处理：渲染后、交错前跑纯 DSP 母带链（EQ→立体声联动压缩→前瞻
+  // 限制器，-1 dBFS 天花板）。峰值统计在交错循环里对处理后的数据重算。
+  if (options?.master) {
+    applyMasterChain(L, R, sampleRate);
+  }
   const pcm = new Float32Array(L.length * 2);
   let peak = 0;
   for (let i = 0; i < L.length; i++) {

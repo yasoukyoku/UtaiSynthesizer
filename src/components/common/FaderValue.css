@@ -1,0 +1,37 @@
+.fader-val {
+  font-size: 8px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  flex-shrink: 0;
+  min-width: 40px;
+  text-align: left;
+  margin-left: 1px;
+  line-height: 1;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: text;
+}
+
+.fader-val:hover {
+  color: var(--accent-primary);
+}
+
+.fader-val-input {
+  font-size: 8px;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--accent-primary);
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+  min-width: 40px;
+  max-width: 56px;
+  text-align: left;
+  margin-left: 0;
+  padding: 2px 3px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}

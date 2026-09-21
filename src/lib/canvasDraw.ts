@@ -5,7 +5,8 @@ import type { TimeAxis } from "./timeAxis";
  * Single source of truth for the timeline chrome that the arrangement canvas, the timeline ruler and the
  * minimap each used to draw with their own copies of the same literals + loops. A 2D context can't read
  * CSS `var()`s, so the colors are concrete literals mirrored from theme.css (noted per-constant) — keep
- * them in sync. The accent hue itself lives in trackColors (`ACCENT_RGB`), reused here.
+ * them in sync. The accent hue itself lives in trackColors (`ACCENT_RGB`), reused here; skin-aware
+ * surfaces (TimelineRuler) override it per-draw via `BeatGridOpts.accentRgb`.
  */
 
 // Canvas-chrome colors (mirror theme.css). The accent teal comes from `rgba(ACCENT_RGB, a)`, not here.
@@ -13,6 +14,42 @@ export const PLAYHEAD = "#ff6b9d"; // --accent-tertiary
 export const PLAYHEAD_HOVER = "#ffadc8"; // brighter near-hover playhead (no theme var)
 export const CANVAS_BORDER = "#2a3a5c"; // --border-default
 export const SEPARATOR_RGB: [number, number, number] = [30, 42, 69]; // track/lane separator (#1e2a45 = --border-subtle)
+
+/**
+ * Theme-aware canvas colors. A 2D context can't read CSS `var()`s, so the arrangement canvas and the
+ * timeline ruler read the live computed values from <html> here — keeping the canvas backgrounds,
+ * text and borders in sync with skin ([data-skin]) and light/dark ([data-theme]) switches.
+ *
+ * getComputedStyle is expensive; results are cached and invalidated only when the skin/theme
+ * dataset key changes (both setters write dataset synchronously before any redraw happens).
+ */
+export interface CanvasThemeVars {
+  bgBase: string;       // --bg-base (arrangement canvas background)
+  bgSurface: string;    // --bg-surface (ruler background)
+  textPrimary: string;  // --text-primary (bar numbers)
+  textMuted: string;    // --text-muted (wall-clock labels)
+  borderDefault: string; // --border-default (canvas bottom border)
+  accentPrimary: string; // --accent-primary (grid accent)
+}
+
+let themeVarsCache: { key: string; v: CanvasThemeVars } | null = null;
+
+export function canvasThemeVars(): CanvasThemeVars {
+  const root = document.documentElement;
+  const key = `${root.dataset.skin ?? "default"}|${root.dataset.theme ?? "dark"}`;
+  if (themeVarsCache && themeVarsCache.key === key) return themeVarsCache.v;
+  const cs = getComputedStyle(root);
+  const v: CanvasThemeVars = {
+    bgBase: cs.getPropertyValue("--bg-base").trim() || "#0d1220",
+    bgSurface: cs.getPropertyValue("--bg-surface").trim() || "#131a2b",
+    textPrimary: cs.getPropertyValue("--text-primary").trim() || "#e8ecf4",
+    textMuted: cs.getPropertyValue("--text-muted").trim() || "#556b94",
+    borderDefault: cs.getPropertyValue("--border-default").trim() || "#2a3a5c",
+    accentPrimary: cs.getPropertyValue("--accent-primary").trim() || "#39c5bb",
+  };
+  themeVarsCache = { key, v };
+  return v;
+}
 
 type AnyCtx = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -29,6 +66,9 @@ export interface BeatGridOpts {
   barAlpha: number;
   /** Accent alpha for the in-between beat lines. */
   beatAlpha: number;
+  /** Skin-aware accent override (default: the static `ACCENT_RGB` teal). TimelineRuler passes the
+   *  active skin's `--accent-primary` parsed per-draw so its grid follows theme switching. */
+  accentRgb?: [number, number, number];
   /** y at which non-bar beat lines start (bar lines always start at 0). Default 0 → full-height beat
    *  lines (arrangement); pass `height - n` for short ruler ticks (timeline ruler). */
   beatTop?: number;
@@ -43,8 +83,9 @@ export interface BeatGridOpts {
  */
 export function drawBeatGrid(ctx: AnyCtx, o: BeatGridOpts) {
   const beatTop = o.beatTop ?? 0;
-  const barColor = rgba(ACCENT_RGB, o.barAlpha);
-  const beatColor = rgba(ACCENT_RGB, o.beatAlpha);
+  const accent = o.accentRgb ?? ACCENT_RGB;
+  const barColor = rgba(accent, o.barAlpha);
+  const beatColor = rgba(accent, o.beatAlpha);
   const startTick = Math.floor(o.scrollX / o.ppt);
   const endTick = Math.ceil((o.scrollX + o.width) / o.ppt);
   for (const { tick, isBar } of o.axis.gridLinesInRange(startTick, endTick)) {

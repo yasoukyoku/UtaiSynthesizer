@@ -1,4 +1,4 @@
-/* S66 pre-run model dialog — rides ConfirmDialog.css for the overlay/box/buttons chrome;
+﻿/* S66 pre-run model dialog 鈥?rides ConfirmDialog.css for the overlay/box/buttons chrome;
    only the row list is its own. Square/angular per the house style. */
 
 .mm-dialog {
@@ -38,7 +38,7 @@
 }
 
 .mm-done {
-  color: #4ade80;
+  color: var(--color-success);
 }
 
 .mm-btn {
@@ -68,7 +68,7 @@
 .mm-error {
   margin-top: 6px;
   font-size: 11px;
-  color: var(--error, #f87171);
+  color: var(--color-error);
   word-break: break-all;
 }
 

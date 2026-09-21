@@ -1,45 +1,52 @@
-# UtaiSynthesizer
+# MunoAI
 
 [English](README.md) | **简体中文** | [日本語](README.ja.md)
 
-[![Release](https://img.shields.io/github/v/release/yasoukyoku/UtaiSynthesizer)](https://github.com/yasoukyoku/UtaiSynthesizer/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-informational)
-[![QQ 群](https://img.shields.io/badge/QQ-1058227212-1EBAFC)](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2)](https://discord.com/invite/p3fGh942fJ)
-[![网站](https://img.shields.io/badge/Website-utaisynthesizer.net-2B6D51?labelColor=202321)](https://utaisynthesizer.net)
 
-Windows 平台的歌声合成 DAW。在钢琴卷帘上写谱,**直接让 SVC 声音模型开口唱**
+**MunoAI（造乐之地）** 是一款 Windows 平台的一站式 AI 音乐工作站:歌声合成 DAW、本地 AI
+歌曲制作与母带处理,全部集中在一个程序里。在钢琴卷帘上写谱,**直接让 SVC 声音模型开口唱**
 (乐谱 → [Score2ConVec](https://github.com/yasoukyoku/Score2ConVec) → SVC 解码,
 不需要任何人声干声做中介);用逐片段节点工作流渲染 AI 翻唱;原生人声分离;
-本地训练自己的声音模型——全部在一个程序里完成,推理阶段完全不依赖 Python。
+**本地一键生成整首歌曲**;混音后直接母带;还能在本地训练自己的声音模型——
+推理阶段完全不依赖 Python。
 
-![UtaiSynthesizer——编排视图](docs/images/overview-arrangement.png)
+![MunoAI——编排视图](docs/images/overview-arrangement.png)
 
 ## 功能
 
 - **钢琴卷帘歌声合成**——UTAU 式自由音符摆放、直接在音符上打歌词(整句自动分配)、
-  SynthV 式音高过渡/颤音/手绘音高偏差、**常开的自动音高调教**(自动跟随,手调即接管)、响度与共振腔参数带、呼吸音符,以及
+  SynthV 式音高过渡/颤音/手绘音高偏差、**常开的自动音高调教**(自动跟随,手调即接管)、
+  响度与共振腔参数带、呼吸音符,以及
   **7 种语言**(中/英/日/德/法/西/意)的词典化歌词与三级 OOV(无法发音)警示。
 - **AI 翻唱工作流**——每个音频片段自带节点图:人声分离
   (BS-Roformer、MelBand Roformer、MDX23C、HTDemucs、VR、老式 MDX-Net——全部用 Rust
   原生重实现)→ RVC / So-VITS-SVC 4.0 与 4.1 声音转换(浅扩散、NSF-HiFiGAN
   增强器/声码器、多歌手声线混合)→ 频谱移调 → 以非破坏性子轨道回落到轨道上。
+- **歌曲制作(Song Studio)**——本地完成整首歌:由内置 **GGUF 大模型引擎**(Yue2 等
+  GGUF 模型,应用内下载)提供歌词与创作辅助,再用本地音乐生成模型
+  (ACE-Step / HeartMuLa 系列)完成整曲渲染。全程本地运行,**不需要任何云端 API**。
 - **本地训练**——RVC、SoVITS 4.1/4.0/4.0-v2、浅扩散、声码器微调,**以项目方式管理数据集、
   多歌手结构与存档**,跑在内嵌便携 Python 运行时上(NVIDIA / AMD / Intel / CPU 四种包,应用内
   下载;CUDA 运行时全自包含,
   **无需安装 CUDA Toolkit**)。
+- **母带与响度套件**——真峰值 / 响度测量(LUFS)、削波检测、DC 偏移清理、
+  立体声宽度与相位相关性表,以及含总线 EQ、饱和、抖动处理的完整母带链。
+- **SoundFont / MIDI 合成**——基于 FluidSynth 播放 **SF2 / SFZ** 音色库,
+  为乐器轨与伴奏轨提供音源;人声转 MIDI 转录(GAME 引擎)。
 - **DAW 基本功**——多轨时间线、拖放导入与智能落位、交叉淡化、片段/轨道剪贴板、
   BPM 与节拍网格检测、保音高变速(Signalsmith)、响度包络、小地图、完整撤销/重做。
 - **音域工具链**——声音模型自动音域测试、舒适区微调、可选的音域扩展
   (超出音域的乐句先在模型舒适区内合成,再用 Signalsmith 引擎移回原调)。
-- **人声转 MIDI**——把分离出的人声子轨道转写成可编辑音符(GAME 引擎)。
+- **合规守护**——导出前内置检测,标记可能侵权或标注不当的 AI 生成内容,
+  让你对自己发布的东西始终心里有数。
 - 导出:音频(wav / flac / mp3 / ogg / opus / m4a,离线混音与播放所听严格一致)、
   乐谱(ust / ustx / midi)、**声音模型包(.zip,可搬到别的设备无损重导入)**。导入:ustx / ust / midi、9 种音频格式,以及模型包。
 - 三语界面(简体中文 / English / 日本語),下载全程 sha256 校验并内置对中国大陆
   友好的镜像选项,自动更新带 minisign 签名校验。
 
-**只是想用这个软件?** 直接从 [Releases](https://github.com/yasoukyoku/UtaiSynthesizer/releases)
+**只是想用这个软件?** 直接从 [Releases](https://github.com/junziai/munoai/releases)
 下载安装包,并阅读 **[使用指南](docs/user-guide.zh-CN.md)**——不需要任何开发环境。
 安装目录整体可拷走当便携版用(数据跟着目录走)。
 
@@ -66,7 +73,7 @@ C++ 变速库用 `cc` crate 走 MSVC 编译,不需要 libclang/bindgen。
 | `bin/ffmpeg.exe` | 解码兜底 + 全部非 wav 导出编码 | [gyan.dev "essentials"](https://www.gyan.dev/ffmpeg/builds/) GPL 构建(镜像:[GyanD/codexffmpeg](https://github.com/GyanD/codexffmpeg/releases));必须含 `libmp3lame/libvorbis/libopus/aac/flac` 编码器 |
 | `runtime/ort/*.dll` | ONNX Runtime **1.24.4 DirectML 构建**(`onnxruntime.dll`、`onnxruntime_providers_shared.dll`、`DirectML.dll`) | NuGet 包 [Microsoft.ML.OnnxRuntime.DirectML 1.24.4](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.DirectML/1.24.4)(附 DirectML 再分发 DLL)。版本必须与 `ort` crate 的 API 级别匹配——版本不配会在初始化时死锁 |
 | `data/dictionaries/*.tsv` | 中/英/德/法/西/意歌词的 G2P 词典(8 个文件) | 目前最省事:装一份 release 版,把它的 `data\dictionaries` 拷过来(源码侧构建脚本是已知缺口) |
-| `data/models/` | 声音/分离/辅助模型 | 应用内下载(设置 → 模型资产、资源管理) |
+| `data/models/` | 声音/分离/辅助/歌曲生成模型 | 应用内下载(设置 → 模型资产、资源管理) |
 | `converter/.venv` | 导入 `.pth` 声音模型用的 Python 环境 | 可选——应用内「CPU 运行时」包(设置 → 训练环境)可替代 |
 
 其余(图标、安装器美术、vendored C++/Python)都在仓库里。
@@ -103,6 +110,8 @@ pwsh -File scripts/verify-install.ps1   # 装机目录 39 项核对
 | 前端 | React 19 + TypeScript + zustand + Canvas 2D(钢琴卷帘/编排是脱-React 画布),节点编辑器用 @xyflow/react |
 | 后端 | 单个 Rust 进程;全部 DSP 与推理在进程内 |
 | 推理 | `ort`(load-dynamic)驱动 ONNX Runtime:默认随包 **DirectML**,可选应用内下载的全自包含 **CUDA** 运行时,CPU 兜底 |
+| 歌曲生成 | 本地 GGUF 大模型引擎(Yue2)负责歌词/辅助 + ACE-Step / HeartMuLa 音乐模型负责整曲渲染 |
+| 音色库 | FluidSynth(FFI)播放 SF2 / SFZ 乐器音源 |
 | 训练 | vendored 训练移植(RVC / so-vits-svc / SingingVocoders),跑在内嵌便携 Python 运行时包上 |
 
 **歌声合成链**(钢琴卷帘路径):
@@ -117,8 +126,8 @@ pwsh -File scripts/verify-install.ps1   # 装机目录 39 项核对
 
 [**Score2ConVec**](https://github.com/yasoukyoku/Score2ConVec) 是让这一切成立的
 「乐谱→内容向量」模型:它把符号乐谱直接映射进 SVC 模型消费的 ContentVec 特征空间,
-因此任何普通 SVC 声音模型都能*照谱唱歌*,不需要人声引导。该模型为本项目专门训练,
-模型、训练代码与细节都在其仓库里。
+因此任何普通 SVC 声音模型都能*照谱唱歌*,不需要人声引导。该模型为原 UtaiSynthesizer
+项目专门训练,模型、训练代码与细节都在其仓库里。
 
 翻唱模式复用同一套 SVC 解码器,特征提取用 ContentVec,音高用 RMVPE。人声分离是
 MSST/UVR 模型家族的 Rust 原生重实现,由 Python 转换器产出的逐模型 JSON 配置驱动。
@@ -129,7 +138,7 @@ MSST/UVR 模型家族的 Rust 原生重实现,由 Python 转换器产出的逐�
 
 ## 负责任使用与免责声明
 
-UtaiSynthesizer 是一个创作工具。**你用它做出的内容,责任完全在你自己。**
+MunoAI 是一个创作工具。**你用它做出的内容,责任完全在你自己。**
 
 - **声音权利。** 只在有权利的前提下训练或使用声音模型:你自己的声音、明确同意者的
   声音、或许可条款允许的角色/数据集。不得假冒真实人物;在可能造成混淆的场合,
@@ -146,14 +155,12 @@ UtaiSynthesizer 是一个创作工具。**你用它做出的内容,责任完全�
 ## 已知限制与开放问题
 
 下面这些是我们**知道、并且有意留着**的问题,也是真心希望有人一起做的部分。
-它们开着不是因为没人看过,而是因为**我们手上的硬件回答不了**。
 
 - **大机器上的训练吞吐没有被吃满。** 数据加载器现在按机器的**可用提交内存**来决定
   worker/预取的规模,而不是一个固定数字;但它是**只减不增**的 —— 内存宽裕的机器
   拿到的就是上游默认值,任何情况下都不会被调高。要在大机器上**往上调**属于性能主张,
   我们没法负责任地下这个结论:worker 数对速度并不单调,要定下来需要多台不同内存/CPU
-  的机器跑真实数据集。我们只有一台开发机(32GB 内存 + RTX 3080 Ti 12GB),
-  **找不到那个拐点**。
+  的机器跑真实数据集。
   **如果你有更好的硬件**:一份实测(真实数据集上 step 耗时 vs worker 数)、一个 issue
   或者一个 PR 都非常欢迎。旋钮和全部推理写在 `training/utai_train/loader_budget.py`。
 - **A 卡运行时包目前只覆盖 gfx1103 一类核显**(Radeon 780M / 760M / 740M)。
@@ -167,9 +174,8 @@ UtaiSynthesizer 是一个创作工具。**你用它做出的内容,责任完全�
 
 ## 社区
 
-- **QQ 群**:[1058227212](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
-- **Discord**:<https://discord.com/invite/p3fGh942fJ>
-- **Bug / 功能建议**:[GitHub Issues](https://github.com/yasoukyoku/UtaiSynthesizer/issues)
+- **QQ 群**:4446804
+- **Bug / 功能建议**:[GitHub Issues](https://github.com/junziai/munoai/issues)
   (请附应用版本和日志——见应用内「日志」页)
 - 安全问题:见 [SECURITY.md](SECURITY.md)
 

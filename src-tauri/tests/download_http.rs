@@ -1,4 +1,4 @@
-//! Automated E2E of the unified downloader (S42) against a REAL local HTTP server:
+﻿//! Automated E2E of the unified downloader (S42) against a REAL local HTTP server:
 //! full transfer, Range resume, sha256 rejection, mirror fallback. Runs in normal
 //! `cargo test` (binds an ephemeral localhost port; no network).
 //!
@@ -82,14 +82,14 @@ fn payload_bytes() -> Vec<u8> {
 fn sha_of(data: &[u8], dir: &std::path::Path) -> String {
     let p = dir.join("payload.ref");
     std::fs::write(&p, data).unwrap();
-    utai_lib::download::sha256_file(&p).unwrap()
+    muno_lib::download::sha256_file(&p).unwrap()
 }
 
-fn run_download(req: &utai_lib::download::DownloadRequest) -> utai_lib::Result<()> {
+fn run_download(req: &muno_lib::download::DownloadRequest) -> muno_lib::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let client = utai_lib::download::client().unwrap();
+    let client = muno_lib::download::client().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    rt.block_on(utai_lib::download::download(&client, req, &cancel, |_done, _total| {}))
+    rt.block_on(muno_lib::download::download(&client, req, &cancel, |_done, _total| {}))
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn downloader_full_resume_sha_and_mirrors() {
 
     // 1. full download + hash verify
     let dest = dir.join("full.bin");
-    run_download(&utai_lib::download::DownloadRequest {
+    run_download(&muno_lib::download::DownloadRequest {
         urls: vec![format!("{base}/pack.bin")],
         dest: dest.clone(),
         sha256: Some(good_sha.clone()),
@@ -115,9 +115,9 @@ fn downloader_full_resume_sha_and_mirrors() {
     // 2. RESUME: pre-seed a truncated .part — the server must see Range: bytes=1000000-
     //    and the result must still be byte-perfect.
     let dest2 = dir.join("resume.bin");
-    std::fs::write(utai_lib::download::part_path(&dest2), &payload[..1_000_000]).unwrap();
+    std::fs::write(muno_lib::download::part_path(&dest2), &payload[..1_000_000]).unwrap();
     ranges.lock().unwrap().clear();
-    run_download(&utai_lib::download::DownloadRequest {
+    run_download(&muno_lib::download::DownloadRequest {
         urls: vec![format!("{base}/pack.bin")],
         dest: dest2.clone(),
         sha256: Some(good_sha.clone()),
@@ -133,7 +133,7 @@ fn downloader_full_resume_sha_and_mirrors() {
 
     // 3. sha mismatch → loud error AND the poisoned .part is discarded
     let dest3 = dir.join("badsha.bin");
-    let err = run_download(&utai_lib::download::DownloadRequest {
+    let err = run_download(&muno_lib::download::DownloadRequest {
         urls: vec![format!("{base}/pack.bin")],
         dest: dest3.clone(),
         sha256: Some("0".repeat(64)),
@@ -147,13 +147,13 @@ fn downloader_full_resume_sha_and_mirrors() {
     );
     assert!(!dest3.exists(), "dest must not exist after sha failure");
     assert!(
-        !utai_lib::download::part_path(&dest3).exists(),
+        !muno_lib::download::part_path(&dest3).exists(),
         "corrupt .part must be discarded"
     );
 
     // 4. mirror fallback: first URL 404s, second succeeds
     let dest4 = dir.join("mirror.bin");
-    run_download(&utai_lib::download::DownloadRequest {
+    run_download(&muno_lib::download::DownloadRequest {
         urls: vec![format!("{base}/missing"), format!("{base}/pack.bin")],
         dest: dest4.clone(),
         sha256: Some(good_sha),

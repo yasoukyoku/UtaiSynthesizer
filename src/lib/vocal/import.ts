@@ -89,7 +89,30 @@ export async function importScoreFile(): Promise<void> {
       filters: [{ name: "Score", extensions: SCORE_EXTENSIONS }],
     });
     if (!sel || typeof sel !== "string") return;
+    await importScoreFromPath(sel, { askQuantize: true });
+  } finally {
+    busy = false;
+  }
+}
 
+/**
+ * 拖拽全通（§user "MIDI 拖到轨道直接导入"）：拖放的 .mid/.midi 直接按同一路径导入，
+ * 不弹任何确认（导入是纯增量操作，一步撤销即可回退）；量化沿用上次保存的选择。
+ */
+export async function importScoreFromDrop(path: string): Promise<void> {
+  if (busy) return;
+  busy = true;
+  try {
+    await importScoreFromPath(path, { askQuantize: false });
+  } finally {
+    busy = false;
+  }
+}
+
+/** Shared core: parse one score file and build tracks. `askQuantize` = show the S87
+ *  grid-rounding dialog (menu import); false = use the saved default (drag import). */
+async function importScoreFromPath(sel: string, opts: { askQuantize: boolean }): Promise<void> {
+  try {
     const score = await invoke<ImportedScore>("import_score_file", { path: sel });
     if (!score.tracks.length) {
       useAppStore.getState().showToast(t("import.error.empty"), "error");
@@ -105,31 +128,33 @@ export async function importScoreFile(): Promise<void> {
     const allSpans = score.tracks.filter((tk) => tk.notes.length).flatMap(absSpans);
     const off = offGridCount(allSpans);
     let quantize = loadSetting(QUANTIZE_IMPORT_KEY, true);
-    const choice = await useAppStore.getState().showConfirm({
-      title: t("import.options.title"),
-      body: t("import.options.body", {
-        total: allSpans.length,
-        off,
-        pct: allSpans.length ? Math.round((off / allSpans.length) * 100) : 0,
-      }),
-      check: {
-        label: t("import.options.quantize"),
-        initial: quantize,
-        onChange: (v) => {
-          quantize = v;
+    if (opts.askQuantize) {
+      const choice = await useAppStore.getState().showConfirm({
+        title: t("import.options.title"),
+        body: t("import.options.body", {
+          total: allSpans.length,
+          off,
+          pct: allSpans.length ? Math.round((off / allSpans.length) * 100) : 0,
+        }),
+        check: {
+          label: t("import.options.quantize"),
+          initial: quantize,
+          onChange: (v) => {
+            quantize = v;
+          },
         },
-      },
-      buttons: [
-        { id: "cancel", label: t("common.cancel") },
-        { id: "ok", label: t("import.options.start"), kind: "primary" },
-      ],
-    });
-    if (choice !== "ok") {
-      // Cancel / Esc / backdrop — nothing was touched yet. Say so: showConfirm force-settles an
-      // already-open dialog, so this ALSO fires when another prompt (e.g. MIDI extraction) opens while the
-      // file was still parsing — without a word the user's import would just evaporate (audit-caught).
-      useAppStore.getState().showToast(t("import.cancelled"), "info");
-      return;
+        buttons: [
+          { id: "cancel", label: t("common.cancel") },
+          { id: "ok", label: t("import.options.start"), kind: "primary" },
+        ],
+      });
+      if (choice !== "ok") {
+        // Cancel / Esc / backdrop — nothing was touched yet. Say so: showConfirm force-settles an
+        // already-open dialog, so this ALSO fires when another prompt (e.g. MIDI extraction) opens while the
+        // file was still parsing — without a word the user's import would just evaporate (audit-caught).
+        useAppStore.getState().showToast(t("import.cancelled"), "info");
+        return;
+      }
     }
     saveSetting(QUANTIZE_IMPORT_KEY, quantize);
 
@@ -224,7 +249,5 @@ export async function importScoreFile(): Promise<void> {
     }
   } catch (e) {
     useAppStore.getState().showToast(mapImportError(e instanceof Error ? e.message : String(e)), "error");
-  } finally {
-    busy = false;
   }
 }

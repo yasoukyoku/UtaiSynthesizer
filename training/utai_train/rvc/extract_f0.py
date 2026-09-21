@@ -16,13 +16,6 @@ from ..audio import load_audio
 
 logger = logging.getLogger(__name__)
 
-from ..augment import is_aug_name
-from ..prep_codes import (
-    AUG_SLICES_DROPPED_CODE,
-    FULL_TRACEBACKS,
-    SLICE_PREP_FAILED_CODE,
-)
-
 
 class FeatureInput(object):
     def __init__(self, rmvpe_pt, device, is_half, ffmpeg, samplerate=16000, hop_size=160):
@@ -100,31 +93,9 @@ def extract_f0(pool_dir, rmvpe_pt, device, is_half, ffmpeg, reporter, stop):
             np.save(opt_path2, featur_pit, allow_pickle=False)  # nsf
             coarse_pit = fi.coarse_f0(featur_pit)
             np.save(opt_path1, coarse_pit, allow_pickle=False)  # ori
-        except Exception as exc:
+        except Exception:
             failed += 1
-            if failed <= FULL_TRACEBACKS:
-                logger.error("f0 failed for %s\n%s", inp_path, traceback.format_exc())
-            else:
-                # identical failures by construction — keep the line, drop the 38 repeated
-                # frames (see prep_codes.FULL_TRACEBACKS)
-                logger.error("f0 failed for %s: %s: %s", inp_path, type(exc).__name__, exc)
-            # ⛔ S172, house policy (prep_codes.py): a BASE slice is fatal on the first one.
-            # This used to raise only when ALL of them failed, and filelist.py's 4-way set
-            # INTERSECTION then dropped the survivors' missing partners in silence — 369 of
-            # 370 failing produced a run that trained on the remainder and said "completed".
-            if not is_aug_name(os.path.basename(inp_path)):
-                raise RuntimeError(
-                    "%s: f0 extraction failed for %s (%s: %s)"
-                    % (SLICE_PREP_FAILED_CODE, os.path.basename(inp_path),
-                       type(exc).__name__, exc)
-                )
+            logger.error("f0 failed for %s\n%s", inp_path, traceback.format_exc())
     reporter.stage("f0", done=len(paths), total=len(paths))
-    if failed:
-        # only augmented copies can reach here; the base ones raised above. They are our own
-        # generated products, so the run continues without them — but never silently, and
-        # RVC needs no cleanup pass: the filelist intersection already excludes them.
-        logger.error(
-            "f0: %d augmented slice(s) of %d failed and will be dropped from training",
-            failed, len(paths),
-        )
-        reporter.warn(AUG_SLICES_DROPPED_CODE)
+    if paths and failed == len(paths):
+        raise RuntimeError("所有切片的 f0 提取均失败（详见日志）")

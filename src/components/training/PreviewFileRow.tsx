@@ -10,9 +10,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { readFile } from "@tauri-apps/plugin-fs";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../../store/app";
 import { backendErrorMessage, isBusyError } from "../../lib/backendError";
 import { fmtDur } from "../../lib/constants";
+import { exportOneAudioFileToFolder, laneExportErrorMessage } from "../../lib/audio/exportLaneAudio";
 import { preview } from "../common/previewPlayer";
 import { Scrubber } from "../common/Scrubber";
 
@@ -145,6 +147,10 @@ export function useFilePreview(stillPresent?: (path: string) => boolean): FilePr
     reset,
     stopIfPlaying: (p) => {
       if (playingPath === p) {
+        // Invalidate any in-flight decode/play for this path: the bytes may already be in
+        // memory, and leaving the token valid would let the coroutine start playing a file that
+        // is being removed (the exact race the `stillPresent` contract exists to prevent).
+        playTokenRef.current += 1;
         preview.stop();
         reset();
       }
@@ -176,6 +182,20 @@ export function PreviewFileRow({
   const isActive = p.playingPath === path;
   const isLoading = p.loadingPath === path;
   const isPlaying = isActive && !p.paused && !isLoading;
+
+  // 试听行的「下载」按钮：把该音频文件(原样复制,不重编码)存入用户自选的文件夹。
+  const download = async () => {
+    const out = await open({ directory: true, title: t("tracks.exportTracks") });
+    if (!out || typeof out !== "string") return;
+    try {
+      await exportOneAudioFileToFolder({ label: name, sourcePath: path }, out, name);
+      useAppStore
+        .getState()
+        .showToast(`${t("tracks.exportDone")} 1 ${t("tracks.exportCopied")} ${out}`, "success");
+    } catch (e) {
+      useAppStore.getState().showToast(laneExportErrorMessage(e), "error");
+    }
+  };
   return (
     <div className="training-file-row" title={title ?? path}>
       <div className="training-file-main">
@@ -192,6 +212,16 @@ export function PreviewFileRow({
           }
         >
           {isLoading ? "◌" : isPlaying ? "❚❚" : "▶"}
+        </button>
+        <button
+          className="training-file-dl"
+          onClick={(e) => {
+            e.stopPropagation();
+            void download();
+          }}
+          title={t("tracks.exportTracks")}
+        >
+          ⬇
         </button>
         {lead}
         <span className="training-file-name tproj-ds-file">{name}</span>

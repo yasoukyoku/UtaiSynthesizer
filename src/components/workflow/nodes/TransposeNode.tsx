@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { NodeShell } from "./NodeShell";
 import { useNodeParams } from "./useNodeParams";
 import { ParamSlider } from "./ParamSlider";
+import { ParamSliderWithUnit } from "./ParamSliderWithUnit";
 import { t18 } from "../../../lib/models/msst-catalog";
 
 /** The Signalsmith node (spectral pitch-shift + engine-native formant controls,
@@ -31,15 +32,15 @@ export function TransposeNode(props: NodeProps) {
     <NodeShell nodeId={props.id} label="Signalsmith" icon="[S]" color="#fbbf24" inputs={1} outputs={1}>
       <div className="sep-node-body">
         <div className="sep-params">
-          <ParamSlider
+          <ParamSliderWithUnit
             label={t18({ zh: "半音", en: "Semitones", ja: "半音" }, lang)}
+            unitType="semitones"
             title={t18({
               zh: "频谱域保真移调（保持时长与高频自然感，适合给伴奏整体移调）；0 = 原样直通",
               en: "Spectral-domain fidelity pitch shift (length & natural highs preserved — made for transposing accompaniment); 0 = exact passthrough",
               ja: "スペクトル領域の高品質ピッチシフト（長さと高域の自然さを保持、伴奏の移調向け）。0 = そのまま通過",
             }, lang)}
             min={-24} max={24} step={1} value={semitones}
-            format={(v) => (v > 0 ? `+${v}` : `${v}`)}
             onChange={(v) => updateParams({ semitones: v })}
           />
           <ParamSlider
@@ -53,15 +54,15 @@ export function TransposeNode(props: NodeProps) {
             format={(v) => v.toFixed(2)}
             onChange={(v) => updateParams({ formantFollow: v })}
           />
-          <ParamSlider
+          <ParamSliderWithUnit
             label={t18({ zh: "共振峰偏移", en: "Formant shift", ja: "フォルマントシフト" }, lang)}
+            unitType="semitones"
             title={t18({
               zh: "在跟随基准之上再偏移共振峰（半音）：正 = 更亮/更年轻，负 = 更暗/更浑厚。音高不变，0 半音时也可单独用来改音色",
               en: "Shift the formants on top of the follow base (semitones): higher = brighter/younger, lower = darker/fuller. Pitch is untouched — usable as a pure timbre control even at 0 semitones",
               ja: "追従基準に加えてフォルマントをシフト（半音）：高い = 明るい/若い、低い = 暗い/太い。音高は不変。0 半音でも音色調整として単独で使えます",
             }, lang)}
             min={-24} max={24} step={1} value={formantOffset}
-            format={(v) => (v > 0 ? `+${v}` : `${v}`)}
             onChange={(v) => updateParams({ formantOffset: v })}
           />
         </div>

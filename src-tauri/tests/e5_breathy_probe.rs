@@ -1,9 +1,9 @@
-//! E5 裁决实验 harness — breathy/falsetto expressiveness through the REAL cover pipeline.
+﻿//! E5 裁决实验 harness — breathy/falsetto expressiveness through the REAL cover pipeline.
 //!
 //! Diagnostic only, NOT a gate (`--ignored`). Converts paired GTSinger recordings
 //! (breathy vs control / falsetto vs control, same singer, same phrase) to target
 //! singers through the exact production path (RMVPE → ContentVec → net_g via
-//! utai_lib::inference::{rvc,sovits}::run_pipeline) so the user can EAR-judge whether
+//! muno_lib::inference::{rvc,sovits}::run_pipeline) so the user can EAR-judge whether
 //! breathiness survives the ContentVec bottleneck. Mirrors tests\voice_pipeline.rs's
 //! init_ort + model construction verbatim; no production code is touched.
 //!
@@ -26,8 +26,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use utai_lib::inference::engine::{DeviceConfig, OnnxEngine};
-use utai_lib::inference::{RvcOptions, SovitsOptions};
+use muno_lib::inference::engine::{DeviceConfig, OnnxEngine};
+use muno_lib::inference::{RvcOptions, SovitsOptions};
 
 const WORK_DIR: &str = r"D:\MyDev\TESTING\e5_breathy_probe";
 
@@ -41,16 +41,16 @@ fn init_ort() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("muno_lib=info")),
         )
         .try_init();
-    utai_lib::suppress_windows_dll_error_dialogs();
-    utai_lib::setup_cuda_dll_paths(&app_root());
-    utai_lib::init_ort_runtime(&app_root());
+    muno_lib::suppress_windows_dll_error_dialogs();
+    muno_lib::setup_cuda_dll_paths(&app_root());
+    muno_lib::init_ort_runtime(&app_root());
 }
 
 fn aux_dir() -> PathBuf {
-    app_root().join("data").join("models").join(utai_lib::models::AUX_DIR_NAME)
+    app_root().join("data").join("models").join(muno_lib::models::AUX_DIR_NAME)
 }
 
 fn read_sidecar(model: &PathBuf) -> serde_json::Value {
@@ -186,7 +186,7 @@ fn e5_breathy_probe() {
         eprintln!("[e5] arm {}: {} (dim={} sr={} vol={} uv={})",
             arm, model_path.display(), dim, sample_rate, vol_embedding, feed_uv);
 
-        let m = utai_lib::inference::sovits::SovitsModel {
+        let m = muno_lib::inference::sovits::SovitsModel {
             engine: &engine,
             voice_session: &voice_sid,
             contentvec_session: cv_sid,
@@ -215,8 +215,8 @@ fn e5_breathy_probe() {
                 continue;
             }
             let t0 = Instant::now();
-            let audio = utai_lib::audio::load_audio(&work.join(src)).expect("load input wav");
-            let result = utai_lib::inference::sovits::run_pipeline(
+            let audio = muno_lib::audio::load_audio(&work.join(src)).expect("load input wav");
+            let result = muno_lib::inference::sovits::run_pipeline(
                 &m, &audio, &options, None, &|_p| {}, &|| false,
             )
             .expect("sovits pipeline");
@@ -238,12 +238,12 @@ fn e5_breathy_probe() {
         let sample_rate = sc["sample_rate"].as_u64().expect("sample_rate") as u32;
         let min_frames = sc["min_frames"].as_u64().unwrap_or(12) as usize;
         let nch = noise_channels(&sc);
-        let index = utai_lib::inference::rvc::RvcIndex::load(&rvc_dir.join("lengv2.3.npy"))
+        let index = muno_lib::inference::rvc::RvcIndex::load(&rvc_dir.join("lengv2.3.npy"))
             .expect("load index npy");
         let voice_sid = engine.load_model_with(&rvc_model, false).expect("load rvc net_g");
         let cv_sid = if dim == 768 { &cv768_sid } else { &cv256_sid };
 
-        let m = utai_lib::inference::rvc::RvcModel {
+        let m = muno_lib::inference::rvc::RvcModel {
             engine: &engine,
             voice_session: &voice_sid,
             contentvec_session: cv_sid,
@@ -270,8 +270,8 @@ fn e5_breathy_probe() {
                     continue;
                 }
                 let t0 = Instant::now();
-                let audio = utai_lib::audio::load_audio(&work.join(src)).expect("load input wav");
-                let result = utai_lib::inference::rvc::run_pipeline(
+                let audio = muno_lib::audio::load_audio(&work.join(src)).expect("load input wav");
+                let result = muno_lib::inference::rvc::run_pipeline(
                     &m, &audio, &options, None, &|_p| {}, &|| false,
                 )
                 .expect("rvc pipeline");

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { flushAutosaveNow } from "../../lib/project/autosave";
 import {
@@ -26,7 +26,65 @@ import { RvcNode } from "./nodes/RvcNode";
 import { SoVitsNode } from "./nodes/SoVitsNode";
 import { SeparationNode } from "./nodes/SeparationNode";
 import { TransposeNode } from "./nodes/TransposeNode";
-import { NodePalette } from "./NodePalette";
+import { AmtMidiNode } from "./nodes/AmtMidiNode";
+import { SpeedShiftNode } from "./nodes/SpeedShiftNode";
+import { ChordDetectNode } from "./nodes/ChordDetectNode";
+import { AutoArrangeNode } from "./nodes/AutoArrangeNode";
+import { DeepOriginalNode } from "./nodes/DeepOriginalNode";
+import { MidiFileInNode } from "./nodes/MidiFileInNode";
+import { ChordBlockInNode } from "./nodes/ChordBlockInNode";
+import { SoundfontRenderNode } from "./nodes/SoundfontRenderNode";
+import { MelodySimilarityNode } from "./nodes/MelodySimilarityNode";
+import { SplitNode } from "./nodes/SplitNode";
+import { MergeNode } from "./nodes/MergeNode";
+import { ComplianceCheckNode } from "./nodes/ComplianceCheckNode";
+import { LufsNormalizeNode } from "./nodes/LufsNormalizeNode";
+import { DitherNode } from "./nodes/DitherNode";
+import { BusEqNode } from "./nodes/BusEqNode";
+import { StereoWidthNode } from "./nodes/StereoWidthNode";
+import { SaturateNode } from "./nodes/SaturateNode";
+import { PhaseRotateNode } from "./nodes/PhaseRotateNode";
+import { DcRemoveNode } from "./nodes/DcRemoveNode";
+// Phase 5 分析可视化节点族
+import { SpectrogramNode } from "./nodes/SpectrogramNode";
+import { F0CurveNode } from "./nodes/F0CurveNode";
+import { TimbreMetricsNode } from "./nodes/TimbreMetricsNode";
+import { HarmonicityCheckNode } from "./nodes/HarmonicityCheckNode";
+import { SpectralCompareNode } from "./nodes/SpectralCompareNode";
+import { DtwAlignNode } from "./nodes/DtwAlignNode";
+import { AbCompareNode } from "./nodes/AbCompareNode";
+import { LufsAnalyzeNode } from "./nodes/LufsAnalyzeNode";
+import { HarmonizerNode } from "./nodes/HarmonizerNode";
+import { MelodyGenNode } from "./nodes/MelodyGenNode";
+import { SongLyricsNode } from "./nodes/SongLyricsNode";
+import { SongPromptNode } from "./nodes/SongPromptNode";
+import { SongGenNode } from "./nodes/SongGenNode";
+import { SongCoverNode } from "./nodes/SongCoverNode";
+import { SongRepaintNode } from "./nodes/SongRepaintNode";
+import { SongCompleteNode } from "./nodes/SongCompleteNode";
+import { SongExtractNode } from "./nodes/SongExtractNode";
+import { SongLegoNode } from "./nodes/SongLegoNode";
+import { SongStemsNode } from "./nodes/SongStemsNode";
+import { SongSheetNode } from "./nodes/SongSheetNode";
+import { MidiHumanizeNode } from "./nodes/MidiHumanizeNode";
+import { VelocityCurveNode } from "./nodes/VelocityCurveNode";
+import { SwingQuantizeNode } from "./nodes/SwingQuantizeNode";
+import { MelodyReharmNode } from "./nodes/MelodyReharmNode";
+import { RhythmRestructureNode } from "./nodes/RhythmRestructureNode";
+import { ContourMorphNode } from "./nodes/ContourMorphNode";
+import { MotifDevelopNode } from "./nodes/MotifDevelopNode";
+import { ReharmonizeNode } from "./nodes/ReharmonizeNode";
+import { RhythmVariationNode } from "./nodes/RhythmVariationNode";
+import { StructureEditNode } from "./nodes/StructureEditNode";
+import { BreathPlannerNode } from "./nodes/BreathPlannerNode";
+import { NodePalette, getPaletteDefs, type PaletteNodeDef } from "./NodePalette";
+import { ExampleWorkflowLibrary } from "./ExampleWorkflowLibrary";
+import { TutorialOverlay, shouldShowTutorial } from "./TutorialOverlay";
+import { NodeAnnotationEditor } from "./NodeAnnotation";
+import type { NodeAnnotation } from "../../lib/workflow/nodeAnnotations";
+import type { ExampleWorkflow } from "../../lib/workflow/exampleWorkflows";
+import { SmartConnectionHelper } from "./SmartConnectionHelper";
+import { EnhancedErrorDisplay } from "./EnhancedErrorDisplay";
 import { useProjectStore } from "../../store/project";
 import { useAudioStore } from "../../store/audio";
 import { useWorkflowStore, type NodeStatus } from "../../store/workflow";
@@ -37,12 +95,61 @@ import { DEFAULT_OUTPUT_GROUP } from "../../lib/constants";
 import i18n from "../../i18n";
 import { executeWorkflow, executeSingleNode, preflightRun, collectCachedPaths, loadCachedOutput, outputLanes, rehydrateRenderState, planDetachGroup, type CachedPath } from "../../lib/workflow/engine";
 import { nodeHistoryFor } from "../../lib/workflow/nodeHistory";
+import { listNodeParamPresets, saveNodeParamPreset, deleteNodeParamPreset, type NodeParamPreset } from "../../lib/workflow/nodeParamPresets";
+import { computeAutoLayout } from "../../lib/workflow/autoLayout";
+import { alignNodes, distributeNodes, type AlignMode, type DistributeMode } from "../../lib/workflow/alignNodes";
 import { logToBackend } from "../../lib/log";
 import { clearBufferCache, loadAudioBuffer } from "../../lib/audio/playback";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import { useTranslation } from "react-i18next";
 import type { Workflow, WorkflowNode as WfNode, WorkflowConnection, WorkflowNodeType, ProcessedOutput } from "../../types/project";
+import { save, open } from "@tauri-apps/plugin-dialog";
+import { rfTypeToWfType, wfTypeToRfType } from "../../lib/workflow/rfTypes";
+import { NODE_DAMAGE, cumulativeSnrDb } from "../../lib/workflow/damage";
+import { canConnect } from "../../lib/workflow/ports";
 import "./WorkflowEditor.css";
+
+// Phase 4-4: 母带三档预设 (规划 8.6 表 → 一键预连线链). complianceCheck 恒在链尾 —
+// 体检必须看最终成品; 链头留空由用户接音频源, 链尾 out-0 接 Output.
+const MASTER_CHAIN_LABELS: Record<string, string> = {
+  dcRemove: "workflow.nodeDcRemove",
+  busEq: "workflow.nodeBusEq",
+  stereoWidth: "workflow.nodeStereoWidth",
+  saturate: "workflow.nodeSaturate",
+  phaseRotate: "workflow.nodePhaseRotate",
+  lufsNormalize: "workflow.nodeLufsNormalize",
+  dither: "workflow.nodeDither",
+  complianceCheck: "workflow.nodeComplianceCheck",
+};
+const MASTER_CHAINS: Record<string, { type: string; params?: Record<string, unknown> }[]> = {
+  // 🟢 透明: ①dc ⑥lufs ⑦dither ⑧compliance — 混音已好, 只规整响度 (>130dB SNR).
+  transparent: [
+    { type: "dcRemove" },
+    { type: "lufsNormalize", params: { targetLufs: -16 } },
+    { type: "dither", params: { ditherType: 2 } },
+    { type: "complianceCheck" },
+  ],
+  // 🟡 标准 (默认): + ②busEq ③stereoWidth — 多数情况 (~112dB SNR).
+  standard: [
+    { type: "dcRemove" },
+    { type: "busEq" },
+    { type: "stereoWidth" },
+    { type: "lufsNormalize", params: { targetLufs: -16 } },
+    { type: "dither", params: { ditherType: 2 } },
+    { type: "complianceCheck" },
+  ],
+  // 🟠 响度: 全开 (含 ④saturate + 相位旋转给限幅余量) — 竞争性响度的流行/电子 (~68dB SNR).
+  loud: [
+    { type: "dcRemove" },
+    { type: "busEq" },
+    { type: "stereoWidth" },
+    { type: "saturate", params: { drive: 0.05 } },
+    { type: "phaseRotate", params: { strength: 0.25 } },
+    { type: "lufsNormalize", params: { targetLufs: -16 } },
+    { type: "dither", params: { ditherType: 2 } },
+    { type: "complianceCheck" },
+  ],
+};
 
 const nodeTypes: NodeTypes = {
   audioInput: AudioInputNode,
@@ -51,29 +158,66 @@ const nodeTypes: NodeTypes = {
   sovits: SoVitsNode,
   separation: SeparationNode,
   transpose: TransposeNode,
+  amtMidi: AmtMidiNode,
+  // 新增 4 个纯前端/半纯前端节点:
+  speedShift: SpeedShiftNode,
+  chordDetect: ChordDetectNode,
+  autoArrange: AutoArrangeNode,
+  deepOriginal: DeepOriginalNode,
+  midiFileIn: MidiFileInNode,
+  chordBlockIn: ChordBlockInNode,
+  soundfontRender: SoundfontRenderNode,
+  melodySimilarity: MelodySimilarityNode,
+  split: SplitNode,
+  // Phase 1 母带合规节点族
+  merge: MergeNode,
+  complianceCheck: ComplianceCheckNode,
+  lufsNormalize: LufsNormalizeNode,
+  dither: DitherNode,
+  // Phase 4 母带补全节点族
+  busEq: BusEqNode,
+  stereoWidth: StereoWidthNode,
+  saturate: SaturateNode,
+  phaseRotate: PhaseRotateNode,
+  dcRemove: DcRemoveNode,
+  // Phase 5 分析可视化节点族
+  spectrogram: SpectrogramNode,
+  f0Curve: F0CurveNode,
+  timbreMetrics: TimbreMetricsNode,
+  harmonicityCheck: HarmonicityCheckNode,
+  spectralCompare: SpectralCompareNode,
+  dtwAlign: DtwAlignNode,
+  abCompare: AbCompareNode,
+  lufsAnalyze: LufsAnalyzeNode,
+  harmonizer: HarmonizerNode,
+  melodyGen: MelodyGenNode,
+  // P2-14 歌曲节点族
+  songLyrics: SongLyricsNode,
+  songPrompt: SongPromptNode,
+  songGen: SongGenNode,
+  songCover: SongCoverNode,
+  songRepaint: SongRepaintNode,
+  songComplete: SongCompleteNode,
+  songExtract: SongExtractNode,
+  songLego: SongLegoNode,
+  songStems: SongStemsNode,
+  songSheet: SongSheetNode,
+  // P2 符号域原创化节点族
+  midiHumanize: MidiHumanizeNode,
+  velocityCurve: VelocityCurveNode,
+  swingQuantize: SwingQuantizeNode,
+  melodyReharm: MelodyReharmNode,
+  rhythmRestructure: RhythmRestructureNode,
+  contourMorph: ContourMorphNode,
+  motifDevelop: MotifDevelopNode,
+  reharmonize: ReharmonizeNode,
+  rhythmVariation: RhythmVariationNode,
+  structureEdit: StructureEditNode,
+  breathPlanner: BreathPlannerNode,
   // Legacy — kept for loading old workflows ("msst" was the pre-catalog separation type).
   // The dead Effects node types (pitchShift/formantShift/audioEnhance) are migrated to
   // "transpose" at LOAD (parseLoadedBundle), so they never reach ReactFlow.
   msst: SeparationNode,
-};
-
-const rfTypeToWfType: Record<string, WorkflowNodeType> = {
-  audioInput: "input",
-  audioOutput: "output",
-  rvc: "rvc",
-  sovits: "sovits",
-  separation: "msstSeparation",
-  transpose: "transpose",
-  msst: "msstSeparation",
-};
-
-const wfTypeToRfType: Record<string, string> = {
-  input: "audioInput",
-  output: "audioOutput",
-  rvc: "rvc",
-  sovits: "sovits",
-  msstSeparation: "separation",
-  transpose: "transpose",
 };
 
 interface Props {
@@ -90,7 +234,12 @@ function workflowToReactFlow(wf: Workflow): { nodes: Node[]; edges: Edge[] } {
     id: n.id,
     type: wfTypeToRfType[n.nodeType] ?? n.nodeType,
     position: { x: n.position.x, y: n.position.y },
-    data: { label: n.nodeType, params: n.params },
+    data: { 
+      label: n.nodeType, 
+      params: n.params, 
+      bypass: n.bypass === true,
+      annotation: n.annotation,
+    },
     deletable: n.nodeType !== "input", // Output nodes are deletable now (live deposit — deleting one drops its lanes)
     zIndex: i,
   }));
@@ -106,12 +255,21 @@ function workflowToReactFlow(wf: Workflow): { nodes: Node[]; edges: Edge[] } {
 }
 
 function reactFlowToWorkflow(nodes: Node[], edges: Edge[]): Workflow {
-  const wfNodes: WfNode[] = nodes.map((n) => ({
-    id: n.id,
-    nodeType: rfTypeToWfType[n.type ?? ""] ?? (n.type as WorkflowNodeType),
-    position: { x: n.position.x, y: n.position.y },
-    params: (n.data?.params as Record<string, unknown>) ?? {},
-  }));
+  const wfNodes: WfNode[] = nodes.map((n) => {
+    const base = {
+      id: n.id,
+      nodeType: rfTypeToWfType[n.type ?? ""] ?? (n.type as WorkflowNodeType),
+      position: { x: n.position.x, y: n.position.y },
+      params: (n.data?.params as Record<string, unknown>) ?? {},
+    };
+    if (n.data?.bypass === true) {
+      (base as any).bypass = true;
+    }
+    if (n.data?.annotation) {
+      (base as any).annotation = n.data.annotation;
+    }
+    return base as WfNode;
+  });
   const wfConns: WorkflowConnection[] = edges.map((e) => ({
     fromNode: e.source,
     fromPort: parseInt(e.sourceHandle?.replace("out-", "") ?? "0", 10),
@@ -122,12 +280,12 @@ function reactFlowToWorkflow(nodes: Node[], edges: Edge[]): Workflow {
 }
 
 /** Structural signature of the node graph for undo diffing — EXCLUDES selection/dimensions (which
- *  must not create undo steps), includes node type/position/params and edge wiring. */
+ *  must not create undo steps), includes node type/bypass/params and edge wiring. */
 function sigOfGraph(nodes: Node[], edges: Edge[]): string {
   const ns = nodes
     // Node POSITION is intentionally EXCLUDED — moving a node around the canvas is not a meaningful edit and
     // must not create an undo step (position is still persisted via the debounced save, just not undoable).
-    .map((n) => `${n.id}:${n.type}:${JSON.stringify(n.data?.params ?? {})}`)
+    .map((n) => `${n.id}:${n.type}:${n.data?.bypass === true ? "B" : "b"}:${JSON.stringify(n.data?.params ?? {})}`)
     .sort()
     .join("|");
   const es = edges.map((e) => `${e.source}.${e.sourceHandle}>${e.target}.${e.targetHandle}`).sort().join("|");
@@ -145,6 +303,7 @@ function describeNodeDelta(from: { nodes: Node[]; edges: Edge[] }, to: { nodes: 
     const fn = fById.get(tn.id);
     if (!fn) return "nodeEdit";
     if (Math.round(fn.position.x) !== Math.round(tn.position.x) || Math.round(fn.position.y) !== Math.round(tn.position.y)) return "nodeMove";
+    if (fn.data?.bypass !== tn.data?.bypass) return "nodeBypass";
     if (JSON.stringify(fn.data?.params ?? {}) !== JSON.stringify(tn.data?.params ?? {})) return "nodeParam";
   }
   return "nodeEdit";
@@ -232,8 +391,124 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
   const segTrackIdRef = useRef(segment?.trackId);
   segTrackIdRef.current = segment?.trackId;
   const [rfInstance, setRfInstance] = useState<ReactFlowInstance | null>(null);
+  // 可折叠左侧节点面板(默认展开;折叠后释放画布空间)。
+  const [paletteOpen, setPaletteOpen] = useState(true);
+  const paletteCollapseLabel = i18n.language.startsWith("ja")
+    ? "ノードパネルを折りたたむ"
+    : i18n.language.startsWith("en")
+      ? "Collapse node palette"
+      : "收起节点面板";
+  const paletteExpandLabel = i18n.language.startsWith("ja")
+    ? "ノードパネルを展開"
+    : i18n.language.startsWith("en")
+      ? "Expand node palette"
+      : "展开节点面板";
   const [nodeCtx, setNodeCtx] = useState<{ x: number; y: number; nodeId: string } | null>(null);
   const [edgeCtx, setEdgeCtx] = useState<{ x: number; y: number; edgeId: string } | null>(null);
+  // Canvas-background right-click → "add a node" menu, populated from the SAME palette source.
+  const [paneCtx, setPaneCtx] = useState<{ x: number; y: number } | null>(null);
+
+  // ─── 新增功能状态管理 ─────────────────────────────────────────────
+  // 示例工作流库
+  const [showExampleLibrary, setShowExampleLibrary] = useState(false);
+  // 新手引导
+  const [showTutorial] = useState(shouldShowTutorial());
+  // 节点注释系统
+  const [editingAnnotation, setEditingAnnotation] = useState<string | null>(null);
+  // 智能连线建议
+  const [connectingFrom, setConnectingFrom] = useState<{ node: string; handle: string } | null>(null);
+  // 增强错误提示
+  const [errorDisplay, setErrorDisplay] = useState<{ error: string; nodeType: string } | null>(null);
+  // 批量节点操作
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  const [batchCtx, setBatchCtx] = useState<{ x: number; y: number; ids: string[] } | null>(null);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [snapToGrid, setSnapToGrid] = useState(() => {
+    const saved = localStorage.getItem("workflow.snapToGrid");
+    return saved ? JSON.parse(saved) : false;
+  });
+
+  // ─── 工作流预设 · 全局保存/加载 ─────────────────────────────────────────────
+  // 保存:把当前节点图(类型/位置/参数 + 连接)序列化后按自定义名字存入应用数据目录;
+  // 加载:在下拉里选一个已保存的预设,替换整张图(随后的 debounced save 会写回当前片段)。
+  const [presetNames, setPresetNames] = useState<string[]>([]);
+  const loadPresetList = useCallback(async (): Promise<{ name: string; workflow: Workflow }[]> => {
+    try {
+      const raw = await invoke<string>("load_workflow_presets");
+      const arr = JSON.parse(raw) as { name: string; workflow: Workflow }[];
+      setPresetNames(arr.map((p) => p.name));
+      return arr;
+    } catch {
+      setPresetNames([]);
+      return [];
+    }
+  }, []);
+
+  const savePreset = async () => {
+    const name = await useAppStore.getState().showConfirm({
+      title: t("workflow.savePresetTitle"),
+      body: "",
+      buttons: [
+        { id: "ok", label: t("common.confirm"), kind: "primary" },
+        { id: "cancel", label: t("common.cancel") },
+      ],
+      input: { placeholder: t("workflow.savePresetPlaceholder") },
+    });
+    if (!name) return;
+    const wf = reactFlowToWorkflow(nodesRef.current, edgesRef.current);
+    try {
+      await invoke("save_workflow_preset", { name, workflow: wf });
+      await loadPresetList();
+      useAppStore.getState().showToast(`${t("workflow.presetSaved")} ${name}`, "success");
+    } catch (e) {
+      useAppStore.getState().showToast(String(e), "error");
+    }
+  };
+
+  const loadPreset = async (name: string) => {
+    const arr = await loadPresetList();
+    const entry = arr.find((p) => p.name === name);
+    if (!entry) return;
+    const loaded = workflowToReactFlow(entry.workflow);
+    setNodes(loaded.nodes);
+    setEdges(loaded.edges);
+    useAppStore.getState().showToast(`${t("workflow.presetLoaded")} ${name}`, "success");
+  };
+
+  // 规划 6-7 预设导出/导入:导出把应用数据目录里的全部工作流预设写到用户选定的 JSON 文件;
+  // 导入从 JSON 文件读取并按名字合并(同名覆盖),随后刷新下拉列表。数量走后端返回值。
+  const exportPresets = async () => {
+    const dest = await save({
+      title: t("workflow.exportPresets"),
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!dest || typeof dest !== "string") return;
+    try {
+      const n = await invoke<number>("export_workflow_presets", { dest });
+      useAppStore.getState().showToast(t("workflow.presetsExported", { n }), "success");
+    } catch (e) {
+      useAppStore.getState().showToast(String(e), "error");
+    }
+  };
+
+  const importPresets = async () => {
+    const src = await open({
+      title: t("workflow.importPresets"),
+      multiple: false,
+      directory: false,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!src || typeof src !== "string") return;
+    try {
+      const n = await invoke<number>("import_workflow_presets", { src });
+      await loadPresetList();
+      useAppStore.getState().showToast(t("workflow.presetsImported", { n }), "success");
+    } catch (e) {
+      useAppStore.getState().showToast(String(e), "error");
+    }
+  };
+
+  useEffect(() => { void loadPresetList(); }, [loadPresetList]);
 
   // Live refs (used by single-node run + the modal-local undo capture / drag coalescing).
   const nodesRef = useRef(nodes);
@@ -383,12 +658,87 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       // new edge into it mid-run would show a graph the in-flight job (dispatch snapshot) isn't using.
       if (connection.target && isNodeBusy(connection.target)) return;
       setEdges((eds) => addEdge({ ...connection, animated: true }, eds));
+      // 连线完成后清除智能连线建议状态
+      setConnectingFrom(null);
     },
     [setEdges, isNodeBusy],
   );
 
+  // 智能连线建议:拖线开始时记录源端口 → 面板高亮所有类型兼容的目标端口;
+  // 松手(无论落线成功与否)都必须清除,否则提示面板会永久挂在画布上。
+  const onConnectStart = useCallback<NonNullable<ComponentProps<typeof ReactFlow>["onConnectStart"]>>(
+    (_e, params) => {
+      if (params.nodeId && params.handleType === "source") {
+        setConnectingFrom({ node: params.nodeId, handle: params.handleId ?? "out-0" });
+      }
+    },
+    [],
+  );
+
+  const onConnectEnd = useCallback(() => setConnectingFrom(null), []);
+
+  // 规划 6-2 连线校验:拖新线瞬间按端口类型表放行/拒绝(同型或任一端 any 才允许落线,自连拒绝),
+  // 从源头杜绝「报告 JSON 接进音频链」这类哑线。已存在于旧图里的类型不匹配连线不受影响(只拦新拖)。
+  const isValidConnection = useCallback((conn: Connection | Edge): boolean => {
+    if (!conn.source || !conn.target || conn.source === conn.target) return false;
+    const fromNode = nodesRef.current.find((n) => n.id === conn.source);
+    const toNode = nodesRef.current.find((n) => n.id === conn.target);
+    if (!fromNode || !toNode) return false;
+    const fromWf = rfTypeToWfType[fromNode.type ?? ""];
+    const toWf = rfTypeToWfType[toNode.type ?? ""];
+    if (!fromWf || !toWf) return true; // 未知类型不拦(向后兼容)
+    const fromPort = Number.parseInt((conn.sourceHandle ?? "").replace(/^out-/, ""), 10);
+    const toPort = Number.parseInt((conn.targetHandle ?? "").replace(/^in-/, ""), 10);
+    if (!Number.isFinite(fromPort) || !Number.isFinite(toPort)) return true;
+    return canConnect(fromWf, fromPort, toWf, toPort);
+  }, []);
+
+  // Phase 4-4: 在 flowPos 处垂直铺开一条母带预设链并顺序连线 (Handle 命名见 NodeShell: in-0 / out-0).
+  // 声明必须先于 onAddNode/onDropNode/addNodeAtPane — 三者都把 masterPreset:* 路由到这.
+  const insertMasterChain = useCallback(
+    (presetKey: string, flowPos: { x: number; y: number }) => {
+      const chain = MASTER_CHAINS[presetKey];
+      if (!chain) return;
+      const ids: string[] = [];
+      const newNodes: Node[] = chain.map((step, i) => {
+        nodeCounter++;
+        const id = `${step.type}-${crypto.randomUUID().slice(0, 8)}`;
+        ids.push(id);
+        return {
+          id,
+          type: step.type,
+          position: { x: flowPos.x, y: flowPos.y + i * 250 },
+          data: { label: i18n.t(MASTER_CHAIN_LABELS[step.type] ?? step.type), params: { ...(step.params ?? {}) } },
+          zIndex: nodeCounter + 100,
+        };
+      });
+      const newEdges: Edge[] = [];
+      for (let i = 0; i + 1 < ids.length; i++) {
+        const source = ids[i];
+        const target = ids[i + 1];
+        if (!source || !target) continue;
+        newEdges.push({
+          id: `e-${source}-${target}`,
+          source,
+          target,
+          sourceHandle: "out-0",
+          targetHandle: "in-0",
+          animated: true,
+        });
+      }
+      setNodes((nds) => [...nds, ...newNodes]);
+      setEdges((eds) => [...eds, ...newEdges]);
+    },
+    [setNodes, setEdges],
+  );
+
   const onAddNode = useCallback(
     (type: string, label: string, extraParams?: Record<string, unknown>) => {
+      // masterPreset:* 不是单节点 — 是一条预连线母带链 (调色板点击与拖放都汇聚到这).
+      if (type.startsWith("masterPreset:")) {
+        insertMasterChain(type.slice("masterPreset:".length), { x: 300 + Math.random() * 100, y: 150 + Math.random() * 100 });
+        return;
+      }
       nodeCounter++;
       const id = `${type}-${crypto.randomUUID().slice(0, 8)}`;
       const defaultParams: Record<string, unknown> = { ...(extraParams ?? {}) };
@@ -405,7 +755,7 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       };
       setNodes((nds) => [...nds, newNode]);
     },
-    [setNodes],
+    [setNodes, insertMasterChain],
   );
 
   const onDropNode = useCallback(
@@ -418,6 +768,10 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return;
 
       const position = rfInstance.screenToFlowPosition({ x: clientX, y: clientY });
+      if (type.startsWith("masterPreset:")) {
+        insertMasterChain(type.slice("masterPreset:".length), position);
+        return;
+      }
       nodeCounter++;
       const id = `${type}-${crypto.randomUUID().slice(0, 8)}`;
       const defaultParams: Record<string, unknown> = { ...(extraParams ?? {}) };
@@ -434,11 +788,244 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       };
       setNodes((nds) => [...nds, newNode]);
     },
-    [setNodes, rfInstance],
+    [setNodes, rfInstance, insertMasterChain],
   );
 
 
-  const closeMenus = useCallback(() => { setNodeCtx(null); setEdgeCtx(null); }, []);
+  const closeMenus = useCallback(() => { setNodeCtx(null); setEdgeCtx(null); setPaneCtx(null); setBatchCtx(null); }, []);
+
+  const onSelectionChange = useCallback(({ nodes: selectedNodes }: { nodes: Node[] }) => {
+    setSelectedNodeIds(selectedNodes.map((n) => n.id));
+  }, []);
+
+  // 批量操作一律吃「菜单打开那一刻的 id 快照」(batchCtx.ids)或快捷键当场读到的选区,不再读可能已
+  // 被后续点击改写的 selectedNodeIds —— 菜单停留期间误改选区不会让操作打到别的节点上。
+  const handleBatchDelete = useCallback((ids: string[]) => {
+    // 与单节点删除同一口径:IO 节点 deletable:false,执行中/排队中的节点锁定。
+    const victims = new Set(
+      ids.filter((id) => {
+        const node = nodesRef.current.find((n) => n.id === id);
+        return !!node && node.deletable !== false && !isNodeBusy(id);
+      }),
+    );
+    if (victims.size === 0) return;
+    setNodes((nds) => nds.filter((n) => !victims.has(n.id)));
+    // 任一端被删 → 连线必须一起删(留下悬空边会让 parseWorkflowGraph 报「成环」并弄坏整张图)。
+    setEdges((eds) => eds.filter((e) => !victims.has(e.source) && !victims.has(e.target)));
+    setBatchCtx(null);
+  }, [setNodes, setEdges, isNodeBusy]);
+
+  const handleBatchBypass = useCallback((ids: string[], bypass: boolean) => {
+    const targets = new Set(
+      ids.filter((id) => {
+        const node = nodesRef.current.find((n) => n.id === id);
+        return !!node && node.type !== "audioInput" && node.type !== "audioOutput";
+      }),
+    );
+    if (targets.size === 0) return;
+    setNodes((nds) =>
+      nds.map((n) => (targets.has(n.id) ? { ...n, data: { ...n.data, bypass } } : n)),
+    );
+    setBatchCtx(null);
+  }, [setNodes]);
+
+  // 复制排除 audioInput:一张图只能有一个输入节点(多一个 → errGraphMultiInput),粘贴出第二个
+  // 只会让图不可运行。只保留「两端都在选区内」的连线,避免粘贴出指向原图节点的跨图边。
+  const handleBatchCopy = useCallback((ids: string[]) => {
+    const picked = new Set(ids);
+    const copyNodes = nodesRef.current
+      .filter((n) => picked.has(n.id) && n.type !== "audioInput")
+      .map(({ selected, dragging, ...rest }) => rest);
+    if (copyNodes.length === 0) return;
+    const copyIds = new Set(copyNodes.map((n) => n.id));
+    const copyEdges = edgesRef.current.filter((e) => copyIds.has(e.source) && copyIds.has(e.target));
+    try {
+      localStorage.setItem("workflow-clipboard", JSON.stringify({ nodes: copyNodes, edges: copyEdges }));
+      useAppStore.getState().showToast(t("workflow.batchCopied", { count: copyNodes.length }), "success");
+    } catch {
+      useAppStore.getState().showToast(t("workflow.batchCopyError"), "error");
+    }
+    setBatchCtx(null);
+  }, [t]);
+
+  const handleBatchPaste = useCallback(() => {
+    const raw = localStorage.getItem("workflow-clipboard");
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as { nodes?: Node[]; edges?: Edge[] };
+      const clipNodes = Array.isArray(parsed.nodes) ? parsed.nodes : [];
+      const clipEdges = Array.isArray(parsed.edges) ? parsed.edges : [];
+      if (clipNodes.length === 0) return;
+      // 全新 id + 偏移 40px 落点,并重写连线端点到新 id —— 粘贴出的是一份独立子图。
+      const idMap = new Map<string, string>();
+      const newNodes: Node[] = clipNodes.map((n) => {
+        nodeCounter++;
+        const newId = `${n.type}-${crypto.randomUUID().slice(0, 8)}`;
+        idMap.set(n.id, newId);
+        return {
+          ...n,
+          id: newId,
+          position: { x: (n.position?.x ?? 0) + 40, y: (n.position?.y ?? 0) + 40 },
+          selected: true,
+          zIndex: nodeCounter + 100,
+        };
+      });
+      const newEdges: Edge[] = clipEdges.flatMap((e) => {
+        const source = idMap.get(e.source);
+        const target = idMap.get(e.target);
+        if (!source || !target) return []; // 端点不在本次粘贴集合内 → 丢弃,绝不留悬空边
+        return [{ ...e, id: `e-${crypto.randomUUID().slice(0, 8)}`, source, target, selected: false }];
+      });
+      // 粘贴后选区切到新节点(旧选区取消),可以直接拖走或继续批量操作。
+      setNodes((nds) => [...nds.map((n) => (n.selected ? { ...n, selected: false } : n)), ...newNodes]);
+      setEdges((eds) => [...eds, ...newEdges]);
+      useAppStore.getState().showToast(t("workflow.batchPasted", { count: newNodes.length }), "success");
+    } catch {
+      useAppStore.getState().showToast(t("workflow.batchPasteError"), "error");
+    }
+  }, [setNodes, setEdges, t]);
+
+  const handleSelectAll = useCallback(() => {
+    setNodes((nds) => nds.map((n) => (n.selected ? n : { ...n, selected: true })));
+  }, [setNodes]);
+
+  // ─── Opt 9 · 一键整理画布 ───────────────────────────────────────────────────
+  // 注意:节点位置**刻意不进**撤销栈(见 sigOfGraph 上方那段注释 —— 位置不是有意义的编辑,
+  // 拖节点不该产生一步撤销)。这意味着整理之后 Ctrl+Z 是**救不回**原布局的,所以这里自己留一份
+  // 整理前的坐标快照,并在工具栏上放一个「还原布局」按钮。不去改 sigOfGraph 把位置纳入签名:
+  // 那会让每次拖动节点都变成一步撤销,破坏既有手感(那正是它被排除的原因)。
+  const preLayoutRef = useRef<Map<string, { x: number; y: number }> | null>(null);
+  const [canRestoreLayout, setCanRestoreLayout] = useState(false);
+
+  const handleAutoLayout = useCallback(() => {
+    const cur = nodesRef.current;
+    if (cur.length === 0) return;
+    const { positions, moved } = computeAutoLayout(
+      cur.map((n) => ({
+        id: n.id,
+        type: n.type,
+        position: n.position,
+        // ReactFlow v12 渲染后把实测尺寸回填到 node.measured;首帧或隐藏节点可能还没有,
+        // computeAutoLayout 内部会退回默认尺寸。
+        ...(n.measured ? { measured: n.measured } : {}),
+      })),
+      edgesRef.current.map((e) => ({ source: e.source, target: e.target })),
+    );
+    const app = useAppStore.getState();
+    if (moved === 0) {
+      // 已经是整理后的样子:什么都不写,免得白占一次「还原」快照。
+      app.showToast(t("workflow.autoLayoutNoop"), "info");
+      return;
+    }
+    preLayoutRef.current = new Map(cur.map((n) => [n.id, { ...n.position }]));
+    setCanRestoreLayout(true);
+    setNodes((nds) => nds.map((n) => {
+      const p = positions.get(n.id);
+      return p && (p.x !== n.position.x || p.y !== n.position.y) ? { ...n, position: p } : n;
+    }));
+    // 整理后把视野拉回到整张图上 —— 不然节点被挪到视口外会看着像「消失了」。
+    // 位置写入是同步的,但 ReactFlow 要等下一帧才知道新坐标,所以 fitView 放到下一帧。
+    requestAnimationFrame(() => rfInstance?.fitView({ padding: 0.15, duration: 300 }));
+    app.showToast(t("workflow.autoLayoutDone", { count: moved }), "success");
+  }, [setNodes, rfInstance, t]);
+
+  const handleRestoreLayout = useCallback(() => {
+    const snap = preLayoutRef.current;
+    if (!snap) return;
+    // 只还原**仍然存在**的节点;整理之后新加的节点没有快照,保持原地不动。
+    setNodes((nds) => nds.map((n) => {
+      const p = snap.get(n.id);
+      return p && (p.x !== n.position.x || p.y !== n.position.y) ? { ...n, position: { ...p } } : n;
+    }));
+    preLayoutRef.current = null;
+    setCanRestoreLayout(false);
+    requestAnimationFrame(() => rfInstance?.fitView({ padding: 0.15, duration: 300 }));
+    useAppStore.getState().showToast(t("workflow.autoLayoutRestored"), "info");
+  }, [setNodes, rfInstance, t]);
+
+  const handleAlign = useCallback((mode: AlignMode) => {
+    const cur = nodesRef.current.filter((n) => n.selected);
+    if (cur.length === 0) return;
+    const { positions, moved } = alignNodes(
+      cur.map((n) => ({
+        id: n.id,
+        type: n.type,
+        position: n.position,
+        ...(n.measured ? { measured: n.measured } : {}),
+      })),
+      mode,
+    );
+    if (moved === 0) {
+      useAppStore.getState().showToast(t("workflow.alignNoop"), "info");
+      return;
+    }
+    setNodes((nds) => nds.map((n) => {
+      const p = positions.get(n.id);
+      return p ? { ...n, position: p } : n;
+    }));
+    useAppStore.getState().showToast(t("workflow.alignDone", { count: moved }), "success");
+  }, [setNodes, t]);
+
+  const handleDistribute = useCallback((mode: DistributeMode) => {
+    const cur = nodesRef.current.filter((n) => n.selected);
+    if (cur.length < 3) {
+      useAppStore.getState().showToast(t("workflow.distributeNeedThree"), "info");
+      return;
+    }
+    const { positions, moved } = distributeNodes(
+      cur.map((n) => ({
+        id: n.id,
+        type: n.type,
+        position: n.position,
+        ...(n.measured ? { measured: n.measured } : {}),
+      })),
+      mode,
+    );
+    if (moved === 0) {
+      useAppStore.getState().showToast(t("workflow.alignNoop"), "info");
+      return;
+    }
+    setNodes((nds) => nds.map((n) => {
+      const p = positions.get(n.id);
+      return p ? { ...n, position: p } : n;
+    }));
+    useAppStore.getState().showToast(t("workflow.alignDone", { count: moved }), "success");
+  }, [setNodes, t]);
+
+  const toggleSnapToGrid = useCallback(() => {
+    const newValue = !snapToGrid;
+    setSnapToGrid(newValue);
+    localStorage.setItem("workflow.snapToGrid", JSON.stringify(newValue));
+    useAppStore.getState().showToast(
+      t(newValue ? "workflow.snapToGridOn" : "workflow.snapToGridOff"),
+      "info"
+    );
+  }, [snapToGrid, t]);
+
+  // Canvas right-click → add a node AT the clicked flow position (mirrors onDropNode, which places
+  // a dragged palette node at the drop point; the pane menu is the click-only equivalent).
+  const addNodeAtPane = useCallback((def: PaletteNodeDef, pos: { x: number; y: number }) => {
+    if (!rfInstance) return;
+    const position = rfInstance.screenToFlowPosition({ x: pos.x, y: pos.y });
+    if (def.type.startsWith("masterPreset:")) {
+      insertMasterChain(def.type.slice("masterPreset:".length), position);
+      setPaneCtx(null);
+      return;
+    }
+    nodeCounter++;
+    const id = `${def.type}-${crypto.randomUUID().slice(0, 8)}`;
+    const defaultParams: Record<string, unknown> = { ...(def.extraParams ?? {}) };
+    if (def.type === "audioOutput") defaultParams.laneLabel = DEFAULT_OUTPUT_GROUP;
+    const newNode: Node = {
+      id,
+      type: def.type,
+      position,
+      data: { label: def.label, params: defaultParams },
+      zIndex: nodeCounter + 100,
+    };
+    setNodes((nds) => [...nds, newNode]);
+    setPaneCtx(null);
+  }, [rfInstance, setNodes, insertMasterChain]);
 
   // An edge is render-locked ONLY when its CONSUMER (target) is queued/running in the live run — that
   // input is what the run is (about to be) computing with, so cutting it would misrepresent the run.
@@ -455,8 +1042,16 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
   // veto uses — so the visual and the behavior can never drift; segNodeStatuses/executionState are
   // subscribed purely to re-fire this memo when the busy set changes.
   const displayEdges = useMemo(
-    () => edges.map((e) => ({ ...e, className: isEdgeRenderLocked(e) ? "wf-edge-locked" : "wf-edge-free" })),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- segNodeStatuses/executionState?.status are re-fire triggers (values read via getState inside the predicate)
+    () => edges.map((e) => {
+      const isLocked = isEdgeRenderLocked(e);
+      const sourceStatus = segNodeStatuses?.[e.source];
+      const isSourceRunning = sourceStatus === "running";
+      return {
+        ...e,
+        className: isLocked ? "wf-edge-locked" : "wf-edge-free",
+        animated: isSourceRunning,
+      };
+    }),
     [edges, segNodeStatuses, executionState?.status, isEdgeRenderLocked],
   );
 
@@ -464,9 +1059,19 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
     event.preventDefault();
     if (node.deletable === false) return;
     if (isNodeBusy(node.id)) return; // 正在执行/排队的节点不弹删除菜单
+    
+    // 如果右键的节点在多选集合中,显示批量操作菜单
+    if (selectedNodeIds.length > 1 && selectedNodeIds.includes(node.id)) {
+      setNodeCtx(null);
+      setEdgeCtx(null);
+      setBatchCtx({ x: event.clientX, y: event.clientY, ids: selectedNodeIds });
+      return;
+    }
+    
     setEdgeCtx(null);
+    setBatchCtx(null);
     setNodeCtx({ x: event.clientX, y: event.clientY, nodeId: node.id });
-  }, [isNodeBusy]);
+  }, [isNodeBusy, selectedNodeIds]);
 
   const onEdgeContextMenu: EdgeMouseHandler = useCallback((event, edge) => {
     event.preventDefault();
@@ -509,9 +1114,124 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
     [isNodeBusy, isEdgeRenderLocked],
   );
 
+  // 规划 6-3 旁通切换:仅翻转 bypass 标志(sigOfGraph 含旁通位 → 撤销自动捕获为一步)。
+  const toggleBypass = useCallback((nodeId: string) => {
+    setNodes((nds) =>
+      nds.map((n) => (n.id === nodeId ? { ...n, data: { ...n.data, bypass: n.data?.bypass !== true } } : n)),
+    );
+    setNodeCtx(null);
+  }, [setNodes]);
+
+  // ── Opt 7 节点参数预设 ────────────────────────────────────────────────────
+  // localStorage 不是响应式的:存/删之后用这个计数器让菜单项重算,否则右键菜单里
+  // 还是上一次的列表。
+  const [paramPresetTick, setParamPresetTick] = useState(0);
+
+  const handleSaveNodeParamPreset = useCallback(async (nodeId: string) => {
+    const node = nodesRef.current.find((n) => n.id === nodeId);
+    setNodeCtx(null);
+    if (!node?.type) return;
+    const params = (node.data?.params as Record<string, unknown>) ?? {};
+    const app = useAppStore.getState();
+    if (Object.keys(params).length === 0) {
+      app.showToast(t("workflow.paramPreset.noParams"), "info");
+      return;
+    }
+    // 带 input 的 showConfirm 里,primary 键 resolve 的是输入框文本,取消/Esc/点遮罩 resolve ""
+    // (见 ConfirmDialog),所以空串就是取消 —— 和工作流预设那边同一个口径。
+    const name = await app.showConfirm({
+      title: t("workflow.paramPreset.saveTitle"),
+      body: "",
+      buttons: [
+        { id: "ok", label: t("common.confirm"), kind: "primary" },
+        { id: "cancel", label: t("common.cancel") },
+      ],
+      input: { placeholder: t("workflow.paramPreset.savePlaceholder") },
+    });
+    if (!name) return;
+    if (!saveNodeParamPreset(node.type, name, params)) {
+      app.showToast(t("workflow.paramPreset.limit"), "warning");
+      return;
+    }
+    setParamPresetTick((v) => v + 1);
+    app.showToast(`${t("workflow.paramPreset.saved")}${name}`, "success");
+  }, [t]);
+
+  const handleApplyNodeParamPreset = useCallback((nodeId: string, preset: NodeParamPreset) => {
+    // 合并而不是整体替换:预设可能是旧版本存的,缺的键保留节点当前值,免得把必填参数清空。
+    // 走 setNodes → sigOfGraph 含 params → 自动被捕获成一步撤销,Ctrl+Z 可以退回。
+    setNodes((nds) => nds.map((n) => (n.id === nodeId
+      ? { ...n, data: { ...n.data, params: { ...((n.data?.params as Record<string, unknown>) ?? {}), ...preset.params } } }
+      : n)));
+    setNodeCtx(null);
+    useAppStore.getState().showToast(`${t("workflow.paramPreset.applied")}${preset.name}`, "success");
+  }, [setNodes, t]);
+
+  const handleDeleteNodeParamPreset = useCallback((nodeType: string, name: string) => {
+    deleteNodeParamPreset(nodeType, name);
+    setParamPresetTick((v) => v + 1);
+    setNodeCtx(null);
+    useAppStore.getState().showToast(`${t("workflow.paramPreset.deleted")}${name}`, "info");
+  }, [t]);
+
+  // 示例工作流库:整图替换当前画布(与 loadPreset 同一口径 —— 走 workflowToReactFlow,
+  // 由 300ms 防抖的保存 effect 落盘;撤销栈照常捕获,误载可以直接 Ctrl+Z 退回)。
+  const handleLoadExampleWorkflow = useCallback((example: ExampleWorkflow) => {
+    const loaded = workflowToReactFlow(example.workflow);
+    setNodes(loaded.nodes);
+    setEdges(loaded.edges);
+    useAppStore.getState().showToast(
+      `${t("workflow.exampleLibrary.loaded")} ${i18n.language === "en" ? example.nameEn : example.name}`,
+      "success",
+    );
+  }, [setNodes, setEdges, t]);
+
+  const handleSaveAnnotation = useCallback((nodeId: string, content: string, color?: "yellow" | "blue" | "green" | "red" | "purple") => {
+    setNodes(prev => prev.map(n => {
+      if (n.id !== nodeId) return n;
+      const existing = (n.data as { annotation?: { content: string; color?: string; createdAt: number; updatedAt: number } })?.annotation;
+      const now = Date.now();
+      return {
+        ...n,
+        data: {
+          ...n.data,
+          annotation: {
+            content,
+            color: color ?? existing?.color ?? "yellow",
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now,
+          },
+        },
+      };
+    }));
+    setEditingAnnotation(null);
+  }, [setNodes]);
+
+  const handleDeleteAnnotation = useCallback((nodeId: string) => {
+    setNodes(prev => prev.map(n => {
+      if (n.id !== nodeId) return n;
+      const { annotation, ...rest } = n.data ?? {};
+      return { ...n, data: rest };
+    }));
+    setEditingAnnotation(null);
+  }, [setNodes]);
+
+  const nodeCtxNode = nodeCtx ? nodesRef.current.find((n) => n.id === nodeCtx.nodeId) : undefined;
+
+  // Opt 7:参数预设只对处理节点有意义 —— IO 节点排除(和旁通同一口径)。
+  const presetNodeType =
+    nodeCtxNode?.type && nodeCtxNode.type !== "audioInput" && nodeCtxNode.type !== "audioOutput"
+      ? nodeCtxNode.type
+      : null;
+  const paramPresetList = useMemo(
+    () => (presetNodeType ? listNodeParamPresets(presetNodeType) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- paramPresetTick 是存/删后的重算触发器(localStorage 非响应式)
+    [presetNodeType, paramPresetTick],
+  );
+
   const nodeCtxItems: MenuItem[] = nodeCtx ? [
     // "Detach": only for a MULTI-input Output node — splits it into one Output (group) per inbound edge.
-    ...(nodesRef.current.find((n) => n.id === nodeCtx.nodeId)?.type === "audioOutput" &&
+    ...(nodeCtxNode?.type === "audioOutput" &&
     edgesRef.current.filter((e) => e.target === nodeCtx.nodeId).length >= 2
       ? [{
           label: t("workflow.detachGroup"),
@@ -521,12 +1241,120 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
           },
         }]
       : []),
+    // 规划 6-3 旁通/取消旁通(IO 节点无旁通意义,菜单里排除)。
+    ...(nodeCtxNode && nodeCtxNode.type !== "audioInput" && nodeCtxNode.type !== "audioOutput"
+      ? [{
+          label: nodeCtxNode.data?.bypass === true ? t("workflow.unbypassNode") : t("workflow.bypassNode"),
+          onClick: () => toggleBypass(nodeCtx.nodeId),
+        }]
+      : []),
+    // 节点注释功能
+    {
+      label: nodeCtxNode?.data?.annotation ? t("workflow.annotation.edit") : t("workflow.annotation.add"),
+      onClick: () => {
+        setEditingAnnotation(nodeCtx.nodeId);
+        setNodeCtx(null);
+      },
+    },
+    // Opt 7 参数预设:存当前参数 / 套用 / 删除。套用与删除在没有预设时给一个禁用占位项,
+    // 而不是把子菜单整块藏掉 —— 空子菜单点开是空白面板,反而像坏了。
+    ...(presetNodeType
+      ? [{
+          type: "submenu" as const,
+          label: t("workflow.paramPreset.menu"),
+          items: [
+            {
+              label: t("workflow.paramPreset.save"),
+              onClick: () => { void handleSaveNodeParamPreset(nodeCtx.nodeId); },
+            },
+            { type: "divider" as const },
+            ...(paramPresetList.length === 0
+              ? [{ label: t("workflow.paramPreset.empty"), disabled: true, onClick: () => {} }]
+              : [
+                  {
+                    type: "submenu" as const,
+                    label: t("workflow.paramPreset.apply"),
+                    items: paramPresetList.map((p) => ({
+                      label: p.name,
+                      onClick: () => handleApplyNodeParamPreset(nodeCtx.nodeId, p),
+                    })),
+                  },
+                  {
+                    type: "submenu" as const,
+                    label: t("workflow.paramPreset.delete"),
+                    danger: true,
+                    items: paramPresetList.map((p) => ({
+                      label: p.name,
+                      danger: true,
+                      onClick: () => handleDeleteNodeParamPreset(presetNodeType, p.name),
+                    })),
+                  },
+                ]),
+          ],
+        }]
+      : []),
     { label: t("toolbar.delete"), shortcut: "Del", danger: true, onClick: () => handleDeleteNode(nodeCtx.nodeId) },
   ] : [];
 
   const edgeCtxItems: MenuItem[] = edgeCtx ? [
     { label: t("workflow.deleteConnection"), shortcut: "Del", danger: true, onClick: () => handleDeleteEdge(edgeCtx.edgeId) },
   ] : [];
+
+  const batchCtxItems: MenuItem[] = batchCtx ? [
+    { 
+      label: t("workflow.batchBypass"), 
+      onClick: () => handleBatchBypass(batchCtx.ids, true) 
+    },
+    { 
+      label: t("workflow.batchUnbypass"), 
+      onClick: () => handleBatchBypass(batchCtx.ids, false) 
+    },
+    { 
+      label: t("workflow.batchCopy"), 
+      shortcut: "Ctrl+C", 
+      onClick: () => handleBatchCopy(batchCtx.ids) 
+    },
+    { 
+      type: "submenu",
+      label: t("workflow.align"), 
+      items: [
+        { label: t("workflow.alignLeft"), onClick: () => handleAlign("left") },
+        { label: t("workflow.alignHCenter"), onClick: () => handleAlign("hcenter") },
+        { label: t("workflow.alignRight"), onClick: () => handleAlign("right") },
+        { label: t("workflow.alignTop"), onClick: () => handleAlign("top") },
+        { label: t("workflow.alignVCenter"), onClick: () => handleAlign("vcenter") },
+        { label: t("workflow.alignBottom"), onClick: () => handleAlign("bottom") },
+      ],
+    },
+    { 
+      type: "submenu",
+      label: t("workflow.distribute"), 
+      items: [
+        { label: t("workflow.distributeH"), onClick: () => handleDistribute("horizontal") },
+        { label: t("workflow.distributeV"), onClick: () => handleDistribute("vertical") },
+      ],
+    },
+    { 
+      label: t("workflow.batchDelete"), 
+      shortcut: "Del", 
+      danger: true, 
+      onClick: () => handleBatchDelete(batchCtx.ids) 
+    },
+  ] : [];
+
+  // Pane menu = EVERY palette node (same defs as the sidebar → never drifts), flat in sidebar order.
+  const installedModels = useMsstModelStore((s) => s.installed);
+  const paletteGroups = useMemo(
+    () => getPaletteDefs(i18n.language, new Set(installedModels.map((m) => m.filename))),
+    [installedModels, i18n.language],
+  );
+  const paneCtxItems: MenuItem[] = paneCtx
+    ? paletteGroups.flatMap((g) => g.nodes.map((n) => ({
+        label: n.label,
+        icon: `[${n.icon}]`,
+        onClick: () => addNodeAtPane(n, paneCtx),
+      })))
+    : [];
 
   const handleExecute = useCallback(async () => {
     const trackId = segTrackIdRef.current;
@@ -576,8 +1404,108 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       useWorkflowStore.getState().clearPendingStatuses(segmentId);
       if (err instanceof Error && err.message === "Cancelled") return;
       console.error("Workflow execution failed:", err);
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      setErrorDisplay({ error: errorMsg, nodeType: "workflow" });
     }
   }, [segmentId, segment, nodes, edges, hist]);
+
+  // 键盘快捷键系统。handleExecute 随 nodes/edges/hist 变化 —— 若放进依赖数组,window 监听器
+  // 会在每次改图时解绑重绑。改用 ref 承载最新实现(与本文件 nodesRef/segmentRef 同一套做法),
+  // 监听器只注册一次。
+  //
+  // 这里**刻意不接** Ctrl+Z / Ctrl+Y / Ctrl+S,它们已经由 App.tsx 的全局 document 监听器处理:
+  //  - Ctrl+Z/Y → routeUndo()/routeRedo(),而 store/history.ts 的 workflowUndoActive() 在本面板
+  //    聚焦时会把它们转给上面 setUndoScope 注册的 localUndo/localRedo,所以撤销**已经**是工作流
+  //    级的;在这里再接一次会让一次按键撤销两步。
+  //  - Ctrl+S 是全局「保存项目」(App.tsx 明确写了 fire regardless of focus),和工作流预设
+  //    另存不是一回事;两边都接会一次按键同时存项目 + 弹预设命名框。预设另存走工具栏按钮。
+  const selectedIdsRef = useRef(selectedNodeIds);
+  selectedIdsRef.current = selectedNodeIds;
+  const shortcutsRef = useRef({
+    handleSelectAll, handleBatchCopy, handleBatchPaste, handleBatchBypass,
+    handleExecute, closeMenus, handleAutoLayout, handleAlign, handleDistribute,
+    toggleSnapToGrid,
+  });
+  shortcutsRef.current = {
+    handleSelectAll, handleBatchCopy, handleBatchPaste, handleBatchBypass,
+    handleExecute, closeMenus, handleAutoLayout, handleAlign, handleDistribute,
+    toggleSnapToGrid,
+  };
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const h = shortcutsRef.current;
+      if (useAppStore.getState().activePane !== "workflow") return;
+      const el = e.target as HTMLElement | null;
+      const inInput = el && (el.isContentEditable || el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT");
+      
+      // Escape: 关闭菜单/取消选择
+      if (e.key === "Escape") {
+        e.preventDefault();
+        h.closeMenus();
+        if (selectedIdsRef.current.length > 0) {
+          setNodes((nds) => nds.map((n) => (n.selected ? { ...n, selected: false } : n)));
+        }
+        return;
+      }
+      
+      // ?键: 显示/隐藏快捷键面板
+      if (e.key === "?" && !inInput) {
+        e.preventDefault();
+        setShowShortcuts((s) => !s);
+        return;
+      }
+      
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+      if (inInput) return;
+      
+      const ids = selectedIdsRef.current;
+      const key = e.key.toLowerCase();
+      
+      // Ctrl+E: 执行工作流
+      if (key === "e") {
+        e.preventDefault();
+        void h.handleExecute();
+      }
+      // Ctrl+A: 全选
+      else if (key === "a") {
+        e.preventDefault();
+        h.handleSelectAll();
+      }
+      // Ctrl+C: 复制
+      else if (key === "c") {
+        if (ids.length === 0) return;
+        e.preventDefault();
+        h.handleBatchCopy(ids);
+      }
+      // Ctrl+V: 粘贴
+      else if (key === "v") {
+        e.preventDefault();
+        h.handleBatchPaste();
+      }
+      // Ctrl+L: 一键整理画布。App.tsx 的全局 keydown 只占了 z/y/s/o/n,并且只拦
+      // f/g/p/u/j/r 的浏览器默认行为 —— l 两边都没人用,不会打架。
+      else if (key === "l") {
+        e.preventDefault();
+        h.handleAutoLayout();
+      }
+      // Ctrl+B: 批量旁通
+      else if (key === "b") {
+        if (ids.length === 0) return;
+        e.preventDefault();
+        const picked = new Set(ids);
+        const anyActive = nodesRef.current.some((n) => picked.has(n.id) && n.data?.bypass !== true);
+        h.handleBatchBypass(ids, anyActive);
+      }
+      // Ctrl+G: 切换网格吸附
+      else if (key === "g") {
+        e.preventDefault();
+        h.toggleSnapToGrid();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [setNodes]);
 
   const handleCancel = useCallback(() => {
     const wf = useWorkflowStore.getState();
@@ -588,6 +1516,9 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
     // "Cancelling…" for the interim instead.
     wf.cancelExecution(segmentId);
     invoke("cancel_separation").catch(() => {});
+    // Force-kill any live AMT (audio→MIDI) sidecar too — its Python worker is a
+    // separate process that "voice"/"separation" cancels never reach.
+    invoke("cancel_amt_all").catch(() => {});
     // Voice invokes (run_rvc/run_sovits) are direct awaits — no polling loop ever re-checks
     // isCancelled mid-run, so the Rust-side flag is the only way to abort a long
     // diffusion/synthesis. Global like the separation cancel.
@@ -611,6 +1542,19 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
         segments: track.segments.map((s) => (s.id === segmentId ? { ...s, workflow: wf } : s)),
       });
     };
+  }, [segmentId]);
+
+  // 超级原创向导的「挂载即自动执行」：向导建轨→写模板工作流→openWorkflow + 置 workflowAutoRun
+  // 标志；本编辑器挂载时消费标志并直接触发 handleExecute —— 完整复用 preflight（缺失组件弹
+  // MissingModelsDialog）、进度、取消、轨道沉积，向导绝不旁路执行引擎。挂载渲染的
+  // handleExecute 闭包里的 nodes/edges 正是 segment.workflow 的初始图（同步 useState 初始化），
+  // 因此无需等待任何 settle。一次性：消费即清（失败/取消也清——用户手动点 Run 即可重试）。
+  useEffect(() => {
+    const app = useAppStore.getState();
+    if (app.workflowAutoRun !== segmentId) return;
+    app.clearWorkflowAutoRun();
+    void handleExecute();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segmentId]);
 
   const handleRunSingleNode = useCallback((nodeId: string) => {
@@ -944,10 +1888,26 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
 
   useEffect(() => {
     useWorkflowStore.getState().registerSingleNodeRunner(handleRunSingleNode);
-    return () => useWorkflowStore.getState().registerSingleNodeRunner(null);
+    useWorkflowStore.getState().registerAnnotationEditor(setEditingAnnotation);
+    return () => {
+      useWorkflowStore.getState().registerSingleNodeRunner(null);
+      useWorkflowStore.getState().registerAnnotationEditor(null);
+    };
   }, [handleRunSingleNode]);
 
   const isRunning = effExec?.status === "running";
+
+  // 规划 6-5 链路 SNR(实时):非 IO、未旁通的节点按损伤表累加 → 整条链保真度估计(旁通切换经
+  // setNodes 立即重算)。全透传图(无损耗节点)→ null,不显示。
+  const chainSnrDb = useMemo(() => {
+    const snrs: number[] = [];
+    for (const n of nodes) {
+      if (n.type === "audioInput" || n.type === "audioOutput" || n.data?.bypass === true) continue;
+      const wf = rfTypeToWfType[n.type ?? ""];
+      if (wf) snrs.push(NODE_DAMAGE[wf].snrDb);
+    }
+    return cumulativeSnrDb(snrs);
+  }, [nodes]);
 
   return (
     <div className="workflow-editor" style={style} onPointerDownCapture={focusEditor} onFocusCapture={focusEditor}>
@@ -961,6 +1921,36 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
           </span>
         </div>
         <div className="workflow-header-actions">
+          <button className="wf-run-btn" onClick={() => setShowExampleLibrary(true)} title={t("workflow.exampleLibrary.title")}>
+            📚 {t("workflow.exampleLibrary.button")}
+          </button>
+          <button className="wf-run-btn" onClick={handleAutoLayout} title={t("workflow.autoLayoutTip")}>
+            ⌗ {t("workflow.autoLayout")}
+          </button>
+          {canRestoreLayout && (
+            <button className="wf-run-btn" onClick={handleRestoreLayout} title={t("workflow.autoLayoutRestoreTip")}>
+              ↩ {t("workflow.autoLayoutRestore")}
+            </button>
+          )}
+          <select
+            className="wf-preset-select"
+            value=""
+            onChange={(e) => { const v = e.target.value; if (v) void loadPreset(v); }}
+            title={presetNames.length ? t("workflow.loadPreset") : t("workflow.noPresets")}
+          >
+            <option value="" disabled>{presetNames.length ? t("workflow.loadPreset") : t("workflow.noPresets")}</option>
+            {presetNames.map((n) => (
+              <option key={n} value={n}>{n}</option>
+            ))}
+          </select>
+          <button className="wf-run-btn" onClick={() => void savePreset()}>{t("workflow.savePreset")}</button>
+          <button className="wf-run-btn" onClick={() => void exportPresets()} title={t("workflow.exportPresets")}>{t("workflow.exportPresetsShort")}</button>
+          <button className="wf-run-btn" onClick={() => void importPresets()} title={t("workflow.importPresets")}>{t("workflow.importPresetsShort")}</button>
+          {chainSnrDb != null && (
+            <span className="wf-chain-snr" title={t("workflow.chainSnrTip")}>
+              {t("workflow.chainSnr", { snr: Math.round(chainSnrDb) })}
+            </span>
+          )}
           {effExec?.status === "error" && (
             <span className="wf-error">{effExec.error}</span>
           )}
@@ -990,7 +1980,14 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
         </div>
       </div>
       <div className="workflow-body">
-        <NodePalette onAddNode={onAddNode} onDropNode={onDropNode} />
+        {paletteOpen && <NodePalette onAddNode={onAddNode} onDropNode={onDropNode} />}
+        <button
+          className={`palette-collapse ${paletteOpen ? "open" : ""}`}
+          title={paletteOpen ? paletteCollapseLabel : paletteExpandLabel}
+          onClick={() => setPaletteOpen((v) => !v)}
+        >
+          {paletteOpen ? "◀" : "▶"}
+        </button>
         <div className="workflow-canvas">
           <ReactFlow
             nodes={nodes}
@@ -998,25 +1995,38 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
+            onConnectStart={onConnectStart}
+            onConnectEnd={onConnectEnd}
+            isValidConnection={isValidConnection}
             onNodeDragStart={onNodeDragStart}
             onNodeDragStop={onNodeDragStop}
             onNodeContextMenu={onNodeContextMenu}
             onEdgeContextMenu={onEdgeContextMenu}
+            onPaneContextMenu={(e) => {
+              // Right-click the canvas BACKGROUND → add any palette node at the cursor.
+              e.preventDefault();
+              setNodeCtx(null);
+              setEdgeCtx(null);
+              setPaneCtx({ x: e.clientX, y: e.clientY });
+            }}
             onBeforeDelete={onBeforeDelete}
             onPaneClick={closeMenus}
             onNodeClick={onNodeClick}
             onMoveStart={closeMenus}
             onInit={setRfInstance}
+            onSelectionChange={onSelectionChange}
             nodeTypes={nodeTypes}
             fitView
+            // 批量操作: Ctrl/Cmd+点击 累加选择, Shift+拖拽 框选。
+            multiSelectionKeyCode={["Control", "Meta"]}
+            selectionKeyCode="Shift"
             // S66 手感: a dragged wire END snaps to the nearest port within this radius —
             // the pickup end is covered by the handles' 24px ::after hit zone (CSS).
             connectionRadius={24}
             deleteKeyCode={activePane === "workflow" ? "Delete" : null}
-            // Edge stroke lives in WorkflowEditor.css (the single source): the old inline default style
-            // overrode the stylesheet for freshly-connected edges only (a new edge changed color after
-            // save/reload) — and an inline stroke also beats the :hover affordance.
             defaultEdgeOptions={{ animated: true }}
+            snapToGrid={snapToGrid}
+            snapGrid={[20, 20]}
             proOptions={{ hideAttribution: true }}
           >
             <Background
@@ -1037,8 +2047,139 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
           </ReactFlow>
           {nodeCtx && <ContextMenu x={nodeCtx.x} y={nodeCtx.y} items={nodeCtxItems} onClose={() => setNodeCtx(null)} />}
           {edgeCtx && <ContextMenu x={edgeCtx.x} y={edgeCtx.y} items={edgeCtxItems} onClose={() => setEdgeCtx(null)} />}
+          {paneCtx && <ContextMenu x={paneCtx.x} y={paneCtx.y} items={paneCtxItems} onClose={() => setPaneCtx(null)} />}
+          {batchCtx && <ContextMenu x={batchCtx.x} y={batchCtx.y} items={batchCtxItems} onClose={() => setBatchCtx(null)} />}
+
+          {selectedNodeIds.length > 1 && (
+            <div className="wf-batch-badge">
+              {t("workflow.batchSelected", { count: selectedNodeIds.length })}
+            </div>
+          )}
+          
+          {connectingFrom && (
+            <SmartConnectionHelper
+              nodes={nodes}
+              sourceNode={connectingFrom.node}
+              sourceHandle={connectingFrom.handle}
+            />
+          )}
+
+          {errorDisplay && (
+            <EnhancedErrorDisplay
+              error={errorDisplay.error}
+              nodeType={errorDisplay.nodeType}
+              onDismiss={() => setErrorDisplay(null)}
+            />
+          )}
+
         </div>
       </div>
+      
+      {showExampleLibrary && (
+        <ExampleWorkflowLibrary
+          onLoad={handleLoadExampleWorkflow}
+          onClose={() => setShowExampleLibrary(false)}
+        />
+      )}
+      
+      {editingAnnotation && (
+        <NodeAnnotationEditor
+          annotation={
+            (nodes.find((n) => n.id === editingAnnotation)?.data as { annotation?: NodeAnnotation })?.annotation ?? {
+              nodeId: editingAnnotation,
+              content: "",
+              color: "yellow",
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+            }
+          }
+          onSave={(content, color) => handleSaveAnnotation(editingAnnotation, content, color)}
+          onDelete={() => handleDeleteAnnotation(editingAnnotation)}
+          onClose={() => setEditingAnnotation(null)}
+        />
+      )}
+      
+      {showTutorial && (
+        <TutorialOverlay />
+      )}
+      
+      {showShortcuts && (
+        <div className="wf-shortcuts-overlay" onClick={() => setShowShortcuts(false)}>
+          <div className="wf-shortcuts-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="wf-shortcuts-header">
+              <h3>{t("workflow.shortcuts")}</h3>
+              <button className="wf-shortcuts-close" onClick={() => setShowShortcuts(false)}>×</button>
+            </div>
+            <div className="wf-shortcuts-content">
+              <div className="wf-shortcuts-section">
+                <h4>{t("workflow.shortcutsGeneral")}</h4>
+                <div className="wf-shortcut-item">
+                  <kbd>Ctrl</kbd>+<kbd>Z</kbd>
+                  <span>{t("workflow.shortcutUndo")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>Ctrl</kbd>+<kbd>Y</kbd>
+                  <span>{t("workflow.shortcutRedo")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>Ctrl</kbd>+<kbd>S</kbd>
+                  <span>{t("workflow.shortcutSave")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>Ctrl</kbd>+<kbd>E</kbd>
+                  <span>{t("workflow.shortcutExecute")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>Ctrl</kbd>+<kbd>L</kbd>
+                  <span>{t("workflow.shortcutAutoLayout")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>Esc</kbd>
+                  <span>{t("workflow.shortcutCancel")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>?</kbd>
+                  <span>{t("workflow.shortcutHelp")}</span>
+                </div>
+              </div>
+              <div className="wf-shortcuts-section">
+                <h4>{t("workflow.shortcutsSelection")}</h4>
+                <div className="wf-shortcut-item">
+                  <kbd>Ctrl</kbd>+<kbd>A</kbd>
+                  <span>{t("workflow.shortcutSelectAll")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>Ctrl</kbd>+<kbd>Click</kbd>
+                  <span>{t("workflow.shortcutMultiSelect")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>Shift</kbd>+<kbd>Drag</kbd>
+                  <span>{t("workflow.shortcutBoxSelect")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>Del</kbd>
+                  <span>{t("workflow.shortcutDelete")}</span>
+                </div>
+              </div>
+              <div className="wf-shortcuts-section">
+                <h4>{t("workflow.shortcutsBatch")}</h4>
+                <div className="wf-shortcut-item">
+                  <kbd>Ctrl</kbd>+<kbd>C</kbd>
+                  <span>{t("workflow.shortcutCopy")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>Ctrl</kbd>+<kbd>V</kbd>
+                  <span>{t("workflow.shortcutPaste")}</span>
+                </div>
+                <div className="wf-shortcut-item">
+                  <kbd>Ctrl</kbd>+<kbd>B</kbd>
+                  <span>{t("workflow.shortcutBypass")}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

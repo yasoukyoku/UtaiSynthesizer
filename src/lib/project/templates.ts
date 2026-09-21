@@ -1,0 +1,77 @@
+﻿export interface ProjectTemplate {
+  id: string;
+  name: string;
+  description: string;
+  tracks: Array<{
+    type: "audio" | "vocal" | "midi" | "chord";
+    name: string;
+    singerId?: string;
+    soundfont?: string;
+  }>;
+  bpm: number;
+  timeSig: [number, number];
+}
+
+export const PROJECT_TEMPLATES: ProjectTemplate[] = [
+  {
+    id: "blank",
+    name: "空白工程",
+    description: "从零开始",
+    tracks: [],
+    bpm: 120,
+    timeSig: [4, 4],
+  },
+  {
+    id: "pop-ballad",
+    name: "流行抒情",
+    description: "4/4 · 88BPM · 人声 + 钢琴 + 贝斯 + 轻鼓",
+    tracks: [
+      { type: "vocal", name: "主唱" },
+      { type: "midi", name: "钢琴", soundfont: "GM-Piano" },
+      { type: "midi", name: "贝斯", soundfont: "GM-ElectricBass" },
+      { type: "midi", name: "鼓机", soundfont: "GM-Drums" },
+    ],
+    bpm: 88,
+    timeSig: [4, 4],
+  },
+  {
+    id: "edm",
+    name: "电子舞曲",
+    description: "4/4 · 128BPM · Vocal + Lead + Sub Bass + 4x4",
+    tracks: [
+      { type: "vocal", name: "主唱" },
+      { type: "midi", name: "Lead Synth", soundfont: "GM-SynthLead" },
+      { type: "midi", name: "Sub Bass", soundfont: "GM-SynthBass" },
+      { type: "midi", name: "鼓组", soundfont: "GM-Drums" },
+    ],
+    bpm: 128,
+    timeSig: [4, 4],
+  },
+  {
+    id: "chinese",
+    name: "古风弹唱",
+    description: "4/4 · 78BPM · 人声 + 古筝 + 竹笛 + 轻打击",
+    tracks: [
+      { type: "vocal", name: "主唱" },
+      { type: "midi", name: "古筝", soundfont: "GM-Guzheng" },
+      { type: "midi", name: "竹笛", soundfont: "GM-Flute" },
+      { type: "midi", name: "打击", soundfont: "GM-Drums" },
+    ],
+    bpm: 78,
+    timeSig: [4, 4],
+  },
+  {
+    id: "cover",
+    name: "AI 翻唱改编",
+    description: "伴奏 + AI 翻唱 + 鼓/贝斯/键盘",
+    tracks: [
+      { type: "audio", name: "伴奏" },
+      { type: "vocal", name: "AI 翻唱" },
+      { type: "midi", name: "鼓", soundfont: "GM-Drums" },
+      { type: "midi", name: "贝斯", soundfont: "GM-ElectricBass" },
+      { type: "midi", name: "键盘", soundfont: "GM-Piano" },
+    ],
+    bpm: 100,
+    timeSig: [4, 4],
+  },
+];

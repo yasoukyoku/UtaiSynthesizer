@@ -1,4 +1,4 @@
-//! Manual E2E for the S42 runtime-pack chain, WITHOUT the UI:
+﻿//! Manual E2E for the S42 runtime-pack chain, WITHOUT the UI:
 //! local archive → (manifest verify) → extract+commit → scan/resolve → envtest.
 //!
 //!   UTAI_PACK_FILE=D:\...\runtime-cpu-v1.tar.zst \
@@ -48,18 +48,18 @@ fn install_local_pack_into_root_no_wipe() {
 }
 
 fn run_chain(root: std::path::PathBuf) {
-    utai_lib::suppress_windows_dll_error_dialogs();
+    muno_lib::suppress_windows_dll_error_dialogs();
     let file = std::env::var("UTAI_PACK_FILE").expect("set UTAI_PACK_FILE to the built .tar.zst");
     let picked = std::path::PathBuf::from(&file);
 
     std::fs::create_dir_all(&root).unwrap();
-    utai_lib::pyenv::init_runtime_root(&root);
+    muno_lib::pyenv::init_runtime_root(&root);
 
     // 1. local-archive resolution (+ hash verification when the manifest travels along)
-    let (parts, manifest) = utai_lib::pyenv::resolve_local_parts(&picked).unwrap();
+    let (parts, manifest) = muno_lib::pyenv::resolve_local_parts(&picked).unwrap();
     println!("parts: {:?}", parts.iter().map(|p| p.file_name()).collect::<Vec<_>>());
     if let Some(man) = &manifest {
-        utai_lib::pyenv::verify_parts(man, picked.parent().unwrap()).unwrap();
+        muno_lib::pyenv::verify_parts(man, picked.parent().unwrap()).unwrap();
         println!("manifest sha256 verified ({} parts)", man.parts.len());
     } else {
         println!("no manifest next to archive — verification skipped");
@@ -70,7 +70,7 @@ fn run_chain(root: std::path::PathBuf) {
     //    WHY-NOT on extract_and_commit. (S115: this line used to say there was one.)
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let t0 = std::time::Instant::now();
-    let meta = utai_lib::pyenv::extract_and_commit(&parts, &cancel, |n| {
+    let meta = muno_lib::pyenv::extract_and_commit(&parts, &cancel, |n| {
         if n % 5000 == 0 {
             println!("  ... {n} entries");
         }
@@ -80,11 +80,11 @@ fn run_chain(root: std::path::PathBuf) {
 
     // 3. scan-based discovery + converter-role resolution (fake app dir = no dev venv,
     //    so the pack MUST win over the PATH fallback)
-    let packs = utai_lib::pyenv::list_packs();
+    let packs = muno_lib::pyenv::list_packs();
     assert!(packs.iter().any(|p| p.meta.id == meta.id), "installed pack not discovered by scan");
     let fake_app = root.join("fake_app");
     std::fs::create_dir_all(&fake_app).unwrap();
-    let py = utai_lib::pyenv::converter_python(&fake_app);
+    let py = muno_lib::pyenv::converter_python(&fake_app);
     assert!(
         py.exists() && py.extension().map(|e| e == "exe").unwrap_or(false),
         "converter_python did not resolve to the pack: {}",
@@ -109,9 +109,9 @@ fn run_chain(root: std::path::PathBuf) {
     // That failure is not a nuisance, it is the control that proves the passing runs
     // actually reached the device.
     let device = std::env::var("UTAI_PACK_DEVICE")
-        .unwrap_or_else(|_| utai_lib::pyenv::envtest_device_for_variant(&meta.variant).to_string());
+        .unwrap_or_else(|_| muno_lib::pyenv::envtest_device_for_variant(&meta.variant).to_string());
     println!("envtest tier: variant {:?} -> --device {device}", meta.variant);
-    let mut cmd = utai_lib::util::python_command(&py);
+    let mut cmd = muno_lib::util::python_command(&py);
     cmd.current_dir(&training)
         .args(["-m", "utai_train.envtest", "--device", &device, "--out"])
         .arg(&report_path);
@@ -119,7 +119,7 @@ fn run_chain(root: std::path::PathBuf) {
     // pack re-verified here must pick its GPU by arch exactly like the badge run did,
     // or the two answer about different silicon.
     if let Some(targets) =
-        utai_lib::pyenv::envtest_gfx_targets_for(&meta.variant, meta.version)
+        muno_lib::pyenv::envtest_gfx_targets_for(&meta.variant, meta.version)
     {
         println!("envtest gfx targets: {targets}");
         cmd.args(["--gfx-targets", &targets]);

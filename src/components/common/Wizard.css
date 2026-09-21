@@ -1,0 +1,831 @@
+/* Splash / Wizard shared */
+.wizard-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(4px);
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.wizard-card {
+  background: var(--bg-panel, #1f1f2a);
+  color: var(--text-primary, #fff);
+  border-radius: 14px;
+  padding: 24px;
+  max-width: 640px;
+  width: 90%;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  border: 1px solid var(--border-subtle, rgba(255,255,255,0.08));
+  font-family: inherit;
+}
+.wizard-card h2 { margin: 0 0 6px 0; font-size: 20px; }
+.wizard-card .hint { color: var(--text-muted, #888); margin: 0 0 16px 0; font-size: 13px; }
+.wizard-card .field { margin-bottom: 12px; }
+.wizard-card .field label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
+.wizard-card .field input, .wizard-card .field select, .wizard-card .field textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-input, rgba(255,255,255,0.04));
+  color: var(--text-primary);
+  font-size: 14px;
+  box-sizing: border-box;
+  font-family: inherit;
+}
+.wizard-card .field textarea { resize: vertical; font-family: ui-monospace, monospace; }
+.wizard-card .field-row { display: flex; gap: 10px; }
+.wizard-card .field-row .field { flex: 1; }
+.wizard-card .wizard-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+.wizard-card .wizard-actions button {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  font-family: inherit;
+}
+.wizard-card .wizard-actions button.primary {
+  background: var(--brand-grad-a, #a78bfa);
+  border-color: transparent;
+  color: #fff;
+  font-weight: 600;
+}
+
+/* Splash-specific */
+.splash-card { max-width: 720px; }
+.splash-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 12px;
+}
+.splash-card-item {
+  background: var(--bg-input, rgba(255,255,255,0.04));
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  padding: 16px;
+  cursor: pointer;
+  text-align: left;
+  transition: all .15s;
+  display: block;
+  width: 100%;
+  color: var(--text-primary);
+  font-family: inherit;
+}
+.splash-card-item:hover {
+  border-color: var(--brand-grad-a, #a78bfa);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(167, 139, 250, 0.25);
+}
+.splash-emoji { font-size: 22px; font-family: ui-monospace, monospace; margin-bottom: 8px; color: var(--brand-grad-a, #a78bfa); }
+.splash-title { font-weight: 600; font-size: 14px; margin-bottom: 2px; }
+.splash-desc { font-size: 12px; color: var(--text-muted); }
+
+/* ── 启动欢迎页(Studio Pro 式:新建卡片 + 最近打开列表) ───────────────────────
+   z-index 90:标题栏(100)之下 — 窗口最小化/关闭按钮保持可点;ConfirmDialog(--z-modal,
+   1000)之上 — 崩溃恢复确认等弹窗盖在欢迎页上仍可交互。 */
+.startpage-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: startpage-fade 0.16s ease;
+}
+@keyframes startpage-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.startpage-card {
+  width: min(880px, 92vw);
+  max-height: 86vh;
+  overflow-y: auto;
+  padding: 28px;
+  animation: startpage-rise 0.2s ease;
+}
+@keyframes startpage-rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.startpage-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+}
+.startpage-open-btn {
+  padding: 9px 16px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: var(--brand-grad-a, #a78bfa);
+  color: #fff;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+  transition: filter 0.15s ease, transform 0.15s ease;
+}
+.startpage-open-btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
+.startpage-section { margin-top: 22px; }
+.startpage-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.startpage-card .splash-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+.startpage-recent { display: flex; flex-direction: column; gap: 8px; }
+.startpage-recent-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-input, rgba(255, 255, 255, 0.04));
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  color: var(--text-primary);
+  font-family: inherit;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  overflow: hidden;
+}
+.startpage-recent-item::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: 11px;
+  background: linear-gradient(90deg, rgba(167,139,250,0.4), rgba(196,181,253,0.7), rgba(255,255,255,0.3), rgba(196,181,253,0.7), rgba(167,139,250,0.4));
+  background-size: 200% 100%;
+  z-index: -1;
+  opacity: 0;
+  animation: border-flow 2.5s linear infinite;
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  padding: 1px;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+.startpage-recent-item:hover {
+  border-color: transparent;
+  box-shadow: 0 6px 20px rgba(167, 139, 250, 0.25);
+  transform: translateY(-1px);
+}
+.startpage-recent-item:hover::after { opacity: 1; }
+.startpage-recent-item.opening { opacity: 0.55; pointer-events: none; }
+/* crashed 意外退出标记 */
+.startpage-recent-item.crashed {
+  border-color: rgba(251, 191, 36, 0.4);
+  background: linear-gradient(90deg, rgba(251, 191, 36, 0.08), var(--bg-input, rgba(255, 255, 255, 0.04)), rgba(251, 191, 36, 0.08));
+  background-size: 200% 100%;
+  animation: crashed-pulse 2s ease-in-out infinite, border-flow 3s linear infinite;
+}
+.startpage-recent-item.crashed::after {
+  opacity: 1;
+  background: linear-gradient(90deg, rgba(251,191,36,0.6), rgba(253,224,71,0.9), rgba(255,255,255,0.4), rgba(253,224,71,0.9), rgba(251,191,36,0.6));
+  background-size: 200% 100%;
+}
+.startpage-recent-item.crashed:hover::after {
+  background: linear-gradient(90deg, rgba(251,191,36,0.8), rgba(253,224,71,1), rgba(255,255,255,0.6), rgba(253,224,71,1), rgba(251,191,36,0.8));
+}
+.startpage-recent-crash-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #1a1a2e;
+  background: linear-gradient(90deg, #fbbf24, #fde047);
+  border-radius: 4px;
+  letter-spacing: 0.5px;
+  animation: badge-blink 1.5s ease-in-out infinite;
+}
+@keyframes crashed-pulse {
+  0%, 100% { box-shadow: 0 0 0 rgba(251, 191, 36, 0); }
+  50% { box-shadow: 0 0 18px rgba(251, 191, 36, 0.35); }
+}
+@keyframes badge-blink {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
+}
+.startpage-recent-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  background: linear-gradient(135deg, var(--brand-grad-a, #a78bfa), var(--brand-grad-b, #7c6cf0));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 17px;
+  flex-shrink: 0;
+}
+.startpage-recent-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.startpage-recent-name { font-weight: 600; font-size: 13px; }
+.startpage-recent-meta {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 0;
+}
+.startpage-recent-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl; /* 长路径从末尾截断,保住文件名 */
+  text-align: left;
+}
+.startpage-recent-remove {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.startpage-recent-remove:hover { background: rgba(251, 113, 133, 0.15); color: #fb7185; }
+/* ── 空状态：插图 + 主标题 + 说明,替代原来的单行灰字 ── */
+.startpage-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 34px 20px;
+  text-align: center;
+  border: 1px dashed var(--border-subtle);
+  border-radius: 12px;
+  background: radial-gradient(120% 90% at 50% 0%, rgba(167, 139, 250, 0.07), transparent 70%);
+}
+.startpage-empty-art {
+  font-size: 40px;
+  line-height: 1;
+  opacity: 0.85;
+  filter: drop-shadow(0 4px 14px rgba(139, 92, 246, 0.35));
+  animation: empty-art-float 4s ease-in-out infinite;
+}
+.startpage-empty-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.startpage-empty-desc {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  max-width: 34ch;
+}
+@keyframes empty-art-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
+}
+
+/* ── 重命名输入框 ── */
+.startpage-rename-input {
+  flex: 1;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--brand-grad-a, #a78bfa);
+  background: var(--bg-input, rgba(255, 255, 255, 0.08));
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  outline: none;
+}
+.startpage-recent-item.renaming {
+  border-color: var(--brand-grad-a, #a78bfa);
+  box-shadow: 0 4px 14px rgba(167, 139, 250, 0.25);
+}
+
+/* ── 右键菜单 ── */
+.context-menu {
+  position: fixed;
+  background: var(--bg-panel, #1f1f2a);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+  z-index: 10000;
+  min-width: 160px;
+  animation: context-menu-fade 0.12s ease;
+}
+@keyframes context-menu-fade {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+.context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: background 0.12s ease;
+}
+.context-menu-item:hover {
+  background: var(--bg-input, rgba(255, 255, 255, 0.06));
+}
+.context-menu-item.danger:hover {
+  background: rgba(251, 113, 133, 0.15);
+  color: #fb7185;
+}
+.startpage-foot { margin-top: 20px; display: flex; justify-content: center; }
+.startpage-foot button {
+  padding: 8px 22px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  transition: border-color 0.15s ease;
+}
+.startpage-foot button:hover { border-color: var(--brand-grad-a, #a78bfa); }
+
+/* ── 强制欢迎页(左右分区:左=新建，右=历史记录) ─────────────────────── */
+.startpage-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-base, #0d1220);
+  z-index: var(--z-overlay, 100) + 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: startpage-fade 0.18s ease;
+  overflow: hidden;
+}
+/* ── 顶部品牌 LOGO 区 ── */
+.startpage-brand-header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 24px 0 12px;
+  user-select: none;
+}
+.startpage-brand-logo {
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+  box-shadow: 0 0 24px rgba(139, 92, 246, 0.55), 0 0 60px rgba(139, 92, 246, 0.25);
+  animation: logo-float 4s ease-in-out infinite, logo-glow 3s ease-in-out infinite;
+}
+.startpage-brand-name {
+  font-size: 40px;
+  font-weight: 800;
+  letter-spacing: 4px;
+  background: linear-gradient(90deg, #a78bfa 0%, #c4b5fd 25%, #ffffff 50%, #c4b5fd 75%, #a78bfa 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shine 3s linear infinite;
+}
+.startpage-brand-sep {
+  font-size: 36px;
+  font-weight: 300;
+  color: rgba(196, 181, 253, 0.4);
+  animation: tagline-pulse 3s ease-in-out infinite;
+}
+.startpage-brand-tagline {
+  font-size: 40px;
+  font-weight: 800;
+  letter-spacing: 4px;
+  background: linear-gradient(90deg, #a78bfa 0%, #c4b5fd 25%, #ffffff 50%, #c4b5fd 75%, #a78bfa 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shine 3s linear infinite;
+}
+@keyframes shine {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+@keyframes logo-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+@keyframes logo-glow {
+  0%, 100% { box-shadow: 0 0 24px rgba(139, 92, 246, 0.55), 0 0 60px rgba(139, 92, 246, 0.25); }
+  50% { box-shadow: 0 0 36px rgba(139, 92, 246, 0.85), 0 0 80px rgba(139, 92, 246, 0.4); }
+}
+@keyframes tagline-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+@keyframes border-flow {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+@keyframes border-flow-runner {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.startpage-wrap {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  gap: 32px;
+  max-width: 1100px;
+  width: 94vw;
+  max-height: 92vh;
+  padding: 8px;
+  animation: startpage-rise 0.22s ease;
+}
+
+/* ── 响应式：窄窗口下两栏塌成单栏,整体可纵向滚动;品牌头与 Hero 同步缩小 ──
+   960px 以下两栏各自宽度不足以承载 Hero(360px 高)+ 历史列表,改为上下堆叠。 */
+@media (max-width: 960px) {
+  .startpage-wrap {
+    grid-template-columns: 1fr;
+    gap: 20px;
+    width: 96vw;
+    overflow-y: auto;
+  }
+  .startpage-right {
+    max-height: none;
+    overflow-y: visible;
+  }
+  .startpage-hero { min-height: 220px; }
+  .startpage-brand-header { padding: 14px 0 8px; gap: 10px; }
+  .startpage-brand-logo { width: 40px; height: 40px; border-radius: 10px; }
+  .startpage-brand-name,
+  .startpage-brand-tagline { font-size: 26px; letter-spacing: 2px; }
+  .startpage-brand-sep { font-size: 22px; }
+}
+
+@media (max-width: 620px) {
+  .startpage-wrap { gap: 14px; padding: 4px; }
+  .startpage-hero { min-height: 170px; }
+  .startpage-brand-name,
+  .startpage-brand-tagline { font-size: 20px; letter-spacing: 1px; }
+  .startpage-brand-sep { font-size: 16px; }
+  .startpage-brand-logo { width: 32px; height: 32px; border-radius: 8px; }
+  .startpage-title { font-size: 18px; }
+  /* 窄屏隐藏长路径,只保留名字+时间,避免卡片被撑破 */
+  .startpage-recent-path { display: none; }
+}
+
+/* 尊重系统「减少动效」设置:关掉欢迎页所有装饰性无限动画 */
+@media (prefers-reduced-motion: reduce) {
+  .startpage-brand-logo,
+  .startpage-brand-name,
+  .startpage-brand-tagline,
+  .startpage-brand-sep,
+  .startpage-recent-item::after,
+  .startpage-recent-item.crashed,
+  .startpage-recent-crash-badge,
+  .startpage-hero::before,
+  .startpage-hero::after {
+    animation: none !important;
+  }
+}
+
+/* ── 左侧：新建区域 ── */
+.startpage-left {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+/* ── Hero:大空白工程卡 ── */
+.startpage-hero {
+  position: relative;
+  min-height: 360px;
+  border-radius: 18px;
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+  background:
+    radial-gradient(120% 80% at 0% 0%, rgba(167, 139, 250, 0.25), transparent 60%),
+    radial-gradient(100% 80% at 100% 100%, rgba(124, 108, 240, 0.2), transparent 60%),
+    var(--bg-panel, #161b2e);
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+  padding: 28px;
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+}
+.startpage-hero::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(135deg, transparent 48%, rgba(167, 139, 250, 0.15) 50%, transparent 52%);
+  background-size: 220% 220%;
+  opacity: 0.25;
+  animation: hero-stripes 8s linear infinite;
+  pointer-events: none;
+  border-radius: inherit;
+}
+.startpage-hero::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 20px;
+  background: linear-gradient(
+    90deg,
+    rgba(167, 139, 250, 0.6) 0%,
+    rgba(196, 181, 253, 0.9) 25%,
+    rgba(255, 255, 255, 0.4) 50%,
+    rgba(196, 181, 253, 0.9) 75%,
+    rgba(167, 139, 250, 0.6) 100%
+  );
+  background-size: 200% 100%;
+  z-index: -1;
+  animation: border-flow 3s linear infinite;
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  padding: 2px;
+  pointer-events: none;
+}
+.startpage-hero {
+  border-color: transparent;
+}
+@keyframes hero-stripes {
+  from { background-position: 0% 0%; }
+  to { background-position: 200% 200%; }
+}
+.startpage-hero:hover {
+  transform: translateY(-3px);
+  border-color: var(--brand-grad-a, #a78bfa);
+  box-shadow: 0 16px 48px rgba(167, 139, 250, 0.25);
+}
+.startpage-hero:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.startpage-hero-inner { position: relative; z-index: 1; }
+.startpage-hero-emoji {
+  font-size: 52px;
+  line-height: 1;
+  margin-bottom: 18px;
+  color: var(--brand-grad-a, #a78bfa);
+  text-shadow: 0 0 24px rgba(167, 139, 250, 0.4);
+}
+.startpage-hero-title {
+  font-size: 26px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  letter-spacing: -0.01em;
+}
+.startpage-hero-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 22px;
+}
+.startpage-hero-arrow {
+  display: inline-block;
+  padding: 7px 18px;
+  border-radius: 8px;
+  background: var(--brand-grad-a, #a78bfa);
+  color: #fff;
+  font-weight: 600;
+  font-size: 13px;
+  transition: transform 0.15s ease;
+}
+.startpage-hero:hover .startpage-hero-arrow { transform: translateX(4px); }
+
+/* ── 右列 ── */
+.startpage-right {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 10px;
+  overflow-y: auto;
+  padding-right: 4px;
+  max-height: 92vh;
+}
+.startpage-title {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin-bottom: 2px;
+}
+.startpage-subtitle {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+/* ── autosave 恢复卡 ── */
+.startpage-autosave {
+  display: flex;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(251, 191, 36, 0.12), rgba(251, 113, 133, 0.08));
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  margin-bottom: 10px;
+  animation: autosave-pulse 2.2s ease-in-out infinite;
+}
+@keyframes autosave-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.2); }
+  50% { box-shadow: 0 0 0 4px rgba(251, 191, 36, 0.06); }
+}
+.startpage-autosave-icon {
+  font-size: 24px;
+  flex-shrink: 0;
+  align-self: center;
+}
+.startpage-autosave-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.startpage-autosave-title { font-weight: 600; font-size: 14px; color: #fbbf24; }
+.startpage-autosave-meta { font-size: 12px; color: var(--text-muted); }
+.startpage-autosave-actions { display: flex; gap: 8px; margin-top: 4px; }
+.startpage-autosave-recover {
+  padding: 5px 14px;
+  border-radius: 6px;
+  border: none;
+  background: var(--brand-grad-a, #a78bfa);
+  color: #fff;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.startpage-autosave-recover:disabled { opacity: 0.5; cursor: not-allowed; }
+.startpage-autosave-discard {
+  padding: 5px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+.startpage-autosave-discard:hover { color: #fb7185; border-color: rgba(251, 113, 133, 0.4); }
+.startpage-autosave-discard:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── 标题栏 splash 锁定态 ── */
+.titlebar.splash-locked nav,
+.titlebar.splash-locked .titlebar-btn,
+.titlebar.splash-locked .skin-picker { display: none !important; }
+.titlebar.splash-locked .titlebar-center { flex: 1; justify-content: center; }
+
+/* ── 历史记录「查看全部」──
+   从原来的虚线大方块(混在卡片流里、像是又一个工程)改成列表下方的文字链接:
+   自身不再是卡片,视觉层级明显低于工程卡,但 hover 有下划线+箭头位移提示可点。 */
+.startpage-recent-more {
+  align-self: flex-end;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  padding: 6px 4px;
+  background: none;
+  border: none;
+  color: #a78bfa;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  transition: color 0.15s ease;
+}
+.startpage-recent-more:hover { color: #ddd6fe; }
+.startpage-recent-more-label {
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s ease;
+}
+.startpage-recent-more:hover .startpage-recent-more-label {
+  border-bottom-color: currentColor;
+}
+.startpage-recent-more-num {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(139, 92, 246, 0.16);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+.startpage-recent-more-arrow {
+  font-size: 12px;
+  transition: transform 0.15s ease;
+}
+.startpage-recent-more:hover .startpage-recent-more-arrow { transform: translateX(3px); }
+.startpage-recent-more:focus-visible {
+  outline: 2px solid rgba(167, 139, 250, 0.7);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* ── 更多历史弹窗 ── */
+.startpage-modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  animation: fadeIn 0.18s ease;
+}
+.startpage-modal {
+  width: min(680px, 88vw);
+  max-height: min(70vh, 520px);
+  background: var(--bg-surface, #1a1d2e);
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  border-radius: 16px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(139, 92, 246, 0.1);
+  display: flex;
+  flex-direction: column;
+  animation: modalSlide 0.22s ease;
+  overflow: hidden;
+}
+.startpage-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  background: linear-gradient(180deg, rgba(139, 92, 246, 0.1), transparent);
+}
+.startpage-modal-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: 0.5px;
+}
+.startpage-modal-close {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.12s ease;
+}
+.startpage-modal-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+/* 虚拟滚动容器：滚动由 react-window 的 List 自己接管(rows 绝对定位),
+   所以这里只负责给出确定的高度和内边距,不能再用 flex+gap 排列子节点。 */
+.startpage-modal-list {
+  min-height: 0;
+  padding: 12px;
+}
+.startpage-vlist {
+  /* List 注入 overflow:auto;这里只收敛滚动条观感 */
+  scrollbar-width: thin;
+}
+/* 单个虚拟行：外层承接 List 给的 top/height,内层卡片撑满并留出行间距 */
+.startpage-vrow {
+  box-sizing: border-box;
+  padding-bottom: 8px;
+}
+.startpage-vrow .startpage-recent-item {
+  height: 100%;
+  padding: 10px 14px;
+}
+.startpage-modal-list .startpage-recent-item:hover {
+  /* 弹窗里的卡片不要 hover 上浮，避免在虚拟行里抖动 */
+  transform: none;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes modalSlide {
+  from { opacity: 0; transform: translateY(12px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}

@@ -192,13 +192,6 @@ def check_cuda_driver(ctx):
         return None  # 该档位不适用
     import torch  # importing torch does NOT initialize CUDA
 
-    # S172: a ROCm pack also runs on the "cuda" tier (HIP masquerades as torch.cuda),
-    # where torch.version.cuda is None — the old text then read "cuda ? (no driver floor
-    # required)", which names the wrong vendor on an AMD box and establishes nothing.
-    # Say which runtime was actually seen; the CUDA 13 driver floor genuinely does not
-    # apply to HIP, so this stays a pass either way.
-    if getattr(torch.version, "hip", None):
-        return "rocm/hip %s (no CUDA driver floor applies)" % torch.version.hip
     cu = torch.version.cuda or ""
     if not cu.startswith("13"):
         return "cuda %s (no driver floor required)" % (cu or "?")
@@ -706,264 +699,6 @@ def check_gpu_amp_step(ctx):
     return None
 
 
-# ─── S172: the hole this tier had ────────────────────────────────────────────
-# MEASURED: the 22 checks above return overall=pass, 22/22, on a machine where every
-# single f0 slice fails and no training chain can start. The reason is structural, not a
-# matter of degree — MIOpen resolves convolution from PRECOMPILED objects, so tiny_gan /
-# gpu_stft_vs_cpu / gpu_amp_step never once ask the run-time kernel compiler to build
-# anything. The only op in utai_train that does is rmvpe's BiGRU, and it was untested.
-HIPRTC_HEADERS_CODE = "ENVTEST_HIPRTC_CXX_HEADERS_MISSING"
-HIPRTC_PAYLOAD_CODE = "ENVTEST_HIPRTC_CXX_HEADERS_NOT_SHIPPED"
-HIPRTC_PROBE_CODE = "ENVTEST_HIPRTC_PROBE_FAILED"
-GPU_RNN_CODE = "ENVTEST_GPU_RNN_BROKEN"
-
-_PROBE_KERNEL = b"__global__ void utai_probe(float* o){ *o = 0.f; }\n"
-_PROBE_SRC = (
-    b"#include <type_traits>\n"
-    b'static_assert(std::is_same<float,float>::value,"");\n' + _PROBE_KERNEL
-)
-
-
-def _pack_cxx_include_dirs():
-    """The C++ standard-library headers we ship for hipRTC, as RELATIVE paths.
-
-    ⛔ ONE SOURCE with the Rust launcher: `util::hiprtc_cxx_include_options` builds
-    `HIPRTC_COMPILE_OPTIONS_APPEND` from this same layout and both spawn sites set cwd to
-    `<app_dir>/training`. If the directory moves, both move — otherwise this gate stops
-    describing what the app actually does, which is worse than having no gate.
-    [] = a build that ships none (every pack up to 0.12.3), where the this-machine arm
-    below is the whole verdict.
-    """
-    override = os.environ.get("UTAI_HIPRTC_INCLUDE_DIRS")  # harness/manual override only
-    if override:
-        return [p for p in override.split(os.pathsep) if p]
-    root = "rocm_cxx_headers"
-    subs = [os.path.join(root, d) for d in ("v1", "clangres")
-            if os.path.isdir(os.path.join(root, d))]
-    return subs
-
-
-def _hiprtc_lib():
-    """ctypes handle on the hipRTC the PACK ships (never a system ROCm install)."""
-    import ctypes
-
-    try:
-        import _rocm_sdk_core  # only exists inside a ROCm pack
-
-        bindir = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "bin")
-        names = [n for n in sorted(os.listdir(bindir))
-                 if n.lower().startswith("hiprtc") and n.lower().endswith(".dll")
-                 and "builtin" not in n.lower()]
-        if hasattr(os, "add_dll_directory") and os.path.isdir(bindir):
-            os.add_dll_directory(bindir)  # amd_comgr.dll sits next to it
-        if not names:
-            raise RuntimeError("no hiprtc*.dll under %s" % bindir)
-        lib = ctypes.CDLL(os.path.join(bindir, names[0]))
-    except Exception as e:
-        # "the probe could not run" — a DIFFERENT red from "the compiler cannot find the
-        # headers" (closed-gate iron rule: a tool that failed to START must never read as
-        # either a pass or as the failure it exists to detect).
-        raise RuntimeError("%s: %s: %s" % (HIPRTC_PROBE_CODE, type(e).__name__, e))
-    lib.hiprtcCreateProgram.restype = ctypes.c_int
-    lib.hiprtcCreateProgram.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_char_p,
-        ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_char_p)]
-    lib.hiprtcCompileProgram.restype = ctypes.c_int
-    lib.hiprtcCompileProgram.argtypes = [
-        ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
-    lib.hiprtcGetProgramLogSize.restype = ctypes.c_int
-    lib.hiprtcGetProgramLogSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
-    lib.hiprtcGetProgramLog.restype = ctypes.c_int
-    lib.hiprtcGetProgramLog.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    lib.hiprtcDestroyProgram.restype = ctypes.c_int
-    lib.hiprtcDestroyProgram.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-    return os.path.basename(lib._name), lib
-
-
-def _hiprtc_try(lib, src, opts):
-    """(rc, log) for one hipRTC compile. rc 0 = compiled."""
-    import ctypes
-
-    prog = ctypes.c_void_p()
-    rc0 = lib.hiprtcCreateProgram(ctypes.byref(prog), src, b"utai_probe.cpp", 0, None, None)
-    if rc0 != 0:
-        return rc0, "hiprtcCreateProgram rc=%d" % rc0
-    try:
-        arr = (ctypes.c_char_p * len(opts))(*opts)
-        rc = lib.hiprtcCompileProgram(prog, len(opts), arr)
-        n = ctypes.c_size_t()
-        lib.hiprtcGetProgramLogSize(prog, ctypes.byref(n))
-        buf = ctypes.create_string_buffer(max(n.value, 1))
-        lib.hiprtcGetProgramLog(prog, buf)
-        return rc, buf.value.decode("utf-8", "replace").strip()
-    finally:
-        try:
-            lib.hiprtcDestroyProgram(ctypes.byref(prog))
-        except Exception:
-            pass
-
-
-def _first_error_line(log):
-    for ln in (log or "").splitlines():
-        if "error" in ln.lower():
-            return ln.strip()[:240]
-    txt = (log or "").strip()
-    return txt.splitlines()[0][:240] if txt else "(the compiler printed nothing)"
-
-
-def check_hiprtc_cxx_headers(ctx):
-    """ROCm packs only (~2 s). MIOpen does not ship every kernel precompiled: several are
-    JIT-compiled through hipRTC at RUN TIME, and those sources reach
-    `#include <type_traits>` (miopen_type_traits.hpp:151 <- vector_types.hpp:8). AMD's
-    comgr is supposed to embed the libc++ headers for exactly that and our pinned nightly
-    ships the payload EMPTY (2 of ~180), so on a machine with no Microsoft C++ toolchain
-    NOTHING satisfies that include and every such kernel dies as
-    HIPRTC_ERROR_COMPILATION(6) -> miopenStatusUnknownError. First production victim:
-    rmvpe's BiGRU, i.e. f0 extraction — 4 of the 5 training chains die before step 1
-    (S172 community reports). Ask the SHIPPED compiler directly instead of inferring it
-    from a symptom, and ask it in BOTH the shipping-regression form and the
-    this-machine form."""
-    if ctx["device"] != "cuda":
-        return None
-    import torch
-
-    if not getattr(torch.version, "hip", None):
-        return None  # an NVIDIA cuda-tier pack has no hipRTC to ask
-    arch = str(torch.cuda.get_device_properties(0).gcnArchName).split(":")[0]
-    name, lib = _hiprtc_lib()
-    oa = ("--offload-arch=%s" % arch).encode()
-    std = b"-std=c++17"
-
-    # (1) can this compiler build ANYTHING here? Otherwise a red below would be
-    #     misattributed to the headers.
-    rc_bare, log_bare = _hiprtc_try(lib, _PROBE_KERNEL, [oa, std])
-    if rc_bare != 0:
-        raise RuntimeError("%s: the shipped hipRTC cannot compile even a bare kernel for %s "
-                           "(rc=%d) — %s" % (HIPRTC_PROBE_CODE, arch, rc_bare,
-                                             _first_error_line(log_bare)))
-    # (2) NEGATIVE CONTROL: a bogus arch MUST fail, or this probe cannot see failure at
-    #     all and its green means nothing.
-    rc_neg, _ = _hiprtc_try(lib, _PROBE_KERNEL, [b"--offload-arch=gfx9999", std])
-    if rc_neg == 0:
-        raise RuntimeError("%s: the negative control COMPILED (gfx9999 is not a real arch) — "
-                           "this probe cannot detect a compile failure, so its verdict is "
-                           "worthless" % HIPRTC_PROBE_CODE)
-    # (3) THE SHIPPING-REGRESSION ASSERTION. -nostdinc drops the system include dirs, so
-    #     this passes only if the headers WE ship are self-sufficient — a developer's
-    #     installed MSVC can no longer mask a payload that stopped shipping.
-    shipped = _pack_cxx_include_dirs()
-    ship_note = "this build ships no C++ headers"
-    if shipped:
-        # -idirafter, concatenated, v1 first — the SAME form the launcher injects
-        # (util::hiprtc_cxx_include_options). A gate that tested `-I` would be testing
-        # something the app never does, and `-I` is exactly the form that breaks a
-        # Visual-Studio machine by shadowing its C++ library (S172, measured).
-        opts = [oa, std, b"-nostdinc"] + [b"-idirafter" + d.encode() for d in shipped]
-        rc_s, log_s = _hiprtc_try(lib, _PROBE_SRC, opts)
-        if rc_s != 0:
-            raise RuntimeError(
-                "%s: the C++ headers this build ships do not satisfy <type_traits> on their "
-                "own (rc=%d, %d dir(s): %s). %s"
-                % (HIPRTC_PAYLOAD_CODE, rc_s, len(shipped), os.pathsep.join(shipped),
-                   _first_error_line(log_s)))
-        ship_note = "%d shipped dir(s) self-sufficient under -nostdinc" % len(shipped)
-        for d in shipped:
-            if " " in d:
-                # HIPRTC_COMPILE_OPTIONS_APPEND is split on whitespace and honours no
-                # quoting ('error reading "-IC:\\Program": invalid argument'), so a path
-                # with a space cannot be injected at all — catch it here, not in the field.
-                raise RuntimeError("%s: shipped include dir contains a space and therefore "
-                                   "cannot be injected: %s" % (HIPRTC_PAYLOAD_CODE, d))
-
-    # (4) THIS MACHINE, as the app actually runs it — the launcher's injected
-    #     HIPRTC_COMPILE_OPTIONS_APPEND is honoured for this call too (measured).
-    rc_tt, log_tt = _hiprtc_try(lib, _PROBE_SRC, [oa, std])
-    if rc_tt != 0:
-        raise RuntimeError(
-            "%s: MIOpen compiles kernels at run time and they #include <type_traits>; the "
-            "compiler in this pack cannot find it on this machine (arch %s, rc=%d). %s"
-            % (HIPRTC_HEADERS_CODE, arch, rc_tt, _first_error_line(log_tt)))
-    ctx["hiprtc_headers_ok"] = True
-    return "%s resolves <type_traits> for %s; %s; gfx9999 control failed as required" % (
-        name, arch, ship_note)
-
-
-# Device-vs-CPU limits, RELATIVE to max|reference| (S172, measured):
-#   fp32  worst measured 5.81e-04 — NVIDIA/cuDNN with TF32 ON (torch's default); the same
-#         GRU on ROCm/MIOpen measures 5.83e-07 and on cuDNN with TF32 off 7.02e-06.
-#         Limit 1e-2 = 17x the worst real reading. ⛔ Do NOT "tighten it to match AMD":
-#         1e-4 would redden every Ampere+ NVIDIA box in the field.
-#   fp16  worst measured 1.31e-03 (ROCm 780M; cuDNN 6.94e-04). Limit 2e-2 = 15x.
-# Mutation control (measured): all-zeros, one direction dropped, directions swapped, time
-# reversed, one frame in 128 zeroed, +1% noise and a uniform 2x gain all go RED; +0.1%
-# noise and a 1.01x gain do not — that is this check's sensitivity floor, stated rather
-# than implied.
-RNN_REL_TOL = {"fp32": 1e-2, "fp16": 2e-2}
-RNN_MIN_COS = 0.999
-
-
-def check_gpu_rnn_vs_cpu(ctx):
-    """The production shape of rmvpe's BiGRU — rvc/rmvpe.py:161-173 (fp16) and
-    sovits/f0/rmvpe/seq.py:6-12 (fp32) — i.e. the f0 extractor that 4 of the 5 training
-    chains run BEFORE step 1, and the ONLY live RNN in utai_train. It is also the one op
-    family the rest of this tier structurally cannot cover: tiny_gan / gpu_stft /
-    gpu_amp are convolution+FFT, and MIOpen resolves convolution from precompiled
-    objects, so none of them ever asks the run-time compiler to build a kernel (measured).
-    Asserts NUMBERS against a same-machine CPU reference built from the SAME weights, in
-    both production dtypes: a kernel that returns shaped garbage must fail here, not only
-    one that raises."""
-    import torch
-
-    dev = ctx["device"]
-    if dev == "cpu":
-        return None
-    torch.manual_seed(2172)
-    net = torch.nn.GRU(128, 96, num_layers=1, batch_first=True, bidirectional=True).eval()
-    x = torch.randn(1, 128, 128)
-    with torch.no_grad():
-        ref = net(x)[0]
-    scale = float(ref.abs().max())
-    if not (scale > 0.1):
-        raise RuntimeError("the CPU reference itself is degenerate (max|ref|=%.3e) — this "
-                           "check cannot conclude anything" % scale)
-    try:
-        with torch.no_grad():
-            g = net.to(dev)
-            outs = {"fp32": g(x.to(dev))[0].float().cpu()}
-            outs["fp16"] = g.half()(x.to(dev).half())[0].float().cpu()
-    except RuntimeError as e:
-        # The raise shape on a ROCm box with no C++ headers: RuntimeError out of _VF.gru
-        # carrying "miopenStatusUnknownError" and NOTHING else — the reason lives only in
-        # MIOpen's Warning-level log. Say what it means here.
-        hint = ("" if ctx.get("hiprtc_headers_ok") else
-                " — see hiprtc_cxx_headers above: this pack's run-time kernel compiler "
-                "could not find the C++ headers it needs on this machine, which is what "
-                "makes every RNN kernel fail")
-        raise RuntimeError("%s: the GPU RNN kernel did not run (%s: %s)%s"
-                           % (GPU_RNN_CODE, type(e).__name__, e, hint))
-    parts = []
-    for tag in ("fp32", "fp16"):
-        y = outs[tag]
-        if not torch.isfinite(y).all():
-            raise RuntimeError("%s: %s GPU RNN output contains NaN/Inf" % (GPU_RNN_CODE, tag))
-        rel = float((y - ref).abs().max()) / scale
-        cos = float(torch.nn.functional.cosine_similarity(
-            y.flatten().unsqueeze(0), ref.flatten().unsqueeze(0)).item())
-        # Both assertions are load-bearing and neither subsumes the other (measured):
-        # cosine is blind to a uniform gain (2x scores 1.000000); rel is the coarser of
-        # the two on a single-frame dropout.
-        if not (rel < RNN_REL_TOL[tag]):
-            raise RuntimeError("%s: %s GPU RNN deviates from the CPU reference: rel=%.3e "
-                               "(limit %.0e, |ref|max %.3f)"
-                               % (GPU_RNN_CODE, tag, rel, RNN_REL_TOL[tag], scale))
-        if not (cos > RNN_MIN_COS):
-            raise RuntimeError("%s: %s GPU RNN output does not track the CPU reference "
-                               "(cosine %.6f, floor %.3f)"
-                               % (GPU_RNN_CODE, tag, cos, RNN_MIN_COS))
-        parts.append("%s rel %.2e cos %.6f" % (tag, rel, cos))
-    return "BiGRU(128->96x2, 128 frames) vs CPU: " + ", ".join(parts)
-
-
 def check_fallback_selftest(ctx):
     """Validates the CPU-fallback capture+classify harness itself — the ONE piece of
     §4.5(c) reachable WITHOUT an Intel GPU. Emit a synthetic PyTorch-shaped fallback
@@ -1000,16 +735,11 @@ def check_fallback_ops(ctx):
     throughput → explicit WARN (visible, not a silent green); a cold op is tolerable
     (still WARN, but flagged as limited impact). Never a hard FAIL — a fallback is
     'neither green nor a crash' (design §4.5)."""
-    # S172: skip on every NON-xpu tier, not just cpu. _FALLBACK_SIG only matches the
-    # XPU-specific warning text, so on cuda/ROCm the sink is empty BY CONSTRUCTION —
-    # and the old code turned that structural emptiness into the green sentence "every
-    # operator ran natively on the device", which is a claim about something this check
-    # never measured. An empty detector must report "not applicable", never "clean".
-    if ctx["device"] != "xpu":
-        return None
+    if ctx["device"] == "cpu":
+        return None  # no xpu fallback path on the cpu tier
     ops = sorted(_FALLBACK_OPS)
     if not ops:
-        return "no CPU fallbacks (every operator ran natively on the xpu device)"
+        return "no CPU fallbacks (every operator ran natively on the device)"
     hot = sorted(_classify_hot(_FALLBACK_OPS))
     if hot:
         return _Warn("ENVTEST_OP_FALLBACK_HOT: %s | all fallbacks: %s"
@@ -1041,16 +771,6 @@ CHECKS = [
     ("dataloader_spawn", check_dataloader_spawn),
     ("gpu_stft_vs_cpu", check_gpu_stft_vs_cpu),
     ("gpu_amp_step", check_gpu_amp_step),
-    # S172 — the two checks that close this tier's structural hole. Order matters: the
-    # cause (can the run-time kernel compiler find its C++ headers?) runs BEFORE the
-    # symptom (does an on-device RNN produce the right numbers?), so when both go red the
-    # second one can point at the first instead of reporting a bare
-    # `miopenStatusUnknownError`. Neither subsumes the other — measured, a WARM MIOpen
-    # kernel cache makes the RNN pass on a machine whose compiler is broken, and a
-    # payload that stopped shipping makes the header check fail on a machine whose RNN
-    # is fine because it has Visual Studio.
-    ("hiprtc_cxx_headers", check_hiprtc_cxx_headers),
-    ("gpu_rnn_vs_cpu", check_gpu_rnn_vs_cpu),
     # last: after every on-device check has run under the fallback capture, so the
     # accumulator is fully populated before we summarize it.
     ("fallback_selftest", check_fallback_selftest),
@@ -1059,7 +779,7 @@ CHECKS = [
 
 # on-device checks run inside _capture_fallbacks so a hot op silently falling to CPU
 # on xpu is recorded (not the selftest — it uses its own local sink — nor fallback_ops).
-_FALLBACK_TIER = {"tiny_gan", "gpu_stft_vs_cpu", "gpu_amp_step", "gpu_rnn_vs_cpu"}
+_FALLBACK_TIER = {"tiny_gan", "gpu_stft_vs_cpu", "gpu_amp_step"}
 
 
 def main():

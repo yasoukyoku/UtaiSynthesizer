@@ -1,8 +1,9 @@
 {
-  "name": "utai",
+  "name": "muno",
   "private": true,
-  "version": "0.12.4",
+  "version": "0.12.2",
   "license": "AGPL-3.0-only",
+  "description": "Muno — AI Music Workstation",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -22,6 +23,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-i18next": "^15.4.0",
+    "react-window": "2.3.1",
     "zustand": "^5.0.0"
   },
   "devDependencies": {

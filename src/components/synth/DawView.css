@@ -9,7 +9,8 @@
 .daw-grid {
   flex: 1;
   display: grid;
-  grid-template-columns: auto 1fr;
+  /* 第二列是轨头↔画布之间的拖拽分隔条(6px) */
+  grid-template-columns: auto 6px 1fr;
   grid-template-rows: 24px 1fr 20px;
   overflow: hidden;
 }
@@ -19,10 +20,47 @@
   background: var(--bg-panel);
   border-right: 1px solid var(--border-subtle);
   border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.daw-corner {
+  display: flex;
+  gap: 4px;
+  padding: 0 4px;
+}
+
+.corner-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.corner-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+  transform: scale(1.08);
+}
+
+.corner-btn:active {
+  transform: scale(0.95);
 }
 
 .timeline-ruler {
-  grid-row: 1; grid-column: 2;
+  grid-row: 1; grid-column: 2 / span 2;
 }
 
 .daw-tracklist-wrap {
@@ -30,8 +68,20 @@
   overflow: hidden;
 }
 
-.daw-canvas-container {
+/* 竖向分隔条:悬停高亮 + col-resize 光标;拖拽中(P5 上 body cursor 已接管)整条提亮 */
+.daw-header-divider {
   grid-row: 2; grid-column: 2;
+  cursor: col-resize;
+  background: var(--border-subtle);
+  transition: background 0.12s ease;
+  touch-action: none; /* 拖拽期间禁用触摸滚动手势 */
+}
+.daw-header-divider:hover {
+  background: var(--accent-primary);
+}
+
+.daw-canvas-container {
+  grid-row: 2; grid-column: 3;
   position: relative;
   overflow: hidden;
 }
@@ -41,4 +91,9 @@
   background: var(--bg-panel);
   border-right: 1px solid var(--border-subtle);
   border-top: 1px solid var(--border-subtle);
+}
+
+/* 底部横向滚动条:显式占第 3 行的分隔条+画布两列(自动放置在新三列网格会错位) */
+.hscrollbar-track {
+  grid-row: 3; grid-column: 2 / span 2;
 }

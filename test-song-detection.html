@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>模型检测测试</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #0a0d12; color: #fff; }
+    h2 { color: #38bdf8; }
+    pre { background: #161d2b; padding: 10px; border-radius: 4px; overflow-x: auto; }
+    .error { color: #ff5555; }
+    .success { color: #50fa7b; }
+  </style>
+</head>
+<body>
+  <h1>🎵 歌曲模型检测诊断工具</h1>
+  <button onclick="runTest()">开始检测</button>
+  <div id="output"></div>
+
+  <script>
+    const { invoke } = window.__TAURI__.core;
+
+    async function runTest() {
+      const output = document.getElementById('output');
+      output.innerHTML = '<p>正在检测...</p>';
+
+      try {
+        // 1. 获取模型目录
+        const modelsDir = await invoke('get_song_models_dir');
+        output.innerHTML += `<h2>模型目录</h2><pre>${modelsDir}</pre>`;
+
+        // 2. 列出所有文件
+        const files = await invoke('list_song_models');
+        output.innerHTML += `<h2>检测到的文件 (共 ${files.length} 个)</h2>`;
+        output.innerHTML += '<pre>' + JSON.stringify(files, null, 2) + '</pre>';
+
+        // 3. 检查每个模型
+        const catalog = [
+          { id: "yue2-3b", files: [
+            "model.safetensors", "config.json", "generation_config.json", 
+            "vae/model.safetensors", "vae/config.json"
+          ]},
+          { id: "acestep-v1-3.5b", files: ["ace_step_v1_3.5b.safetensors"] },
+          { id: "acestep-v1.5", files: [
+            "unet/acestep_v1.5_xl_turbo_bf16.safetensors",
+            "vae/ace_1.5_vae.safetensors",
+            "text_encoders/qwen_0.6b_ace15.safetensors",
+            "text_encoders/qwen_1.7b_ace15.safetensors"
+          ]},
+          { id: "heartmula-3b", files: [
+            "HeartMuLa-oss-3B/model-00001-of-00004.safetensors",
+            "HeartCodec-oss/model-00001-of-00002.safetensors",
+            "tokenizer.json", "gen_config.json"
+          ]}
+        ];
+
+        const fileSet = new Set(files.map(f => f.filename.replace(/\\/g, '/')));
+        
+        output.innerHTML += '<h2>模型检测结果</h2>';
+        
+        for (const model of catalog) {
+          let html = `<h3>${model.id}</h3><ul>`;
+          let allFound = true;
+          
+          for (const file of model.files) {
+            const fullPath = `${model.id}/${file}`;
+            const found = fileSet.has(fullPath);
+            if (!found) allFound = false;
+            
+            html += `<li class="${found ? 'success' : 'error'}">`;
+            html += found ? '✅' : '❌';
+            html += ` ${fullPath}</li>`;
+          }
+          
+          html += '</ul>';
+          html += `<p><strong>状态: ${allFound ? '<span class="success">🟢 已安装</span>' : '<span class="error">🔴 未安装</span>'}</strong></p>`;
+          output.innerHTML += html;
+        }
+
+      } catch (err) {
+        output.innerHTML += `<p class="error">错误: ${err}</p>`;
+      }
+    }
+  </script>
+</body>
+</html>

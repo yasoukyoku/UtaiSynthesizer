@@ -1,4 +1,4 @@
-//! Voice-model ONNX smoke tests against the NEW converter contracts:
+﻿//! Voice-model ONNX smoke tests against the NEW converter contracts:
 //!   - ContentVec extractors: waveform [1,N] @16k raw → features [1,T,dim], T=(N-400)/320+1
 //!   - RMVPE e2e: log-mel [1,128,T] + threshold [1] → f0 [1,T] Hz@100fps, unvoiced == 0.0
 //!   - RVC voice: phone/phone_lengths/pitch/pitchf/sid/rnd → audio [1,1,T·(sr/100)]
@@ -11,7 +11,7 @@
 //! and no-NaN only.
 
 use std::path::PathBuf;
-use utai_lib::inference::engine::{InputTensor, OnnxEngine};
+use muno_lib::inference::engine::{InputTensor, OnnxEngine};
 
 fn app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
@@ -49,21 +49,21 @@ fn ort_root() -> PathBuf {
 fn init_ort() {
     // S74: without a subscriber every engine INFO/WARN (chosen EP, the Auto-CUDA fallback
     // warning UTAI_SIMULATE_CUDA_FAIL exists to exercise) goes nowhere — a "verification" run
-    // that can't show the path it claims to test proves nothing. `RUST_LOG=utai_lib=info` +
+    // that can't show the path it claims to test proves nothing. `RUST_LOG=muno_lib=info` +
     // `-- --nocapture` to see them.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("muno_lib=warn")),
         )
         .try_init();
-    utai_lib::suppress_windows_dll_error_dialogs();
+    muno_lib::suppress_windows_dll_error_dialogs();
     // PATH must carry runtime/cuda BEFORE ORT builds a CUDA session: the cudnn 9
     // shim resolves its sub-DLLs via PATH at graph-build time — without this the
     // first Conv dies with CUDNN_BACKEND_API_FAILED (bare-harness-only failure
     // that reads like an environment drift; the app does this in run()).
-    utai_lib::setup_cuda_dll_paths(&ort_root());
-    utai_lib::init_ort_runtime(&ort_root());
+    muno_lib::setup_cuda_dll_paths(&ort_root());
+    muno_lib::init_ort_runtime(&ort_root());
 }
 
 fn test_output(name: &str) -> PathBuf {
@@ -109,7 +109,7 @@ fn test_contentvec_onnx_length_contract() {
         // two lengths → T = (N-400)/320 + 1 (odd + even frame counts)
         for n in [16000usize, 8000] {
             let t = (n - 400) / 320 + 1;
-            let feats = utai_lib::inference::features::contentvec_extract(
+            let feats = muno_lib::inference::features::contentvec_extract(
                 &engine,
                 &session,
                 &sine_16k(n),
@@ -140,7 +140,7 @@ fn test_rmvpe_onnx_f0_contract() {
 
     // T = 1 + N/160, N deliberately NOT a multiple of 160 or 32-frame-aligned
     for n in [16000usize, 24135, 700] {
-        let f0 = utai_lib::inference::f0::rmvpe_detect(&engine, &session, &mel, &sine_16k(n), 0.03)
+        let f0 = muno_lib::inference::f0::rmvpe_detect(&engine, &session, &mel, &sine_16k(n), 0.03)
             .expect("rmvpe detect");
         let expect_t = 1 + n.max(513) / 160;
         assert_eq!(f0.len(), expect_t, "T for N={}", n);
@@ -297,7 +297,7 @@ fn test_sovits_onnx_inference() {
 /// tolerant serde ModelConfig with every field the pipelines consume intact.
 #[test]
 fn test_real_sidecars_parse_into_model_config() {
-    use utai_lib::models::ModelConfig;
+    use muno_lib::models::ModelConfig;
 
     // RVC v2 (lengv2.3.json)
     let p = test_output("lengv2.3.json");

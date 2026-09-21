@@ -1,0 +1,688 @@
+import { readFile } from "@tauri-apps/plugin-fs";
+import { FADER_MIN_DB } from "../constants";
+import { laneGroupId, laneReachesSeam, laneRowKey, laneVisiblePieces, msToTicks, segStretch, ticksToMs } from "./laneOps";
+import { ensureStretched } from "./stretchCache";
+import { evalCurveAt } from "../f0eval";
+import { LOUDNESS_DB_RANGE } from "../vocalGeometry";
+import { isLaneRowMuted, laneControlFor, segmentPlaysLanes } from "../trackLayout";
+import { useProjectStore } from "../../store/project";
+import { connectTrackOutput, getFxBusConfig } from "./effectsBus";
+let audioCtx = null;
+const loadedBuffers = new Map();
+let scheduledSources = [];
+let playGeneration = 0;
+let scheduleTimeOrigin = 0;
+export function getContext() {
+    if (!audioCtx || audioCtx.state === "closed") {
+        audioCtx = new AudioContext();
+    }
+    if (audioCtx.state === "suspended") {
+        audioCtx.resume();
+    }
+    return audioCtx;
+}
+// ── ② Vocal-editor light preview tones (§9.7) ────────────────────────────────────────────────────────
+// A single-oscillator PLACEHOLDER voice for the piano-roll editor: click a key / audition a note pitch so
+// pitch editing isn't blind. Reuses THE singleton AudioContext above (never opens a second one — the §9.7
+// constraint). NOT the SVC voice/timbre; the real render is Phase 6. Separate nodes from the transport's
+// scheduledSources, so previewing never disturbs playback.
+let previewTone = null;
+/** Warm-up handle for the vocal editor: create + resume THE shared AudioContext ahead of the first key
+ *  click, so the initial preview isn't delayed by an on-gesture resume (that's the audible first-click lag).
+ *  Same singleton as the transport (§9.7) — never a second context. */
+export function getPreviewContext() {
+    return getContext();
+}
+/** Play a short (or sustained, durationMs=0) preview tone at `hz`. Replaces any still-sounding preview. */
+export function playPreviewTone(hz, durationMs = 180) {
+    const ctx = getContext();
+    stopPreviewTone();
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.value = Math.max(20, Math.min(20000, hz));
+    const gain = ctx.createGain();
+    const now = ctx.currentTime;
+    const peak = 0.2;
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(peak, now + 0.0025); // 2.5ms attack — snappy onset, still click-free
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(now);
+    if (durationMs > 0) {
+        const end = now + durationMs / 1000;
+        gain.gain.setValueAtTime(peak, Math.max(now + 0.0025, end - 0.05));
+        gain.gain.linearRampToValueAtTime(0, end); // 50ms release
+        osc.stop(end + 0.02);
+        const self = { osc, gain };
+        osc.onended = () => { if (previewTone === self)
+            previewTone = null; };
+    }
+    previewTone = { osc, gain };
+}
+/** Live-retune the sustained preview tone (dragging a note's pitch), no re-trigger. */
+export function setPreviewToneHz(hz) {
+    if (previewTone)
+        previewTone.osc.frequency.setValueAtTime(Math.max(20, Math.min(20000, hz)), getContext().currentTime);
+}
+// Dev-only: on an HMR reload of THIS module, stop any sustained preview tone before the module var
+// (previewTone) is reset — else a durationMs=0 tone would orphan on the old context (verify: stuck tone).
+if (import.meta.hot)
+    import.meta.hot.dispose(() => stopPreviewTone());
+/** Stop the sustained preview tone with a short release, if any. */
+export function stopPreviewTone() {
+    if (!previewTone)
+        return;
+    const { osc, gain } = previewTone;
+    previewTone = null;
+    try {
+        const now = getContext().currentTime;
+        gain.gain.cancelScheduledValues(now);
+        gain.gain.setValueAtTime(gain.gain.value, now);
+        gain.gain.linearRampToValueAtTime(0, now + 0.03);
+        osc.stop(now + 0.05);
+    }
+    catch { /* already stopped */ }
+}
+/** In-flight decode dedup (S59 deposit-perf O1): the cache below stores only FINISHED AudioBuffers,
+ *  so the reconciler's warm-up and a reschedule racing ~140ms later both MISSed and decoded the same
+ *  ~85MB stem twice (0.5–2.5s each). Concurrent callers now share one decode promise. */
+const inFlightBuffers = new Map();
+export async function loadAudioBuffer(filePath) {
+    const hit = loadedBuffers.get(filePath);
+    if (hit)
+        return hit;
+    const inflight = inFlightBuffers.get(filePath);
+    if (inflight)
+        return inflight;
+    let p;
+    p = (async () => {
+        const ctx = getContext();
+        const bytes = await readFile(filePath);
+        const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+        // publish only while still the registered decode — a clearBufferCache() mid-flight must not
+        // let this orphaned result re-poison the cache with the old bytes (p is assigned before the
+        // first await resolves, so the comparison is always against the real promise)
+        if (inFlightBuffers.get(filePath) === p)
+            loadedBuffers.set(filePath, audioBuffer);
+        return audioBuffer;
+    })();
+    inFlightBuffers.set(filePath, p);
+    try {
+        return await p;
+    }
+    finally {
+        inFlightBuffers.delete(filePath);
+    }
+}
+/** S60-3: pre-warm every (stretch artifact, decoded buffer) the schedule might touch, in PARALLEL,
+ *  before the sequential scheduling loop. `ensureStretched` and `loadAudioBuffer` are both
+ *  promise-deduped, so the loop's own awaits then hit warm caches (≈instant) while the loop's
+ *  order-dependent invariants (generation checks / liveMix reads / crossfade neighbor pairing /
+ *  late compensation against one `now`) stay UNTOUCHED — this is strictly a cache warmer (the S59
+ *  落轨四刀 deliberately left the scheduling loop alone; the warmer honors that). It mirrors the
+ *  loop's source selection as a SUPERSET (a decoded-but-unscheduled buffer is harmless); failures
+ *  are swallowed here — the loop's own error handling reports them per source. */
+function prewarmScheduleSources(tracks, audioFiles, playheadTick, supersededBy) {
+    const jobs = [];
+    const warm = (path, r) => {
+        jobs.push((async () => {
+            const p = r !== 1 ? await ensureStretched(path, r) : path;
+            if (playGeneration !== supersededBy)
+                return;
+            if (!loadedBuffers.get(p))
+                await loadAudioBuffer(p);
+        })().catch(() => { }));
+    };
+    // 🎯 Solo 过滤: 任何轨 solo=true → 只听 solo 的轨
+    const soloActive = tracks.some((t) => t.solo);
+    const effectiveTracks = soloActive ? tracks.filter((t) => t.solo) : tracks;
+    for (const track of effectiveTracks) {
+        for (const seg of track.segments) {
+            // mirror the loop's own skip: a segment fully behind the playhead never schedules,
+            // so warming it would decode dead weight (audit S60 — a play from the outro must not
+            // pay for the whole song's stems)
+            if (seg.loading || seg.startTick + seg.durationTicks <= playheadTick)
+                continue;
+            const r = segStretch(seg);
+            if (segmentPlaysLanes(track, seg)) {
+                for (const out of seg.processedOutputs ?? []) {
+                    if (!out.loading && out.audioPath)
+                        warm(out.audioPath, r);
+                }
+            }
+            else if (seg.content.type === "audioClip") {
+                const meta = audioFiles[seg.content.sourcePath];
+                if (meta)
+                    warm(meta.playbackPath || seg.content.sourcePath, r);
+            }
+        }
+    }
+    return Promise.all(jobs);
+}
+// ⚠ MIXDOWN PARITY ANCHOR (S63 audio export): exportMixdown.ts re-builds this exact schedule on an
+// OfflineAudioContext (playhead=0, snapshot mix, no live machinery). The FORMULA helpers are shared
+// (dbToLinear / clampPan / loudnessEnvNode / applyFadeIn / applyFadeOut + the laneOps/trackLayout
+// predicates), but the LOOP STRUCTURE exists in both files — any change to scheduling semantics here
+// (source selection, piece math, gain chain, crossfade gating) MUST be mirrored in exportMixdown.ts,
+// or the export stops matching what the user hears.
+export async function playAllTracks(tracks, audioFiles, playheadTick, tempo, onAllEnded) {
+    // Parallel cache warm-up BEFORE stopPlayback(): during a mid-playback reschedule the OLD
+    // schedule keeps sounding while cold sources decode (warming after the stop would silence
+    // everything for the whole warm-up and snap the playhead back by that much — audit S60
+    // MAJOR). The initial play has nothing sounding, so ordering doesn't matter there.
+    // Competition: any newer playAllTracks (or a manual stop) bumps playGeneration — compare
+    // against the ENTRY snapshot (stopPlayback below bumps too, so the snapshot is only valid
+    // for the pre-stop window).
+    const genAtStart = playGeneration;
+    await prewarmScheduleSources(tracks, audioFiles, playheadTick, genAtStart);
+    if (playGeneration !== genAtStart)
+        return "superseded"; // a newer call raced past us
+    stopPlayback();
+    const gen = ++playGeneration;
+    const ctx = getContext();
+    const now = ctx.currentTime;
+    scheduleTimeOrigin = now;
+    const hasSolo = tracks.some((t) => t.solo);
+    let totalScheduled = 0;
+    let endedCount = 0;
+    // Scheduling is INCREMENTAL and can `await` (buffer decode) mid-loop, so a short/late source can END
+    // before the loop finishes counting. Defer onAllEnded until every source is scheduled — otherwise an
+    // early end fires `endedCount >= totalScheduled` against a partial count, flipping the UI to "stopped" +
+    // snapping the playhead to the end while the rest of the audio keeps playing (the split-point ghost).
+    let schedulingDone = false;
+    // Live-mix read for source creation: the loop can `await` a buffer decode; a fader drag during that
+    // window updates the ALREADY-scheduled sources (updateTrack*/updateLane*), but a source created AFTER
+    // the await would bake the stale snapshot value in. Mix values (volume/pan/mute/solo/lane controls)
+    // are therefore resolved from the LIVE store per source; the schedule STRUCTURE (segments/pieces/
+    // crossfades) stays on the snapshot — structural edits bump scheduleVersion and reschedule wholesale.
+    const liveMix = (snap) => {
+        const live = useProjectStore.getState().tracks;
+        const t = live.find((x) => x.id === snap.id) ?? snap;
+        const solo = live.length > 0 ? live.some((x) => x.solo) : hasSolo;
+        return { t, audible: !t.muted && (!solo || t.solo) };
+    };
+    // 🎯 Solo 过滤: 任何轨 solo=true → 只听 solo 的轨
+    const soloActive = tracks.some((t) => t.solo);
+    const effectiveTracks = soloActive ? tracks.filter((t) => t.solo) : tracks;
+    for (const track of effectiveTracks) {
+        const sorted = [...track.segments]
+            // ② vocal render: a notes segment with a ready baked lane plays too (segmentPlaysLanes admits it —
+            // the single source-selection predicate). audioClip is always admitted (it may play original audio).
+            .filter((s) => (s.content.type === "audioClip" || segmentPlaysLanes(track, s)) && !s.loading)
+            .sort((a, b) => a.startTick - b.startTick);
+        for (let si = 0; si < sorted.length; si++) {
+            const seg = sorted[si];
+            const segEnd = seg.startTick + seg.durationTicks;
+            if (segEnd <= playheadTick)
+                continue;
+            // THE source-selection predicate (shared with the main-row waveform + future mixdown): ready
+            // lanes play unless the track's playOriginal bypass is on. NOT gated on track.expanded —
+            // collapse is pure view state. (`.some(!loading)` inside: while a deposit is still decoding ALL
+            // lanes, fall through to the original audio instead of going silent.)
+            const hasLaneOutputs = segmentPlaysLanes(track, seg);
+            if (hasLaneOutputs) {
+                for (const out of seg.processedOutputs) {
+                    if (out.loading)
+                        continue; // a still-decoding deposit placeholder — nothing to play yet
+                    const rowKey = laneRowKey(out); // ROW identity — crossfade pairing + per-row mute
+                    const groupId = laneGroupId(out); // 组 identity — volume/pan ("recorded on the Output node")
+                    // S59 Tempo Slider: a stretched segment plays per-(stem, r) artifacts; the recipe/window
+                    // math below stays in source coordinates and only the BUFFER + its offsets change.
+                    const stretchR = segStretch(seg);
+                    let stemPath = out.audioPath;
+                    if (stretchR !== 1) {
+                        try {
+                            stemPath = await ensureStretched(out.audioPath, stretchR);
+                        }
+                        catch (e) {
+                            console.error(`[playback] stretch failed for lane ${out.audioPath} ×${stretchR}:`, e);
+                            if (gen !== playGeneration)
+                                return "superseded";
+                            continue;
+                        }
+                        if (gen !== playGeneration)
+                            return "superseded";
+                    }
+                    let buf = loadedBuffers.get(stemPath);
+                    if (!buf) {
+                        try {
+                            buf = await loadAudioBuffer(stemPath);
+                        }
+                        catch (e) {
+                            console.error(`Failed to load lane audio: ${stemPath}`, e);
+                            // The failed await was still an await — without this check a superseded loop would keep
+                            // scheduling stale sources into the NEW generation's scheduledSources.
+                            if (gen !== playGeneration)
+                                return "superseded";
+                            continue;
+                        }
+                        if (gen !== playGeneration)
+                            return "superseded"; // a NEWER playAllTracks superseded this one
+                    }
+                    if (!buf)
+                        continue;
+                    // Resolve mix values LIVE, after the possible await (see liveMix above).
+                    const { t: lt, audible } = liveMix(track);
+                    const laneCtrl = laneControlFor(lt, groupId, out.laneId);
+                    const laneMuted = isLaneRowMuted(lt, rowKey, out.laneId);
+                    const laneVol = laneMuted ? 0 : dbToLinear(laneCtrl?.volumeDb ?? 0);
+                    const trackVol = audible ? dbToLinear(lt.volumeDb) : 0;
+                    // Non-destructive sub-lane recipe (D2): the lane plays its KEPT pieces (stem-ms windows). An
+                    // UNEDITED lane yields exactly ONE whole-window piece → identical scheduling to the pre-P3 single
+                    // source. Sliced/trimmed/deleted regions simply produce no piece → silence; the stem is untouched.
+                    const group = laneGroupId(out);
+                    const stemDurMs = seg.content.type === "audioClip" ? seg.content.totalDurationMs : out.totalDurationMs;
+                    const pieces = laneVisiblePieces(seg, seg.laneOps?.[group], stemDurMs, tempo, out.offsetMs ?? 0);
+                    for (const piece of pieces) {
+                        if (piece.endTick <= playheadTick)
+                            continue;
+                        let startDelay;
+                        let audioOffset;
+                        let playDuration;
+                        // A piece reads from its stem-ms offset (== the source offset, since the stem spans the whole
+                        // trimmed source): seg.content.offsetMs for a whole/first piece, a later position for a sliced one.
+                        // Stretched playback reads the ARTIFACT, whose time axis is source×r.
+                        const pieceOffsetSec = (piece.startMs * stretchR) / 1000;
+                        if (playheadTick >= piece.startTick) {
+                            const secsInto = ticksToSeconds(playheadTick - piece.startTick, tempo);
+                            audioOffset = pieceOffsetSec + secsInto;
+                            startDelay = 0;
+                            playDuration = ticksToSeconds(piece.endTick - piece.startTick, tempo) - secsInto;
+                        }
+                        else {
+                            audioOffset = pieceOffsetSec;
+                            startDelay = ticksToSeconds(piece.startTick - playheadTick, tempo);
+                            playDuration = ticksToSeconds(piece.endTick - piece.startTick, tempo);
+                        }
+                        audioOffset = Math.max(0, Math.min(audioOffset, buf.duration));
+                        playDuration = Math.min(playDuration, buf.duration - audioOffset);
+                        if (playDuration <= 0)
+                            continue;
+                        // Sync-correct a LATE schedule: a buffer that loaded slowly (heavy track added mid-playback)
+                        // pushes `now + startDelay` into the PAST; without this it would start from the stale offset and
+                        // lag the on-time tracks (the desync "ghosting"). Advance the offset by the lateness so it plays
+                        // in sync instead.
+                        {
+                            const late = ctx.currentTime - (now + startDelay);
+                            if (late > 0) {
+                                audioOffset = Math.min(buf.duration, audioOffset + late);
+                                playDuration -= late;
+                                startDelay += late;
+                                if (playDuration <= 0)
+                                    continue;
+                            }
+                        }
+                        const laneGainNode = ctx.createGain();
+                        laneGainNode.gain.setValueAtTime(laneVol, now);
+                        const trackGainNode = ctx.createGain();
+                        trackGainNode.gain.setValueAtTime(trackVol, now);
+                        const panner = ctx.createStereoPanner();
+                        const lanePan = laneCtrl?.pan ?? 0;
+                        panner.pan.value = clampPan(lt.pan + lanePan);
+                        // Crossfade only the piece that TOUCHES a segment boundary against a neighbour clip carrying the
+                        // SAME lane ROW (a genuine same-row overlap) — interior slice edges are hard cuts (no fade), and a
+                        // trimmed-back edge that no longer reaches the boundary doesn't fade. Fades are isolated from
+                        // laneGain so live volume/mute changes don't fight the ramps (mirrors the original-audio branch).
+                        const fadeInNode = ctx.createGain();
+                        const fadeOutNode = ctx.createGain();
+                        const atSegEnd = Math.abs(piece.endTick - segEnd) < 1;
+                        const atSegStart = Math.abs(piece.startTick - seg.startTick) < 1;
+                        if (atSegEnd && si + 1 < sorted.length) {
+                            const next = sorted[si + 1];
+                            if (next.startTick < segEnd && laneReachesSeam(next, rowKey, tempo, "start")) {
+                                applyFadeOut(fadeOutNode, next.startTick, Math.min(segEnd, next.startTick + next.durationTicks), playheadTick, tempo, now);
+                            }
+                        }
+                        if (atSegStart && si > 0) {
+                            const prev = sorted[si - 1];
+                            const prevEnd = prev.startTick + prev.durationTicks;
+                            if (seg.startTick < prevEnd && laneReachesSeam(prev, rowKey, tempo, "end")) {
+                                applyFadeIn(fadeInNode, seg.startTick, Math.min(prevEnd, segEnd), playheadTick, tempo, now, startDelay);
+                            }
+                        }
+                        const source = ctx.createBufferSource();
+                        source.buffer = buf;
+                        const envNode = loudnessEnvNode(ctx, seg, playheadTick, tempo, now, startDelay, playDuration, seg.laneLoudness?.[group]);
+                        const laneTail = source.connect(fadeInNode).connect(fadeOutNode);
+                        (envNode ? laneTail.connect(envNode) : laneTail).connect(laneGainNode).connect(trackGainNode).connect(panner);
+                        // S12: dry → destination (unchanged) + per-track FX sends into the aux buses.
+                        connectTrackOutput(ctx, panner, { reverb: lt.reverbSend, delay: lt.delaySend }, getFxBusConfig(), track.id);
+                        source.onended = () => { if (gen !== playGeneration)
+                            return; endedCount++; if (schedulingDone && endedCount >= totalScheduled)
+                            onAllEnded(); };
+                        source.start(now + startDelay, audioOffset, playDuration);
+                        scheduledSources.push({
+                            trackId: track.id, groupId, rowKey, source,
+                            trackGain: trackGainNode, laneGain: laneGainNode, panner,
+                            trackPan: lt.pan, lanePan,
+                            fadeIn: fadeInNode, fadeOut: fadeOutNode,
+                            silenced: !audible, laneSilenced: laneMuted,
+                        });
+                        totalScheduled++;
+                    }
+                }
+                continue;
+            }
+            // Original audio scheduling (no lane outputs). A notes segment always took the lane branch above
+            // (a render deposits processedOutputs → segmentPlaysLanes → continue); it has no source audio, so
+            // this guard is type-safety + a defensive skip (never reached for a notes segment in practice).
+            if (seg.content.type !== "audioClip")
+                continue;
+            const filePath = seg.content.sourcePath;
+            const audioMeta = audioFiles[filePath];
+            if (!audioMeta)
+                continue;
+            // Use WAV cache for non-WAV files to avoid browser codec delay mismatch
+            let bufPath = audioMeta.playbackPath || filePath;
+            // S59 Tempo Slider: play the stretched artifact (source coordinates × r → artifact time)
+            const origStretchR = segStretch(seg);
+            if (origStretchR !== 1) {
+                try {
+                    bufPath = await ensureStretched(bufPath, origStretchR);
+                }
+                catch (e) {
+                    console.error(`[playback] stretch failed for ${bufPath} ×${origStretchR}:`, e);
+                    if (gen !== playGeneration)
+                        return "superseded";
+                    continue;
+                }
+                if (gen !== playGeneration)
+                    return "superseded";
+            }
+            let buf = loadedBuffers.get(bufPath);
+            if (!buf) {
+                try {
+                    buf = await loadAudioBuffer(bufPath);
+                }
+                catch (e) {
+                    console.error(`[playback] failed to load ${bufPath}:`, e);
+                    if (gen !== playGeneration)
+                        return "superseded"; // see the lane branch's catch
+                    continue;
+                }
+                if (gen !== playGeneration)
+                    return "superseded"; // a NEWER playAllTracks superseded this one
+            }
+            if (!buf)
+                continue;
+            // Resolve mix values LIVE, after the possible await (see liveMix above).
+            const { t: lt, audible } = liveMix(track);
+            const trackVol = audible ? dbToLinear(lt.volumeDb) : 0;
+            let audioOffset;
+            let startDelay;
+            let playDuration;
+            // offsetMs is a SOURCE coordinate — in the stretched artifact it sits at offsetMs × r.
+            // secsInto/playDuration are timeline (= artifact) time and need no factor.
+            if (playheadTick >= seg.startTick) {
+                const ticksInto = playheadTick - seg.startTick;
+                const secsInto = ticksToSeconds(ticksInto, tempo);
+                audioOffset = (seg.content.offsetMs * origStretchR) / 1000 + secsInto;
+                startDelay = 0;
+                playDuration = ticksToSeconds(seg.durationTicks, tempo) - secsInto;
+            }
+            else {
+                audioOffset = (seg.content.offsetMs * origStretchR) / 1000;
+                startDelay = ticksToSeconds(seg.startTick - playheadTick, tempo);
+                playDuration = ticksToSeconds(seg.durationTicks, tempo);
+            }
+            audioOffset = Math.max(0, Math.min(audioOffset, buf.duration));
+            playDuration = Math.min(playDuration, buf.duration - audioOffset);
+            if (playDuration <= 0)
+                continue;
+            // Sync-correct a LATE schedule (see the lane branch): advance the offset by how late we are so a
+            // buffer that loaded slowly mid-reschedule plays in sync with the on-time tracks, not lagging.
+            {
+                const late = ctx.currentTime - (now + startDelay);
+                if (late > 0) {
+                    audioOffset = Math.min(buf.duration, audioOffset + late);
+                    playDuration -= late;
+                    startDelay += late;
+                    if (playDuration <= 0)
+                        continue;
+                }
+            }
+            const trackGainNode = ctx.createGain();
+            trackGainNode.gain.setValueAtTime(trackVol, now);
+            const panner = ctx.createStereoPanner();
+            panner.pan.value = lt.pan;
+            // Separate fade nodes: crossfade automation isolated from track volume. The fade-in/out envelopes are
+            // shared with the sub-lane branch via applyFadeIn/applyFadeOut (one source of truth — see bottom).
+            const fadeInNode = ctx.createGain();
+            const fadeOutNode = ctx.createGain();
+            // Crossfade fade-out: overlap with the next segment
+            if (si + 1 < sorted.length) {
+                const next = sorted[si + 1];
+                if (next.startTick < segEnd) {
+                    applyFadeOut(fadeOutNode, next.startTick, Math.min(segEnd, next.startTick + next.durationTicks), playheadTick, tempo, now);
+                }
+            }
+            // Crossfade fade-in: overlap with the previous segment
+            if (si > 0) {
+                const prev = sorted[si - 1];
+                const prevEnd = prev.startTick + prev.durationTicks;
+                if (seg.startTick < prevEnd) {
+                    applyFadeIn(fadeInNode, seg.startTick, Math.min(prevEnd, segEnd), playheadTick, tempo, now, startDelay);
+                }
+            }
+            const source = ctx.createBufferSource();
+            source.buffer = buf;
+            const envNode = loudnessEnvNode(ctx, seg, playheadTick, tempo, now, startDelay, playDuration);
+            const origTail = source.connect(fadeInNode).connect(fadeOutNode);
+            (envNode ? origTail.connect(envNode) : origTail).connect(trackGainNode).connect(panner);
+            // S12: dry → destination (unchanged) + per-track FX sends into the aux buses.
+            connectTrackOutput(ctx, panner, { reverb: lt.reverbSend, delay: lt.delaySend }, getFxBusConfig(), track.id);
+            source.onended = () => {
+                // Ignore end events from a superseded generation — stopPlayback() (called when a new
+                // playback/seek starts) fires onended on the old sources, which would otherwise trip the
+                // previous onAllEnded and flip isPlaying off (freezing the playhead during a seek).
+                if (gen !== playGeneration)
+                    return;
+                endedCount++;
+                if (schedulingDone && endedCount >= totalScheduled)
+                    onAllEnded();
+            };
+            source.start(now + startDelay, audioOffset, playDuration);
+            scheduledSources.push({
+                trackId: track.id, source, trackGain: trackGainNode,
+                fadeIn: fadeInNode, fadeOut: fadeOutNode, panner,
+                trackPan: lt.pan, lanePan: 0,
+                silenced: !audible, laneSilenced: false,
+            });
+            totalScheduled++;
+        }
+    }
+    // Count is final now — honor any end that already happened during the loop (so a genuinely finished
+    // playback still ends), without ever having fired against a partial count mid-scheduling. A stale
+    // loop must not report at all (its onAllEnded would stop the WINNING generation's UI).
+    schedulingDone = true;
+    if (gen !== playGeneration)
+        return "superseded";
+    if (totalScheduled > 0 && endedCount >= totalScheduled) {
+        // Everything finished DURING the scheduling awaits (a sliver right at the content end while a
+        // later buffer decoded slowly). onAllEnded has already stopped + snapped the playhead — report
+        // "empty" so handleTogglePlay doesn't flip isPlaying back on for a playback with zero live
+        // sources (runaway playhead past the end).
+        onAllEnded();
+        return "empty";
+    }
+    return totalScheduled > 0 ? "started" : "empty";
+}
+export function stopPlayback() {
+    // Invalidate the current generation so the stopped sources' onended callbacks are gen-guarded out.
+    // Otherwise a MANUAL stop (pause) would fire onAllEnded (which now snaps the playhead to the end),
+    // making pause jump back to the end. onAllEnded must fire only on a NATURAL end (no stopPlayback).
+    playGeneration++;
+    for (const s of scheduledSources) {
+        try {
+            s.source.stop();
+        }
+        catch { /* already stopped */ }
+    }
+    scheduledSources = [];
+}
+export function updateTrackVolume(trackId, volumeDb) {
+    const vol = dbToLinear(volumeDb);
+    for (const s of scheduledSources) {
+        if (s.trackId === trackId && !s.silenced) {
+            s.trackGain.gain.setValueAtTime(vol, s.trackGain.context.currentTime);
+        }
+    }
+}
+export function updateTrackPan(trackId, pan) {
+    for (const s of scheduledSources) {
+        if (s.trackId === trackId) {
+            s.trackPan = pan;
+            s.panner.pan.setValueAtTime(clampPan(s.trackPan + s.lanePan), s.panner.context.currentTime);
+        }
+    }
+}
+export function updateTrackAudibility(tracks) {
+    const hasSolo = tracks.some((t) => t.solo);
+    for (const s of scheduledSources) {
+        const track = tracks.find((t) => t.id === s.trackId);
+        if (!track)
+            continue;
+        const audible = !track.muted && (!hasSolo || track.solo);
+        s.silenced = !audible;
+        s.trackGain.gain.setValueAtTime(audible ? dbToLinear(track.volumeDb) : 0, s.trackGain.context.currentTime);
+    }
+}
+export function updateLaneVolume(trackId, groupId, volumeDb) {
+    const vol = dbToLinear(volumeDb);
+    for (const s of scheduledSources) {
+        if (s.trackId === trackId && s.groupId === groupId && s.laneGain && !s.laneSilenced) {
+            s.laneGain.gain.setValueAtTime(vol, s.laneGain.context.currentTime);
+        }
+    }
+}
+export function updateLanePan(trackId, groupId, pan) {
+    for (const s of scheduledSources) {
+        if (s.trackId === trackId && s.groupId === groupId) {
+            s.lanePan = pan;
+            s.panner.pan.setValueAtTime(clampPan(s.trackPan + s.lanePan), s.panner.context.currentTime);
+        }
+    }
+}
+export function updateLaneMute(trackId, rowKey, muted, volumeDb) {
+    for (const s of scheduledSources) {
+        if (s.trackId === trackId && s.rowKey === rowKey && s.laneGain) {
+            s.laneSilenced = muted;
+            s.laneGain.gain.setValueAtTime(muted ? 0 : dbToLinear(volumeDb), s.laneGain.context.currentTime);
+        }
+    }
+}
+export function clearBufferCache(filePath) {
+    if (filePath) {
+        loadedBuffers.delete(filePath);
+        // also drop the in-flight decode: a post-clear load must not join a stale decode of the old
+        // bytes (and the orphaned promise's publish is generation-guarded in loadAudioBuffer)
+        inFlightBuffers.delete(filePath);
+    }
+    else {
+        loadedBuffers.clear();
+        inFlightBuffers.clear();
+    }
+}
+export function getContextTime() {
+    return audioCtx?.currentTime ?? 0;
+}
+export function getScheduleTimeOrigin() {
+    return scheduleTimeOrigin;
+}
+// Second-based wrappers around THE tick<->ms conversions in laneOps.ts (the single formula source).
+export function ticksToSeconds(ticks, tempo) {
+    return ticksToMs(ticks, tempo) / 1000;
+}
+export function secondsToTicks(secs, tempo) {
+    return msToTicks(secs * 1000, tempo);
+}
+export function durationMsToTicks(ms, tempo) {
+    return msToTicks(ms, tempo);
+}
+export function dbToLinear(db) {
+    // The fader floor means −∞/MUTE (DAW convention: bounded up, unbounded down) — see FADER_MIN_DB.
+    if (db <= FADER_MIN_DB)
+        return 0;
+    return Math.pow(10, db / 20);
+}
+/** StereoPannerNode.pan is [-1, 1] — the composed track+lane pan must stay in range. */
+export function clampPan(p) {
+    return Math.max(-1, Math.min(1, p));
+}
+/** S59 audio-track loudness lane (playback-domain clip gain): a dedicated per-source GainNode
+ *  driven by setValueCurveAtTime, sampled from the clip's "loudness" curve (dB on box-relative
+ *  ticks → 10^(dB/20)). Returns null when the segment has no curve — the common path gains zero
+ *  extra nodes and stays byte-identical in behaviour. NEVER applied to notes segments (their
+ *  loudness lane is render-domain), and never written onto trackGain/laneGain (the live fader
+ *  setValueAtTime updates would fight the curve). The sampling origin is derived INSIDE from
+ *  playhead + the FINAL startDelay (call AFTER the late-compensation block): the source starts
+ *  sounding at timeline tick playhead + ticks(startDelay) in every case — immediate, delayed
+ *  piece, and late-corrected schedules alike (audit: a pre-late fromTick desynced the curve by
+ *  the lateness while audioOffset WAS advanced). */
+export function loudnessEnvNode(ctx, seg, playheadTick, tempo, now, startDelay, playDuration, laneCurve) {
+    // S59b: a lane source can carry TWO envelopes — the clip-wide curve (the bottom band) and its
+    // group's own curve (drawn on the lane row). They ADD in dB (the vocal-track "标量+泳道加性"
+    // philosophy), so riding a stem down doesn't fight a clip-wide fade.
+    const clipCurve = seg.content.type === "audioClip" ? seg.content.paramCurves?.["loudness"] : undefined;
+    const curves = [];
+    if (clipCurve && clipCurve.xs.length > 0)
+        curves.push(clipCurve);
+    if (laneCurve && laneCurve.xs.length > 0)
+        curves.push(laneCurve);
+    if (curves.length === 0 || playDuration <= 0.001)
+        return null;
+    const node = ctx.createGain();
+    const fromTick = playheadTick + msToTicks(startDelay * 1000, tempo);
+    // ~20 Hz envelope resolution, capped — ample for mix automation, cheap to build
+    const n = Math.max(2, Math.min(2048, Math.ceil(playDuration / 0.05)));
+    const vals = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const sec = (i / (n - 1)) * playDuration;
+        const tick = fromTick + msToTicks(sec * 1000, tempo);
+        // belt-and-suspenders clamp PER CURVE: no write path may hand the AudioParam an absurd gain
+        let db = 0;
+        for (const cv of curves) {
+            db += Math.max(-LOUDNESS_DB_RANGE, Math.min(LOUDNESS_DB_RANGE, evalCurveAt(cv, tick - seg.startTick)));
+        }
+        vals[i] = Math.pow(10, db / 20);
+    }
+    node.gain.setValueCurveAtTime(vals, now + startDelay, playDuration);
+    return node;
+}
+/** Linear crossfade FADE-OUT envelope on `node` for a source overlapping a LATER neighbour over
+ *  [fadeStartTick, fadeEndTick]. Handles the playhead landing past / inside / before the overlap. Shared by
+ *  the original-audio AND sub-lane branches so they crossfade identically (one source of truth). */
+export function applyFadeOut(node, fadeStartTick, fadeEndTick, playheadTick, tempo, now) {
+    const fadeLenTicks = fadeEndTick - fadeStartTick;
+    if (fadeLenTicks <= 0)
+        return;
+    if (playheadTick >= fadeEndTick) {
+        node.gain.setValueAtTime(0, now);
+    }
+    else if (playheadTick > fadeStartTick) {
+        const progress = (playheadTick - fadeStartTick) / fadeLenTicks;
+        node.gain.setValueAtTime(1 - progress, now);
+        node.gain.linearRampToValueAtTime(0, now + ticksToSeconds(fadeEndTick - playheadTick, tempo));
+    }
+    else {
+        node.gain.setValueAtTime(1, now + ticksToSeconds(fadeStartTick - playheadTick, tempo));
+        node.gain.linearRampToValueAtTime(0, now + ticksToSeconds(fadeEndTick - playheadTick, tempo));
+    }
+}
+/** Linear crossfade FADE-IN envelope on `node` for a source overlapping an EARLIER neighbour over
+ *  [segStartTick, fadeEndTick]. `startDelay` is the source's scheduled start offset (a not-yet-started
+ *  source ramps from its real start). Shared by the original-audio AND sub-lane branches. */
+export function applyFadeIn(node, segStartTick, fadeEndTick, playheadTick, tempo, now, startDelay) {
+    const fadeLenTicks = fadeEndTick - segStartTick;
+    if (fadeLenTicks <= 0 || playheadTick >= fadeEndTick)
+        return;
+    if (playheadTick > segStartTick) {
+        const progress = (playheadTick - segStartTick) / fadeLenTicks;
+        node.gain.setValueAtTime(progress, now);
+        node.gain.linearRampToValueAtTime(1, now + ticksToSeconds(fadeEndTick - playheadTick, tempo));
+    }
+    else {
+        node.gain.setValueAtTime(0, now + startDelay);
+        node.gain.linearRampToValueAtTime(1, now + ticksToSeconds(fadeEndTick - playheadTick, tempo));
+    }
+}

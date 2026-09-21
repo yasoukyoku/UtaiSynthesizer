@@ -1,4 +1,4 @@
-//! S60-1 GAME port-parity gate: the Rust 5-graph pipeline vs the python-ORT oracle
+﻿//! S60-1 GAME port-parity gate: the Rust 5-graph pipeline vs the python-ORT oracle
 //! AND the UST ground truth.
 //!
 //! ★ Per-note BITWISE parity is NOT a valid target here — the OFFICIAL pipeline is
@@ -26,8 +26,8 @@
 
 use std::path::PathBuf;
 
-use utai_lib::inference::engine::OnnxEngine;
-use utai_lib::inference::midi_extract;
+use muno_lib::inference::engine::OnnxEngine;
+use muno_lib::inference::midi_extract;
 
 fn app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
@@ -37,11 +37,11 @@ fn init_ort() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("muno_lib=info")),
         )
         .try_init();
-    utai_lib::suppress_windows_dll_error_dialogs();
-    utai_lib::init_ort_runtime(&app_root());
+    muno_lib::suppress_windows_dll_error_dialogs();
+    muno_lib::init_ort_runtime(&app_root());
 }
 
 fn oracle_dir() -> PathBuf {
@@ -81,7 +81,7 @@ fn game_parity_vs_oracle() {
 
     let oracle: OracleFile =
         serde_json::from_str(&std::fs::read_to_string(&oracle_path).unwrap()).unwrap();
-    let buf = utai_lib::audio::load_audio(&wav_path).unwrap();
+    let buf = muno_lib::audio::load_audio(&wav_path).unwrap();
     assert_eq!(buf.channels, 1, "prep input must be mono");
     let sr = buf.sample_rate;
     assert_eq!(sr, 44100);

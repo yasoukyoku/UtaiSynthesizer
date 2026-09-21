@@ -46,7 +46,7 @@ fn err(msg: impl Into<String>) -> UtaiError {
 
 /// THE user-agent for every outbound HTTP client (S64 audit: the "UTAI/2.0" literal had already
 /// drifted into two files and both had to be hand-edited during the rebrand).
-pub const APP_USER_AGENT: &str = concat!("UtaiSynthesizer/", env!("CARGO_PKG_VERSION"));
+pub const APP_USER_AGENT: &str = concat!("Muno/", env!("CARGO_PKG_VERSION"));
 
 /// THE GH-proxy prefix sanitizer (S64 audit: update.rs and midi_extract.rs each had their own,
 /// already divergent). Trims, strips trailing slashes, and requires **https** — the updater's

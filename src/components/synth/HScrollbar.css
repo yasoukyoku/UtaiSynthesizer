@@ -14,6 +14,7 @@
   bottom: 2px;
   background: var(--border-strong);
   border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
   cursor: grab;
   transition: background 0.1s;
 }
@@ -27,4 +28,35 @@
 .hscrollbar-thumb:active {
   background: var(--accent-primary);
   cursor: grabbing;
+}
+
+/* 拇指两端缩放拖拽手柄 */
+.hscroll-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: ew-resize;
+  z-index: 1;
+}
+
+.hscroll-handle::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 2px;
+  height: 9px;
+  background: var(--text-primary);
+  border-radius: 1px;
+  left: 50%;
+  margin-left: -1px;
+}
+
+.hscroll-handle-l {
+  left: 0;
+}
+
+.hscroll-handle-r {
+  right: 0;
 }

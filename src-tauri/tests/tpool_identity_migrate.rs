@@ -1,4 +1,4 @@
-//! Drive the §F2⒝ ④d layout 3→4 identity migration against REAL python-built pools.
+﻿//! Drive the §F2⒝ ④d layout 3→4 identity migration against REAL python-built pools.
 //!
 //! ## Why an `#[ignore]`d integration test
 //!
@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use utai_lib::training::{tpool, tproject};
+use muno_lib::training::{tpool, tproject};
 
 #[test]
 #[ignore]
@@ -44,7 +44,7 @@ fn identity_migrate_data_root() {
     // ⑵ **拒绝的理由此前根本不进转录**:`IdentityOutcome::Refused(why)` 只经 `tracing::warn!` 出场,
     //    而这个测试从来没装过 subscriber ⇒ 那些行去了虚空,python 侧只剩 `layout` 一个数字,
     //    而 layout<4 同时对应【被 refuse】【被 other_instance 跳过】【前面几折失败】三种因。
-    let blocked = utai_lib::crashlog::other_instance_alive();
+    let blocked = muno_lib::crashlog::other_instance_alive();
     println!("IDENTITY_ENV {{\"other_instance_alive\":{blocked}}}");
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -54,7 +54,7 @@ fn identity_migrate_data_root() {
     // The WHOLE chain, not just the last step: a slot arrives here at layout 0 (python built its
     // pools without any marker), and the identity step must refuse anything the earlier folds have
     // not committed. Driving only the last step would prove the one thing that cannot happen.
-    utai_lib::training::migrate_layouts(data);
+    muno_lib::training::migrate_layouts(data);
 
     let training = tproject::training_root(data);
     let Ok(rd) = std::fs::read_dir(&training) else {
@@ -76,11 +76,11 @@ fn identity_migrate_data_root() {
                 .into_iter()
                 .map(|p| format!("{{\"id\":{:?},\"fp\":{:?}}}", p.id, p.fp_text))
                 .collect();
-            let runs: Vec<String> = utai_lib::training::trun::run_dirs(&slot)
+            let runs: Vec<String> = muno_lib::training::trun::run_dirs(&slot)
                 .expect("the fixture's runs/ must be listable")
                 .iter()
                 .map(|r| {
-                    let pool = utai_lib::training::trun::pool_of_run(r)
+                    let pool = muno_lib::training::trun::pool_of_run(r)
                         .map(|s| format!("{s:?}"))
                         .unwrap_or_else(|| "null".to_string());
                     format!(

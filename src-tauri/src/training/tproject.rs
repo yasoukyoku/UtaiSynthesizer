@@ -169,16 +169,7 @@ pub const FAMILIES: [&str; 4] = ["rvc", "sovits", "sovits_v2", "vocoder"];
 /// (pinned by `new_project_id_is_stable_charset_safe_and_dodges_reserved_names`). The only
 /// way a REAL project could carry one of these names is a hand-rename, and refusing that is
 /// the safe direction.
-/// ⛔ Bundled code/asset directories that live under `<training>/` and are NEVER user data.
-/// S168 bought this the hard way: `has_family_slot` stamps any directory holding rvc/sovits/…
-/// children, `utai_train` matches by construction, and the run fold then moved our own
-/// `sovits/diffusion` source package into a `runs/` slot — deleting the "project" deleted the
-/// trainer. Anything we ship into this directory has to be listed here.
-/// `rocm_cxx_headers` (S172): the C++ standard headers the AMD runtime's kernel compiler needs
-/// — comgr is supposed to embed them and ships with 2 of ~180, so without these on disk every
-/// MIOpen kernel build fails on a machine that has no MSVC headers.
-pub const RESERVED_TRAINING_DIRS: [&str; 4] =
-    ["utai_train", "assets", "packs", "rocm_cxx_headers"];
+pub const RESERVED_TRAINING_DIRS: [&str; 3] = ["utai_train", "assets", "packs"];
 
 /// Case-insensitive on purpose: NTFS is, so `Utai_Train` addresses the same directory.
 pub fn is_reserved_training_dir(name: &str) -> bool {
@@ -2029,17 +2020,6 @@ pub fn unfold_reserved_dirs(data_dir: &Path) {
                     || dir.join("audition_10s.wav").is_file()
             }
             "packs" => dir.join("build_pack.py").is_file() || dir.join("locks").is_dir(),
-            // S172: added to RESERVED_TRAINING_DIRS in the same change that started shipping it,
-            // but missed HERE — so it fell to `_ => false` and every boot warned that the app's
-            // own resource "carries a reserved name but not the bundled content". That fires for
-            // exactly the users whose data dir IS the install root, i.e. the S168 population, and
-            // a warning that is always wrong is worse than none: it trains people to ignore the
-            // one that is right.
-            "rocm_cxx_headers" => {
-                dir.join("v1").is_dir()
-                    || dir.join("clangres").is_dir()
-                    || dir.join("LICENSE.TXT").is_file()
-            }
             _ => false,
         };
         if !looks_bundled {
@@ -2579,19 +2559,7 @@ mod tests {
     /// (NTFS is case-insensitive), while every minted-shape id passes.
     #[test]
     fn reserved_training_dir_names_are_refused_in_any_case() {
-        for name in [
-            "utai_train",
-            "Utai_Train",
-            "UTAI_TRAIN",
-            "assets",
-            "Assets",
-            "packs",
-            // S172: shipped into <training>/ as a Tauri resource, so it has to be reserved
-            // for the same reason utai_train is — deleting it as a "project" would break
-            // every MIOpen kernel build on an AMD machine without MSVC headers.
-            "rocm_cxx_headers",
-            "ROCm_CXX_Headers",
-        ] {
+        for name in ["utai_train", "Utai_Train", "UTAI_TRAIN", "assets", "Assets", "packs"] {
             assert!(is_reserved_training_dir(name), "{name}");
         }
         for name in ["utai_train_1a2b3c4d", "assets_00000000", "mon3tr_eacea4e4", "song"] {

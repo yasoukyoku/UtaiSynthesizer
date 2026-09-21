@@ -1,4 +1,4 @@
-//! §F2⒝ 批 2 ④d(R3)—— **五条训练链的池身份公式**,头一次有东西看着。
+﻿//! §F2⒝ 批 2 ④d(R3)—— **五条训练链的池身份公式**,头一次有东西看着。
 //!
 //! ## 它守的是什么
 //!
@@ -33,8 +33,8 @@
 
 use std::collections::BTreeSet;
 
-use utai_lib::training::resume_lock::{resume_locked_fields, LockTier};
-use utai_lib::training::tpool;
+use muno_lib::training::resume_lock::{resume_locked_fields, LockTier};
+use muno_lib::training::tpool;
 
 const SOVITS_PY: &str = include_str!("../../training/utai_train/sovits/pipeline.py");
 const DIFF_PY: &str = include_str!("../../training/utai_train/sovits/diff_pipeline.py");
@@ -432,7 +432,7 @@ fn the_two_languages_build_the_same_identity_suffix() {
 /// ⇒ 右值必须是 `try_start` 里那个具名绑定;绑定本身的右值由 `mod.rs` 的源序棘轮钉。
 #[test]
 fn the_two_languages_agree_on_the_fresh_run_carrier() {
-    use utai_lib::training::trun;
+    use muno_lib::training::trun;
     // ⑴ 键名逐字相同。⛔ 与 ④d 的版本号键同一种失效:python 对 ABSENT 回落 False(旧 run.json
     //    描述的确实是旧世界的 start),所以**改名不会报错**,只会让这道闸永远不生效。
     assert!(

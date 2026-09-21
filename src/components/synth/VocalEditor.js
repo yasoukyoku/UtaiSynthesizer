@@ -1,0 +1,2625 @@
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+// ② Vocal (piano-roll) editor — S48 Phase 4 (§9). Docked at the bottom (mirrors WorkflowEditor), the
+// canvas is OFF-React (store.subscribe + rAF; drag paints from off-store refs and commits ONCE on mouseup
+// via applyNoteEdits — §9.4), geometry is the single lib/vocalGeometry module (absolute tick space), and
+// undo is Route-A timeline-native (vocal fields are already in meaningfulSig; the editor just claims the
+// pane so Ctrl+Z/Delete route correctly). Tools: Arrow / Pen / Delete functional this phase; Pitch shows
+// the baseline f0 line (full pitch editing = Phase 5). One-position-one-note truncation runs at commit.
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { useProjectStore } from "../../store/project";
+import { useAppStore } from "../../store/app";
+import { useAudioStore } from "../../store/audio";
+import { useTranslation } from "react-i18next";
+import { PIXELS_PER_TICK, TICKS_PER_BEAT } from "../../lib/constants";
+import { msToTicks } from "../../lib/audio/laneOps";
+import { TimeAxis, formatBarBeat } from "../../lib/timeAxis";
+import * as playback from "../../lib/audio/playback";
+import { resolveOverlaps, DEFAULT_TRANSITION, isSilentLyric, splitLyricTokens, vocalTokens } from "../../lib/vocalNotes";
+import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
+import { useVoiceModelStore } from "../../store/voice-models";
+import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels, renderFrameTicks } from "../../lib/vocal/vocalRender";
+import { boundaryDraggableAfter, PHONE_SCALE_MAX, PHONE_SCALE_MIN, phonemeLaneRequest, phonemeLaneSig, redistributeConserving } from "../../lib/vocal/phonemeLane";
+import { maybeShowErrorModal } from "../../lib/errorDisplay";
+import { logToBackend } from "../../lib/log";
+import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
+import { isUserTuned, DEV_TINT_EPS_CENTS } from "../../lib/vocal/autoTune";
+import { TUNED_MARKER } from "../../lib/trackColors";
+import { PLAYHEAD } from "../../lib/canvasDraw";
+import { V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX, tickToX, xToTick, noteTickToX, xToNoteTick, pitchToY, yToPitch, centsToY, yToCents, rowsContentHeight, snapPlaceTick, snapEdgeTick, snapMoveDelta, resizeEndTick, isBlackKey, pitchName, pitchToHz, centsToHz, paramToY, yToParam, LOUDNESS_DB_RANGE, } from "../../lib/vocalGeometry";
+import { langById, aliasDefaultLyric, DEFAULT_LANG_ID } from "../../lib/vocal/languages";
+import { smartCleanStems, cleanChangedTotal } from "../../lib/midiCleanup";
+import { matchGmName, translateGmName, isDrumLikeName, gmDrumShort, GM_INSTRUMENTS } from "../../lib/gmInstruments";
+import { playSoundfontAudition } from "../../lib/soundfont/instrumentRender";
+// Muno 阶段3:简谱标尺 —— 音高 → 唱名(1-7+变化音+八度点);主音优先取本轨和弦分析的调性。
+import { jianpuForPitch } from "../../lib/jianpu";
+import { estimateKey } from "../../lib/analysis/chordAnalysis";
+import { useChordTrackStore } from "../../store/chordTrack";
+import { VocalSidebar } from "./VocalSidebar";
+import { HScrollbarView } from "./HScrollbar";
+import "./VocalEditor.css";
+/** Grid / snap divisions per beat (§9.4 — all land on the constant 12/beat six-based grid; triplets 3/6). */
+const GRID_DIVS = [
+    { div: 1, key: "1/4" }, { div: 2, key: "1/8" }, { div: 4, key: "1/16" },
+    { div: 3, key: "1/8T" }, { div: 6, key: "1/16T" }, { div: 12, key: "1/12" },
+];
+const KEY_COL_W = 56; // fixed piano-key column at the canvas left edge
+const RULER_H = 18; // bar-number ruler strip along the top of the note area
+const LANE_H = 88; // ② bottom automation-lane band height (only reserved when the lane is OPEN — §M-defer)
+const EDGE_PX = 6; // note right-edge resize hotzone (screen px)
+const LANE_PARAMS = [
+    // loudness range = the shared LOUDNESS_DB_RANGE (vocalGeometry) — the S59 audio-track loudness
+    // band uses the SAME constant, so the two lanes' dB scales cannot drift apart.
+    { id: "loudness", min: -LOUDNESS_DB_RANGE, max: LOUDNESS_DB_RANGE, unit: "dB", labelKey: "vocalEditor.lane.loudness" },
+    { id: "formant", min: -12, max: 12, unit: "st", labelKey: "vocalEditor.lane.formant" },
+];
+const laneCfg = (p) => LANE_PARAMS.find((x) => x.id === p);
+// S58: the default lyric for a newly drawn note follows the TRACK's language (a ja "あ" on a zh/en
+// track would be instant OOV — audit MAJOR). langById falls back to ja for an out-of-range id.
+// S91: on an ALIAS track a new ENGLISH note must start out legal in that CONVENTION — the English
+// default `a` is not ARPABET, so on an ARPAsing track the pen tool would mint notes that hard-fail
+// the whole segment render (review S91). Non-English notes keep their language's default.
+const defaultLyricFor = (langId, set) => {
+    const l = langById(langId ?? DEFAULT_LANG_ID);
+    return set && l.code === "en" ? aliasDefaultLyric(set) : l.defaultLyric;
+};
+/** THE notes the pitch LINE is made of — silent ones (a rest, a breath) are not part of it, so the line
+ *  breaks over them and their neighbours become phrase edges (§10.5), matching the render's f0 feed.
+ *  Every evaluator in this file goes through here: the overlay, the preview tone AND the paint commit.
+ *  That last one is not cosmetic — `paintedDev` stores each drawn point as a DELTA from this line, so a
+ *  commit evaluated against a different note set writes a deviation the user never drew (the S88 review
+ *  measured ~325 ¢ of snap-back at a rest boundary, because the commit was the one site still unfiltered). */
+const pitchChain = (notes, tokens) => notes.filter((n) => !isSilentLyric(n.lyric, tokens)).sort((a, b) => a.tick - b.tick);
+const MIN_LEN_TICKS = TICKS_PER_BEAT / 12; // shortest note the UI allows = 1/12 (40t), the finest grid — so you
+export function VocalEditor({ segmentId, onClose, style }) {
+    const { t, i18n } = useTranslation();
+    const tracks = useProjectStore((s) => s.tracks);
+    const tempo = useProjectStore((s) => s.tempo);
+    const timeSignature = useProjectStore((s) => s.timeSignature);
+    const selectedNotes = useProjectStore((s) => s.selectedNotes);
+    const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
+    const selectNotes = useProjectStore((s) => s.selectNotes);
+    const setSegmentPitchDev = useProjectStore((s) => s.setSegmentPitchDev);
+    const setSegmentParamCurve = useProjectStore((s) => s.setSegmentParamCurve);
+    const setActivePane = useAppStore((s) => s.setActivePane);
+    // S87 grid snapping is a persisted APP preference (mirrors the arrangement's snapSegments/snapPlayhead,
+    // same `utai.` localStorage funnel) — NOT project state: it must never enter a project signature nor an
+    // undo step. OFF = continuous placement for scores whose timing is authored off-grid (UTAU CVVC).
+    const snapNotes = useAppStore((s) => s.snapNotes);
+    const toggleSnapNotes = useAppStore((s) => s.toggleSnapNotes);
+    // Resolve the notes part by the STABLE segment id (a track reorder / rename must not lose it).
+    const part = useMemo(() => {
+        for (const tr of tracks) {
+            const sg = tr.segments.find((s) => s.id === segmentId);
+            if (sg && sg.content.type === "notes") {
+                return {
+                    trackId: tr.id, trackName: tr.name, trackType: tr.trackType, soundfont: tr.soundfont, seg: sg, notes: sg.content.notes, start: sg.startTick, dur: sg.durationTicks,
+                    pitchDev: sg.content.pitchDev, paramCurves: sg.content.paramCurves,
+                    transition: tr.vocalParams?.transition ?? DEFAULT_TRANSITION,
+                    vocalParams: tr.vocalParams ?? DEFAULT_VOCAL_PARAMS, voiceModel: tr.voiceModel,
+                };
+            }
+        }
+        return null;
+    }, [tracks, segmentId]);
+    // ── 乐器轨模式 ──
+    // MIDI 转写导入的 instrument 轨没有真实歌词：编辑器改以「音名」（C4 / D#3…）呈现音符、
+    // 隐藏人声专属控件（歌手侧栏/自动化泳道/音素视图），改挂「音源试听 + 一键修复」。
+    // 带真实歌词的轨（人声轨或歌词 MIDI 导入）保持完整的人声编辑形态——用户点开就是
+    // 对应歌词。"あ"（无词占位）与 "La"（导入兜底）不算真实歌词。
+    const PLACEHOLDER_LYRICS = new Set(["啊", "あ", "la"]);
+    const hasRealLyrics = (part?.notes ?? []).some((n) => {
+        const l = (n.lyric ?? "").trim();
+        return l !== "" && !PLACEHOLDER_LYRICS.has(l.toLowerCase());
+    });
+    const instrumentMode = !!part && part.trackType === "instrument" && !hasRealLyrics;
+    // 乐器轨标题：GM 名翻译成当前语言（"Electric Guitar (clean)" → 「清音电吉他」）。
+    // matchGmName 同时给出试听用的 GM program；鼓名轨走 channel 9。
+    const gmMatch = useMemo(() => (part ? matchGmName(part.trackName, i18n.language) : null), [part, i18n.language]);
+    const instrumentRef = useRef(instrumentMode);
+    instrumentRef.current = instrumentMode;
+    // Muno 阶段2:乐器轨当前选中的音源音色(轨道头选择)。有它 → 交互发声用真实音色
+    // (playSoundfontAudition);没有 → 维持振荡器占位音(与旧行为一致)。
+    const trackSf = instrumentMode ? part?.soundfont : undefined;
+    const trackSfRef = useRef(trackSf);
+    trackSfRef.current = trackSf;
+    // ── 鼓轨模式（§建议3）：键列 / 音符标签显示鼓件名（底鼓/军鼓/闭镲…），比音名直观。 ──
+    const isDrumTrack = instrumentMode && isDrumLikeName(part?.trackName ?? "");
+    const drumTrackRef = useRef(isDrumTrack);
+    drumTrackRef.current = isDrumTrack;
+    // ── Muno 阶段3「简谱标尺」主音（1 = tonic）——两层来源 ──
+    // ① 和弦轨道的会话分析来自本轨（用户跑过「识别和弦」）→ 直接用它的调性；
+    // ② 否则用当前段音符 estimateKey 即时估计（KK 模板，O(n)+12×12，够便宜可挂在每次编辑上），
+    //    空段默认 C。绘制闭包每帧读 ref，计算用 useMemo 挂 notes —— 不会逐帧重算。
+    const chordKey = useChordTrackStore((s) => (s.sourceTrackId === part?.trackId ? s.key : null));
+    const segKey = useMemo(() => {
+        if (!part || chordKey)
+            return null;
+        if (part.notes.length === 0)
+            return null;
+        return estimateKey(part.notes.map((n) => ({ tick: n.tick, duration: n.duration, pitch: n.pitch, velocity: n.velocity })));
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [chordKey, part?.notes]);
+    const jianpuTonicRef = useRef(0);
+    jianpuTonicRef.current = chordKey?.tonic ?? segKey?.tonic ?? 0;
+    // ── GM 音色下拉（§建议2）：null = 按轨道名反猜；选中后试听/渲染都用它。鼓轨固定 channel 9 无需选。 ──
+    const [selectedProgram, setSelectedProgram] = useState(null);
+    // ── 一键修复差异高亮（§建议1）：被修过且留存的音符 id，6 秒内描琥珀边。 ──
+    const [repairIds, setRepairIds] = useState(new Set());
+    const repairIdsRef = useRef(repairIds);
+    repairIdsRef.current = repairIds;
+    const repairTimerRef = useRef(null);
+    // ── 快捷键速查卡（§建议4）：「?」按钮弹出。 ──
+    const [helpOpen, setHelpOpen] = useState(false);
+    const helpOpenRef = useRef(helpOpen);
+    helpOpenRef.current = helpOpen;
+    // ── 歌词总编辑面板（§用户）：「歌词」按钮打开整轨歌词文本框，粘贴/修改后逐音符分配。 ──
+    const [lyricsOpen, setLyricsOpen] = useState(false);
+    const [lyricsText, setLyricsText] = useState("");
+    const [tool, setTool] = useState("arrow");
+    const [gridDiv, setGridDiv] = useState(2); // 1/8 default
+    const [laneOpen, setLaneOpen] = useState(false); // ② bottom automation lane — collapsed by default (§user)
+    const [laneParam, setLaneParam] = useState("loudness");
+    const [maximized, setMaximized] = useState(false);
+    const [playing, setPlaying] = useState(false);
+    // GLOBAL render flag (one vocal render at a time) — reactive so every editor's button disables together.
+    const vocalRenderActive = useAppStore((s) => s.vocalRenderActive);
+    const [lyricEdit, setLyricEdit] = useState(null);
+    const canvasRef = useRef(null);
+    const wrapRef = useRef(null);
+    const drawRef = useRef(() => { });
+    const dragRef = useRef(null);
+    const mouseRef = useRef(null);
+    const clipboardRef = useRef([]);
+    const lyricCancelRef = useRef(false); // Escape in the lyric input → suppress the unmount-blur commit
+    const lyricNavRef = useRef(false); // Tab/Shift+Tab navigating between notes → suppress the old input's unmount-blur (it already committed)
+    // Local view state (NOT the arrangement's global scroll/zoom, §9.4).
+    const viewRef = useRef({ scrollX: 0, scrollY: 0, ppt: PIXELS_PER_TICK * 2, rowH: 16, top: RULER_H });
+    const sizeRef = useRef({ w: 800, h: 300, dpr: 1 });
+    // Content refs (synced each render) so the imperative draw/pointer code reads fresh values.
+    const notesRef = useRef(part?.notes ?? []);
+    notesRef.current = part?.notes ?? [];
+    // Pitch-line inputs (the always-shown real f0 = evalF0Cents): the segment's hand-drawn deviation curve +
+    // the track's default transition (per-note transitions live on each note).
+    const pitchDevRef = useRef(part?.pitchDev);
+    pitchDevRef.current = part?.pitchDev;
+    // ② automation-lane curves (loudness/formant) — synced every render so the imperative draw/pointer read fresh.
+    const paramCurvesRef = useRef(part?.paramCurves);
+    paramCurvesRef.current = part?.paramCurves;
+    const transitionRef = useRef(part?.transition ?? DEFAULT_TRANSITION);
+    transitionRef.current = part?.transition ?? DEFAULT_TRANSITION;
+    // The pitch line skips SILENT notes — a breath (unvoiced) and, since S88, a rest (silent): the line
+    // breaks so the prev note releases / the next scoops, §10.5. Dynamic: editing either token re-connects
+    // the OLD token's notes. Same predicate as the render feed (isSilentLyric) — the drawn line must never
+    // claim a shape the audio does not have.
+    const tokensRef = useRef(vocalTokens(part?.vocalParams));
+    tokensRef.current = vocalTokens(part?.vocalParams);
+    // S58: the track's default lang drives the default lyric of newly drawn notes (must be singable).
+    const defaultLyricRef = useRef(defaultLyricFor(part?.vocalParams?.langId, part?.vocalParams?.phonemeSet));
+    defaultLyricRef.current = defaultLyricFor(part?.vocalParams?.langId, part?.vocalParams?.phonemeSet);
+    // ② S58 OOV verdicts for THIS segment (async, from the oovWatch watcher) — ref-synced for the draw
+    // closure; the dedicated redraw effect below re-invokes it when the verdict changes.
+    const oovIds = useAppStore((s) => s.vocalOov[segmentId]);
+    // S85b: dropped-to-zero-frames notes share the red marking (both = "will not sound") — union here.
+    const droppedIds = useAppStore((s) => s.vocalDropped[segmentId]);
+    const oovRef = useRef(new Set());
+    oovRef.current = new Set([...(oovIds ?? []), ...(droppedIds ?? [])]);
+    // S87 #3: rescued-by-borrow notes — a SEPARATE, non-blocking channel (amber), kept out of oovRef so the
+    // blocking red keeps meaning exactly "this note will not sound".
+    const shortIds = useAppStore((s) => s.vocalShort[segmentId]);
+    const shortRef = useRef(new Set());
+    shortRef.current = new Set(shortIds ?? []);
+    // S113 (§C14): the alias-shape channel — also NON-blocking (the note sings exactly what it sang
+    // before), so it joins the amber tier rather than the red one. Kept as its OWN store map for the
+    // reason S85b/S87/S109 each kept theirs: the track-header sentence has to be true of the notes it
+    // describes, and "this alias is a word" is not "this note was lent a frame".
+    const aliasHintIds = useAppStore((s) => s.vocalAliasHint[segmentId]);
+    const aliasHintRef = useRef(new Set());
+    aliasHintRef.current = new Set(aliasHintIds ?? []);
+    // S73b/c 调教所有权着色(θ 维度):手设 vibrato/transition 的音符=用户地盘(左缘金条,
+    // 自动调教绕行);pitchDev 的手绘段则由音高线分段染金表达(逐采样查 dev,画线循环内)。
+    const userTunedIds = useMemo(() => {
+        const s = new Set();
+        for (const n of part?.notes ?? [])
+            if (isUserTuned(n))
+                s.add(n.id);
+        return s;
+    }, [part?.notes]);
+    const userTunedRef = useRef(userTunedIds);
+    userTunedRef.current = userTunedIds;
+    const startRef = useRef(part?.start ?? 0);
+    startRef.current = part?.start ?? 0;
+    const durRef = useRef(part?.dur ?? 0);
+    durRef.current = part?.dur ?? 0;
+    // ② Render (Phase 6): build the score triples + Option-A f0 from the edited notes and invoke the Rust
+    // score→singing render; the baked wav deposits as a processedOutputs overlay (plays back via the lane
+    // path). The SVC voice/backend/transpose/speaker come from the track's vocalParams + voiceModel (sidebar).
+    const render = useCallback(async () => {
+        if (!part)
+            return;
+        // Resolve the live Track + Segment and delegate to the ONE shared render path (renderVocalPart) — the
+        // SAME code the Play-time auto-render batch runs, so the manual button and auto-render can never drift.
+        const track = useProjectStore.getState().tracks.find((tr) => tr.id === part.trackId);
+        const seg = track?.segments.find((s) => s.id === segmentId);
+        if (!track || !seg)
+            return;
+        // S66: missing core models → the one-click dialog instead of a mid-render AUX_FILE_MISSING.
+        if (!(await preflightVocalModels()))
+            return;
+        try {
+            await renderVocalPart(track, seg, tempoRef.current, t("vocalEditor.render.laneLabel"));
+        }
+        catch (e) {
+            if (isVocalCancelError(e))
+                return; // user cancelled — silent settle (payload-aware: OOV lyrics can't fake a cancel)
+            // Shared error→message mapping (vocalRenderErrorMessage) — the SAME one the Play-time auto-render
+            // batch uses, so the two paths can never drift (§user: they must report identically).
+            logToBackend("error", `Vocal render failed: ${String(e)}`);
+            const display = vocalRenderErrorMessage(e);
+            if (!maybeShowErrorModal(e, display)) {
+                useAppStore.getState().showToast(display, "error");
+            }
+        }
+    }, [part, segmentId, t]);
+    // Load the installed voice models once when the editor opens — the sidebar's singer picker needs them
+    // (otherwise the list stays empty until the Resource Manager is opened, which triggers the scan; §user).
+    useEffect(() => {
+        void useVoiceModelStore.getState().fetchModels();
+    }, []);
+    const selRef = useRef(new Set(selectedNotes));
+    selRef.current = new Set(selectedNotes);
+    const toolRef = useRef(tool);
+    toolRef.current = tool;
+    const gridDivRef = useRef(gridDiv);
+    gridDivRef.current = gridDiv;
+    const snapNotesRef = useRef(snapNotes); // gestures/draw run outside React — read the live value via ref
+    snapNotesRef.current = snapNotes;
+    const laneOpenRef = useRef(laneOpen);
+    laneOpenRef.current = laneOpen;
+    const laneParamRef = useRef(laneParam);
+    laneParamRef.current = laneParam;
+    // ② global transport playhead (project store, ABSOLUTE tick) — read via ref inside the draw closure and
+    // driven by a dedicated store.subscribe (below), NOT a reactive selector (that would re-render 60×/s).
+    const playheadTickRef = useRef(useProjectStore.getState().playheadTick);
+    const tempoRef = useRef(tempo);
+    tempoRef.current = tempo;
+    // Same meter authority as the arrangement — for the sub-beat grid (built from the global time signature).
+    const timeAxis = useMemo(() => TimeAxis.global(timeSignature[0], timeSignature[1]), [timeSignature]);
+    const axisRef = useRef(timeAxis);
+    axisRef.current = timeAxis;
+    const snapTicks = () => TICKS_PER_BEAT / gridDivRef.current; // 480/div: 1/4=480,1/8=240,1/16=120,1/8T=160,1/16T=80,1/12=40
+    /** S87 — THE single gate for grid snapping in this editor: the editor's binding of the pure contract in
+     *  vocalGeometry (part start + the live toggle come from refs, because gestures/draw run outside React).
+     *  `snapPlace` FLOORs to the SELECTED grid cell (creation); `snapEdge` ROUNDs to its `unit` (a creation
+     *  drag-out uses the grid cell, move/resize use the fixed MIN_LEN_TICKS — §user: "only CREATION uses the
+     *  grid"). Snapping OFF ⇒ continuous whole ticks. ONE gate, so a gesture can never be half-snapped.
+     *  Both snap in ABSOLUTE tick space (see vocalGeometry) so notes land on the lines actually drawn.
+     *  The grid LINES themselves are drawn independently (12/beat) and stay visible either way — with
+     *  snapping off they are a reference, not a magnet (§user: 1/12 格线降级为参考). */
+    const snapPlace = (relTick) => snapPlaceTick(relTick, startRef.current, snapTicks(), snapNotesRef.current);
+    const snapEdge = (relTick, unit) => snapEdgeTick(relTick, startRef.current, unit, snapNotesRef.current);
+    // ② lane geometry (live, from refs): when the bottom automation lane is OPEN it reserves LANE_H at the
+    // canvas bottom, so the note-row area shrinks — EVERY visible-note-height / scroll clamp must subtract it
+    // (else the lowest rows sit permanently behind the lane at max scroll). laneOpen=false ⇒ 0 = exact old behavior.
+    const laneBandH = () => (laneOpenRef.current ? LANE_H : 0);
+    const noteBottom = () => sizeRef.current.h - laneBandH(); // y where the note rows end (lane band below it)
+    const visNoteH = () => Math.max(1, sizeRef.current.h - RULER_H - laneBandH()); // visible note-row height
+    // rAF-coalesced redraw + preview-playback rAF (scrubs the segment following evalF0Cents so you can HEAR
+    // the smooth transitions / vibrato — placeholder tone, not the SVC voice, §9.7).
+    const rafRef = useRef(0);
+    const playRafRef = useRef(0);
+    const edgeRafRef = useRef(0); // marquee edge auto-scroll rAF
+    const edgeScrollRef = useRef(() => { });
+    // S73e 底部滚动条:脱-React 画布的 scrollX 活在 viewRef,不触发 React 渲染——滚动条做成
+    // 自我强刷的微型子组件(两个 div),经此 ref 在每次重绘后同步,主组件零重渲染。
+    const scrollbarSyncRef = useRef(() => { });
+    const requestRedraw = useCallback(() => {
+        if (rafRef.current)
+            return;
+        rafRef.current = requestAnimationFrame(() => {
+            rafRef.current = 0;
+            drawRef.current();
+            scrollbarSyncRef.current();
+        });
+    }, []);
+    // S73e:底部滚动条的受控写入口(与 marquee edge auto-scroll 的 maxSX 同一几何)。
+    const scrollTo = useCallback((x) => {
+        const v = viewRef.current;
+        const { w } = sizeRef.current;
+        const maxSX = Math.max(0, (startRef.current + durRef.current) * v.ppt + 400 - Math.max(1, w - KEY_COL_W));
+        v.scrollX = Math.max(0, Math.min(maxSX, x));
+        requestRedraw();
+    }, [requestRedraw]);
+    // ── preview playback: scrub the segment following the single evalF0Cents so you HEAR the smooth
+    //    transitions / vibrato / drawn pitchDev (placeholder tone, not the SVC voice, §9.7). ──
+    // Part-relative tick of the RUNNING pitch preview (drives the hollow ruler indicator);
+    // null = preview not playing. Ref, not state — it moves every frame.
+    const previewPosRef = useRef(null);
+    const stopPreviewPlay = useCallback(() => {
+        if (playRafRef.current) {
+            cancelAnimationFrame(playRafRef.current);
+            playRafRef.current = 0;
+        }
+        playback.stopPreviewTone();
+        previewPosRef.current = null;
+        setPlaying(false);
+        requestRedraw(); // erase the ruler indicator
+    }, [requestRedraw]);
+    const startPreviewPlay = useCallback(() => {
+        if (!part)
+            return;
+        if (playRafRef.current) {
+            cancelAnimationFrame(playRafRef.current);
+            playRafRef.current = 0;
+        } // clear any orphan
+        // §user S68c: start from the TRANSPORT playhead when it sits inside this part — after each
+        // edit you'd otherwise wait for the scrub to crawl from bar 1 back to the spot you're tuning.
+        // Playhead outside the part ⇒ whole-part preview from the top (the old behavior). Snapshot at
+        // press: the preview stays independent of the main transport (which is never touched).
+        const rawRel = playheadTickRef.current - startRef.current;
+        const startRel = rawRel > 0 && rawRel < durRef.current ? rawRel : 0;
+        const startMs = performance.now();
+        playback.playPreviewTone(centsToHz(6000), 0); // seed a sustained tone; retuned each frame
+        setPlaying(true);
+        const tick = () => {
+            const rel = startRel + msToTicks(performance.now() - startMs, tempoRef.current);
+            if (rel > durRef.current) {
+                stopPreviewPlay();
+                return;
+            } // reached the segment end
+            // the preview tone goes near-silent over a rest/breath exactly as it does over a written gap.
+            const sorted = pitchChain(notesRef.current, tokensRef.current);
+            // Build opts PER-FRAME from the live refs so a sidebar edit to the TRACK-DEFAULT transition (or tempo)
+            // retunes the RUNNING preview immediately — else only the overlay updates and the audio stays stale
+            // until stop+replay (review finding E).
+            const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
+            const r = evalF0CentsAt(sorted, pitchDevRef.current, rel, opts);
+            playback.setPreviewToneHz(r.voiced ? centsToHz(r.cents) : 20); // rest → near-silent low freq
+            previewPosRef.current = rel;
+            requestRedraw(); // move the ruler indicator (rAF-coalesced with any other redraw)
+            playRafRef.current = requestAnimationFrame(tick);
+        };
+        playRafRef.current = requestAnimationFrame(tick);
+    }, [part, stopPreviewPlay, requestRedraw]);
+    // ── 乐器轨：音源试听 + 一键修复 ─────────────────────────────────────────────
+    // 音源下拉读 amt_list_soundfonts（与转换结果工作台同一份资源管理数据），选择即
+    // amt_set_active_soundfont 全局生效；试听 = preview_notes_render（音符→临时 MIDI→
+    // FluidSynth→WAV）后用共享 AudioContext 播放。一键修复复用 midiCleanup 的
+    // smartCleanStems（与转换结果工作台同一套 7 步算法），提交为一个 undo 步。
+    const [soundfonts, setSoundfonts] = useState([]);
+    const [previewBusy, setPreviewBusy] = useState(false);
+    const wavSrcRef = useRef(null);
+    useEffect(() => {
+        if (!instrumentMode)
+            return;
+        invoke("amt_list_soundfonts")
+            .then((list) => setSoundfonts((list ?? []).map((s) => ({ name: String(s.name ?? s.filename), filename: String(s.filename), active: !!s.active }))))
+            .catch(() => { });
+    }, [instrumentMode]);
+    const pickSoundfont = useCallback((filename) => {
+        invoke("amt_set_active_soundfont", { filename })
+            .then(() => invoke("amt_list_soundfonts"))
+            .then((list) => setSoundfonts((list ?? []).map((s) => ({ name: String(s.name ?? s.filename), filename: String(s.filename), active: !!s.active }))))
+            .catch((e) => useAppStore.getState().showToast(String(e), "error"));
+    }, []);
+    const stopWavPreview = useCallback(() => {
+        if (wavSrcRef.current) {
+            try {
+                wavSrcRef.current.stop();
+            }
+            catch { /* already ended */ }
+            wavSrcRef.current = null;
+        }
+        setPlaying(false);
+        requestRedraw();
+    }, [requestRedraw]);
+    const startInstrumentPreview = useCallback(async () => {
+        if (!part)
+            return;
+        if (wavSrcRef.current) {
+            stopWavPreview();
+            return;
+        } // 播放中再点 = 停止
+        if (playRafRef.current)
+            stopPreviewPlay(); // 人声占位音预览先停
+        if (part.notes.length === 0) {
+            useAppStore.getState().showToast(t("vocalEditor.nothingToPreview"), "info");
+            return;
+        }
+        setPreviewBusy(true);
+        try {
+            const bpm = tempoRef.current > 0 ? tempoRef.current : 120;
+            // Muno 阶段2:轨道头选了音源音色 → 原生 SFZ/SF2 合成(render_soundfont_notes,
+            // 无 FluidSynth 外部依赖,与 Play/导出烘焙同一引擎);没选 → 旧的 GM/FluidSynth
+            // 试听路径(转换结果工作台同一套,兼容未选音色的老工程)。
+            const sf = trackSfRef.current;
+            let wavPath;
+            if (sf) {
+                const msPerTick = 60000 / bpm / TICKS_PER_BEAT;
+                wavPath = await invoke("render_soundfont_notes", {
+                    fontId: sf.fontId,
+                    presetId: sf.presetId,
+                    notes: notesRef.current.map((n) => ({
+                        start: (n.tick * msPerTick) / 1000,
+                        dur: (Math.max(1, n.duration) * msPerTick) / 1000,
+                        key: n.pitch,
+                        vel: n.velocity ?? 100,
+                    })),
+                    sampleRate: 44100,
+                });
+            }
+            else {
+                const drums = isDrumLikeName(part.trackName);
+                wavPath = await invoke("preview_notes_render", {
+                    bpm,
+                    // 鼓轨走 channel 9（GM 打击乐组）；旋律轨优先用用户在 GM 下拉里选的音色，未选则按轨道名反猜。
+                    program: drums ? 0 : (selectedProgram ?? (gmMatch && gmMatch.matched ? gmMatch.program : 0)),
+                    channel: drums ? 9 : 0,
+                    notes: notesRef.current.map((n) => ({
+                        tick: Math.round(n.tick),
+                        duration: Math.round(n.duration),
+                        pitch: n.pitch,
+                        velocity: n.velocity ?? 100,
+                    })),
+                });
+            }
+            const ctx = playback.getPreviewContext();
+            const buf = await playback.loadAudioBuffer(wavPath);
+            const src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(ctx.destination);
+            src.onended = () => {
+                if (wavSrcRef.current === src) {
+                    wavSrcRef.current = null;
+                    setPlaying(false);
+                    requestRedraw();
+                }
+            };
+            wavSrcRef.current = src;
+            src.start();
+            setPlaying(true);
+        }
+        catch (e) {
+            const raw = String(e);
+            const display = raw.includes("EXPORT_FLUIDSYNTH_NOT_FOUND") ? t("amt.exportErrFluidsynth") || "FluidSynth 未安装，请先在资源管理中下载"
+                : raw.includes("EXPORT_SOUNDFONT_NOT_FOUND") ? t("amt.exportErrSoundfont") || "音源缺失，请先在资源管理中下载音源"
+                    : raw.includes("PREVIEW_NO_NOTES") ? t("vocalEditor.nothingToPreview") || "没有可试听的音符"
+                        : raw;
+            useAppStore.getState().showToast(display, "error");
+        }
+        finally {
+            setPreviewBusy(false);
+        }
+    }, [part, gmMatch, selectedProgram, t, stopPreviewPlay, stopWavPreview, requestRedraw]);
+    /** 一键修复（乐器轨）：midiCleanup.smartCleanStems 的 7 步全自动修补——删除伪音/幻觉/
+     *  域外音、合并重叠、修力度、按重复规律补漏小节——记为一个 undo 步，可整体撤销。 */
+    const oneClickRepair = useCallback(() => {
+        if (!part)
+            return;
+        const stems = [{ notes: part.notes.map((n) => ({ ...n })) }];
+        const stats = smartCleanStems(stems, {
+            bpm: tempoRef.current > 0 ? tempoRef.current : 120,
+            ppq: TICKS_PER_BEAT,
+            durationTicks: Math.max(1, part.dur),
+        });
+        if (cleanChangedTotal(stats) === 0) {
+            useAppStore.getState().showToast(t("amt.editorCleanNoChange") || "已经非常干净，没有需要修复的音符", "success");
+            return;
+        }
+        commitNotes(stems[0]?.notes ?? [], []);
+        // 差异高亮（§建议1）：被修过且留存的音符 → 琥珀描边 6 秒，让用户看清修复动了哪里。
+        if (stats.touched.length > 0) {
+            setRepairIds(new Set(stats.touched));
+            if (repairTimerRef.current)
+                window.clearTimeout(repairTimerRef.current);
+            repairTimerRef.current = window.setTimeout(() => setRepairIds(new Set()), 6000);
+        }
+        const removedExtra = stats.removedShort + stats.removedRange + stats.removedGhost + stats.removedKey;
+        useAppStore.getState().showToast(t("amt.editorCleanReport", {
+            removed: removedExtra,
+            merged: stats.mergedOverlap,
+            velocity: stats.fixedVelocity,
+            filled: stats.filledNotes,
+            trimmed: stats.trimmedHang,
+            snapped: stats.snapped,
+        }) || "一键修复完成", "success");
+    }, [part, t]);
+    // marquee edge auto-scroll (§9.4): while the cursor is held at a border during a marquee, scroll the view
+    // and PIN the box's anchor to the content (its screen origin shifts opposite the scroll) so the box grows
+    // over the newly-revealed area. Reassigned each render so it reads fresh refs; recurses via the ref.
+    edgeScrollRef.current = () => {
+        const d = dragRef.current, m = mouseRef.current;
+        if (!d || (d.kind !== "marquee" && d.kind !== "marquee-delete") || !m) {
+            edgeRafRef.current = 0;
+            return;
+        }
+        const { w } = sizeRef.current, v = viewRef.current;
+        const EDGE = 28, SPEED = 10;
+        let dx = 0, dy = 0;
+        if (m.x < KEY_COL_W + EDGE)
+            dx = -SPEED;
+        else if (m.x > w - EDGE)
+            dx = SPEED;
+        if (m.y < RULER_H + EDGE)
+            dy = -SPEED;
+        else if (m.y > noteBottom() - EDGE)
+            dy = SPEED; // note-area bottom (above the lane)
+        if (!dx && !dy) {
+            edgeRafRef.current = 0;
+            return;
+        } // cursor left the border → stop
+        const maxSX = Math.max(0, (startRef.current + durRef.current) * v.ppt + 400 - Math.max(1, w - KEY_COL_W));
+        const maxSY = Math.max(0, rowsContentHeight(v.rowH) - visNoteH());
+        const nSX = Math.max(0, Math.min(maxSX, v.scrollX + dx)), nSY = Math.max(0, Math.min(maxSY, v.scrollY + dy));
+        d.clientX0 -= nSX - v.scrollX;
+        d.clientY0 -= nSY - v.scrollY; // pin the anchor to content
+        v.scrollX = nSX;
+        v.scrollY = nSY;
+        requestRedraw();
+        edgeRafRef.current = requestAnimationFrame(edgeScrollRef.current);
+    };
+    // ── size / DPR ──
+    useEffect(() => {
+        const wrap = wrapRef.current;
+        if (!wrap)
+            return;
+        const measure = () => {
+            const r = wrap.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            sizeRef.current = { w: Math.max(1, r.width), h: Math.max(1, r.height), dpr };
+            const cv = canvasRef.current;
+            if (cv) {
+                cv.width = Math.round(sizeRef.current.w * dpr);
+                cv.height = Math.round(sizeRef.current.h * dpr);
+                cv.style.width = `${sizeRef.current.w}px`;
+                cv.style.height = `${sizeRef.current.h}px`;
+            }
+            requestRedraw();
+        };
+        measure();
+        const ob = new ResizeObserver(measure);
+        ob.observe(wrap);
+        return () => ob.disconnect();
+    }, [requestRedraw]);
+    // Center the vertical view on the notes' pitch range (or C4) once, on first mount for this segment.
+    useEffect(() => {
+        const ns = notesRef.current;
+        const avg = ns.length > 0 ? ns.reduce((a, n) => a + n.pitch, 0) / ns.length : 60;
+        const v = viewRef.current;
+        const visH = visNoteH(); // visible note-row height (below the ruler, above the lane band if open)
+        // center avg at the MIDDLE of the visible note area [RULER_H, noteBottom()] — not the full canvas, else
+        // an open lane pushes the average pitch ~LANE_H/2 too low (into/behind the band). noteBottom()==h when closed.
+        v.scrollY = Math.max(0, Math.min(Math.max(0, rowsContentHeight(v.rowH) - visH), pitchToY(avg, { ...v, scrollY: 0 }) - (RULER_H + noteBottom()) / 2));
+        // S68c: anchor the horizontal view on the FIRST NOTE, not the part's left edge. Extracted-MIDI
+        // parts (GAME) pin partStart to the source AUDIO segment's start, so a song with a long intro
+        // opened onto bars of empty grid — every note sat off-screen to the right and the piano roll
+        // "showed nothing" while rendering (same notes array) sang fine. Empty parts keep the left edge.
+        const firstTick = ns.length > 0 ? ns.reduce((a, n) => Math.min(a, n.tick), Infinity) : 0;
+        v.scrollX = Math.max(0, (startRef.current + firstTick) * v.ppt - 24);
+        requestRedraw();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [segmentId]);
+    // ② Re-clamp scrollY when the lane opens/closes. Toggling the lane reserves/frees LANE_H, changing the
+    // visible note-row height, so a scroll position valid for the old height can overshoot the new max — leaving
+    // the lowest rows behind the band (open) or a blank strip below the last row (close) until the next wheel
+    // event. Clamp to the new max here (band from the `laneOpen` STATE, not the ref, so timing is unambiguous).
+    useEffect(() => {
+        const v = viewRef.current;
+        const vis = Math.max(1, sizeRef.current.h - RULER_H - (laneOpen ? LANE_H : 0));
+        const max = Math.max(0, rowsContentHeight(v.rowH) - vis);
+        if (v.scrollY > max) {
+            v.scrollY = max;
+            requestRedraw();
+        }
+    }, [laneOpen, requestRedraw]);
+    // ── S83 phoneme-timing lane data: dry-run the RENDER's own allocator (preview_vocal_phonemes →
+    //    build_arrays_daw — the single source; never a JS re-computation) whenever the phoneme lane is
+    //    visible and its inputs changed. Debounced + sig-guarded; a superseded response is dropped (seq
+    //    token, bumped at SCHEDULE time so an in-flight older invoke can never land over a newer edit).
+    //    A failed preview (OOV / missing dictionary) clears the lane — the note area already paints OOV
+    //    red via oovWatch — and closing the lane then RESETS the failed sig, so an explicit reopen is a
+    //    retry signal (dictionary installed later must not stay blank forever — S83 review #12). Deps are
+    //    the narrow refs the payload actually reads (notes/vocalParams/tempo), not `part` — unrelated
+    //    store churn (a fader drag on another track) must not re-stringify every note (review #9). ──
+    const phonemeLaneRef = useRef(null);
+    const phonemeSigRef = useRef("");
+    // S167c: the just-committed lane working values, painted (and hit-tested) until the lane's
+    // debounced refetch lands — without it the release flashed the stale pre-edit split for
+    // ~300 ms, and a quick second gesture inside that window operated on pre-edit geometry
+    // (review findings). Cleared by the very next lane answer; keyed to the sig it was
+    // committed against so it can never dress up foreign data.
+    const phoneCommitOverlayRef = useRef(null);
+    const phonemeSeqRef = useRef(0);
+    const phonemePrevOnRef = useRef(false);
+    const phonemeLaneOn = laneOpen && laneParam === "phoneme";
+    const phonemeNotes = part?.notes;
+    const phonemeVp = part?.vocalParams;
+    useEffect(() => {
+        const wasOn = phonemePrevOnRef.current;
+        phonemePrevOnRef.current = phonemeLaneOn;
+        if (!phonemeLaneOn || !phonemeNotes || !phonemeVp) {
+            // lane off with nothing cached = the last attempt failed/cleared → unpin so reopen retries.
+            if (!phonemeLaneRef.current)
+                phonemeSigRef.current = "";
+            return;
+        }
+        // ONE description of what the lane depends on — the cache key AND the IPC payload both come out
+        // of it, so an input can never reach the backend without also invalidating the cache (S88's
+        // dormant-fix hazard; see phonemeLane.ts).
+        const laneInputs = {
+            notes: phonemeNotes,
+            tempo,
+            tokens: vocalTokens(phonemeVp), // both triggers: re-pointing either re-resolves phones
+            langId: phonemeVp.langId,
+            consonantPreroll: phonemeVp.consonantPreroll !== false,
+            phonemeSet: phonemeVp.phonemeSet, // S91: decides WHICH phones an English note has at all
+            esDialect: phonemeVp.esDialect, // S167: decides WHICH phones a Spanish note has (θ/s · ʎ/ʝ)
+        };
+        const sig = phonemeLaneSig(laneInputs);
+        // reopening onto notes edited while the lane was hidden: blank beats cross-state spans (the onset
+        // reference lines already follow the NEW notes). Mid-edit staleness while the lane stays open is
+        // left visible (blanking every keystroke would flicker); the debounce below replaces it shortly.
+        if (!wasOn && phonemeLaneRef.current && phonemeLaneRef.current.sig !== sig) {
+            phonemeLaneRef.current = null;
+            requestRedraw();
+        }
+        if (sig === phonemeSigRef.current)
+            return;
+        const seq = ++phonemeSeqRef.current;
+        const timer = window.setTimeout(async () => {
+            phonemeSigRef.current = sig; // set at fire time so a persistent backend error can't hot-loop
+            const { args, tripleNoteIds, ticksPerFrame } = phonemeLaneRequest(laneInputs);
+            try {
+                const spans = await invoke("preview_vocal_phonemes", args);
+                if (seq !== phonemeSeqRef.current)
+                    return; // superseded by a newer request
+                phonemeLaneRef.current = { spans, tripleNoteIds, ticksPerFrame, sig };
+                phoneCommitOverlayRef.current = null; // S167c: any fresh answer supersedes the commit overlay
+            }
+            catch {
+                if (seq !== phonemeSeqRef.current)
+                    return;
+                phonemeLaneRef.current = null;
+            }
+            requestRedraw();
+        }, 250);
+        return () => window.clearTimeout(timer);
+    }, [phonemeLaneOn, phonemeNotes, phonemeVp, tempo, requestRedraw]);
+    // ② Drive a redraw when the global transport playhead moves (playback / seek), OFF-React (a reactive
+    // selector would re-render the whole editor 60×/s). Mirrors TimelineRuler's imperative subscribe — the
+    // draw closure reads playheadTickRef.current, so it just needs re-invoking each time the tick changes.
+    useEffect(() => {
+        const unsub = useProjectStore.subscribe((s) => {
+            if (s.playheadTick !== playheadTickRef.current) {
+                playheadTickRef.current = s.playheadTick;
+                requestRedraw();
+            }
+        });
+        return unsub;
+    }, [requestRedraw]);
+    // ── the draw closure (rebuilt when content/selection/tool change) ──
+    useEffect(() => {
+        drawRef.current = () => {
+            const cv = canvasRef.current;
+            if (!cv)
+                return;
+            const ctx = cv.getContext("2d");
+            if (!ctx)
+                return;
+            const { w, h, dpr } = sizeRef.current;
+            const v = viewRef.current;
+            const notes = notesRef.current;
+            const start = startRef.current;
+            const sel = selRef.current;
+            const css = getComputedStyle(document.documentElement);
+            const col = (n) => css.getPropertyValue(n).trim();
+            ctx.save();
+            ctx.scale(dpr, dpr);
+            ctx.clearRect(0, 0, w, h);
+            // background
+            ctx.fillStyle = col("--bg-base") || "#0d1220";
+            ctx.fillRect(0, 0, w, h);
+            const noteAreaX = KEY_COL_W;
+            const noteAreaW = w - KEY_COL_W;
+            // ── pitch-class row striping + per-semitone row lines ──
+            const topPitch = yToPitch(0, v);
+            const botPitch = yToPitch(h, v);
+            for (let p = botPitch; p <= topPitch; p++) {
+                const y = pitchToY(p, v);
+                // black-key rows DARKER than white-key rows (visual bands). ⚠ theme's --piano-black is LIGHTER than
+                // --bg-base, so tinting with it inverts the shading — use an explicit dark overlay instead.
+                if (isBlackKey(p)) {
+                    ctx.fillStyle = "#000000";
+                    ctx.globalAlpha = 0.22;
+                    ctx.fillRect(noteAreaX, y, noteAreaW, v.rowH);
+                    ctx.globalAlpha = 1;
+                }
+                // a faint line at EVERY semitone boundary so adjacent white keys (E|F, B|C) read as separate rows,
+                ctx.strokeStyle = "rgba(130,150,185,0.13)";
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(noteAreaX, Math.round(y) + 0.5);
+                ctx.lineTo(w, Math.round(y) + 0.5);
+                ctx.stroke();
+                // and a STRONGER line at the bottom of each C (octave separation) — white, like the meter lines.
+                if (p % 12 === 0) {
+                    ctx.strokeStyle = "rgba(226,232,244,0.2)";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(noteAreaX, Math.round(y + v.rowH) + 0.5);
+                    ctx.lineTo(w, Math.round(y + v.rowH) + 0.5);
+                    ctx.stroke();
+                }
+            }
+            // ── vertical grid (bar / beat / 1-6 / 1-12) via the single TimeAxis sub-grid (triplet-capable). A
+            //    CLEAR prominence hierarchy so the meter reads at a glance — bar ≫ beat ≫ 1/6 ≫ 1/12 (the alphas
+            //    were too close before → the sub-grid competed with bar/beat and it all read as clutter). ──
+            const absFrom = xToTick(0, v);
+            const absTo = xToTick(noteAreaW, v);
+            for (const g of axisRef.current.subGridLinesInRange(Math.max(0, Math.floor(absFrom)), Math.ceil(absTo), 12)) {
+                const x = noteAreaX + tickToX(g.tick, v);
+                if (x < noteAreaX - 1)
+                    continue;
+                // WHITE/gray meter lines (cyan is reserved for the "current position" guide, so they don't clash).
+                let a, lw;
+                if (g.level === "bar") {
+                    a = 0.4;
+                    lw = 1.6;
+                } // bar = STRONGEST
+                else if (g.level === "beat") {
+                    a = 0.19;
+                    lw = 1.1;
+                } // beat = clearly second
+                else if (g.sub % 2 === 0) {
+                    a = 0.06;
+                    lw = 1;
+                } // 1/6-beat = faint
+                else {
+                    a = 0.03;
+                    lw = 1;
+                } // 1/12-beat = barely there
+                ctx.strokeStyle = `rgba(226,232,244,${a})`; // = --text-primary-ish white
+                ctx.lineWidth = lw;
+                ctx.beginPath();
+                ctx.moveTo(Math.round(x) + 0.5, 0);
+                ctx.lineTo(Math.round(x) + 0.5, h);
+                ctx.stroke();
+            }
+            // ── out-of-part dimming: anything outside [partStart, partStart+dur] is NOT part of THIS segment and
+            //    very likely won't be rendered — dim it so notes drawn there read as "outside the part" (§ user). ──
+            const partX0 = noteAreaX + tickToX(start, v);
+            const partX1 = noteAreaX + tickToX(start + durRef.current, v);
+            ctx.fillStyle = col("--bg-deep") || "#080b14";
+            ctx.globalAlpha = 0.55;
+            if (partX0 > noteAreaX)
+                ctx.fillRect(noteAreaX, 0, partX0 - noteAreaX, h);
+            if (partX1 < w) {
+                const rx = Math.max(noteAreaX, partX1);
+                ctx.fillRect(rx, 0, w - rx, h);
+            }
+            ctx.globalAlpha = 1;
+            // ── part bounds (the editable window) — crisp accent lines on top of the dimming ──
+            ctx.strokeStyle = col("--accent-secondary") || "#8b5cf6";
+            ctx.globalAlpha = 0.7;
+            ctx.lineWidth = 1.5;
+            for (const px of [partX0, partX1]) {
+                if (px >= noteAreaX && px <= w) {
+                    ctx.beginPath();
+                    ctx.moveTo(Math.round(px) + 0.5, 0);
+                    ctx.lineTo(Math.round(px) + 0.5, h);
+                    ctx.stroke();
+                }
+            }
+            ctx.globalAlpha = 1;
+            // ── notes (from off-ref drag preview if a gesture is live, else the store) ──
+            const drawNotes = dragRef.current?.previewNotes?.() ?? notes;
+            ctx.font = `${Math.min(13, Math.max(9, v.rowH - 4))}px system-ui, sans-serif`;
+            ctx.textBaseline = "middle";
+            for (const n of drawNotes) {
+                const x0 = noteAreaX + noteTickToX(n.tick, start, v);
+                const x1 = noteAreaX + noteTickToX(n.tick + n.duration, start, v);
+                if (x1 < noteAreaX || x0 > w)
+                    continue;
+                const y = pitchToY(n.pitch, v);
+                const selected = sel.has(n.id);
+                // ② S58 OOV: an unsingable lyric fills RED (LOUD — never silent, §3.7 ACE-style marking). A
+                // selected OOV note keeps the selection fill but takes the red stroke, so both states read.
+                const oov = oovRef.current.has(n.id);
+                // S87 #3: a BORROWED note is a NON-blocking notice — it sounds; the renderer merely lent it a frame
+                // from a neighbour. Amber, never the blocking red (§user: 红色现在一律=阻塞性警告). `oov` wins if a
+                // note somehow lands in both (blocking always outranks advisory).
+                // S113 §C14 joins this tier: an alias whose shape its convention cannot produce also SOUNDS.
+                const borrowed = !oov && (shortRef.current.has(n.id) || aliasHintRef.current.has(n.id));
+                const cx0 = Math.max(noteAreaX, x0);
+                ctx.fillStyle = selected
+                    ? (col("--note-selected") || "#8b5cf6")
+                    : oov
+                        ? (col("--color-error") || "#f87171")
+                        : borrowed
+                            ? (col("--color-warning") || "#fbbf24")
+                            : (col("--note-fill") || "#39c5bb");
+                ctx.globalAlpha = 0.9;
+                ctx.fillRect(cx0, y + 1, Math.max(2, x1 - cx0), Math.max(2, v.rowH - 2));
+                ctx.globalAlpha = 1;
+                ctx.strokeStyle = oov
+                    ? (col("--color-error") || "#f87171")
+                    : borrowed
+                        ? (col("--color-warning") || "#fbbf24")
+                        : selected
+                            ? (col("--accent-secondary") || "#8b5cf6")
+                            : "rgba(0,0,0,0.4)";
+                ctx.lineWidth = selected ? 1.5 : 1;
+                ctx.strokeRect(Math.round(cx0) + 0.5, Math.round(y + 1) + 0.5, Math.max(2, x1 - cx0) - 1, Math.max(2, v.rowH - 2) - 1);
+                // 一键修复差异高亮（§建议1）：被修过且留存的音符 → 琥珀描边 + 柔光，6 秒自动消退。
+                if (repairIdsRef.current.has(n.id)) {
+                    ctx.save();
+                    ctx.strokeStyle = "#ffb300";
+                    ctx.lineWidth = 2;
+                    ctx.shadowBlur = 6;
+                    ctx.shadowColor = "rgba(255, 179, 0, 0.9)";
+                    ctx.strokeRect(Math.round(cx0) - 1 + 0.5, Math.round(y) + 0.5, Math.max(2, x1 - cx0) + 2, Math.max(2, v.rowH) + 1);
+                    ctx.restore();
+                }
+                // S73b 调教所有权:用户调教的音符左缘竖条(金;SV1 Manual 标记同构)——机器调教/未调教不标。
+                // 只在真实左缘可见时画(裁剪态不画,免得贴屏幕边出现假标记)。
+                if (x0 >= noteAreaX && userTunedRef.current.has(n.id)) {
+                    ctx.fillStyle = TUNED_MARKER;
+                    ctx.fillRect(Math.round(x0) + 1, y + 2, 3, Math.max(2, v.rowH - 4));
+                }
+                // lyric — 乐器轨模式显示「音名」（C4 / D#3…），鼓轨显示「鼓件名」（底鼓/军鼓/闭镲…），人声轨显示歌词。
+                if (x1 - cx0 > 14 && v.rowH >= 11) {
+                    ctx.fillStyle = "#0a0f18";
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(cx0 + 2, y, x1 - cx0 - 3, v.rowH);
+                    ctx.clip();
+                    ctx.fillText(instrumentRef.current
+                        ? (drumTrackRef.current ? (gmDrumShort(n.pitch, i18n.language) || pitchName(n.pitch)) : pitchName(n.pitch))
+                        : n.lyric, cx0 + 4, y + v.rowH / 2 + 0.5);
+                    ctx.restore();
+                }
+            }
+            // ── PITCH LINE: the always-shown REAL f0 (SynthV — the sounding pitch = base ⊕ transition + pitchDev
+            //    + vibrato, all summed by the single evalF0Cents). Sampled across the note area every few px; an
+            //    unvoiced (rest) sample BREAKS the line (carrier-aware, §9.3). Emphasized under the Pitch tool. ──
+            {
+                // the pitch LINE skips SILENT notes — the line breaks over them and their neighbours become phrase
+                // edges (prev note release-drift 段中尾音, next note onset-scoop). The note RECTANGLES above
+                // (drawNotes) still show the note; only the sung-pitch chain drops it.
+                const sorted = pitchChain(drawNotes, tokensRef.current);
+                const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
+                const dr0 = dragRef.current; // live pitch-paint → preview the drawn curve on the line
+                const dev = dr0?.kind === "pitch-paint" && dr0.paint ? paintedDev(sorted, dr0.paint, pitchDevRef.current, opts) : pitchDevRef.current;
+                // S73c 手绘段染色(SV 同构):|dev|≥阈值的采样段用用户金,其余用常规粉——「被手动
+                // 调教过的音高线段」一眼可辨;基线 θ 在其下照常再生成(层隔离,见 autoTune.ts)。
+                // 颜色切换处从上一采样点接笔,线不断。evalCurveAt=二分,画线循环内零压力。
+                const baseColor = col("--accent-tertiary") || "#ff6b9d";
+                ctx.lineWidth = toolRef.current === "pitch" ? 2 : 1.5;
+                ctx.globalAlpha = toolRef.current === "pitch" ? 0.95 : 0.7;
+                ctx.strokeStyle = baseColor;
+                ctx.beginPath();
+                let pen = false; // whether a voiced sub-path is open
+                let curTint = false;
+                let prevPt = null;
+                for (let px = noteAreaX; px <= w; px += 2) {
+                    const rel = xToNoteTick(px - KEY_COL_W, start, v);
+                    const r = evalF0CentsAt(sorted, dev, rel, opts);
+                    if (!r.voiced) {
+                        pen = false;
+                        prevPt = null;
+                        continue;
+                    } // rest → break the line
+                    const y = centsToY(r.cents, v);
+                    const tint = Math.abs(evalCurveAt(dev, rel)) >= DEV_TINT_EPS_CENTS;
+                    if (tint !== curTint) {
+                        ctx.stroke();
+                        ctx.beginPath();
+                        ctx.strokeStyle = tint ? TUNED_MARKER : baseColor;
+                        curTint = tint;
+                        if (pen && prevPt) {
+                            ctx.moveTo(prevPt.x, prevPt.y);
+                            ctx.lineTo(px, y);
+                            pen = true;
+                        }
+                        else {
+                            ctx.moveTo(px, y);
+                            pen = true;
+                        }
+                    }
+                    else if (!pen) {
+                        ctx.moveTo(px, y);
+                        pen = true;
+                    }
+                    else {
+                        ctx.lineTo(px, y);
+                    }
+                    prevPt = { x: px, y };
+                }
+                ctx.stroke();
+                ctx.globalAlpha = 1;
+            }
+            // ── live gesture overlays ──
+            const d = dragRef.current;
+            if (d && (d.kind === "marquee" || d.kind === "marquee-delete")) {
+                const x = Math.min(d.clientX0, d.curX), yy = Math.min(d.clientY0, d.curY);
+                const ww = Math.abs(d.curX - d.clientX0), hh = Math.abs(d.curY - d.clientY0);
+                const del = d.kind === "marquee-delete";
+                ctx.fillStyle = del ? (col("--color-error") || "#f87171") : (col("--accent-primary") || "#39c5bb");
+                ctx.globalAlpha = 0.12;
+                ctx.fillRect(x, yy, ww, hh);
+                ctx.globalAlpha = 0.8;
+                ctx.strokeStyle = del ? (col("--color-error") || "#f87171") : (col("--accent-primary") || "#39c5bb");
+                ctx.lineWidth = 1;
+                ctx.setLineDash([4, 3]);
+                ctx.strokeRect(x + 0.5, yy + 0.5, ww, hh);
+                ctx.setLineDash([]);
+                ctx.globalAlpha = 1;
+            }
+            // ── piano key column (fixed left) — real-keyboard look: light WHITE keys full width, dark BLACK keys
+            //    inset from the right (so they read as shorter, between the whites), thin white-key separators. ──
+            // The whole column is WHITE-key surface first; on a real keyboard the black keys are SHORT and sit at
+            // the back, with the white keys extending past them to the FRONT. Here the front = the right side, so
+            // black keys are dark rects inset from the right and the WHITE shows to their right (that white — not
+            // a dark gap — is what makes the inset read).
+            ctx.fillStyle = col("--piano-white") || "#c8d0e0";
+            ctx.fillRect(0, 0, KEY_COL_W, h);
+            const blackW = Math.round(KEY_COL_W * 0.6);
+            // black keys: dark, short (inset from the right) → white front stays visible to their right.
+            // 鼓轨不画黑白键（对鼓没有意义）——整列平铺，腾出位置给鼓件名。
+            if (!drumTrackRef.current) {
+                for (let p = botPitch; p <= topPitch; p++) {
+                    if (!isBlackKey(p))
+                        continue;
+                    const y = pitchToY(p, v);
+                    ctx.fillStyle = "#10192c";
+                    ctx.fillRect(0, Math.round(y), blackW, Math.max(1, Math.round(v.rowH)));
+                }
+            }
+            // thin separator at EVERY row boundary so each key (white or black) is framed
+            ctx.strokeStyle = "rgba(10,15,24,0.4)";
+            ctx.lineWidth = 1;
+            for (let p = botPitch; p <= topPitch; p++) {
+                const y = Math.round(pitchToY(p, v)) + 0.5;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(KEY_COL_W, y);
+                ctx.stroke();
+            }
+            if (v.rowH >= 10) {
+                ctx.font = "10px system-ui, sans-serif";
+                ctx.textBaseline = "middle";
+                ctx.textAlign = "left";
+                ctx.fillStyle = "#0a0f18";
+                if (drumTrackRef.current) {
+                    // 鼓轨（§建议3）：每一行左边标鼓件名（底鼓/军鼓/闭镲/吊镲…），按 GM 分组序读起来
+                    // 就是「一套鼓」，比 C4/D#3 音名直观得多。无映射的行不标（留空）。
+                    for (let p = botPitch; p <= topPitch; p++) {
+                        const lbl = gmDrumShort(p, i18n.language);
+                        if (lbl)
+                            ctx.fillText(lbl, 4, pitchToY(p, v) + v.rowH / 2 + 0.5);
+                    }
+                }
+                else {
+                    // Muno 阶段3「简谱标尺·双显示」：每行左侧标简谱唱名（1-7 + 变化音 + 八度点），
+                    // 与右侧 C 音名并列（规划第五部分 5.1）。主音取当前段音符的 estimateKey
+                    // （空段默认 C 调）。八度点画在数字上/下方（自绘 2px 点，组合字符跨字体不稳）。
+                    const tonic = jianpuTonicRef.current;
+                    for (let p = botPitch; p <= topPitch; p++) {
+                        const j = jianpuForPitch(p, tonic);
+                        const black = isBlackKey(p);
+                        const yC = pitchToY(p, v) + v.rowH / 2 + 0.5;
+                        ctx.fillStyle = black ? "rgba(226,232,244,0.8)" : "#0a0f18";
+                        ctx.fillText(j.text, 4, yC);
+                        ctx.fillStyle = black ? "rgba(226,232,244,0.8)" : "#0a0f18";
+                        for (let d = 0; d < j.dotsAbove; d++)
+                            ctx.fillRect(5, yC - v.rowH / 2 + 1 + d * 3, 2, 2);
+                        for (let d = 0; d < j.dotsBelow; d++)
+                            ctx.fillRect(5, yC + v.rowH / 2 - 3 - d * 3, 2, 2);
+                    }
+                    // C labels (dark text on the white front, right side — always visible even on a black-key neighbour)
+                    for (let p = botPitch; p <= topPitch; p++) {
+                        if (p % 12 !== 0)
+                            continue;
+                        ctx.fillText(pitchName(p), KEY_COL_W - 20, pitchToY(p, v) + v.rowH / 2 + 0.5);
+                    }
+                }
+            }
+            ctx.strokeStyle = col("--border-default") || "#2a3a5c";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(KEY_COL_W + 0.5, 0);
+            ctx.lineTo(KEY_COL_W + 0.5, h);
+            ctx.stroke();
+            // ── bar-number ruler (top strip) — always know which bar you're in (mirrors the arrangement ruler) ──
+            ctx.fillStyle = col("--bg-panel") || "#1a2236";
+            ctx.fillRect(0, 0, w, RULER_H);
+            ctx.strokeStyle = col("--border-default") || "#2a3a5c";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(0, RULER_H + 0.5);
+            ctx.lineTo(w, RULER_H + 0.5);
+            ctx.stroke();
+            ctx.font = "10px system-ui, sans-serif";
+            ctx.textBaseline = "middle";
+            ctx.textAlign = "left";
+            for (const g of axisRef.current.gridLinesInRange(Math.max(0, Math.floor(absFrom)), Math.ceil(absTo))) {
+                const gx = noteAreaX + tickToX(g.tick, v);
+                if (gx < noteAreaX)
+                    continue;
+                ctx.strokeStyle = g.isBar ? "rgba(226,232,244,0.5)" : "rgba(226,232,244,0.26)"; // white, match the note-grid
+                ctx.lineWidth = g.isBar ? 1.4 : 1;
+                ctx.beginPath();
+                ctx.moveTo(Math.round(gx) + 0.5, g.isBar ? 3 : RULER_H - 5);
+                ctx.lineTo(Math.round(gx) + 0.5, RULER_H);
+                ctx.stroke();
+                if (g.isBar) {
+                    ctx.fillStyle = col("--text-muted") || "#556b94";
+                    ctx.fillText(String(axisRef.current.tickToBarBeat(g.tick).bar), gx + 3, RULER_H / 2);
+                }
+            }
+            // ── ② bottom automation lane (loudness / formant) — a FIXED band drawn OVER the bottom LANE_H of the
+            //    note area (its opaque bg covers the note rows/pitch-line that painted into this region). Shows ONE
+            //    param at a time (selector in the header); the curve is a RELATIVE offset, neutral 0 at the midline. ──
+            if (laneOpenRef.current) {
+                const laneTop = h - LANE_H;
+                ctx.fillStyle = col("--bg-panel") || "#1a2236";
+                ctx.fillRect(0, laneTop, w, LANE_H);
+                ctx.strokeStyle = col("--border-default") || "#2a3a5c";
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(0, laneTop + 0.5);
+                ctx.lineTo(w, laneTop + 0.5);
+                ctx.stroke();
+                // vertical meter grid within the band (time alignment with the notes above)
+                for (const g of axisRef.current.subGridLinesInRange(Math.max(0, Math.floor(absFrom)), Math.ceil(absTo), 12)) {
+                    const gx = noteAreaX + tickToX(g.tick, v);
+                    if (gx < noteAreaX)
+                        continue;
+                    const a = g.level === "bar" ? 0.28 : g.level === "beat" ? 0.13 : g.sub % 2 === 0 ? 0.05 : 0.025;
+                    ctx.strokeStyle = `rgba(226,232,244,${a})`;
+                    ctx.lineWidth = g.level === "bar" ? 1.4 : 1;
+                    ctx.beginPath();
+                    ctx.moveTo(Math.round(gx) + 0.5, laneTop + 1);
+                    ctx.lineTo(Math.round(gx) + 0.5, h);
+                    ctx.stroke();
+                }
+                if (laneParamRef.current === "phoneme") {
+                    // ── S83 READ-ONLY phoneme-timing view: blocks at the render allocator's true cv-frame
+                    //    positions — a pre-rolled onset consonant visibly starts BEFORE its note's onset line.
+                    //    Nucleus = accent fill; voiced consonant = violet (note-selected hue); voiceless = dim;
+                    //    SP invisible; AP faint (an audible breath). Text = the vocab IPA token itself. ──
+                    const pd = phonemeLaneRef.current;
+                    // S167: during a lane gesture, paint the WORKING split/gain instead of the cached answer.
+                    const drP = dragRef.current;
+                    // S167c: after a commit, the lane's answer arrives via a 250 ms debounce + IPC — keep
+                    // painting the just-committed working values until it lands, or the release flashes the
+                    // stale pre-edit split and reads as yet another snap-back (review finding). The overlay
+                    // is cleared by the very next lane answer (and only ever applies to the sig it was
+                    // committed against).
+                    const ovP = phoneCommitOverlayRef.current;
+                    const spansEff = pd && drP && (drP.kind === "phone-dur" || drP.kind === "phone-gain") && drP.phoneWork
+                        ? pd.spans.map((s, i) => ({
+                            ...s,
+                            frames: drP.phoneWork.frames.get(i) ?? s.frames,
+                            gain_db: drP.phoneWork.gain.get(i) ?? s.gain_db,
+                        }))
+                        : pd && ovP && ovP.sig === pd.sig
+                            ? pd.spans.map((s, i) => ({
+                                ...s,
+                                frames: ovP.frames.get(i) ?? s.frames,
+                                gain_db: ovP.gain.get(i) ?? s.gain_db,
+                            }))
+                            : pd?.spans;
+                    const bandY = laneTop + 14;
+                    const bandH = LANE_H - 20;
+                    if (pd && spansEff) {
+                        // S167c: note-onset reference lines REMOVED (user, matching SV): they were white
+                        // verticals fighting the draggable-boundary handles for attention — and the note grid
+                        // is already visible in the piano roll directly above (a pre-rolled consonant still
+                        // reads as "left of its note block"). The lane's only bright verticals are handles.
+                        // S167b: the 0 dB STRENGTH reference — the per-phone level lines below read against it
+                        // (mid = 0, top = +12, bottom = −12; same mapping the plain-drag gesture uses).
+                        ctx.strokeStyle = "rgba(226,232,244,0.12)";
+                        ctx.lineWidth = 1;
+                        ctx.setLineDash([2, 3]);
+                        const zeroY = Math.round(bandY + bandH * 0.5) + 0.5;
+                        ctx.beginPath();
+                        ctx.moveTo(noteAreaX, zeroY);
+                        ctx.lineTo(w, zeroY);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                        ctx.font = "9px Consolas, monospace";
+                        ctx.textAlign = "center";
+                        ctx.textBaseline = "middle";
+                        let f = 0;
+                        for (const s of spansEff) {
+                            const t0 = f * pd.ticksPerFrame;
+                            const t1 = (f + s.frames) * pd.ticksPerFrame;
+                            f += s.frames;
+                            const x0 = noteAreaX + noteTickToX(t0, start, v);
+                            const x1 = noteAreaX + noteTickToX(t1, start, v);
+                            if (x1 < noteAreaX || x0 > w)
+                                continue;
+                            const bx0 = Math.max(x0, noteAreaX);
+                            const bw = Math.max(1, Math.min(x1, w) - bx0 - 1);
+                            if (s.dropped) {
+                                // S167 (§E1, S86#4): a phone the allocator STARVED OUT — a zero-width marker with the
+                                // phone above it, so a silent discard is never invisible again (lengthen the note or
+                                // re-split its timing to fund it).
+                                ctx.fillStyle = col("--danger") || "#e0567b";
+                                ctx.fillRect(Math.round(bx0) - 1, bandY - 4, 2, bandH + 8);
+                                ctx.font = "8px Consolas, monospace";
+                                ctx.textBaseline = "alphabetic";
+                                ctx.fillText(s.phone, bx0, bandY - 6);
+                                ctx.font = "9px Consolas, monospace";
+                                ctx.textBaseline = "middle";
+                                continue;
+                            }
+                            if (s.phone === "SP")
+                                continue; // a true rest draws nothing (the grid shows through)
+                            if (s.phone === "AP") {
+                                ctx.fillStyle = "rgba(226,232,244,0.06)";
+                                ctx.fillRect(bx0, bandY, bw, bandH);
+                            }
+                            else {
+                                ctx.fillStyle = s.nucleus ? (col("--accent-primary") || "#39c5bb") : (col("--note-selected") || "#8b5cf6");
+                                ctx.globalAlpha = s.nucleus ? 0.3 : s.voiceless ? 0.12 : 0.24;
+                                ctx.fillRect(bx0, bandY, bw, bandH);
+                                ctx.globalAlpha = 1;
+                                ctx.strokeStyle = "rgba(226,232,244,0.25)";
+                                ctx.lineWidth = 1;
+                                if (s.stale)
+                                    ctx.setLineDash([3, 2]); // S167: this note's edit no longer matches — visibly dead
+                                ctx.strokeRect(Math.round(bx0) + 0.5, Math.round(bandY) + 0.5, Math.max(1, Math.round(bw) - 1), bandH - 1);
+                                ctx.setLineDash([]);
+                                // S167b (SV-style): the phone's STRENGTH as a level line inside its block — faint at
+                                // 0 dB so the default reads as a continuous mid-line, bold once edited. A plain
+                                // vertical drag moves exactly this line (absolute placement, same mapping).
+                                {
+                                    const gy = Math.round(bandY + bandH * (1 - (s.gain_db + 12) / 24)) + 0.5;
+                                    ctx.strokeStyle = col("--accent-primary") || "#39c5bb";
+                                    ctx.globalAlpha = s.gain_db !== 0 ? 0.95 : 0.3;
+                                    ctx.lineWidth = s.gain_db !== 0 ? 2 : 1;
+                                    ctx.beginPath();
+                                    ctx.moveTo(bx0 + 1, gy);
+                                    ctx.lineTo(bx0 + Math.max(2, bw) - 1, gy);
+                                    ctx.stroke();
+                                    ctx.globalAlpha = 1;
+                                    ctx.lineWidth = 1;
+                                }
+                                if (s.frames !== s.base_frames) {
+                                    // S167: an ACTIVE timing edit — accent underline (strength has its own line above)
+                                    ctx.fillStyle = col("--accent-primary") || "#39c5bb";
+                                    ctx.fillRect(bx0, bandY + bandH - 2, bw, 2);
+                                }
+                            }
+                            if (x1 - x0 >= 14) {
+                                ctx.fillStyle = s.nucleus ? (col("--text-primary") || "#e2e8f4") : (col("--text-muted") || "#8896b4");
+                                ctx.fillText(s.phone, (Math.max(x0, noteAreaX) + Math.min(x1, w)) / 2, bandY + bandH / 2);
+                            }
+                        }
+                        // S167c: DRAGGABLE boundary handles, drawn from the SAME predicate the hit-test uses —
+                        // a bright vertical is never painted where a drag would not work (the S167b shape:
+                        // block outlines and note-onset reference lines read as handles, yet only same-note
+                        // junctions respond — the user hovered "boundary lines" and found them dead). The
+                        // grabbed boundary highlights in accent while dragging.
+                        {
+                            let hb = 0;
+                            for (let i = 0; i < spansEff.length; i++) {
+                                hb += spansEff[i].frames;
+                                if (!boundaryDraggableAfter(pd.spans, pd.tripleNoteIds, i))
+                                    continue;
+                                const hx = noteAreaX + noteTickToX(hb * pd.ticksPerFrame, start, v);
+                                if (hx < noteAreaX || hx > w)
+                                    continue;
+                                const active = drP && (drP.kind === "phone-dur") && drP.phoneLeft === i;
+                                ctx.strokeStyle = active ? (col("--accent-primary") || "#39c5bb") : "rgba(226,232,244,0.7)";
+                                ctx.lineWidth = active ? 2 : 1;
+                                ctx.beginPath();
+                                ctx.moveTo(Math.round(hx) + 0.5, bandY - 2);
+                                ctx.lineTo(Math.round(hx) + 0.5, bandY + bandH + 2);
+                                ctx.stroke();
+                                ctx.lineWidth = 1;
+                            }
+                        }
+                        // hover readout (top-right of the band): the phone under the cursor + its true length + the
+                        // source note's lyric — evt → tripleNoteIds → note (the attribution chain the wire carries).
+                        const mp2 = mouseRef.current;
+                        if (mp2 && mp2.y >= laneTop && mp2.x >= KEY_COL_W) {
+                            let hf = 0;
+                            for (const s of spansEff) {
+                                const hx0 = noteAreaX + noteTickToX(hf * pd.ticksPerFrame, start, v);
+                                hf += s.frames;
+                                const hx1 = noteAreaX + noteTickToX(hf * pd.ticksPerFrame, start, v);
+                                if (mp2.x < hx0 || mp2.x >= hx1)
+                                    continue;
+                                const noteId = pd.tripleNoteIds[s.evt];
+                                const lyric = noteId ? notesRef.current.find((n) => n.id === noteId)?.lyric : undefined;
+                                ctx.fillStyle = col("--text-primary") || "#e2e8f4";
+                                ctx.font = "10px Consolas, monospace";
+                                ctx.textAlign = "right";
+                                ctx.textBaseline = "top";
+                                // S167: the readout carries the edit state too — strength, off-automatic, stale.
+                                const extra = (s.gain_db !== 0 ? ` · ${s.gain_db > 0 ? "+" : ""}${s.gain_db}dB` : "") +
+                                    (s.frames !== s.base_frames ? ` · ${t("vocalEditor.lane.edited")}` : "") +
+                                    (s.stale ? ` · ${t("vocalEditor.lane.stale")}` : "");
+                                ctx.fillText(`${lyric ? `${lyric} · ` : ""}${s.phone} · ${s.frames * 20}ms${extra}`, w - 6, laneTop + 3);
+                                break;
+                            }
+                        }
+                    }
+                    // left scale column: bg + border like the numeric lanes; "IPA" as the unit tag.
+                    ctx.fillStyle = col("--bg-deep") || "#080b14";
+                    ctx.fillRect(0, laneTop, KEY_COL_W, LANE_H);
+                    ctx.strokeStyle = col("--border-default") || "#2a3a5c";
+                    ctx.beginPath();
+                    ctx.moveTo(KEY_COL_W + 0.5, laneTop);
+                    ctx.lineTo(KEY_COL_W + 0.5, h);
+                    ctx.stroke();
+                    ctx.fillStyle = col("--text-muted") || "#556b94";
+                    ctx.font = "9px system-ui, sans-serif";
+                    ctx.textAlign = "left";
+                    ctx.textBaseline = "top";
+                    ctx.fillText("IPA", 4, laneTop + 3);
+                }
+                else {
+                    const cfg = laneCfg(laneParamRef.current);
+                    // neutral (0) midline
+                    const midY = paramToY(0, cfg.min, cfg.max, laneTop, LANE_H);
+                    ctx.strokeStyle = "rgba(226,232,244,0.22)";
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([3, 3]);
+                    ctx.beginPath();
+                    ctx.moveTo(noteAreaX, Math.round(midY) + 0.5);
+                    ctx.lineTo(w, Math.round(midY) + 0.5);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    // the param ENVELOPE = a piecewise-linear curve through the user's control POINTS (§user: insert +
+                    // drag points, not freehand). Live = the working curve during a point drag, else the stored curve.
+                    const stored = paramCurvesRef.current?.[cfg.id];
+                    const dr0 = dragRef.current;
+                    const live = dr0?.kind === "param-point" && dr0.pointCurve && dr0.param === cfg.id ? dr0.pointCurve : stored;
+                    ctx.strokeStyle = col("--accent-primary") || "#39c5bb";
+                    ctx.lineWidth = 1.8;
+                    ctx.globalAlpha = 0.95;
+                    ctx.beginPath();
+                    for (let px = noteAreaX; px <= w; px += 2) {
+                        const rel = xToNoteTick(px - KEY_COL_W, start, v);
+                        const y = paramToY(evalCurveAt(live, rel), cfg.min, cfg.max, laneTop, LANE_H);
+                        if (px === noteAreaX)
+                            ctx.moveTo(px, y);
+                        else
+                            ctx.lineTo(px, y);
+                    }
+                    ctx.stroke();
+                    ctx.globalAlpha = 1;
+                    // control-point HANDLES (grabbable squares) — the dragged one highlighted.
+                    if (live && live.xs.length) {
+                        for (let i = 0; i < live.xs.length; i++) {
+                            const hx = noteAreaX + noteTickToX(live.xs[i], start, v);
+                            if (hx < noteAreaX - 4 || hx > w + 4)
+                                continue;
+                            const hy = paramToY(live.ys[i], cfg.min, cfg.max, laneTop, LANE_H);
+                            const activePt = dr0?.kind === "param-point" && dr0.pointIdx === i && dr0.param === cfg.id;
+                            ctx.fillStyle = activePt ? (col("--note-selected") || "#8b5cf6") : (col("--accent-primary") || "#39c5bb");
+                            ctx.fillRect(Math.round(hx) - 3, Math.round(hy) - 3, 6, 6);
+                        }
+                    }
+                    // left scale column (over the key-column width): +max / 0 / min + unit — numbers + symbol, no i18n.
+                    ctx.fillStyle = col("--bg-deep") || "#080b14";
+                    ctx.fillRect(0, laneTop, KEY_COL_W, LANE_H);
+                    ctx.strokeStyle = col("--border-default") || "#2a3a5c";
+                    ctx.beginPath();
+                    ctx.moveTo(KEY_COL_W + 0.5, laneTop);
+                    ctx.lineTo(KEY_COL_W + 0.5, h);
+                    ctx.stroke();
+                    ctx.fillStyle = col("--text-muted") || "#556b94";
+                    ctx.font = "9px system-ui, sans-serif";
+                    ctx.textAlign = "right";
+                    ctx.textBaseline = "middle";
+                    ctx.fillText(`+${cfg.max}`, KEY_COL_W - 4, laneTop + 9);
+                    ctx.fillText("0", KEY_COL_W - 4, midY);
+                    ctx.fillText(`${cfg.min}`, KEY_COL_W - 4, h - 9);
+                    ctx.textAlign = "left";
+                    ctx.textBaseline = "top";
+                    ctx.fillText(cfg.unit, 4, laneTop + 3);
+                }
+            }
+            // ── mouse-position guide (ALL tools): a vertical line at the snapped tick under the cursor, drawn
+            //    LAST (over the key column + ruler) so it is NEVER covered — fixes "disappears at the leftmost".
+            const mp = mouseRef.current;
+            if (mp && !dragRef.current && mp.x >= KEY_COL_W && mp.y >= RULER_H) {
+                // The clamp mirrors the pen's own Math.max(0, …) so the guide can't promise a position one whole cell
+                // left of where the note appears — snapPlace works in ABSOLUTE space, so inside the leading partial
+                // cell of an off-grid part (every imported / MIDI-extracted part) it returns a NEGATIVE relative tick.
+                // ⚠ It applies ONLY inside the part: left of the part start the cursor is outside it entirely, and
+                // the guide must keep tracking the mouse there for all four tools (pre-S87 behavior — an unconditional
+                // clamp froze the guide on the part's left edge for every part not starting at tick 0; audit-caught).
+                const gRel = xToNoteTick(mp.x - KEY_COL_W, start, v);
+                const gx = noteAreaX + noteTickToX(gRel >= 0 ? Math.max(0, snapPlace(gRel)) : snapPlace(gRel), start, v);
+                if (gx <= w) {
+                    const gxr = Math.max(KEY_COL_W, Math.round(gx)) + 0.5;
+                    ctx.strokeStyle = col("--accent-primary") || "#39c5bb";
+                    ctx.globalAlpha = 0.5;
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(gxr, RULER_H);
+                    ctx.lineTo(gxr, h);
+                    ctx.stroke();
+                    ctx.globalAlpha = 1;
+                }
+            }
+            // ── pitch-preview progress (§user S68c): HOLLOW inverted triangle in the ruler at the scrub
+            //    position — hollow vs the main playhead's FILLED cap keeps the two unmistakable; the main
+            //    playhead is deliberately untouched and still draws after (= over) this. ──
+            if (previewPosRef.current != null) {
+                const pvx = noteAreaX + tickToX(startRef.current + previewPosRef.current, v);
+                if (pvx >= noteAreaX && pvx <= w) {
+                    ctx.strokeStyle = PLAYHEAD;
+                    ctx.lineWidth = 1.5;
+                    ctx.globalAlpha = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(pvx - 4.5, RULER_H - 8.5);
+                    ctx.lineTo(pvx + 4.5, RULER_H - 8.5);
+                    ctx.lineTo(pvx, RULER_H - 1);
+                    ctx.closePath();
+                    ctx.stroke();
+                }
+            }
+            // ── ② pink transport playhead (absolute tick → note-area x), drawn LAST so it's never covered; spans
+            //    the note rows AND the lane band. Solid #ff6b9d (PLAYHEAD, shared) + a triangle cap in the ruler
+            //    disambiguates it from the same-pink f0 line. Its bar:beat readout sits top-right of the ruler. ──
+            {
+                const phx = noteAreaX + tickToX(playheadTickRef.current, v);
+                if (phx >= noteAreaX && phx <= w) {
+                    const xr = Math.round(phx) + 0.5;
+                    ctx.strokeStyle = PLAYHEAD;
+                    ctx.lineWidth = 2;
+                    ctx.globalAlpha = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(xr, RULER_H);
+                    ctx.lineTo(xr, h);
+                    ctx.stroke();
+                    ctx.fillStyle = PLAYHEAD;
+                    ctx.beginPath();
+                    ctx.moveTo(phx - 4, RULER_H - 7);
+                    ctx.lineTo(phx + 4, RULER_H - 7);
+                    ctx.lineTo(phx, RULER_H);
+                    ctx.closePath();
+                    ctx.fill();
+                }
+                // bar:beat:sub readout (transport position) — top-right of the ruler, reuses formatBarBeat (no drift).
+                const txt = formatBarBeat(axisRef.current, Math.max(0, playheadTickRef.current));
+                ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+                ctx.textAlign = "right";
+                ctx.textBaseline = "middle";
+                const tw = ctx.measureText(txt).width;
+                ctx.fillStyle = col("--bg-panel") || "#1a2236";
+                ctx.fillRect(w - tw - 10, 0, tw + 10, RULER_H);
+                ctx.fillStyle = PLAYHEAD;
+                ctx.fillText(txt, w - 5, RULER_H / 2);
+            }
+            ctx.restore();
+        };
+        requestRedraw();
+    }, [part?.notes, selectedNotes, tool, gridDiv, laneOpen, laneParam, requestRedraw]);
+    // Warm the shared AudioContext on mount so the first key-preview isn't delayed by an on-gesture resume;
+    // and make focus-loss / unmount RELEASE a sustained preview tone (belt-and-suspenders with pointerup/
+    // cancel/Esc): if the window loses focus or is hidden mid-drag, the terminal pointerup may never arrive
+    // (release over another window), so cancel the gesture + stop the tone here (verify: stuck-tone race).
+    useEffect(() => {
+        playback.getPreviewContext();
+        const release = () => {
+            if (dragRef.current) {
+                dragRef.current = null;
+                requestRedraw();
+            }
+            if (edgeRafRef.current) {
+                cancelAnimationFrame(edgeRafRef.current);
+                edgeRafRef.current = 0;
+            }
+            if (playRafRef.current) {
+                cancelAnimationFrame(playRafRef.current);
+                playRafRef.current = 0;
+                setPlaying(false);
+            }
+            if (wavSrcRef.current) {
+                try {
+                    wavSrcRef.current.stop();
+                }
+                catch { /* already ended */ }
+                wavSrcRef.current = null;
+                setPlaying(false);
+            }
+            playback.stopPreviewTone();
+        };
+        window.addEventListener("blur", release);
+        document.addEventListener("visibilitychange", release);
+        return () => {
+            window.removeEventListener("blur", release);
+            document.removeEventListener("visibilitychange", release);
+            if (playRafRef.current)
+                cancelAnimationFrame(playRafRef.current);
+            if (edgeRafRef.current)
+                cancelAnimationFrame(edgeRafRef.current);
+            if (wavSrcRef.current) {
+                try {
+                    wavSrcRef.current.stop();
+                }
+                catch { /* already ended */ }
+                wavSrcRef.current = null;
+            }
+            playback.stopPreviewTone();
+        };
+    }, [requestRedraw]);
+    // Redraw when the part boundary (moved / resized on the ARRANGEMENT) or the meter changes. The boundary
+    // edit keeps the notes array ref (only startTick/durationTicks move), so the draw effect above does NOT
+    // re-run — without this the boundary line only "happens" to refresh when some other redraw fires (hover/
+    // scroll), which is the reported intermittent staleness. The draw closure reads start/dur/axis via refs,
+    // so re-invoking it is enough (no rebuild).
+    useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, part?.pitchDev, part?.paramCurves, part?.transition, part?.vocalParams?.breathToken, part?.vocalParams?.restToken, timeSignature, tempo, requestRedraw]);
+    // ② S58 OOV marking: async verdicts from the oovWatch watcher (app store) → ref + redraw (the draw
+    // closure reads the ref — the standard三处同步: ref sync here + this dedicated redraw effect).
+    useEffect(() => { requestRedraw(); }, [oovIds, droppedIds, shortIds, aliasHintIds, requestRedraw]);
+    // Muno 阶段3:简谱主音变化(和弦分析结果更新 / 段音符编辑后重估) → 重画键列唱名。
+    useEffect(() => { requestRedraw(); }, [chordKey, segKey, requestRedraw]);
+    // (laneParam/laneOpen repaints ride the draw-closure rebuild effect above — laneParam is in its dep
+    // array and it ends in requestRedraw(); a second dedicated effect here would be a duplicate
+    // invalidation path. S83 review #7.)
+    // Attach the live preview-notes closure to the drag state (draw reads it).
+    const withPreview = (d) => {
+        const dd = d;
+        dd.previewNotes = () => computePreview(dd);
+        return dd;
+    };
+    // ── geometry helpers on the live view ──
+    const relTickAt = (clientX) => {
+        const cv = canvasRef.current;
+        if (!cv)
+            return 0;
+        const r = cv.getBoundingClientRect();
+        return xToNoteTick(clientX - r.left - KEY_COL_W, startRef.current, viewRef.current);
+    };
+    const pitchAt = (clientY) => {
+        const cv = canvasRef.current;
+        if (!cv)
+            return 60;
+        const r = cv.getBoundingClientRect();
+        return yToPitch(clientY - r.top, viewRef.current);
+    };
+    const centsAt = (clientY) => {
+        const cv = canvasRef.current;
+        if (!cv)
+            return 6000;
+        const r = cv.getBoundingClientRect();
+        return yToCents(clientY - r.top, viewRef.current);
+    };
+    const localXY = (clientX, clientY) => {
+        const cv = canvasRef.current;
+        if (!cv)
+            return { x: 0, y: 0 };
+        const r = cv.getBoundingClientRect();
+        return { x: clientX - r.left, y: clientY - r.top };
+    };
+    // note under a point (reverse z so the topmost/last wins); returns {note, onEdge}
+    const noteAt = (clientX, clientY) => {
+        const { x } = localXY(clientX, clientY);
+        if (x < KEY_COL_W)
+            return null;
+        const p = pitchAt(clientY);
+        const rel = relTickAt(clientX);
+        const v = viewRef.current;
+        for (let i = notesRef.current.length - 1; i >= 0; i--) {
+            const n = notesRef.current[i];
+            if (n.pitch !== p)
+                continue;
+            if (rel >= n.tick && rel < n.tick + n.duration) {
+                const x1 = noteTickToX(n.tick + n.duration, startRef.current, v) + KEY_COL_W;
+                const onEdge = (x1 - x) <= EDGE_PX && n.duration * v.ppt > EDGE_PX * 2;
+                return { note: n, onEdge };
+            }
+        }
+        return null;
+    };
+    // S167 (§E2): hit-test the phoneme lane against the CACHED spans (the same positions the paint
+    // uses). A BOUNDARY between two adjacent same-note phones = a timing handle (drag to re-split);
+    // a phone body = a strength handle (Alt+drag). Returns null when nothing editable is under x.
+    const PHONE_BOUNDARY_HIT = 5;
+    // S167c (user-tuned twice): returns BOTH halves; the CALLER prioritizes boundary over body —
+    // within ±5 px of a draggable junction = the TIMING handle (col-resize), anywhere else on a
+    // phone body = the STRENGTH handle (ns-resize). No modifier key (Alt dropped — user 2026-08-31:
+    // 「按现在这种操控甚至不需要 alt 了」). Draggability comes from the ONE shared predicate
+    // `boundaryDraggableAfter` — the painter draws its bright handles from the same predicate, so
+    // feedback, handles and hit-testing can never disagree (the S167b drift: outlines/reference
+    // lines read as handles yet only same-note junctions respond).
+    const phoneLaneHitAt = (clientX) => {
+        const pd = phonemeLaneRef.current;
+        if (!pd)
+            return {};
+        const cx = localXY(clientX, 0).x;
+        const v = viewRef.current, start = startRef.current;
+        // S167c (review): hit-test in the frames the user is LOOKING at — after a commit the lane's
+        // cached spans lag by debounce+IPC, and the overlay is what the painter shows meanwhile.
+        const ovH = phoneCommitOverlayRef.current;
+        const effF = (i) => (ovH && ovH.sig === pd.sig ? ovH.frames.get(i) : undefined) ?? pd.spans[i].frames;
+        let f = 0;
+        const out = {};
+        for (let i = 0; i < pd.spans.length; i++) {
+            const s = pd.spans[i];
+            const x0 = KEY_COL_W + noteTickToX(f * pd.ticksPerFrame, start, v);
+            f += effF(i);
+            const x1 = KEY_COL_W + noteTickToX(f * pd.ticksPerFrame, start, v);
+            if (s.frames <= 0)
+                continue; // dropped markers are indicators, not handles
+            if (out.boundary === undefined && Math.abs(cx - x1) <= PHONE_BOUNDARY_HIT
+                // S167c (review): only junctions whose HANDLE is actually painted — the painter clips
+                // at the view edges, and an invisible handle must never answer col-resize.
+                && x1 >= KEY_COL_W && x1 <= sizeRef.current.w
+                && boundaryDraggableAfter(pd.spans, pd.tripleNoteIds, i))
+                out.boundary = i;
+            if (!pd.tripleNoteIds[s.evt])
+                continue; // a gap rest is not editable
+            if (out.span === undefined && cx >= x0 && cx < x1)
+                out.span = i;
+        }
+        return out;
+    };
+    // ② index of the lane control-point under the cursor (within LANE_PT_HIT px), or -1. Uses the CURRENTLY
+    // selected lane's stored curve; the caller has already confirmed the cursor is in the lane band.
+    const LANE_PT_HIT = 8;
+    const laneParamPointAt = (clientX, clientY) => {
+        if (laneParamRef.current === "phoneme")
+            return -1; // S83: the phoneme view has no points
+        const cfg = laneCfg(laneParamRef.current);
+        const curve = paramCurvesRef.current?.[cfg.id];
+        if (!curve || curve.xs.length === 0)
+            return -1;
+        const { x: cx, y: cy } = localXY(clientX, clientY);
+        const v = viewRef.current, laneTop = noteBottom();
+        let best = -1, bestD = LANE_PT_HIT;
+        for (let i = 0; i < curve.xs.length; i++) {
+            const px = KEY_COL_W + noteTickToX(curve.xs[i], startRef.current, v);
+            const py = paramToY(curve.ys[i], cfg.min, cfg.max, laneTop, LANE_H);
+            const d = Math.hypot(px - cx, py - cy);
+            if (d < bestD) {
+                bestD = d;
+                best = i;
+            }
+        }
+        return best;
+    };
+    // ── compute the off-ref preview note array for a live gesture (no store writes) ──
+    const computePreview = (d) => {
+        const base = notesRef.current;
+        if (d.kind === "create" && d.newNote) {
+            return [...base, d.newNote];
+        }
+        if (d.kind === "resize") {
+            return base.map((n) => {
+                const o = d.orig.get(n.id);
+                if (!o)
+                    return n;
+                // Snapping ON: the end lands ON a 1/12 line, floored at one cell — HEAD's behavior, byte-identical.
+                // OFF: the end follows the HAND (delta from the grab point), so the grab offset is preserved and a
+                // click cannot teleport the edge to the cursor; the floor becomes ONE RENDER FRAME, which is the
+                // real limit (shorter provably cannot sound) and still well under 1/12, so an imported sub-cell
+                // CVVC note stays editable.
+                const minLen = snapNotesRef.current ? MIN_LEN_TICKS : renderFrameTicks(tempoRef.current);
+                // The fallback is the note's own END, NOT 0: a missing grab tick then degenerates to the pre-S87
+                // absolute-cursor rule instead of adding the whole cursor position to the length. (Both resize
+                // entry points do record startRel; this is the belt to that braces.)
+                const newEnd = resizeEndTick(o.tick, o.duration, relTickAt(d.curX), d.startRel ?? o.tick + o.duration, startRef.current, MIN_LEN_TICKS, minLen, snapNotesRef.current);
+                return { ...o, duration: newEnd - o.tick };
+            });
+        }
+        if (d.kind === "move") {
+            const origs = [...d.orig.values()];
+            // AXIS LOCK: a mostly-vertical drag is PURE pitch (dTick=0); a mostly-horizontal drag is PURE timing
+            // (dPitch=0). Fixes "multi-note vertical drag drifts sideways" — a tiny x-jitter used to jump a whole
+            // snap cell (felt like huge sideways sensitivity), amplified across a multi-selection. Free move (§user).
+            // Adjustment drags step by 1/12 (40t), NOT the (possibly coarse) grid cell (§user: only CREATION uses
+            // the grid). Each axis is INDEPENDENT (activeX/activeY set in onPointerMove) and measured from the
+            // origin — so switching direction mid-drag keeps what the other axis already moved (no jump-back).
+            // S87 — ABSOLUTE snapping: the delta is chosen so the ANCHOR note (the one grabbed at pointerdown,
+            // d.anchorRelTick) lands ON a grid line; every other selected note rides the SAME delta, so spacing is
+            // preserved. The pre-S87 form snapped the CURSOR tick at both ends and subtracted — always a whole
+            // number of cells, which CONSERVES an off-grid offset: an imported off-grid note could never be dragged
+            // back onto the grid (§user 死结). Snapping OFF ⇒ a plain whole-tick continuous delta.
+            const rawDTick = d.activeX
+                ? snapMoveDelta(d.anchorRelTick, relTickAt(d.curX) - (d.startRel ?? 0), startRef.current, MIN_LEN_TICKS, snapNotesRef.current)
+                : 0;
+            const rawDPitch = d.activeY ? pitchAt(d.curY) - (d.startPitch ?? 0) : 0;
+            // GROUP clamp (§9.2): clamp the SHARED delta by the group's headroom so spacing is preserved and two
+            // notes can't collapse onto one tick/pitch at a wall. Translate whole notes — transition/vibrato are
+            // in ABSOLUTE ms so they ride along unchanged; NO retimeNote rebase (that's only the truncation head-move).
+            const dTick = Math.max(rawDTick, -Math.min(...origs.map((o) => o.tick)));
+            const loP = Math.min(...origs.map((o) => o.pitch));
+            const hiP = Math.max(...origs.map((o) => o.pitch));
+            const dPitch = Math.max(V_PITCH_MIN - loP, Math.min(V_PITCH_MAX - hiP, rawDPitch));
+            return base.map((n) => {
+                const o = d.orig.get(n.id);
+                return o ? { ...o, tick: o.tick + dTick, pitch: o.pitch + dPitch } : n;
+            });
+        }
+        // pitch-paint doesn't touch notes — the drawn pitchDev is previewed via paintedDev() in draw/commit.
+        return base;
+    };
+    const clampPitch = (p) => Math.min(V_PITCH_MAX, Math.max(V_PITCH_MIN, p));
+    // ── commit: diff the resolved next-array vs current → applyNoteEdits (ONE step); skip a no-op ──
+    const commitNotes = (nextNotes, activeIds) => {
+        if (!part)
+            return;
+        // min 1 tick = zero-length guard only. The 60ms singability floor is a Phase-6 RENDER concern (Rust
+        // min_frames), NOT a UI clamp — clamping here to 60ms would conflict with a 1/12 grid cell (§user).
+        const resolved = resolveOverlaps(nextNotes, new Set(activeIds), 1);
+        const cur = new Map(part.notes.map((n) => [n.id, n]));
+        const next = new Map(resolved.map((n) => [n.id, n]));
+        const add = [];
+        const update = {};
+        const remove = [];
+        for (const [id, n] of next) {
+            const c = cur.get(id);
+            if (!c)
+                add.push(n);
+            else if (noteSig(c) !== noteSig(n))
+                update[id] = n;
+        }
+        for (const id of cur.keys())
+            if (!next.has(id))
+                remove.push(id);
+        if (add.length === 0 && remove.length === 0 && Object.keys(update).length === 0)
+            return; // no-op → no dirty
+        applyNoteEdits(part.trackId, segmentId, { add, update, remove });
+    };
+    // ── pointer handlers ──
+    // Muno 阶段2:乐器轨交互发声。轨道选了音源音色 → 真实音色试听(audition WAV 按键缓存,
+    // 重复触发零渲染);没选 → 振荡器占位音(人声轨/旧乐器轨行为不变)。audition 内部静默
+    // 失败,绝不打断手势。
+    const audibleTone = useCallback((pitch, durMs) => {
+        const sf = trackSfRef.current;
+        if (sf)
+            void playSoundfontAudition(sf, pitch);
+        else
+            playback.playPreviewTone(pitchToHz(pitch), durMs);
+    }, []);
+    const onPointerDown = useCallback((e) => {
+        if (e.button !== 0)
+            return;
+        // Commit any focused-field edit session (BPM box) before this gesture mutates notes — its store
+        // writes would otherwise fold into the field's open history transaction (see Arrangement
+        // handleMouseDown for the full story; the natural blur fires only after this handler).
+        const ae = document.activeElement;
+        if (ae instanceof HTMLElement && ae !== e.currentTarget)
+            ae.blur();
+        setActivePane("vocal");
+        e.currentTarget.setPointerCapture(e.pointerId);
+        const { x, y } = localXY(e.clientX, e.clientY);
+        if (x < KEY_COL_W) { // left column: a piano key (note area) → preview tone; the lane's scale column → INERT
+            if (y < noteBottom())
+                audibleTone(pitchAt(e.clientY), 220);
+            return; // never fall through to the note-area marquee (which would clear the selection)
+        }
+        // ② TOP RULER → seek the global transport playhead (§user: re-listen after an edit WITHOUT going to the main
+        // arrangement to find the spot). Drag scrubs; during playback set `seeking` so the transport reschedules from
+        // the new tick on release (mirrors TimelineRuler). Absolute tick space (playhead is absolute; x already ≥ KEY_COL_W).
+        if (y < RULER_H) {
+            useProjectStore.getState().setPlayhead(Math.max(0, Math.round(xToTick(x - KEY_COL_W, viewRef.current))));
+            if (useAudioStore.getState().isPlaying)
+                useAudioStore.getState().setSeeking(true);
+            dragRef.current = withPreview({
+                kind: "ruler-seek", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+                activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive: false,
+            });
+            requestRedraw();
+            return;
+        }
+        // ② bottom automation lane: INSERT / DRAG control points (§user: point-based, not freehand). Guarded FIRST so
+        // a lane gesture never touches notes. Click on empty → insert a point + drag it; click ON a point → drag it;
+        // right-click a point → delete (onContextMenu). Commits ONCE on pointerup (one undo step).
+        if (laneOpenRef.current && y >= noteBottom() && x >= KEY_COL_W) {
+            if (laneParamRef.current === "phoneme") {
+                // S167c (user-tuned twice): no modifier key — the ±5 px boundary zone IS the timing
+                // handle (it wins over the body), anywhere else on a phone body is the strength handle.
+                // The note's total length never moves (Rust conserves it); anything else stays
+                // gesture-free, and the hover cursor only lights up where a drag would actually work.
+                const pd = phonemeLaneRef.current;
+                if (!pd)
+                    return;
+                const hit = phoneLaneHitAt(e.clientX);
+                if (hit.boundary !== undefined) {
+                    const s = pd.spans[hit.boundary];
+                    // S167c (review): seed the intent map with the note's STORED scales — an untouched
+                    // phone must commit exactly what it already had. Re-deriving from previewed frames
+                    // drifts ±1 per regrab, and inside the post-commit debounce window the cached spans
+                    // are still pre-edit (the quick-second-drag would silently wipe the first edit).
+                    const seeded = new Map();
+                    const noteId0 = pd.tripleNoteIds[s.evt];
+                    const pt0 = noteId0 ? part?.notes.find((n) => n.id === noteId0)?.phoneTiming : undefined;
+                    if (pt0) {
+                        const nIdxs = [];
+                        pd.spans.forEach((sp, i) => { if (sp.evt === s.evt && sp.frames > 0)
+                            nIdxs.push(i); });
+                        if (pt0.scale.length === nIdxs.length)
+                            nIdxs.forEach((i, k) => seeded.set(i, pt0.scale[k]));
+                    }
+                    dragRef.current = withPreview({
+                        kind: "phone-dur", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+                        activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive: false,
+                        phoneEvt: s.evt, phoneLeft: hit.boundary, phoneWork: { frames: new Map(), gain: new Map() },
+                        phoneScale: seeded,
+                    });
+                    requestRedraw();
+                }
+                else if (hit.span !== undefined) {
+                    const s = pd.spans[hit.span];
+                    dragRef.current = withPreview({
+                        kind: "phone-gain", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+                        activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive: false,
+                        phoneEvt: s.evt, phoneSpan: hit.span,
+                        phoneWork: { frames: new Map(), gain: new Map([[hit.span, s.gain_db]]) },
+                    });
+                    requestRedraw();
+                }
+                return;
+            }
+            const cfg = laneCfg(laneParamRef.current);
+            const laneTop = noteBottom();
+            const stored = paramCurvesRef.current?.[cfg.id];
+            const rel = Math.max(0, Math.round(relTickAt(e.clientX)));
+            const val = Math.round(yToParam(y, cfg.min, cfg.max, laneTop, LANE_H) * 10) / 10; // 0.1-unit quantize
+            const hitIdx = laneParamPointAt(e.clientX, e.clientY);
+            let curve, idx;
+            if (hitIdx >= 0 && stored) {
+                curve = { xs: [...stored.xs], ys: [...stored.ys] };
+                idx = hitIdx; // grab the existing point
+            }
+            else {
+                const xs = stored ? [...stored.xs] : [], ys = stored ? [...stored.ys] : [];
+                const exact = xs.indexOf(rel);
+                if (exact >= 0) {
+                    curve = { xs, ys };
+                    idx = exact;
+                } // a point already sits at this tick → move it
+                else {
+                    let pos = xs.findIndex((xx) => xx > rel);
+                    if (pos < 0)
+                        pos = xs.length;
+                    xs.splice(pos, 0, rel);
+                    ys.splice(pos, 0, val);
+                    curve = { xs, ys };
+                    idx = pos;
+                }
+            }
+            dragRef.current = withPreview({
+                kind: "param-point", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+                activeIds: [], orig: new Map(), newNote: null, anchorRelTick: rel, moved: false, additive: false,
+                param: cfg.id, pointCurve: curve, pointIdx: idx,
+            });
+            requestRedraw();
+            return;
+        }
+        const hit = noteAt(e.clientX, e.clientY);
+        const tl = toolRef.current;
+        if (tl === "pitch") {
+            // Pitch tool = paint Pitch Deviation (SynthV Pencil): drag across the pitch area to draw the TARGET f0
+            // line; on commit the delta vs the automatic line (base ⊕ transition + vibrato) is stored into the
+            // segment's pitchDev (interval-replace). A single click seeds one point; dragging appends the path.
+            // QUANTIZE to whole ticks / whole cents so sub-pixel mouse jitter (the pitch line is ~6¢/px) can't make
+            // the drawn line shiver; 1¢ is far below the audible/visible floor and matches normalizeCurve on commit.
+            const rel = Math.max(0, Math.round(relTickAt(e.clientX)));
+            const c0 = Math.round(centsAt(e.clientY));
+            playback.playPreviewTone(centsToHz(c0), 0); // sustained; follows the drawn pitch
+            dragRef.current = withPreview({
+                kind: "pitch-paint", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+                activeIds: [], orig: new Map(), newNote: null, anchorRelTick: rel, moved: false, additive: false,
+                paint: { xs: [rel], ys: [c0] },
+            });
+            requestRedraw();
+            return;
+        }
+        if (tl === "delete") {
+            if (hit) {
+                commitNotes(notesRef.current.filter((n) => n.id !== hit.note.id), []);
+            }
+            else {
+                dragRef.current = withPreview({ kind: "marquee-delete", clientX0: x, clientY0: localXY(e.clientX, e.clientY).y, curX: x, curY: localXY(e.clientX, e.clientY).y, activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive: false });
+            }
+            requestRedraw();
+            return;
+        }
+        if (hit) {
+            // Pen tool: grabbing a note EXTENDS its length (resize its tail), never moves it (§user — a click on a
+            // note in draw mode most likely means "make it longer", and there was no other easy way to resize).
+            if (toolRef.current === "pen") {
+                selectNotes([hit.note.id]);
+                const o = notesRef.current.find((n) => n.id === hit.note.id);
+                audibleTone(o.pitch, 160);
+                dragRef.current = withPreview({
+                    kind: "resize", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+                    activeIds: [o.id], orig: new Map([[o.id, o]]), newNote: null, anchorRelTick: o.tick, moved: false, additive: false,
+                    // S87 — `startRel` is the GRAB tick: with snapping OFF the resize follows the hand (delta from
+                    // here), so this path MUST record it. It was absent before S87 only because the old formula was
+                    // absolute-cursor and never read it; leaving it out made a pen drag add the whole cursor tick to
+                    // the note's length (runaway note + downstream notes truncated in one undo step — audit MAJOR).
+                    startRel: relTickAt(e.clientX),
+                });
+                return;
+            }
+            // Arrow tool: select (respect shift/ctrl multi-select), then move or resize by edge
+            let nextSel;
+            if (e.shiftKey || e.ctrlKey || e.metaKey) {
+                nextSel = selRef.current.has(hit.note.id) ? [...selRef.current].filter((i) => i !== hit.note.id) : [...selRef.current, hit.note.id];
+            }
+            else {
+                nextSel = selRef.current.has(hit.note.id) ? [...selRef.current] : [hit.note.id];
+            }
+            selectNotes(nextSel);
+            const ids = nextSel.includes(hit.note.id) ? nextSel : [hit.note.id];
+            const orig = new Map(notesRef.current.filter((n) => ids.includes(n.id)).map((n) => [n.id, n]));
+            // A MOVE gets a SUSTAINED tone that retunes along the drag (audition the pitch the whole way, §user);
+            // a resize (edge) just gets a brief click. Stopped on pointerup/cancel/Esc/unmount (all wired).
+            // 乐器轨选了音色 → 真实音色试听替代占位音;拖拽变调时按半音阶重触发(见 onPointerMove)。
+            audibleTone(hit.note.pitch, hit.onEdge ? 160 : 0);
+            dragRef.current = withPreview({
+                kind: hit.onEdge ? "resize" : "move",
+                clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+                activeIds: ids, orig, newNote: null, anchorRelTick: hit.note.tick, moved: false, additive: false,
+                startRel: relTickAt(e.clientX), startPitch: pitchAt(e.clientY),
+            });
+            return;
+        }
+        // empty space
+        const drawNote = tl === "pen" || ((tl === "arrow") && (e.ctrlKey || e.metaKey));
+        if (drawNote) {
+            const snap = snapTicks();
+            const relStart = Math.max(0, snapPlace(relTickAt(e.clientX)));
+            const p = clampPitch(pitchAt(e.clientY));
+            // Created note honors the 60ms floor like resize/truncation do (§9.2) — a fine grid can't make an
+            // inaudible sub-floor note. S87: the grid CELL stays the default/min length even with snapping OFF —
+            // continuous mode frees the note's POSITION, it must not let a click-with-jitter draw a 1-tick note.
+            const newNote = { id: crypto.randomUUID(), tick: relStart, duration: Math.max(1, snap), pitch: p, lyric: defaultLyricRef.current, velocity: 100 };
+            audibleTone(p, 0); // sustained while drawing; stops on pointerup (乐器轨选音色时为 0.6s 真实音色)
+            dragRef.current = withPreview({
+                kind: "create", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+                activeIds: [newNote.id], orig: new Map(), newNote, anchorRelTick: relStart, moved: false, additive: false,
+            });
+            requestRedraw();
+            return;
+        }
+        // arrow on empty → marquee select
+        const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+        if (!additive)
+            selectNotes([]);
+        const p0 = localXY(e.clientX, e.clientY);
+        dragRef.current = withPreview({ kind: "marquee", clientX0: p0.x, clientY0: p0.y, curX: p0.x, curY: p0.y, activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive });
+        requestRedraw();
+    }, [setActivePane, selectNotes, applyNoteEdits, part, segmentId, audibleTone]);
+    const onPointerMove = useCallback((e) => {
+        const p = localXY(e.clientX, e.clientY);
+        mouseRef.current = p;
+        const d = dragRef.current;
+        if (!d) {
+            // hover cursor: a left-right resize affordance where grabbing would change a note's LENGTH (Arrow near
+            // the tail / Pen anywhere on a note, §user). Delete keeps its CSS crosshair.
+            const cv = canvasRef.current;
+            if (cv) {
+                if (p.y < RULER_H && p.x >= KEY_COL_W)
+                    cv.style.cursor = "col-resize"; // ② ruler = seek the playhead
+                else if (laneOpenRef.current && p.y >= noteBottom() && p.x >= KEY_COL_W)
+                    cv.style.cursor = laneParamRef.current === "phoneme"
+                        ? (() => {
+                            //         wins (col-resize = timing), a phone body is strength (ns-resize).
+                            const h = phoneLaneHitAt(e.clientX);
+                            if (h.boundary !== undefined)
+                                return "col-resize";
+                            return h.span !== undefined ? "ns-resize" : "default";
+                        })()
+                        : laneParamPointAt(e.clientX, e.clientY) >= 0 ? "grab" : "crosshair"; // ② over a point vs insert
+                else if (toolRef.current === "delete")
+                    cv.style.cursor = "";
+                else {
+                    const hov = noteAt(e.clientX, e.clientY);
+                    cv.style.cursor = hov && (toolRef.current === "pen" || hov.onEdge) ? "ew-resize" : "";
+                }
+            }
+            requestRedraw();
+            return; // hover → redraw so the mouse-position guide follows (all tools)
+        }
+        d.moved = true;
+        if (d.kind === "marquee" || d.kind === "marquee-delete") {
+            d.curX = p.x;
+            d.curY = p.y;
+            if (!edgeRafRef.current) { // kick off edge auto-scroll when the cursor reaches a border
+                const { w } = sizeRef.current, EDGE = 28;
+                // bottom trigger = the note-area bottom (above the lane band), MATCHING edgeScrollRef's condition —
+                // else the lane's LANE_H creates a dead zone where the loop wants to scroll but was never kicked off.
+                if (p.x < KEY_COL_W + EDGE || p.x > w - EDGE || p.y < RULER_H + EDGE || p.y > noteBottom() - EDGE)
+                    edgeRafRef.current = requestAnimationFrame(edgeScrollRef.current);
+            }
+        }
+        else {
+            d.curX = e.clientX;
+            d.curY = e.clientY;
+            // live retune preview for move (only when pitch is unlocked; else the tone stays put — pitch is locked)
+            if (d.kind === "move") {
+                // Each axis ACTIVATES independently once its OWN motion passes a threshold; both are then measured
+                // from the origin. A pure-vertical drag never nudges timing (X stays inactive); switching to
+                // horizontal mid-drag KEEPS the pitch already moved (no jump back to the start height — §user bug).
+                if (!d.activeX && Math.abs(e.clientX - d.clientX0) > 4)
+                    d.activeX = true;
+                if (!d.activeY && Math.abs(e.clientY - d.clientY0) > 4)
+                    d.activeY = true;
+                const dPitch = d.activeY ? pitchAt(e.clientY) - (d.startPitch ?? 0) : 0; // CONTENT origin (scroll-safe, matches computePreview)
+                const anyId = d.activeIds[0];
+                const o = anyId ? d.orig.get(anyId) : undefined;
+                if (o) {
+                    // 乐器轨选了音色 → 拖拽变调按半音阶重触发真实音色试听(试听按键有 WAV 缓存,
+                    // 跟得上拖拽);未选/人声轨 → 振荡器连续变调(旧行为)。
+                    const sf = trackSfRef.current;
+                    if (sf) {
+                        const np = clampPitch(o.pitch + dPitch);
+                        if (d.audPitch === undefined || Math.abs(np - d.audPitch) >= 1) {
+                            d.audPitch = np;
+                            void playSoundfontAudition(sf, np);
+                        }
+                    }
+                    else {
+                        playback.setPreviewToneHz(pitchToHz(clampPitch(o.pitch + dPitch)));
+                    }
+                }
+            }
+            else if (d.kind === "pitch-paint" && d.paint) {
+                const cy = Math.round(centsAt(e.clientY)); // quantize (see pointerdown) — kills sub-pixel line shiver
+                d.paint.xs.push(Math.max(0, Math.round(relTickAt(e.clientX))));
+                d.paint.ys.push(cy);
+                playback.setPreviewToneHz(centsToHz(cy)); // hear the pitch being drawn
+            }
+            else if (d.kind === "param-point" && d.pointCurve && d.pointIdx !== undefined && d.param) {
+                const cfg = laneCfg(d.param); // ② drag the grabbed point: x clamped strictly between neighbors (xs stays sorted), y in range
+                const c = d.pointCurve, i = d.pointIdx;
+                const rel = Math.max(0, Math.round(relTickAt(e.clientX)));
+                const lo = i > 0 ? c.xs[i - 1] + 1 : 0;
+                const hi = i < c.xs.length - 1 ? c.xs[i + 1] - 1 : Number.MAX_SAFE_INTEGER;
+                c.xs[i] = Math.min(hi, Math.max(lo, rel));
+                c.ys[i] = Math.round(yToParam(localXY(e.clientX, e.clientY).y, cfg.min, cfg.max, noteBottom(), LANE_H) * 10) / 10;
+            }
+            else if (d.kind === "phone-dur" && d.phoneWork && d.phoneLeft !== undefined) {
+                // S167c: the preview runs the COMMIT's own math — scale-vs-base with the 0.1..10 clamp,
+                // then the whole-note largest-remainder redistribution (`redistributeConserving`, a
+                // pinned mirror of Rust's `redistribute_conserving`) — so the painted split IS the split
+                // that sticks. The old pair-local ≥1-frame preview allowed frames the commit would floor
+                // or round away, and the release "snapped back" (user 2026-08-31: 「压的时候音素被压得很
+                // 短,松手之后又回弹」). The dragged pair's INTENT scales live on d.phoneScale, and
+                // pointerup sends exactly those — preview inputs ≡ wire payload ≡ Rust's inputs.
+                const pd = phonemeLaneRef.current;
+                if (pd) {
+                    const li = d.phoneLeft;
+                    const L = pd.spans[li];
+                    // the boundary's RIGHT phone: skip same-note dropped markers (same look-ahead as the
+                    // predicate — the old code grabbed spans[li+1] and could land on a zero-width marker).
+                    let ri = li + 1;
+                    while (ri < pd.spans.length && pd.spans[ri].frames <= 0 && pd.spans[ri].evt === L.evt)
+                        ri++;
+                    const R = pd.spans[ri];
+                    if (R && R.evt === L.evt && R.frames > 0) {
+                        const idxs = [];
+                        pd.spans.forEach((s, i) => { if (s.evt === L.evt && s.frames > 0)
+                            idxs.push(i); });
+                        const total = idxs.reduce((a, i) => a + pd.spans[i].frames, 0);
+                        if (total >= idxs.length) { // the commit's own degenerate-note guard
+                            // eff = the frames the user is LOOKING at: working values, else the post-commit
+                            // overlay (the lane's answer lags a commit by debounce+IPC), else the cached spans.
+                            const ovM = phoneCommitOverlayRef.current;
+                            const eff = (i) => d.phoneWork.frames.get(i)
+                                ?? (ovM && ovM.sig === pd.sig ? ovM.frames.get(i) : undefined)
+                                ?? pd.spans[i].frames;
+                            // cursor → wanted boundary frame in the CURRENT preview geometry
+                            let f0 = 0;
+                            for (let i = 0; i < li; i++)
+                                f0 += eff(i);
+                            const pairTotal = eff(li) + eff(ri);
+                            const bf = Math.round(Math.max(0, relTickAt(e.clientX)) / pd.ticksPerFrame) - f0;
+                            const wantL = Math.min(pairTotal - 1, Math.max(1, bf));
+                            // S167c (review): a grab + jitter that never crosses a frame must not touch
+                            // anything — the first write used to re-derive intent from the previewed frames and
+                            // the boundary hopped ±1 with the cursor stationary. Engage only once the wanted
+                            // split actually differs (afterwards a still cursor is stable by determinism).
+                            const engaged = d.phoneWork.frames.size > 0;
+                            if (engaged || wantL !== eff(li)) {
+                                const round3 = (x) => Math.round(x * 1000) / 1000;
+                                d.phoneScale?.set(li, round3(wantL / Math.max(1, L.base_frames)));
+                                d.phoneScale?.set(ri, round3((pairTotal - wantL) / Math.max(1, R.base_frames)));
+                                const scaleOf = (i) => d.phoneScale?.get(i)
+                                    ?? round3(pd.spans[i].frames / Math.max(1, pd.spans[i].base_frames));
+                                const allOne = idxs.every((i) => scaleOf(i) === 1);
+                                if (allOne) {
+                                    // Identity point: the release CLEARS the edit and the render is the allocator's
+                                    // own split — paint exactly that. (Redistribution is NOT identity at all-1
+                                    // scales — floor-1 + largest remainder skews any uneven split — and Rust skips
+                                    // it for all-1 edits for the same reason; review finding.)
+                                    idxs.forEach((i) => d.phoneWork.frames.set(i, pd.spans[i].base_frames));
+                                }
+                                else {
+                                    // ⚠ f32 fidelity: the wire's scale is f32 and Rust clamps in f32 BEFORE
+                                    // widening to f64 (`s.clamp(0.1,10.0)` on f32, then `f64::from`). Math.fround
+                                    // mirrors both narrowings — without it a near-tie largest-remainder can split
+                                    // differently and leave a ±1-frame ghost of the snap-back this preview kills.
+                                    const w = idxs.map((i) => Math.max(1, pd.spans[i].base_frames)
+                                        * Math.fround(Math.min(PHONE_SCALE_MAX, Math.max(Math.fround(PHONE_SCALE_MIN), Math.fround(scaleOf(i))))));
+                                    const frames = redistributeConserving(total, w);
+                                    idxs.forEach((i, k) => d.phoneWork.frames.set(i, frames[k]));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else if (d.kind === "phone-gain" && d.phoneWork && d.phoneSpan !== undefined) {
+                // S167b: ABSOLUTE placement — the strength line lands where the cursor is (mid = 0 dB,
+                // top = +12, bottom = −12; 0.5 dB quantize). Grab-and-place, like dragging the line itself.
+                const pd = phonemeLaneRef.current;
+                if (pd) {
+                    const bandY = noteBottom() + 14;
+                    const bandH = LANE_H - 20;
+                    const y = localXY(e.clientX, e.clientY).y;
+                    const g = Math.max(-12, Math.min(12, Math.round(((1 - (y - bandY) / bandH) * 24 - 12) * 2) / 2));
+                    d.phoneWork.gain.set(d.phoneSpan, g);
+                }
+            }
+            else if (d.kind === "ruler-seek") {
+                // playback may have STARTED mid-drag (Space is a global key) → pin `seeking` here too, not just at
+                // pointerdown, so the transport reschedules from the drop tick on release (mirrors TimelineRuler:124).
+                const a = useAudioStore.getState();
+                if (a.isPlaying && !a.seeking)
+                    a.setSeeking(true);
+                useProjectStore.getState().setPlayhead(Math.max(0, Math.round(xToTick(localXY(e.clientX, e.clientY).x - KEY_COL_W, viewRef.current))));
+            }
+            else if (d.kind === "create" && d.newNote) {
+                const snap = snapTicks();
+                const end = Math.max(d.anchorRelTick + snap, snapEdge(relTickAt(e.clientX), snap)); // S87: min length = one cell in BOTH modes
+                d.newNote = { ...d.newNote, duration: Math.max(snap, end - d.anchorRelTick) };
+            }
+        }
+        requestRedraw();
+    }, [requestRedraw]);
+    const onPointerUp = useCallback((e) => {
+        const d = dragRef.current;
+        dragRef.current = null;
+        if (edgeRafRef.current) {
+            cancelAnimationFrame(edgeRafRef.current);
+            edgeRafRef.current = 0;
+        }
+        if (!d)
+            return; // a bare key/note click (no drag) — let its short audition tone ring out
+        playback.stopPreviewTone();
+        e.currentTarget.releasePointerCapture?.(e.pointerId);
+        if (d.kind === "marquee" || d.kind === "marquee-delete") {
+            const ids = notesInMarquee(d);
+            if (d.kind === "marquee-delete") {
+                if (ids.length)
+                    commitNotes(notesRef.current.filter((n) => !ids.includes(n.id)), []);
+            }
+            else {
+                const base = d.additive ? [...selRef.current] : [];
+                selectNotes([...new Set([...base, ...ids])]);
+            }
+            requestRedraw();
+            return;
+        }
+        if (d.kind === "create" && d.newNote) {
+            const nn = d.newNote;
+            commitNotes([...notesRef.current, nn], [nn.id]);
+            selectNotes([nn.id]);
+            return;
+        }
+        if (d.kind === "pitch-paint" && d.paint && part) {
+            // ★ THE SAME chain the preview drew against (see pitchChain) — it was the one evaluator still on the
+            // pre-S88 semantics, so releasing the stroke snapped the line away from what was drawn.
+            const sorted = pitchChain(notesRef.current, tokensRef.current);
+            const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
+            setSegmentPitchDev(part.trackId, segmentId, paintedDev(sorted, d.paint, pitchDevRef.current, opts)); // normalizeCurve inside
+            requestRedraw();
+            return;
+        }
+        if (d.kind === "ruler-seek") {
+            // release the seek flag so the transport reschedules from the new playhead (if it was playing).
+            if (useAudioStore.getState().seeking)
+                useAudioStore.getState().setSeeking(false);
+            requestRedraw();
+            return;
+        }
+        if ((d.kind === "phone-dur" || d.kind === "phone-gain") && part) {
+            // S167 (§E2): one applyNoteEdits = one undo step. The stored edit is keyed to the EMITTED
+            // phone sequence and weighted against the allocator's own split (`base_frames`), so a re-edit
+            // never compounds; an all-default result CLEARS the override (absent ≡ automatic).
+            const pd = phonemeLaneRef.current;
+            if (pd && d.moved && d.phoneWork && d.phoneEvt !== undefined) {
+                const noteId = pd.tripleNoteIds[d.phoneEvt];
+                const note = noteId ? part.notes.find((n) => n.id === noteId) : undefined;
+                if (note) {
+                    const idxs = [];
+                    pd.spans.forEach((s, i) => {
+                        if (s.evt === d.phoneEvt && s.frames > 0)
+                            idxs.push(i);
+                    });
+                    const phones = idxs.map((i) => pd.spans[i].phone);
+                    const scale = idxs.map((i) => {
+                        const s = pd.spans[i];
+                        // S167c: the dragged pair commits its INTENT scale (what the preview redistributed
+                        // FROM); untouched phones commit their STANDING frames (pd.spans, not the preview
+                        // map — the preview redistributes ALL phones by ±1 rounding, and echoing those back
+                        // would perturb the very inputs the mirror assumed). This keeps the wire payload
+                        // identical to the preview's inputs, so Rust reproduces the painted frames exactly.
+                        const sc = d.phoneScale?.get(i);
+                        if (sc !== undefined)
+                            return sc;
+                        return Math.round((s.frames / Math.max(1, s.base_frames)) * 1000) / 1000;
+                    });
+                    const gainDb = idxs.map((i) => d.phoneWork.gain.get(i) ?? pd.spans[i].gain_db);
+                    const anyGain = gainDb.some((g) => g !== 0);
+                    const any = anyGain || scale.some((s) => s !== 1);
+                    applyNoteEdits(part.trackId, segmentId, {
+                        add: [],
+                        update: { [note.id]: { phoneTiming: any ? { phones, scale, ...(anyGain ? { gainDb } : {}) } : undefined } },
+                        remove: [],
+                    });
+                    // S167c: keep painting the committed working values until the lane's debounced
+                    // refetch lands (see phoneCommitOverlayRef). At the identity point the working
+                    // frames already hold the allocator split, matching the cleared edit.
+                    phoneCommitOverlayRef.current = {
+                        sig: pd.sig,
+                        frames: new Map(d.phoneWork.frames),
+                        gain: new Map(d.phoneWork.gain),
+                    };
+                }
+            }
+            requestRedraw();
+            return;
+        }
+        if (d.kind === "param-point" && d.pointCurve && d.param && part) {
+            // ② one set() → one undo step. An empty curve (last point dragged out of use / deleted) clears the lane.
+            // normalizeCurve(...,"param") rounds/dedups + canonical key order (sig↔serialize consistent).
+            setSegmentParamCurve(part.trackId, segmentId, d.param, d.pointCurve.xs.length ? d.pointCurve : undefined);
+            requestRedraw();
+            return;
+        }
+        // move / resize — a gesture with ZERO pointer motion is a SELECTION click, never an edit. Before S87 the
+        // 1/12 rounding absorbed the whole 6px edge hotzone, so a bare click resolved to the note's own end and
+        // commitNotes' no-op guard swallowed it; with snapping OFF the raw cursor tick lands strictly INSIDE the
+        // note, so the same click would silently truncate it (+dirty +undo step). Guard the CAUSE, not the mode.
+        if (!d.moved) {
+            requestRedraw();
+            return;
+        }
+        commitNotes(computePreview(d), d.activeIds);
+    }, [selectNotes, part, segmentId, setSegmentPitchDev, setSegmentParamCurve, requestRedraw]);
+    // ② right-click a lane control point → delete it (onPointerDown bails on non-left buttons). Suppress the
+    // native context menu inside the editor either way. One set() = one undo step; empty curve clears the lane.
+    const onContextMenu = useCallback((e) => {
+        e.preventDefault();
+        if (!part || !laneOpenRef.current)
+            return;
+        const { x, y } = localXY(e.clientX, e.clientY);
+        if (y < noteBottom() || x < KEY_COL_W)
+            return;
+        if (laneParamRef.current === "phoneme") {
+            // S167c: never clear while a lane gesture is in flight — a chorded right-click mid-drag
+            // would clear the edit and then have pointerup re-commit it (two contradictory undo steps).
+            if (dragRef.current)
+                return;
+            // S167 (§E2): right-click a phone → clear this note's timing/strength edit (back to automatic).
+            const pd = phonemeLaneRef.current;
+            const h = pd ? phoneLaneHitAt(e.clientX) : null;
+            const si = h?.span ?? h?.boundary;
+            if (pd && si !== undefined) {
+                const noteId = pd.tripleNoteIds[pd.spans[si].evt];
+                const note = noteId ? part.notes.find((n) => n.id === noteId) : undefined;
+                if (note?.phoneTiming) {
+                    applyNoteEdits(part.trackId, segmentId, { add: [], update: { [note.id]: { phoneTiming: undefined } }, remove: [] });
+                    requestRedraw();
+                }
+            }
+            return;
+        }
+        const idx = laneParamPointAt(e.clientX, e.clientY);
+        if (idx < 0)
+            return;
+        const cfg = laneCfg(laneParamRef.current);
+        const stored = paramCurvesRef.current?.[cfg.id];
+        if (!stored)
+            return;
+        const xs = stored.xs.filter((_, i) => i !== idx);
+        const ys = stored.ys.filter((_, i) => i !== idx);
+        setSegmentParamCurve(part.trackId, segmentId, cfg.id, xs.length ? { xs, ys } : undefined);
+        requestRedraw();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [part, segmentId, setSegmentParamCurve, requestRedraw]);
+    const notesInMarquee = (d) => {
+        const v = viewRef.current;
+        const start = startRef.current;
+        const x0 = Math.min(d.clientX0, d.curX), x1 = Math.max(d.clientX0, d.curX);
+        const y0 = Math.min(d.clientY0, d.curY), y1 = Math.max(d.clientY0, d.curY);
+        const out = [];
+        for (const n of notesRef.current) {
+            const nx0 = KEY_COL_W + noteTickToX(n.tick, start, v);
+            const nx1 = KEY_COL_W + noteTickToX(n.tick + n.duration, start, v);
+            const ny0 = pitchToY(n.pitch, v);
+            const ny1 = ny0 + v.rowH;
+            if (nx1 >= x0 && nx0 <= x1 && ny1 >= y0 && ny0 <= y1)
+                out.push(n.id);
+        }
+        return out;
+    };
+    // Notes in canonical next/prev order — tick asc, id tiebreak. ONE comparator for lyric-commit
+    // distribution AND Tab/Shift+Tab navigation (so "who's next" never drifts between the two paths).
+    const orderedNotes = () => [...(part?.notes ?? [])].sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : 1));
+    // The lyric-input overlay geometry (x/y/w) for a note — shared by double-click open and Tab nav.
+    const lyricEditFor = (note) => {
+        const v = viewRef.current;
+        const x0 = KEY_COL_W + noteTickToX(note.tick, part.start, v);
+        const y = pitchToY(note.pitch, v);
+        const w = Math.max(40, noteTickToX(note.tick + note.duration, part.start, v) - noteTickToX(note.tick, part.start, v));
+        return { id: note.id, x: Math.max(KEY_COL_W, x0), y, w, value: note.lyric };
+    };
+    const onDoubleClick = useCallback((e) => {
+        if (instrumentRef.current)
+            return; // 乐器轨无歌词可编辑——双击不弹输入框
+        if (toolRef.current === "pitch" || toolRef.current === "delete")
+            return; // lyric editing lives in Arrow/Pen only (§user)
+        // ② lane guard (mirror onPointerDown:818 / onContextMenu:1055): never open a lyric editor inside the bottom
+        // automation lane — a note can scroll behind the band, and the <input> would render overlaying the lane.
+        if (laneOpenRef.current && localXY(e.clientX, e.clientY).y >= noteBottom())
+            return;
+        const hit = noteAt(e.clientX, e.clientY);
+        if (!hit || !part)
+            return;
+        setLyricEdit(lyricEditFor(hit.note));
+    }, [part]);
+    const commitLyric = (id, value) => {
+        if (!part) {
+            setLyricEdit(null);
+            return;
+        }
+        // S91: on an ALIAS track an ENGLISH note's typed string is ONE alias, never a phrase to
+        // distribute — many ARPAsing aliases contain a space (`ae n`, `y uw`), and X-SAMPA/VCCV have
+        // spaced ones too (`E r`, `aI e@`), so distributing on spaces would scatter one note's content
+        // over its neighbours. Import is unaffected either way (one UST line per note, verbatim).
+        // ⚠ Scoped to the note's EFFECTIVE language, exactly like the Rust fold (`resolve_core` bails on
+        // `lang != En`): a review found the first version keyed on the track alone, so a ja note on a
+        // mixed-language alias track silently lost its per-mora distribution. And the empty-commit
+        // fallback must be legal in this convention — the language default `a` is not ARPABET, so on an
+        // ARPAsing track it would mint a note that hard-fails the whole segment render.
+        const noteLang = orderedNotes().find((n) => n.id === id)?.lang ?? langById(part.vocalParams.langId).code;
+        const aliasNote = !!part.vocalParams.phonemeSet && noteLang === "en";
+        const tokens = aliasNote
+            ? [value.trim() || aliasDefaultLyric(part.vocalParams.phonemeSet)]
+            : splitLyricTokens(value.trim(), defaultLyricRef.current);
+        const ordered = orderedNotes();
+        const startIdx = ordered.findIndex((n) => n.id === id);
+        if (tokens.length <= 1 || startIdx < 0) {
+            applyNoteEdits(part.trackId, segmentId, { update: { [id]: { lyric: tokens[0] ?? defaultLyricRef.current } } });
+        }
+        else {
+            const update = {};
+            for (let i = 0; i < tokens.length && startIdx + i < ordered.length; i++) {
+                update[ordered[startIdx + i].id] = { lyric: tokens[i] };
+            }
+            applyNoteEdits(part.trackId, segmentId, { update });
+        }
+        setLyricEdit(null);
+    };
+    // ── 歌词总编辑（§用户）：整轨歌词一次性粘贴/修改，逐音符顺序分配（跳过休止/气声），
+    // 与双击改词共用 splitLyricTokens 的分词规则（中文一字一音符、英文按空格）。
+    const singableOrderedNotes = () => orderedNotes().filter((n) => !isSilentLyric(n.lyric, tokensRef.current));
+    const openLyricsPanel = () => {
+        setLyricsText(singableOrderedNotes().map((n) => n.lyric).join(" "));
+        setLyricsOpen(true);
+    };
+    const applyBulkLyrics = (text, preview = false) => {
+        if (!part) {
+            setLyricsOpen(false);
+            return;
+        }
+        const toks = splitLyricTokens(text.trim(), defaultLyricRef.current);
+        const ordered = singableOrderedNotes();
+        if (toks.length && ordered.length) {
+            const update = {};
+            for (let i = 0; i < toks.length && i < ordered.length; i++)
+                update[ordered[i].id] = { lyric: toks[i] };
+            applyNoteEdits(part.trackId, segmentId, { update });
+        }
+        setLyricsOpen(false);
+        if (preview)
+            startPreviewPlay();
+    };
+    // Tab (dir +1) / Shift+Tab (dir −1) while editing a lyric: commit the current note, then open the
+    // adjacent note's lyric input (SynthV/OpenUTAU convention). At the ends, just commit + close.
+    const navLyric = (fromId, value, dir) => {
+        if (!part) {
+            setLyricEdit(null);
+            return;
+        }
+        lyricNavRef.current = true; // the old input unmounts (key change) → its blur must NOT re-commit
+        queueMicrotask(() => { lyricNavRef.current = false; });
+        const ordered = orderedNotes(); // ticks don't change on a lyric commit → pre-commit order == post
+        const idx = ordered.findIndex((n) => n.id === fromId);
+        commitLyric(fromId, value); // applyNoteEdits + setLyricEdit(null)
+        const next = idx < 0 ? undefined : ordered[idx + dir];
+        if (next)
+            setLyricEdit(lyricEditFor(next)); // overrides the null → opens the neighbour (remounts via key)
+    };
+    // ── keyboard (own handler; MUST bail on editable targets — §9.6) ──
+    useEffect(() => {
+        const onKey = (e) => {
+            if (useAppStore.getState().activePane !== "vocal")
+                return;
+            const el = e.target;
+            if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable))
+                return;
+            const p = part;
+            if (!p)
+                return;
+            // 「?」切换快捷键速查卡（§建议4）；Esc 关闭。
+            if (e.key === "?" || (e.shiftKey && e.key === "/")) {
+                e.preventDefault();
+                setHelpOpen((o) => !o);
+                return;
+            }
+            const sel = [...selRef.current];
+            if (e.key === "Delete" || e.key === "Backspace") {
+                if (sel.length) {
+                    e.preventDefault();
+                    commitNotes(p.notes.filter((n) => !selRef.current.has(n.id)), []);
+                    selectNotes([]);
+                }
+            }
+            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+                e.preventDefault();
+                selectNotes(p.notes.map((n) => n.id));
+            }
+            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
+                clipboardRef.current = p.notes.filter((n) => selRef.current.has(n.id));
+            }
+            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "x") {
+                clipboardRef.current = p.notes.filter((n) => selRef.current.has(n.id));
+                if (sel.length) {
+                    commitNotes(p.notes.filter((n) => !selRef.current.has(n.id)), []);
+                    selectNotes([]);
+                }
+            }
+            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v") {
+                pasteAt();
+            }
+            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
+                e.preventDefault();
+                clipboardRef.current = p.notes.filter((n) => selRef.current.has(n.id));
+                pasteAt(true);
+            }
+            else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key) && sel.length) {
+                e.preventDefault();
+                nudge(e.key);
+            }
+            else if (e.key === "Escape") {
+                if (helpOpenRef.current) {
+                    setHelpOpen(false);
+                    return;
+                }
+                // Cancel a live gesture / stop preview playback — MUST also stop the sustained tone (else it rings).
+                if (wavSrcRef.current) {
+                    try {
+                        wavSrcRef.current.stop();
+                    }
+                    catch { /* already ended */ }
+                    wavSrcRef.current = null;
+                    setPlaying(false);
+                }
+                else if (playRafRef.current) {
+                    cancelAnimationFrame(playRafRef.current);
+                    playRafRef.current = 0;
+                    playback.stopPreviewTone();
+                    setPlaying(false);
+                }
+                else if (dragRef.current) {
+                    dragRef.current = null;
+                    playback.stopPreviewTone();
+                    requestRedraw();
+                }
+                else
+                    selectNotes([]);
+            }
+        };
+        document.addEventListener("keydown", onKey);
+        return () => document.removeEventListener("keydown", onKey);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [part, segmentId]);
+    const pasteAt = (dupInPlace = false) => {
+        if (!part || clipboardRef.current.length === 0)
+            return;
+        const clip = clipboardRef.current;
+        const minTick = Math.min(...clip.map((n) => n.tick));
+        // S87: Ctrl+D's offset and Ctrl+V's mouse anchor are deliberately NOT gated by the snap toggle —
+        // duplicate-in-place is a fixed one-cell STEP (not a snap), and paste-at-mouse has always been
+        // continuous. The toggle governs where a note LANDS during a pointer gesture, not command step sizes.
+        const anchor = dupInPlace ? minTick + snapTicks() : Math.max(0, relTickAt((mouseRef.current?.x ?? KEY_COL_W + 20) + (canvasRef.current?.getBoundingClientRect().left ?? 0)));
+        const shift = dupInPlace ? snapTicks() : anchor - minTick;
+        const pasted = clip.map((n) => ({ ...n, id: crypto.randomUUID(), tick: Math.max(0, n.tick + shift) }));
+        commitNotes([...part.notes, ...pasted], pasted.map((n) => n.id));
+        selectNotes(pasted.map((n) => n.id));
+    };
+    const nudge = (key) => {
+        if (!part)
+            return;
+        const snap = snapTicks(); // S87: a keyboard nudge is a fixed one-cell STEP in both modes (see pasteAt)
+        const dTick = key === "ArrowLeft" ? -snap : key === "ArrowRight" ? snap : 0;
+        const dPitch = key === "ArrowUp" ? 1 : key === "ArrowDown" ? -1 : 0;
+        const sel = part.notes.filter((n) => selRef.current.has(n.id));
+        if (sel.length === 0)
+            return;
+        // GROUP clamp at the tick=0 / pitch 0-127 walls so the selection keeps its shape (no collapse/overlap).
+        const dT = dTick < 0 ? Math.max(dTick, -Math.min(...sel.map((n) => n.tick))) : dTick;
+        const loP = Math.min(...sel.map((n) => n.pitch));
+        const hiP = Math.max(...sel.map((n) => n.pitch));
+        const dP = Math.max(V_PITCH_MIN - loP, Math.min(V_PITCH_MAX - hiP, dPitch));
+        const next = part.notes.map((n) => (selRef.current.has(n.id) ? { ...n, tick: n.tick + dT, pitch: n.pitch + dP } : n));
+        commitNotes(next, [...selRef.current]);
+    };
+    // ── wheel (Ctrl=h-zoom cursor-anchored / Alt=row-height / plain=v-scroll / Shift=h-scroll) ──
+    const onWheel = useCallback((e) => {
+        e.stopPropagation();
+        const v = viewRef.current;
+        const sx0 = v.scrollX, sy0 = v.scrollY; // capture pre-scroll → re-anchor an in-progress marquee below
+        // Upper scroll bound: the part's right edge (+ a margin) — can't scroll off into empty space.
+        const maxScrollX = () => Math.max(0, (startRef.current + durRef.current) * v.ppt + 400 - Math.max(1, sizeRef.current.w - KEY_COL_W));
+        if (e.ctrlKey) {
+            e.preventDefault();
+            const cv = canvasRef.current;
+            const r = cv?.getBoundingClientRect();
+            const cx = (r ? e.clientX - r.left : sizeRef.current.w / 2) - KEY_COL_W;
+            const tickAt = (cx + v.scrollX) / v.ppt;
+            v.ppt = Math.max(0.02, Math.min(4, v.ppt * (e.deltaY > 0 ? 0.9 : 1.1)));
+            v.scrollX = Math.max(0, Math.min(maxScrollX(), tickAt * v.ppt - cx));
+        }
+        else if (e.altKey) {
+            // Vertical (row-height) zoom, ANCHORED at the cursor — the pitch under the mouse stays at the same
+            // screen y (mirrors the horizontal ctrl-zoom; unified with the arrangement's Alt+wheel). This is the
+            // fiddly coordinate part: solve scrollY so the cursor's continuous cents map back to its screen y.
+            e.preventDefault();
+            const cvR = canvasRef.current?.getBoundingClientRect();
+            const cy = Math.min(noteBottom(), Math.max(RULER_H, cvR ? e.clientY - cvR.top : (sizeRef.current.h + RULER_H) / 2)); // cursor y clamped to the note area (not the lane)
+            const anchorCents = yToCents(cy, v);
+            v.rowH = Math.max(V_ROW_H_MIN, Math.min(V_ROW_H_MAX, v.rowH * (e.deltaY > 0 ? 0.9 : 1.1)));
+            const maxSY = Math.max(0, rowsContentHeight(v.rowH) - visNoteH());
+            v.scrollY = Math.max(0, Math.min(maxSY, centsToY(anchorCents, { ...v, scrollY: 0 }) - cy)); // keep anchorCents under the cursor
+        }
+        else if (e.shiftKey) {
+            v.scrollX = Math.max(0, Math.min(maxScrollX(), v.scrollX + e.deltaY));
+        }
+        else {
+            v.scrollY = Math.max(0, Math.min(Math.max(0, rowsContentHeight(v.rowH) - visNoteH()), v.scrollY + e.deltaY));
+        }
+        // A wheel-scroll during a note-move changes the cursor's CONTENT pitch, but onPointerMove doesn't fire
+        // (the mouse didn't move) — so refresh the sustained preview tone here, else it keeps sounding the old
+        // pitch while the note visibly follows the scroll (§user preview race).
+        const d = dragRef.current;
+        if (d?.kind === "move" && d.activeY) {
+            const o = d.activeIds[0] ? d.orig.get(d.activeIds[0]) : undefined;
+            if (o)
+                playback.setPreviewToneHz(pitchToHz(clampPitch(o.pitch + (pitchAt(d.curY) - (d.startPitch ?? 0)))));
+        }
+        else if (d && (d.kind === "marquee" || d.kind === "marquee-delete")) {
+            // pin the marquee's anchor to content while scrolling — else the box stays at its screen position and
+            // selects the wrong notes as content scrolls under it (§user bug; same fix the edge auto-scroll uses).
+            d.clientX0 -= v.scrollX - sx0;
+            d.clientY0 -= v.scrollY - sy0;
+        }
+        requestRedraw();
+    }, [requestRedraw]);
+    if (!part)
+        return null;
+    // 乐器轨模式隐藏「音高（调教）」工具——那是人声 pitchDev 手绘层，乐器音符用不到。
+    const TOOLS = [
+        { id: "arrow", label: t("vocalEditor.toolArrow"), icon: _jsx("path", { d: "M5 3l14 8-6 1.5L10 19 8 12 5 3z" }) },
+        { id: "pen", label: t("vocalEditor.toolPen"), icon: _jsx("path", { d: "M4 20l3-1 10-10-2-2L5 17l-1 3zM15 5l2 2 2-2-2-2-2 2z" }) },
+        ...(instrumentMode ? [] : [{ id: "pitch", label: t("vocalEditor.toolPitch"), icon: _jsx("path", { d: "M3 17c4 0 4-10 8-10s4 10 9 4", fill: "none", stroke: "currentColor", strokeWidth: "2" }) }]),
+        { id: "delete", label: t("vocalEditor.toolDelete"), icon: _jsx("path", { d: "M6 7h12l-1 13H7L6 7zm3-3h6l1 2H8l1-2z" }) },
+    ];
+    return (_jsxs("div", { className: `vocal-editor${maximized ? " vocal-editor--max" : ""}`, style: maximized ? undefined : style, onPointerDownCapture: () => { setActivePane("vocal"); playback.getPreviewContext(); }, onFocusCapture: () => setActivePane("vocal"), children: [_jsxs("div", { className: "vocal-editor-header", children: [_jsx("span", { className: "vocal-editor-title", title: part.trackName, children: instrumentMode
+                            ? `${translateGmName(part.trackName, i18n.language) || t("vocalEditor.title")} · ${part.notes.length} ${t("vocalEditor.notesCount")}`
+                            : part.trackName || t("vocalEditor.title") }), instrumentMode ? (
+                    /* 乐器轨专属控件：GM 音色下拉（试听即用）+ 音源文件 + 一键修复。 */
+                    _jsxs("div", { className: "vocal-lane-ctl", children: [_jsx("label", { className: "vocal-grid-label", children: t("vocalEditor.gmProgram") }), _jsxs("select", { className: "vocal-sf-select", value: selectedProgram === null ? "" : String(selectedProgram), onChange: (e) => setSelectedProgram(e.target.value === "" ? null : Number(e.target.value)), disabled: drumTrackRef.current, title: drumTrackRef.current ? t("vocalEditor.gmDrumHint") : t("vocalEditor.gmProgramTip"), children: [_jsx("option", { value: "", children: gmMatch?.matched ? `${t("vocalEditor.gmAuto")} · ${gmMatch.display}` : t("vocalEditor.gmAuto") }), GM_INSTRUMENTS.map((inst) => (_jsx("option", { value: inst.program, children: i18n.language.startsWith("zh") ? inst.zh : i18n.language.startsWith("ja") ? inst.ja : inst.en }, inst.program)))] }), _jsx("label", { className: "vocal-grid-label", children: t("vocalEditor.soundfont") }), _jsxs("select", { className: "vocal-sf-select", value: soundfonts.find((s) => s.active)?.filename ?? "", onChange: (e) => pickSoundfont(e.target.value), children: [soundfonts.length === 0 && _jsx("option", { value: "", children: t("vocalEditor.soundfontNone") }), soundfonts.map((s) => (_jsx("option", { value: s.filename, children: s.name }, s.filename)))] }), _jsx("button", { className: "snap-toggle vocal-grid-btn", title: t("amt.editorCleanTooltip"), onClick: oneClickRepair, children: t("amt.editorClean") })] })) : (
+                    /* ② loudness / formant automation — two labels sitting DIRECTLY next to the track title (§user: no
+                        "lane" jargon, no extra open step). Each is a self-toggle: click opens + selects that param's bottom
+                        editor; click the active one again closes it; clicking the other switches param with it staying open. */
+                    _jsxs("div", { className: "vocal-lane-ctl", children: [LANE_PARAMS.map((lp) => (_jsx("button", { className: `snap-toggle vocal-grid-btn${laneOpen && laneParam === lp.id ? " active" : ""}`, onClick: () => {
+                                    if (laneOpen && laneParam === lp.id)
+                                        setLaneOpen(false);
+                                    else {
+                                        setLaneParam(lp.id);
+                                        setLaneOpen(true);
+                                    }
+                                }, children: t(lp.labelKey) }, lp.id))), _jsx("button", { className: `snap-toggle vocal-grid-btn${laneOpen && laneParam === "phoneme" ? " active" : ""}`, onClick: () => {
+                                    if (laneOpen && laneParam === "phoneme")
+                                        setLaneOpen(false);
+                                    else {
+                                        setLaneParam("phoneme");
+                                        setLaneOpen(true);
+                                    }
+                                }, children: t("vocalEditor.lane.phoneme") })] })), _jsx("div", { className: "vocal-editor-header-spacer" }), _jsx("button", { className: `snap-toggle${snapNotes ? " active" : ""}`, title: t("vocalEditor.snapNotesTip"), "aria-label": t("vocalEditor.snapNotesTip"), onClick: toggleSnapNotes, children: _jsx("svg", { viewBox: "0 0 24 24", width: "15", height: "15", "aria-hidden": "true", children: _jsx("path", { fill: "currentColor", d: "M3 7v6a9 9 0 0 0 18 0V7h-4v6a5 5 0 0 1-10 0V7z M3 3h4v4H3z M17 3h4v4h-4z" }) }) }), _jsx("label", { className: "vocal-grid-label", children: t("vocalEditor.grid") }), _jsx("div", { className: "vocal-grid-select", children: GRID_DIVS.map((g) => (_jsx("button", { className: `snap-toggle vocal-grid-btn${gridDiv === g.div ? " active" : ""}`, onClick: () => setGridDiv(g.div), children: g.key }, g.div))) }), !instrumentMode && (_jsx("button", { className: `vocal-icon-btn${lyricsOpen ? " active" : ""}`, title: t("vocalEditor.lyricsTitle"), onClick: () => (lyricsOpen ? setLyricsOpen(false) : openLyricsPanel()), children: _jsx("svg", { viewBox: "0 0 24 24", width: "14", height: "14", "aria-hidden": "true", children: _jsx("path", { fill: "currentColor", d: "M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z" }) }) })), _jsx("button", { className: "vocal-icon-btn", disabled: instrumentMode && previewBusy, title: playing ? t("vocalEditor.stop") : instrumentMode ? t("vocalEditor.previewInstrument") : t("vocalEditor.preview"), onClick: () => {
+                            if (instrumentMode) {
+                                if (playing)
+                                    stopWavPreview();
+                                else
+                                    void startInstrumentPreview();
+                            }
+                            else if (playing)
+                                stopPreviewPlay();
+                            else
+                                startPreviewPlay();
+                        }, children: _jsx("svg", { viewBox: "0 0 24 24", width: "13", height: "13", children: _jsx("path", { fill: "currentColor", d: playing ? "M6 5h4v14H6zM14 5h4v14h-4z" : "M7 5l12 7-12 7z" }) }) }), _jsx("button", { className: `vocal-icon-btn${helpOpen ? " active" : ""}`, title: t("vocalEditor.helpTitle"), onClick: () => setHelpOpen((o) => !o), children: _jsx("svg", { viewBox: "0 0 24 24", width: "14", height: "14", children: _jsx("path", { fill: "currentColor", d: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zm.9 14.3h-1.8v-1.8h1.8v1.8zm1.6-5.2-.8.8c-.6.6-.9 1.1-.9 2.1h-1.6v-.4c0-.8.3-1.5.9-2.1l1.1-1.1c.3-.3.5-.7.5-1.2a1.8 1.8 0 0 0-3.6 0H8.5a3.5 3.5 0 0 1 7 0c0 .7-.3 1.4-1 1.9z" }) }) }), lyricsOpen && (_jsxs("div", { className: "vocal-help-card vocal-lyrics-card", role: "dialog", "aria-label": t("vocalEditor.lyricsTitle"), children: [_jsxs("div", { className: "vocal-help-card-head", children: [_jsx("span", { children: t("vocalEditor.lyricsTitle") }), _jsx("button", { className: "vocal-icon-btn", title: t("vocalEditor.close"), onClick: () => setLyricsOpen(false), children: _jsx("svg", { viewBox: "0 0 24 24", width: "12", height: "12", children: _jsx("path", { fill: "none", d: "M6 6l12 12M18 6L6 18", stroke: "currentColor", strokeWidth: "2" }) }) })] }), _jsx("textarea", { className: "vocal-lyrics-textarea", value: lyricsText, onChange: (e) => setLyricsText(e.target.value), onKeyDown: (e) => {
+                                    if (e.key === "Escape") {
+                                        e.preventDefault();
+                                        setLyricsOpen(false);
+                                    }
+                                    else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                                        e.preventDefault();
+                                        applyBulkLyrics(lyricsText);
+                                    }
+                                }, placeholder: t("vocalEditor.lyricsPlaceholder") }), _jsx("div", { className: "vocal-lyrics-hint", children: t("vocalEditor.lyricsHint") }), _jsxs("div", { className: "vocal-lyrics-actions", children: [_jsx("button", { className: "vocal-lyrics-btn", onClick: () => setLyricsOpen(false), children: t("common.cancel") }), _jsx("button", { className: "vocal-lyrics-btn", onClick: () => applyBulkLyrics(lyricsText, true), children: t("vocalEditor.lyricsApplyPreview") }), _jsx("button", { className: "vocal-lyrics-btn primary", onClick: () => applyBulkLyrics(lyricsText), children: t("common.confirm") })] })] })), helpOpen && (_jsxs("div", { className: "vocal-help-card", role: "dialog", "aria-label": t("vocalEditor.helpTitle"), children: [_jsxs("div", { className: "vocal-help-card-head", children: [_jsx("span", { children: t("vocalEditor.helpTitle") }), _jsx("button", { className: "vocal-icon-btn", title: t("vocalEditor.close"), onClick: () => setHelpOpen(false), children: _jsx("svg", { viewBox: "0 0 24 24", width: "12", height: "12", children: _jsx("path", { fill: "none", d: "M6 6l12 12M18 6L6 18", stroke: "currentColor", strokeWidth: "2" }) }) })] }), _jsx("table", { className: "vocal-help-table", children: _jsx("tbody", { children: [
+                                        ["vocalEditor.helpSelect", "vocalEditor.helpSelectKey"],
+                                        ["vocalEditor.helpEditLyric", "vocalEditor.helpEditLyricKey"],
+                                        ["vocalEditor.helpDelete", "vocalEditor.helpDeleteKey"],
+                                        ["vocalEditor.helpCopy", "vocalEditor.helpCopyKey"],
+                                        ["vocalEditor.helpPaste", "vocalEditor.helpPasteKey"],
+                                        ["vocalEditor.helpNudge", "vocalEditor.helpNudgeKey"],
+                                        ["vocalEditor.helpZoom", "vocalEditor.helpZoomKey"],
+                                        ["vocalEditor.helpScroll", "vocalEditor.helpScrollKey"],
+                                        ["vocalEditor.helpEscape", "vocalEditor.helpEscapeKey"],
+                                    ].map(([k, kk]) => (_jsxs("tr", { children: [_jsx("td", { className: "vocal-help-key", children: _jsx("kbd", { children: t(kk) }) }), _jsx("td", { children: t(k) })] }, k))) }) })] })), _jsx("button", { className: "vocal-icon-btn", title: maximized ? t("vocalEditor.restore") : t("vocalEditor.maximize"), onClick: () => setMaximized((m) => !m), children: _jsx("svg", { viewBox: "0 0 24 24", width: "15", height: "15", children: _jsx("path", { fill: "currentColor", d: maximized ? "M8 8h8v8H8V8zM4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4z" : "M4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4zM6 14v4h4v2H4v-6h2zm12 0h2v6h-6v-2h4v-4z" }) }) }), _jsx("button", { className: "vocal-icon-btn", title: t("vocalEditor.close"), onClick: onClose, children: _jsx("svg", { viewBox: "0 0 24 24", width: "15", height: "15", children: _jsx("path", { fill: "none", d: "M6 6l12 12M18 6L6 18", stroke: "currentColor", strokeWidth: "2" }) }) })] }), _jsxs("div", { className: "vocal-editor-body", children: [_jsx("div", { className: `vocal-tools${tool === "delete" ? " danger" : ""}`, children: TOOLS.map((tt) => (_jsx("button", { className: `snap-toggle vocal-tool${tool === tt.id ? " active" : ""}${tt.id === "delete" ? " vocal-tool-delete" : ""}`, title: tt.label, onClick: () => setTool(tt.id), children: _jsx("svg", { viewBox: "0 0 24 24", width: "18", height: "18", fill: "currentColor", children: tt.icon }) }, tt.id))) }), _jsxs("div", { className: `vocal-canvas-wrap${tool === "delete" ? " delete-mode" : ""}`, children: [_jsxs("div", { className: "vocal-canvas-area", ref: wrapRef, children: [_jsx("canvas", { ref: canvasRef, className: "vocal-canvas", onPointerDown: onPointerDown, onPointerMove: onPointerMove, onPointerUp: onPointerUp, onPointerCancel: onPointerUp, onLostPointerCapture: onPointerUp, onDoubleClick: onDoubleClick, onContextMenu: onContextMenu, onWheel: onWheel }), tool === "delete" && _jsx("div", { className: "vocal-delete-overlay" }), lyricEdit && (_jsx("input", { className: "vocal-lyric-input", autoFocus: true, style: { left: lyricEdit.x, top: lyricEdit.y, width: Math.max(40, lyricEdit.w) }, defaultValue: lyricEdit.value, onFocus: () => { lyricCancelRef.current = false; }, onKeyDown: (e) => {
+                                            if (e.key === "Enter")
+                                                commitLyric(lyricEdit.id, e.target.value);
+                                            else if (e.key === "Escape") {
+                                                lyricCancelRef.current = true;
+                                                setLyricEdit(null);
+                                            }
+                                            else if (e.key === "Tab") {
+                                                e.preventDefault();
+                                                navLyric(lyricEdit.id, e.target.value, e.shiftKey ? -1 : 1);
+                                            } // preventDefault: stop the native focus-move off the input
+                                            e.stopPropagation();
+                                        }, onBlur: (e) => {
+                                            if (lyricNavRef.current || lyricCancelRef.current) {
+                                                lyricCancelRef.current = false;
+                                                return;
+                                            } // Tab already committed / Escape cancelled
+                                            commitLyric(lyricEdit.id, e.target.value);
+                                        } }, lyricEdit.id))] }), _jsx(EditorHScrollbar, { viewRef: viewRef, sizeRef: sizeRef, startRef: startRef, durRef: durRef, syncRef: scrollbarSyncRef, onScroll: scrollTo })] }), instrumentMode ? null : (_jsx(VocalSidebar, { trackId: part.trackId, segmentId: segmentId, notes: part.notes, selectedIds: selectedNotes, trackTransition: part.transition, vocalParams: part.vocalParams, voiceModel: part.voiceModel, onRender: render, rendering: vocalRenderActive }))] })] }));
+}
+// ── S73e 底部滚动条:自我强刷的微型子组件(两个 div)——脱-React 画布的 scrollX 活在 viewRef,
+//    经 syncRef 在每次重绘后 force 自己,主 VocalEditor 零重渲染;几何与 edge auto-scroll 的
+//    maxSX 同源(内容宽 = (start+dur)·ppt + 400 余量)。 ──
+function EditorHScrollbar({ viewRef, sizeRef, startRef, durRef, syncRef, onScroll }) {
+    const [, force] = useReducer((x) => x + 1, 0);
+    syncRef.current = force;
+    const v = viewRef.current;
+    const viewW = Math.max(1, sizeRef.current.w - KEY_COL_W);
+    const totalW = Math.max(viewW, (startRef.current + durRef.current) * v.ppt + 400);
+    return _jsx(HScrollbarView, { scrollX: v.scrollX, totalWidth: totalW, viewWidth: viewW, onChange: onScroll });
+}
+// ── module helpers ──
+/** Full per-note content signature for the commit diff (mirrors history.ts noteSig, minus id which is the
+ *  diff key). ⚠ MUST cover EVERY editable field: commitNotes drops an edit whose sig is unchanged, so a
+ *  transition/vibrato/pitchAuto-only edit would be SILENTLY lost if the sig omitted them (silent-regression
+ *  class). Keep in lockstep with history.ts noteSig. */
+function noteSig(n) {
+    const t = n.transition;
+    const tr = t ? `${t.offsetMs ?? ""}|${t.durLeftMs ?? ""}|${t.durRightMs ?? ""}|${t.depthLeftCents ?? ""}|${t.depthRightCents ?? ""}|${t.openEdgeCents ?? ""}` : "";
+    const v = n.vibrato;
+    const vib = v ? `${v.depthCents},${v.freqHz},${v.phase},${v.startMs},${v.easeInMs},${v.easeOutMs}` : "";
+    // S167 (§E2): keep in lockstep with history.ts noteSig — a timing-only edit must not be dropped.
+    const pt = n.phoneTiming;
+    const pts = pt ? `${pt.phones.join(",")}~${pt.scale.join(",")}~${(pt.gainDb ?? []).join(",")}` : "";
+    return (`${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.phoneme ?? ""}.${n.velocity}` +
+        `.${n.detune ?? 0}.${n.tie ? 1 : 0}.${n.pitchAuto === false ? 0 : 1}.${n.autoTuned ? 1 : 0}` +
+        `.${n.lang ?? ""}.${n.phonemeInput ?? ""}.${tr}.${vib}.${pts}`);
+}

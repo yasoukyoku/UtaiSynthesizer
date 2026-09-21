@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Muno 亮色版:白底 + 深蓝音符 -->
+  <rect x="0" y="0" width="1024" height="1024" rx="190" fill="#FFFFFF"/>
+  <g fill="#1E2A4A">
+    <g transform="rotate(-20 372 692)">
+      <ellipse cx="372" cy="692" rx="128" ry="92"/>
+    </g>
+    <rect x="496" y="232" width="42" height="468" rx="18"/>
+    <polyline points="520,268 606,312 660,214 742,258 792,158 864,200"
+      fill="none" stroke="#1E2A4A" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <circle cx="837" cy="837" r="69" fill="#00D4AA"/>
+</svg>

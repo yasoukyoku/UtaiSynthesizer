@@ -237,6 +237,9 @@ export function TrainingPage() {
     // enter-time decision (is this an audio drag we accept?) — reused on `over`
     // and `drop`, which is why it lives in the effect closure, not React state.
     let dragAccept = false;
+    // Drag-drop events are Tauri-WebView-only; skip cleanly in a plain browser
+    // so the app shell still mounts (dev preview / E2E / accidental open).
+    try {
     getCurrentWebview()
       .onDragDropEvent((event) => {
         const p = event.payload;
@@ -331,7 +334,11 @@ export function TrainingPage() {
       .then((u) => {
         if (cancelled) u();
         else unlisten = u;
-      });
+      })
+      .catch(() => { /* Tauri WebView not available — skip drag-drop hooks */ });
+    } catch {
+      /* getCurrentWebview() itself throws outside Tauri — skip */
+    }
     return () => {
       cancelled = true;
       if (unlisten) unlisten();

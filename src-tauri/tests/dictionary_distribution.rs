@@ -1,4 +1,4 @@
-//! S101 — the dictionary DISTRIBUTION chain, driven the way the installed app drives it.
+﻿//! S101 — the dictionary DISTRIBUTION chain, driven the way the installed app drives it.
 //!
 //! WHY THIS EXISTS AS AN INTEGRATION TEST (§user, 2026-08-03): the first version of this coverage
 //! was a unit test that called `sync_bundled_dictionaries` on two temp directories and checked the
@@ -55,11 +55,11 @@
 
 use std::path::{Path, PathBuf};
 
-use utai_lib::commands::settings::{dictionary_fingerprint_for, sync_bundled_dictionaries};
+use muno_lib::commands::settings::{dictionary_fingerprint_for, sync_bundled_dictionaries};
 // `DictSource` must be in scope for `GlobalDicts.words(..)` — it is the trait the render resolves
 // through, so importing it here is the same shape the production call sites have.
-use utai_lib::inference::g2p::{self, DictSource, GlobalDicts, Lang, ResolvedKind, ScoreEvt};
-use utai_lib::inference::g2p_alias::PhonemeSet;
+use muno_lib::inference::g2p::{self, DictSource, GlobalDicts, Lang, ResolvedKind, ScoreEvt};
+use muno_lib::inference::g2p_alias::PhonemeSet;
 
 const SHIPPED: [&str; 8] = [
     "en.tsv", "de.tsv", "fr.tsv", "es.tsv", "it.tsv",

@@ -163,7 +163,7 @@ pub fn install_panic_hook(log_dir: PathBuf, offset: time::UtcOffset) {
         let now = time::OffsetDateTime::now_utc().to_offset(offset);
         let stamp = now.format(crate::logging::LINE_TIME_FORMAT).unwrap_or_default();
         let name = crate::logging::log_file_name(crate::logging::LOG_PREFIX, now.date());
-        let line = format!("{stamp} PANIC utai_lib::crashlog: {info}\n");
+        let line = format!("{stamp} PANIC muno_lib::crashlog: {info}\n");
         if let Ok(mut f) =
             std::fs::OpenOptions::new().create(true).append(true).open(log_dir.join(name))
         {
@@ -204,10 +204,11 @@ pub fn spawn_autopsy(prev: Vec<PrevSession>) {
         for ev in query_events(
             "Application",
             "*[System[Provider[@Name='Application Error'] and (EventID=1000)] and \
-             EventData[Data='UtaiSynthesizer.exe' or Data='utai.exe']]",
+             EventData[Data='UtaiSynthesizer.exe' or Data='utai.exe' or Data='Muno.exe' or Data='muno.exe']]",
             8,
         ) {
-            if ev.epoch < cutoff || !ev.data.to_ascii_lowercase().contains("utai") {
+            let low = ev.data.to_ascii_lowercase();
+            if ev.epoch < cutoff || !(low.contains("utai") || low.contains("muno")) {
                 continue;
             }
             found = true;

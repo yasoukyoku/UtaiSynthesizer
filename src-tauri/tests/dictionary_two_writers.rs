@@ -1,4 +1,4 @@
-//! S141 §E2E-D3 —— 词典目录有**两个写者**,而它们在开机时的先后顺序不是确定的。
+﻿//! S141 §E2E-D3 —— 词典目录有**两个写者**,而它们在开机时的先后顺序不是确定的。
 //!
 //! `lib.rs` setup() 先 **spawn** 数据根回收线程,五行之后才**同步**调
 //! `sync_bundled_dictionaries`。于是回收完全可能落在 sync **之后** —— 而它对
@@ -30,9 +30,9 @@
 
 use std::path::{Path, PathBuf};
 
-use utai_lib::commands::settings::{reclaim_one_root, sync_bundled_dictionaries};
-use utai_lib::inference::g2p::{self, GlobalDicts, Lang, ResolvedKind, ScoreEvt};
-use utai_lib::inference::g2p_alias::PhonemeSet;
+use muno_lib::commands::settings::{reclaim_one_root, sync_bundled_dictionaries};
+use muno_lib::inference::g2p::{self, GlobalDicts, Lang, ResolvedKind, ScoreEvt};
+use muno_lib::inference::g2p_alias::PhonemeSet;
 
 const SHIPPED: [&str; 8] = [
     "en.tsv", "de.tsv", "fr.tsv", "es.tsv", "it.tsv",

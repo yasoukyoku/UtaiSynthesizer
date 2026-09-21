@@ -1,4 +1,4 @@
-//! tempo_oracle.rs — DEV-ONLY oracle harness for the S59 tempo/beat-grid detector.
+﻿//! tempo_oracle.rs — DEV-ONLY oracle harness for the S59 tempo/beat-grid detector.
 //!
 //! Runs `utai_dsp::tempo::analyze_tempo` over local real-music files and dumps JSON for the
 //! librosa comparison script (D:\MyDev\TESTING\utai-v2-testing\tempo_oracle\tempo_oracle.py) —
@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-fn mono_of(buf: &utai_lib::audio::AudioBuffer) -> Vec<f32> {
+fn mono_of(buf: &muno_lib::audio::AudioBuffer) -> Vec<f32> {
     let ch = buf.channels.max(1) as usize;
     if ch == 1 {
         return buf.samples.clone();
@@ -55,7 +55,7 @@ fn dump_tempo_analysis_for_oracle() {
             eprintln!("SKIP (missing): {}", path.display());
             continue;
         }
-        let buf = utai_lib::audio::load_audio(&path).expect("decode");
+        let buf = muno_lib::audio::load_audio(&path).expect("decode");
         let mono = mono_of(&buf);
         let started = std::time::Instant::now();
         let entry = match utai_dsp::tempo::analyze_tempo(&mono, buf.sample_rate, 4) {

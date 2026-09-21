@@ -1,0 +1,82 @@
+.smart-connection-overlay {
+  position: fixed;
+  bottom: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  pointer-events: none;
+}
+
+.smart-connection-hint {
+  background: rgba(15, 19, 28, 0.95);
+  border: 1px solid #38BDF8;
+  border-radius: 8px;
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 4px 16px rgba(56, 189, 248, 0.3);
+  backdrop-filter: blur(8px);
+  animation: slideUp 0.3s ease-out;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.smart-connection-port-indicator {
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: white;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.smart-connection-arrow {
+  color: #38BDF8;
+  font-size: 18px;
+  font-weight: bold;
+}
+
+.smart-connection-text {
+  color: #E9EEF5;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.react-flow__handle.compatible-port {
+  border: 2px solid #38BDF8 !important;
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.6) !important;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.6);
+  }
+  50% {
+    box-shadow: 0 0 20px rgba(56, 189, 248, 0.9);
+  }
+}
+
+.react-flow__node.connection-source {
+  box-shadow: 0 0 16px rgba(56, 189, 248, 0.4) !important;
+}
+
+.react-flow__node.connection-target-compatible {
+  border-color: #38BDF8 !important;
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.3) !important;
+}
+
+.react-flow__node.connection-target-incompatible {
+  opacity: 0.3;
+}

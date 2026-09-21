@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::io::Read;
 use tauri::State;
 
 use crate::AppState;
@@ -10,6 +11,13 @@ pub struct AudioFileInfo {
     pub sample_rate: u32,
     pub channels: u16,
     pub peaks: Vec<f32>,
+    /// 左通道峰值包络(与 peaks 同帧率 300/s)。单声道 = 与 peaks 相同。
+    /// 旧 sidecar JSON 无此字段 → serde default 空 → 前端回退用混音 peaks。
+    #[serde(default)]
+    pub peaks_l: Vec<f32>,
+    /// 右通道峰值包络(与 peaks 同帧率 300/s)。单声道 = 与 peaks 相同。
+    #[serde(default)]
+    pub peaks_r: Vec<f32>,
     /// Path to a content-addressed WAV copy (in audio_cache) for playback. Ensures browser
     /// decodeAudioData and Rust peaks use identical sample data.
     pub playback_path: String,
@@ -34,9 +42,17 @@ pub async fn load_audio_file(
     // CONTENT IDENTITY: hash the raw file bytes (read once). Identical content under a different
     // path/name produces the same hash, so we cache decode results by CONTENT, not path — "stop
     // fighting file names". XXH3-64 is fast (~GB/s) and ample for dedup (not security).
-    let bytes = std::fs::read(&input_path).map_err(|e| format!("read {}: {e}", input_path.display()))?;
-    let content_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
-    drop(bytes);
+    // STREAMED (not fs::read-all): a multi-GB import would otherwise pull the WHOLE file into
+    // memory just to hash it — chunked reads keep peak memory flat regardless of file size.
+    let mut file = std::fs::File::open(&input_path).map_err(|e| format!("open {}: {e}", input_path.display()))?;
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut chunk = [0u8; 1 << 20]; // 1 MiB rolling buffer
+    loop {
+        let n = file.read(&mut chunk).map_err(|e| format!("read {}: {e}", input_path.display()))?;
+        if n == 0 { break; }
+        hasher.update(&chunk[..n]);
+    }
+    let content_hash = format!("{:016x}", hasher.digest());
     let hash_ms = t0.elapsed().as_millis();
 
     let cache_dir = state.cache_dir.join("audio_cache");
@@ -66,7 +82,7 @@ pub async fn load_audio_file(
     // per-pixel renderer draws from the full peaks, so long clips keep their detail; the cache
     // downsamples to its own column cap for the zoomed-out blit).
     let peak_count = ((buf.duration_secs() * 300.0) as usize).clamp(4000, 64000);
-    let peaks = extract_peaks(&buf.samples, buf.channels, peak_count);
+    let (peaks, peaks_l, peaks_r) = extract_peaks(&buf.samples, buf.channels, peak_count);
 
     // Content-addressed playback WAV (same content ⇒ one cache file, shared by all paths/names; also
     // means deleting the original doesn't break playback). For a WAV input, copy the bytes VERBATIM so
@@ -127,6 +143,8 @@ pub async fn load_audio_file(
         sample_rate: buf.sample_rate,
         channels: buf.channels,
         peaks,
+        peaks_l,
+        peaks_r,
         playback_path: wav_path.to_string_lossy().to_string(),
         content_hash,
     };
@@ -146,32 +164,47 @@ pub async fn probe_audio_duration(path: String) -> Result<f64, String> {
     crate::audio::probe_duration_ms(&PathBuf::from(&path)).map_err(|e| e.to_string())
 }
 
-fn extract_peaks(samples: &[f32], channels: u16, target_count: usize) -> Vec<f32> {
-    let frame_count = samples.len() / channels as usize;
+/// 一次遍历同时提取 混音/左/右 三组峰值包络(同帧率、同对齐)。
+/// mixed = 全通道最大绝对值; L = ch0, R = ch1(多声道>2 时取第二声道, 单声道 L=R=mixed)。
+/// 返回 (mixed, left, right)。
+fn extract_peaks(samples: &[f32], channels: u16, target_count: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let ch = channels as usize;
+    let frame_count = samples.len() / ch;
     if frame_count == 0 {
-        return vec![];
+        return (vec![], vec![], vec![]);
     }
 
     let count = target_count.min(frame_count);
     let frames_per_peak = frame_count as f64 / count as f64;
-    let mut peaks = Vec::with_capacity(count);
+    let mut mixed = Vec::with_capacity(count);
+    let mut left = Vec::with_capacity(count);
+    let mut right = Vec::with_capacity(count);
+    let r_idx = if ch > 1 { 1 } else { 0 };
 
     for i in 0..count {
         let start = (i as f64 * frames_per_peak) as usize;
         let end = (((i + 1) as f64) * frames_per_peak) as usize;
         let end = end.min(frame_count);
 
-        let mut max_val = 0.0f32;
+        let mut max_mixed = 0.0f32;
+        let mut max_l = 0.0f32;
+        let mut max_r = 0.0f32;
         for frame in start..end {
-            let idx = frame * channels as usize;
-            if idx < samples.len() {
-                max_val = max_val.max(samples[idx].abs());
+            let idx = frame * ch;
+            if idx + r_idx < samples.len() {
+                let l = samples[idx].abs();
+                let r = samples[idx + r_idx].abs();
+                max_l = max_l.max(l);
+                max_r = max_r.max(r);
+                max_mixed = max_mixed.max(l).max(r);
             }
         }
-        peaks.push(max_val);
+        mixed.push(max_mixed);
+        left.push(max_l);
+        right.push(max_r);
     }
 
-    peaks
+    (mixed, left, right)
 }
 
 /// Trim leading near-zero samples from non-WAV audio.
@@ -298,6 +331,40 @@ pub async fn ensure_cache_dir(
 #[tauri::command]
 pub async fn save_binary_file(path: String, data: Vec<u8>) -> Result<(), String> {
     std::fs::write(&path, data).map_err(|e| format!("write {}: {}", path, e))
+}
+
+/// 轨道头 R 录音: 前端麦克风采集的 PCM WAV 字节保存到 app_dir/recordings/ 下(持久目录,
+/// 不随 audio_cache 启动清理),返回绝对路径供 importAudioToExistingTrack 导入轨道。
+#[tauri::command]
+pub async fn save_recording(
+    state: State<'_, Arc<AppState>>,
+    data: Vec<u8>,
+) -> Result<String, String> {
+    let dir = state.app_dir.join("recordings");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
+    let name = format!(
+        "rec_{}.wav",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, data).map_err(|e| format!("write {}: {}", path.display(), e))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// S-NEW 「导出轨道音频」: byte-exact COPY of one backing audio file to a user-chosen destination.
+/// Kept separate from save_binary_file on purpose — stems are routinely 50MB+ float wavs and must
+/// never round-trip through the JS heap. fs::copy is streamed by the OS (no full-file buffer).
+#[tauri::command]
+pub async fn copy_audio_file_to(source: String, dest: String) -> Result<(), String> {
+    let src = std::path::Path::new(&source);
+    if !src.exists() {
+        return Err(format!("source not found: {}", source));
+    }
+    std::fs::copy(src, &dest).map_err(|e| format!("copy {} -> {}: {}", source, dest, e))?;
+    Ok(())
 }
 
 // ─── S59: segment BPM/beat-grid analysis + Tempo Slider time-stretch ───

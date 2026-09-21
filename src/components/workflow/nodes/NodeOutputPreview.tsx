@@ -1,11 +1,50 @@
 import { useEffect, useRef, useState } from "react";
-import { readFile } from "@tauri-apps/plugin-fs";
+import { copyFile, exists, readFile } from "@tauri-apps/plugin-fs";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useTranslation } from "react-i18next";
 import { useWorkflowStore } from "../../../store/workflow";
 import { useAppStore } from "../../../store/app";
 import { preview } from "../../common/previewPlayer";
 import { Scrubber } from "../../common/Scrubber";
 import { t18 } from "../../../lib/models/msst-catalog";
+import { exportOneAudioFileToFolder, laneExportErrorMessage } from "../../../lib/audio/exportLaneAudio";
+import { useAmtStore } from "../../../store/amt";
+
+/** Build a collision-free plain-file destination path: <dir>/<base>.<ext>,
+ *  <base>_2.<ext>, <base>_3.<ext> … mirroring the project's export naming. */
+async function uniqueFilePath(dir: string, base: string, ext: string): Promise<string> {
+  let candidate = `${dir}/${base}.${ext}`;
+  let n = 2;
+  // eslint-disable-next-line no-await-in-loop
+  while (await exists(candidate).catch(() => false)) {
+    candidate = `${dir}/${base}_${n}.${ext}`;
+    n += 1;
+  }
+  return candidate;
+}
+
+/** Phase 5-1: spectrogram PNG artifact thumbnail — reads the cached PNG into a
+ *  blob URL (auto-revoked on unmount / path change). */
+function PngThumb({ path }: { path: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    let created: string | null = null;
+    readFile(path)
+      .then((bytes) => {
+        if (!alive) return;
+        created = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: "image/png" }));
+        setUrl(created);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+      if (created) URL.revokeObjectURL(created);
+    };
+  }, [path]);
+  if (!url) return null;
+  return <img className="wf-preview-thumb" src={url} alt="" />;
+}
 
 /** S66 — per-node output audition (the v1-style listen-before-deposit, §user). One compact
  *  row per output port whose wav exists in `nodeOutputs` (every intermediate node's outputs
@@ -123,12 +162,136 @@ export function NodeOutputPreview({
     return `${m}:${ss.toString().padStart(2, "0")}`;
   };
 
+  // 每条试听行的「下载」按钮：把该节点的输出音频原样复制到本地自选文件夹。
+  const download = async (path: string, label?: string) => {
+    const out = await open({ directory: true });
+    if (!out || typeof out !== "string") return;
+    try {
+      if (/\.(mid|png|json)$/i.test(path)) {
+        // Plain-file outputs (MIDI / PNG artifact / JSON dump) are copied
+        // verbatim with the existing _2/_3 collision-free naming convention.
+        const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+        const baseName = label ? `${nodeId}_${label}` : nodeId;
+        const dest = await uniqueFilePath(out, baseName, ext);
+        await copyFile(path, dest);
+      } else {
+        await exportOneAudioFileToFolder(
+          { label: label ?? nodeId, sourcePath: path },
+          out,
+          label ? `${nodeId}_${label}` : nodeId,
+        );
+      }
+      useAppStore
+        .getState()
+        .showToast(
+          t18({ zh: "已下载", en: "Downloaded", ja: "ダウンロードしました" }, i18n.language),
+          "success",
+        );
+    } catch (e) {
+      useAppStore.getState().showToast(laneExportErrorMessage(e), "error");
+    }
+  };
+
   return (
     <div className="wf-preview nodrag" onPointerDown={(e) => e.stopPropagation()}>
       {outputs.map((path, i) => {
         if (!path) return null; // sparse rehydrated slot
+        const isMidi = path.toLowerCase().endsWith(".mid");
+        // Phase 5: report ports carry inline JSON strings (never file paths) —
+        // render a copy-only row; also gives complianceCheck's report a real UI.
+        const isJson = !isMidi && path.trimStart().startsWith("{");
+        const isPng = !isMidi && !isJson && path.toLowerCase().endsWith(".png");
         const isActive = active === i;
         const glyph = isActive && phase === "playing" ? "❚❚" : isActive && phase === "loading" ? "◌" : "▶";
+        if (isJson) {
+          return (
+            <div key={i} className="wf-preview-row">
+              <span className="wf-preview-btn" style={{ opacity: 0.7 }}>{"{ }"}</span>
+              {outputLabels?.[i] && (
+                <span className="wf-preview-label" title={outputLabels[i]}>
+                  {outputLabels[i]}
+                </span>
+              )}
+              <span className="wf-preview-scrub" style={{ opacity: 0.6 }}>
+                {t18({ zh: "JSON 报告", en: "JSON report", ja: "JSON レポート" }, i18n.language)}
+              </span>
+              <button
+                className="wf-preview-dl"
+                title={t18({ zh: "复制报告 JSON", en: "Copy report JSON", ja: "レポート JSON をコピー" }, i18n.language)}
+                onClick={() => {
+                  void navigator.clipboard
+                    .writeText(path)
+                    .then(() =>
+                      useAppStore
+                        .getState()
+                        .showToast(
+                          t18({ zh: "已复制", en: "Copied", ja: "コピーしました" }, i18n.language),
+                          "success",
+                        ),
+                    )
+                    .catch(() =>
+                      useAppStore
+                        .getState()
+                        .showToast(
+                          t18({ zh: "复制失败", en: "Copy failed", ja: "コピーに失敗しました" }, i18n.language),
+                          "error",
+                        ),
+                    );
+                }}
+              >
+                ⧉
+              </button>
+            </div>
+          );
+        }
+        if (isPng) {
+          return (
+            <div key={i} className="wf-preview-row wf-preview-row-png">
+              <PngThumb path={path} />
+              {outputLabels?.[i] && (
+                <span className="wf-preview-label" title={outputLabels[i]}>
+                  {outputLabels[i]}
+                </span>
+              )}
+              <button
+                className="wf-preview-dl"
+                title={t18({ zh: "下载此图片", en: "Download this image", ja: "この画像をダウンロード" }, i18n.language)}
+                onClick={() => void download(path, outputLabels?.[i])}
+              >
+                ⬇
+              </button>
+            </div>
+          );
+        }
+        if (isMidi) {
+          return (
+            <div key={i} className="wf-preview-row">
+              <span className="wf-preview-btn" style={{ opacity: 0.7 }}>♪</span>
+              {outputLabels?.[i] && (
+                <span className="wf-preview-label" title={outputLabels[i]}>
+                  {outputLabels[i]}
+                </span>
+              )}
+              <span className="wf-preview-scrub" style={{ opacity: 0.6 }}>
+                {t18({ zh: "MIDI 文件", en: "MIDI file", ja: "MIDI ファイル" }, i18n.language)}
+              </span>
+              <button
+                className="wf-preview-dl"
+                title={t18({ zh: "打开 MIDI 工作台", en: "Open MIDI workbench", ja: "MIDI ワークベンチを開く" }, i18n.language)}
+                onClick={() => useAmtStore.getState().openWorkbench(nodeId)}
+              >
+                ⚙
+              </button>
+              <button
+                className="wf-preview-dl"
+                title={t18({ zh: "下载此 MIDI", en: "Download this MIDI", ja: "この MIDI をダウンロード" }, i18n.language)}
+                onClick={() => void download(path, outputLabels?.[i])}
+              >
+                ⬇
+              </button>
+            </div>
+          );
+        }
         return (
           <div key={i} className="wf-preview-row">
             <button
@@ -155,6 +318,13 @@ export function NodeOutputPreview({
               }}
             />
             <span className="wf-preview-time">{isActive && dur > 0 ? `${fmt(pos)}/${fmt(dur)}` : ""}</span>
+            <button
+              className="wf-preview-dl"
+              title={t18({ zh: "下载此音频", en: "Download this audio", ja: "この音声をダウンロード" }, i18n.language)}
+              onClick={() => void download(path, outputLabels?.[i])}
+            >
+              ⬇
+            </button>
           </div>
         );
       })}

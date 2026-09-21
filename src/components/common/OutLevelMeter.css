@@ -1,0 +1,14 @@
+.out-level-meter {
+  background: var(--bg-tertiary, #181822);
+  border-radius: 3px;
+  border: 1px solid var(--border-subtle, #333);
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column-reverse;
+  flex-shrink: 0;
+}
+.out-level-fill {
+  width: 100%;
+  background: linear-gradient(to top, #10b981 0%, #84cc16 40%, #f59e0b 70%, #ef4444 92%);
+}

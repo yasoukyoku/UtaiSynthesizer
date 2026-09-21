@@ -107,7 +107,11 @@ pub fn migrate_one_slot(data_dir: &Path, project_id: &str, family: &str) -> Resu
 }
 
 const STDERR_RING_CAP: usize = 200;
-const HISTORY_CAP: usize = 40_000;
+// D7.2-003 fix: 40K points × ~200B/point ≈ 8MB was an aggressive upper bound that
+// pushed the OOM ceiling on 4GB-memory machines. 15K still gives loss curves that are
+// visually smooth for any normal training length (the step emitter sends every step
+// but the frontend's visible range is only the last few thousand anyway).
+const HISTORY_CAP: usize = 15_000;
 const SEED: u32 = 1234;
 
 fn d_true() -> bool {
@@ -646,40 +650,6 @@ mod warn_code {
     /// Nothing on the protocol for a long time. Deliberately generic — it catches
     /// the 1455 hang AND every other cause we have not met yet.
     pub const NO_PROGRESS: &str = "TRAINING_NO_PROGRESS";
-    /// S172: MIOpen could not BUILD one of its kernels — hipRTC returned
-    /// HIPRTC_ERROR_COMPILATION. Same shape as HOST_MEMORY above: the reason exists ONLY on
-    /// stderr (MIOpen prints the compiler text at Warning level; the exception that reaches
-    /// the protocol is a bare `miopenStatusUnknownError`), so sniffing the stream is the only
-    /// way this is ever attributable. A community report arrived with 740 of these lines and
-    /// no classification at all, and the triage nearly went to the wrong cause.
-    pub const ROCM_KERNEL_BUILD: &str = "TRAINING_ROCM_KERNEL_BUILD_FAILED";
-}
-
-/// Map ONE line of the sidecar's stderr to a warning CODE, or `None` to leave it alone.
-///
-/// S172: this used to be two `if`s inlined in the stderr reader thread, where nothing
-/// could reach them — so the 1455 sniffer had gone since S114 without a single
-/// execution, and the ROCm one was about to join it. "A never-executed error branch is
-/// an empty criterion": pulling the decision out into a pure function is what makes it
-/// testable at all, and the tests below run BOTH the positives (real lines, copied from
-/// the two community logs) and the negatives that must stay silent.
-fn classify_stderr_line(line: &str) -> Option<&'static str> {
-    // S114 §F5-1: this stream is the ONLY place the commit-limit failure is ever
-    // visible. torch raises it inside multiprocessing's daemon feeder thread, which
-    // prints the traceback and keeps looping, so it never reaches the runner's except
-    // block and never becomes a protocol `error`. Reading it here is not a shortcut —
-    // it is the only evidence that exists.
-    if line.contains("Couldn't open shared file mapping") || line.contains("error code: <1455>") {
-        return Some(warn_code::HOST_MEMORY);
-    }
-    // S172, same argument: MIOpen states WHY a kernel build failed only on stderr, while
-    // the exception that reaches the protocol is a bare `miopenStatusUnknownError`. A
-    // community log carried 740 of these lines with nothing classifying them — which is
-    // exactly how that report arrived and why its triage nearly went to the wrong cause.
-    if line.contains("HIPRTC_ERROR_COMPILATION") {
-        return Some(warn_code::ROCM_KERNEL_BUILD);
-    }
-    None
 }
 
 /// How long the sidecar may say nothing before the watchdog speaks up.
@@ -1729,13 +1699,34 @@ impl TrainingManager {
     /// abort flag closes the pre-spawn window: the worker checks it during dataset
     /// import and inside the child-slotting critical section, so either the worker
     /// self-terminates or the child is here to be killed.
+    ///
+    /// ⛔ D7.2-004/D7.2-001/D7.2-009 fixes:
+    ///   - child.take() BEFORE drop锁: wait() must NOT hold the Mutex (force_stop cannot
+    ///     be blocked by the exit window; the worker similarly takes-then-drops before wait)
+    ///   - kill() + wait(): both required — without wait the child becomes a zombie on Unix
+    ///     and the process table entry leaks on Windows
+    ///   - stop_file clear: a stale stop_file would cause the NEXT start to trigger python's
+    ///     self-stop immediately (python writes this file on its own clean stop request path)
     pub fn force_stop(&self) -> Result<()> {
         self.inner.abort.store(true, Ordering::SeqCst);
-        if let Some(mut child) = self.inner.child.lock().take() {
-            child
-                .kill()
-                .map_err(|e| UtaiError::Training(format!("TRAINING_KILL_FAILED: {}", e)))?;
+
+        // D7.2-009: clear stop_file BEFORE we do anything else — even if the child hasn't
+        // been slotted yet and force_stop effectively no-ops, the next resume must not read
+        // this stale sentinel.
+        let stale_stop = self.inner.stop_file.lock().take();
+        if let Some(path) = stale_stop.as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+
+        // D7.2-001 + D7.2-004: take the child OUT of the slot (drops the Mutex), then kill + wait
+        // in lock-free space so a concurrent force_stop does not pile up.
+        let child_opt = self.inner.child.lock().take();
+        if let Some(mut child) = child_opt {
+            let _ = child.kill();
+            let _ = child.wait();
             tracing::warn!("training force-killed");
+        } else {
+            tracing::info!("force_stop: child not yet slotted or already cleaned up");
         }
         Ok(())
     }
@@ -2691,7 +2682,6 @@ impl TrainingManager {
                     s.stderr_tail = tail;
                     drop(s);
                     tracing::error!("training run failed: {}", e);
-                    log_run_verdict(&inner, "error");
                     emit_done(&inner, &app);
                 }
                 finalize_elapsed(&inner); // idempotent — freezes elapsed on every exit path
@@ -2719,46 +2709,7 @@ fn abort_finish(inner: &Arc<Inner>, app: &tauri::AppHandle) -> Result<()> {
     inner.snapshot.lock().state = "stopped".into();
     emit_done(inner, app);
     tracing::warn!("training aborted before/at sidecar spawn");
-    log_run_verdict(inner, "aborted-pre-spawn");
     Ok(())
-}
-
-/// The ONE line that says how a run ended, written on every ending.
-///
-/// S172. The four endings each logged their own sentence and not one of them read
-/// `snapshot.warnings`, so a run rescued by the MIOpen bypass — degraded, and numerically
-/// different from what the user asked for — logged a bare `training run finished ("completed")`.
-/// The warning existed only as an isolated `training warning: <CODE>` line further up, which
-/// made "was this model trained normally?" a question about correlating timestamps, and
-/// `prune_old_logs` deletes the answer after 30 days.
-///
-/// One grep target on purpose: `training VERDICT`. A reporter sends one file; whoever reads it
-/// should be able to find how the run ended without knowing the codebase.
-fn log_run_verdict(inner: &Inner, ending: &str) {
-    let s = inner.snapshot.lock();
-    let warnings = if s.warnings.is_empty() {
-        "none".to_string()
-    } else {
-        s.warnings.join(",")
-    };
-    let stage = s
-        .stage
-        .as_ref()
-        .map(|st| st.stage.clone())
-        .unwrap_or_else(|| "-".into());
-    // `error` is deliberately included even on the Ok endings: force-stop and abort leave it
-    // untouched, so its presence there is itself a fact worth seeing.
-    tracing::info!(
-        "training VERDICT: ending={} state={} backend={} run={} stage={} elapsed={}s warnings=[{}] error={:?}",
-        ending,
-        s.state,
-        s.backend,
-        s.run_id,
-        stage,
-        s.elapsed_secs,
-        warnings,
-        s.error
-    );
 }
 
 fn stderr_tail(inner: &Inner) -> Vec<String> {
@@ -3441,7 +3392,16 @@ fn run_worker(
         }
     }
     let run_json = run.join("run.json");
-    std::fs::write(&run_json, serde_json::to_vec_pretty(&run_config)?)?;
+    // D7.2-007 fix: atomic write via tmp + same-dir rename. A torn run.json from a mid-write
+    // crash would otherwise surface as an incomprehensible JSON parse failure in python's
+    // `runner.py` (which does not know about our write protocol) — python just reports
+    // "No such file or directory" or a JSON decode error. With rename, a torn write leaves
+    // either the old run.json untouched OR both files exist (tmp visible, old run.json is
+    // what python reads), so python either sees the new config cleanly or the previous one.
+    let run_json_tmp = run.join("run.json.tmp");
+    std::fs::write(&run_json_tmp, serde_json::to_vec_pretty(&run_config)?)?;
+    crate::util::rename_with_retry(&run_json_tmp, &run_json, "TRAINING_RUN_JSON_WRITE")
+        .map_err(UtaiError::Training)?;
 
     // ---- spawn the sidecar ----
     if inner.abort.load(Ordering::SeqCst) {
@@ -3455,14 +3415,6 @@ fn run_worker(
         run_json.display()
     );
     let mut cmd = crate::util::python_command(&python);
-    // S172: hand the ROCm kernel compiler the C++ headers our pinned comgr shipped empty.
-    // Call-site env, not `util::python_command`, for the same reason diagnostics is — the
-    // helper is shared with the converter / MSST spawns, which never reach MIOpen. The value
-    // is RELATIVE and resolves against `current_dir` below; see the function's doc for why
-    // that is load-bearing rather than a shortcut.
-    let hiprtc_opts = crate::util::hiprtc_cxx_include_options();
-    crate::util::log_hiprtc_cxx_provenance(&training_dir, &hiprtc_opts);
-    cmd.env("HIPRTC_COMPILE_OPTIONS_APPEND", &hiprtc_opts);
     cmd.current_dir(&training_dir)
         .arg("-m")
         .arg("utai_train.runner")
@@ -3522,9 +3474,17 @@ fn run_worker(
         let warn_app = app.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
-                tracing::debug!(target: "utai", "[train-py] {}", line);
-                if let Some(code) = classify_stderr_line(&line) {
-                    raise_warning(&ring_inner, &warn_app, code);
+                tracing::debug!(target: "muno", "[train-py] {}", line);
+                // S114 §F5-1: this stream is the ONLY place the commit-limit failure
+                // is ever visible. torch raises it inside multiprocessing's daemon
+                // feeder thread, which prints the traceback and keeps looping, so it
+                // never reaches the runner's except block and never becomes a
+                // protocol `error`. Reading it here is not a shortcut — it is the
+                // only evidence that exists.
+                if line.contains("Couldn't open shared file mapping")
+                    || line.contains("error code: <1455>")
+                {
+                    raise_warning(&ring_inner, &warn_app, warn_code::HOST_MEMORY);
                 }
                 let mut ring = ring_inner.stderr_ring.lock();
                 if ring.len() >= STDERR_RING_CAP {
@@ -3569,7 +3529,7 @@ fn run_worker(
     if let Some(stdout) = stdout {
         for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
-                tracing::debug!(target: "utai", "[train-proto?] {}", line);
+                tracing::debug!(target: "muno", "[train-proto?] {}", line);
                 continue;
             };
             // S114 §F5-1: ANY well-formed protocol message counts as progress, not
@@ -3659,7 +3619,7 @@ fn run_worker(
                     if !code.is_empty() && code.len() <= 64 {
                         raise_warning(inner, app, &code);
                     } else {
-                        tracing::debug!(target: "utai", "[train-proto?] unusable warn code {:?}", code);
+                        tracing::debug!(target: "muno", "[train-proto?] unusable warn code {:?}", code);
                     }
                 }
                 Some("error") => {
@@ -3670,7 +3630,7 @@ fn run_worker(
                             .to_string(),
                     );
                 }
-                _ => tracing::debug!(target: "utai", "[train-proto?] {}", line),
+                _ => tracing::debug!(target: "muno", "[train-proto?] {}", line),
             }
         }
     }
@@ -3688,7 +3648,7 @@ fn run_worker(
     if got_done {
         finalize_elapsed(inner);
         emit_done(inner, app);
-        log_run_verdict(inner, "done");
+        tracing::info!("training run finished ({:?})", inner.snapshot.lock().state);
         return Ok(());
     }
     if let Some(err) = got_error {
@@ -3702,7 +3662,7 @@ fn run_worker(
         // forensics was the one that threw them away: the error card renders on
         // `state === "error"` only, and the next start wipes the whole snapshot AND the
         // stderr ring. The raw lines do survive in `utai.log.<date>` (the `[train-py]`
-        // forward is `tracing::debug!` with target "utai", and the FILE filter is
+        // forward is `tracing::debug!` with target "muno", and the FILE filter is
         // `warn,utai=debug`) — but a user who sees a blank "stopped" has no reason to
         // suspect there is anything worth sending. Carrying the tail here is what turns
         // "it just stopped" into "here is what it said before it stopped".
@@ -3714,13 +3674,8 @@ fn run_worker(
         drop(s);
         emit_done(inner, app);
         tracing::warn!("training force-stopped by user");
-        log_run_verdict(inner, "force-stopped");
         return Ok(());
     }
-    // The crash ending returns Err from here; the caller's error arm logs the verdict for the
-    // protocol-`error` case, not for this one, so it gets its own call rather than silently
-    // becoming the one ending with no VERDICT line.
-    log_run_verdict(inner, "crashed");
     Err(UtaiError::Training(format!(
         "TRAINING_PROCESS_CRASHED: exit code {:?}",
         code
@@ -3730,68 +3685,6 @@ fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// S172. Both stderr sniffers used to live inline in the reader thread, where no
-    /// test could reach them — so the 1455 one had sat since S114 with zero executions,
-    /// and the ROCm one was one commit away from the same fate. A never-executed error
-    /// branch is an empty criterion, so here both get executed.
-    ///
-    /// The ROCm inputs are not invented: they are copied verbatim out of the community
-    /// log `utai.log.2026-09-19`, which carries 740 of them.
-    #[test]
-    fn s172_stderr_classifier_maps_the_lines_that_actually_arrived() {
-        // Verbatim from the report, both MIOpen spellings (Compile and BuildHip).
-        for line in [
-            "MIOpen(HIP): Error [Compile] 'hiprtcCompileProgram(prog.get(), c_options.size(), \
-             c_options.data())' MIOpenNeuron.cpp: HIPRTC_ERROR_COMPILATION (6)",
-            "MIOpen(HIP): Error [BuildHip] HIPRTC status = HIPRTC_ERROR_COMPILATION (6), \
-             source file: MIOpenNeuron.cpp",
-        ] {
-            assert_eq!(
-                classify_stderr_line(line),
-                Some(warn_code::ROCM_KERNEL_BUILD),
-                "unclassified: {line}"
-            );
-        }
-
-        // S114's line, both halves of its OR.
-        for line in [
-            "RuntimeError: Couldn't open shared file mapping: <torch_1234_5678>, error code: <1455>",
-            "Couldn't open shared file mapping",
-            "error code: <1455>",
-        ] {
-            assert_eq!(
-                classify_stderr_line(line),
-                Some(warn_code::HOST_MEMORY),
-                "unclassified: {line}"
-            );
-        }
-    }
-
-    /// The anti-vacuity half: a classifier that answered `Some(..)` to everything would
-    /// pass the test above and then warn on every line of every healthy run.
-    ///
-    /// The first case is the one that matters and it is real, lifted from
-    /// `utai.log(1)(3).2026-07-24`: an ordinary loss line whose float happens to spell
-    /// `1455` inside `1.8825397491455078`. A looser matcher — bare "1455" — would fire
-    /// this warning at a user whose training is perfectly healthy.
-    #[test]
-    fn s172_stderr_classifier_stays_silent_on_healthy_lines() {
-        for line in [
-            "INFO:utai_train.sovits.train:Losses: [2.8869028091430664, 1.8825397491455078, \
-             5.9803056716918945, 19.65444564819336, 1.037317156791687], step: 4000, \
-             lr: 9.947634307304244e-05",
-            // MIOpen talks a lot at log level 4; only a COMPILATION failure is ours.
-            "MIOpen(HIP): Warning [SQLiteBase] Unable to read system database file",
-            "MIOpen(HIP): Info [get_device_name] Raw device name: gfx1100",
-            // A hipRTC status that is not the compilation one.
-            "HIPRTC status = HIPRTC_SUCCESS (0)",
-            "error code: <1450>",
-            "",
-        ] {
-            assert_eq!(classify_stderr_line(line), None, "wrongly classified: {line}");
-        }
-    }
 
     /// S114 §F5-3: the numerical-divergence guard is python, so `cargo test` cannot
     /// exercise its behaviour — that is `converter/verify/training/gate_numerics_guard.py`

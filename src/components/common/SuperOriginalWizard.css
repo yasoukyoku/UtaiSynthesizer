@@ -1,0 +1,297 @@
+﻿/* 搂user銆岃秴绾у師鍒涖€嶄竴閿悜瀵?鈥斺€?寮圭獥澶栧３澶嶇敤 ConfirmDialog锛坈onfirm-overlay/confirm-dialog/
+   confirm-title锛夛紝杩欓噷鍙仛鍚戝鑷繁鐨勫唴閮ㄥ竷灞€銆傜传鑹蹭富棰橈紙鐢ㄦ埛鍏ㄥ眬鍋忓ソ锛夈€?*/
+
+.sow-dialog {
+  width: 620px;
+  max-width: 92vw;
+  max-height: 88vh;
+  overflow-y: auto;
+}
+
+.sow-subtitle {
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+  margin: -4px 0 16px;
+}
+
+/* 鈹€鈹€ 姝ラ鍧?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ */
+
+.sow-step {
+  margin-bottom: 16px;
+}
+
+.sow-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.sow-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  color: #fff;
+  background: var(--accent-secondary);
+  clip-path: polygon(0 4px, 4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%);
+}
+
+/* 鈹€鈹€ 绗?1 姝ワ細閫夋瓕鎸夐挳 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ */
+
+.sow-file-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 14px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px dashed var(--border-strong);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.sow-file-btn:hover {
+  border-color: var(--accent-secondary);
+  background: rgba(139, 92, 246, 0.06);
+}
+
+.sow-file-btn.has-file {
+  border-style: solid;
+  border-color: var(--accent-secondary);
+}
+
+.sow-file-icon {
+  font-size: 18px;
+}
+
+.sow-file-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.sow-file-btn.has-file .sow-file-text {
+  color: var(--text-primary);
+}
+
+/* 鈹€鈹€ 绗?2 姝ワ細妯℃澘鍗＄墖 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ */
+
+.sow-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.sow-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 12px;
+  text-align: left;
+  font-family: var(--font-ui);
+  background: var(--bg-base);
+  border: 1px solid var(--border-strong);
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.sow-card:hover {
+  border-color: #a78bfa;
+}
+
+.sow-card.active {
+  border-color: var(--accent-secondary);
+  box-shadow: 0 0 0 1px var(--accent-secondary), 0 4px 18px rgba(139, 92, 246, 0.25);
+  background: rgba(139, 92, 246, 0.08);
+}
+
+.sow-card-icon {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.sow-card-title {
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.sow-card-desc {
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+/* 鈹€鈹€ 妯℃澘閫夐」 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ */
+
+.sow-opt {
+  margin-bottom: 10px;
+}
+
+.sow-opt-label {
+  display: block;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.sow-select {
+  width: 100%;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-strong);
+  padding: 7px 10px;
+}
+
+.sow-select:focus {
+  outline: none;
+  border-color: var(--accent-secondary);
+}
+
+.sow-semi-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.sow-semi {
+  min-width: 44px;
+  padding: 6px 10px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-strong);
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.sow-semi:hover {
+  border-color: #a78bfa;
+}
+
+.sow-semi.active {
+  color: #fff;
+  background: var(--accent-secondary);
+  border-color: var(--accent-secondary);
+}
+
+.sow-opt-hint {
+  margin-top: 5px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+/* 鈹€鈹€ 灏辩华 / 缂虹粍浠?鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ */
+
+.sow-ready {
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  color: #34d399;
+  margin: 4px 0 12px;
+}
+
+.sow-missing {
+  padding: 10px 12px;
+  margin: 4px 0 12px;
+  background: rgba(251, 146, 60, 0.08);
+  border: 1px solid rgba(251, 146, 60, 0.45);
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.sow-missing-title {
+  font-weight: 600;
+  color: #fb923c;
+  margin-bottom: 6px;
+}
+
+.sow-missing ul {
+  margin: 0 0 8px;
+  padding-left: 18px;
+}
+
+.sow-link-btn {
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  color: #a78bfa;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.sow-link-btn:hover {
+  color: var(--accent-secondary);
+}
+
+/* 鈹€鈹€ 搴曢儴鎿嶄綔 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ */
+
+.sow-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.sow-btn {
+  padding: 8px 18px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-base);
+  color: var(--text-secondary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-strong);
+  cursor: pointer;
+}
+
+.sow-btn:hover:not(:disabled) {
+  border-color: #a78bfa;
+  color: var(--text-primary);
+}
+
+.sow-btn.primary {
+  color: #fff;
+  background: var(--accent-secondary);
+  border-color: var(--accent-secondary);
+  font-weight: 600;
+}
+
+.sow-btn.primary:hover:not(:disabled) {
+  background: #7c3aed;
+  color: #fff;
+}
+
+.sow-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.sow-footnote {
+  margin-top: 10px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+  line-height: 1.45;
+}

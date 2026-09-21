@@ -38,7 +38,7 @@ use crate::AppState;
 /// pubkey). GitHub's `latest/download` redirect always points at the newest NON-prerelease release,
 /// so publishing a release with a `latest.json` asset is the whole update-push protocol.
 const UPDATE_ENDPOINT: &str =
-    "https://github.com/yasoukyoku/UtaiSynthesizer/releases/latest/download/latest.json";
+    "https://github.com/junziai/munoai/releases/latest/download/latest.json";
 
 /// No-bytes window after which the download attempt is abandoned (same posture as download.rs's
 /// stall watchdog: slow links make progress, dead links don't — never a whole-request timeout,
@@ -142,15 +142,6 @@ pub async fn update_check(
             .map_err(|e| format!("UPDATE_CHECK_FAILED: {e}"))?;
         match updater.check().await {
             Ok(r) => {
-                // S170: the WINNING route was the one fact this loop never recorded. On a mainland
-                // box the check silently walks up to 4 gh-proxy routes and only the FAILURES were
-                // logged, so a log with no update-check errors is indistinguishable from one where
-                // every route worked — and when a proxy starts answering wrong (the poisoned-proxy
-                // class this very loop exists to survive) nothing says which one served us.
-                tracing::info!(
-                    "update check succeeded via {ep} ({})",
-                    if r.is_some() { "update available" } else { "up to date" }
-                );
                 check_result = Ok(r);
                 break;
             }

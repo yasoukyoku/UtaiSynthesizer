@@ -95,3 +95,33 @@ bin/
 
 # Claude Code:worktrees 是本地状态,settings.json 与 scripts/memory_hook*.* 要进版本库
 .claude/worktrees/
+
+# temp analyze scripts
+.tmp-analyze*.ps1
+
+# build / dev logs
+*.log
+dev.log
+build.log
+
+# local backup snapshot / temp index
+BACKUP_BEFORE_ORIGINAL_SWAP/
+stable_index.txt
+
+# Large model files inside src-tauri (56GB+ — must never be committed)
+src-tauri/models/
+
+# User recordings & temp outputs
+recordings/
+test_output/
+tmp_out_utai/
+test_out.wav
+
+# IDE / tool caches
+.cache/
+src-tauri/.cache/
+
+# Internal dev docs & AI-tool local config (must never be public)
+.trae/
+.claude/
+docs/superpowers/

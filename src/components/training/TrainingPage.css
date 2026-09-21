@@ -41,7 +41,7 @@
  * died with TrainingPanel.css — Settings got its own scoped copy then too). */
 .training-page-header .panel-title {
   color: var(--text-primary);
-  font-size: var(--font-size-md);
+  font-size: var(--font-size-base);
 }
 
 .training-page-header .panel-close {
@@ -298,6 +298,28 @@
   color: var(--color-error);
 }
 
+/* 试听行下载按钮 —— 与播放/删除同排,仅在不重新编码的前提下原样复制文件。 */
+.training-file-dl {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 5px;
+}
+.training-file-dl:hover {
+  color: var(--accent-secondary);
+  border-color: var(--accent-secondary);
+  background: var(--accent-secondary-glow);
+}
+
 /* -------- ①c singer list (SoVITS multi-speaker co-training) -------- */
 .training-spk-stack {
   display: flex;
@@ -425,7 +447,7 @@
 
 .training-backend-name {
   color: var(--text-primary);
-  font-size: var(--font-size-md);
+  font-size: var(--font-size-base);
 }
 
 .training-backend-desc {
@@ -593,7 +615,7 @@
 }
 
 .training-start-btn {
-  font-size: var(--font-size-md);
+  font-size: var(--font-size-base);
   padding: var(--space-md) var(--space-3xl);
 }
 
@@ -880,7 +902,7 @@
   gap: 8px;
   padding: 8px 10px;
   border: 1px solid var(--color-warning);
-  background: var(--bg-tertiary, rgba(128, 128, 128, 0.12));
+  background: color-mix(in srgb, var(--color-warning) 8%, var(--bg-panel));
   color: var(--color-warning);
   font-size: var(--font-size-sm);
   line-height: 1.5;
@@ -895,7 +917,7 @@
   opacity: 0.45;
 }
 .training-ckpt-row.reference .training-ckpt-kind.reference {
-  background: var(--bg-tertiary, rgba(128, 128, 128, 0.2));
+  background: var(--bg-panel);
   color: var(--text-secondary);
 }
 /* (checkbox visuals live in the shared angular-checkbox block above) */

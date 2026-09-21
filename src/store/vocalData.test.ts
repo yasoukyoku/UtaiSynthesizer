@@ -118,7 +118,8 @@ describe("Phase 3 — .usp save/load round-trips every vocal field (GATE C)", ()
     // S73b/c/d:sanitize 载入时补 concrete 的 autoTuneExpr(2)/Vib(1)/Take(0)——夹具没写它们,期望值补齐
     // S83 knife 6b / S84 C 刀: sanitize always materializes the consonant knobs (absent → defaults).
     // S88: …and the rest token, exactly like the breath token beside it (absent → the canonical "R").
-    expect(loaded.tracks[0]!.vocalParams).toEqual({ ...rich.vocalParams, autoTuneExpr: 2, autoTuneVib: 1, autoTuneTake: 0, consonantEmphasis: 2.5, consonantValley: 1, restToken: "R" });
+    // Phase 7 ①②: 同款物化 voice-realism 百分数旋钮(absent → 0;③ breathLayer 默认 ON = 保持 ABSENCE)。
+    expect(loaded.tracks[0]!.vocalParams).toEqual({ ...rich.vocalParams, autoTuneExpr: 2, autoTuneVib: 1, autoTuneTake: 0, consonantEmphasis: 2.5, consonantValley: 1, restToken: "R", voiceRealism: 0, formantJitter: 0 });
     expect(loaded.tracks[0]!.segments[0]!.content).toEqual(rich.segments[0]!.content);
   });
 
@@ -543,6 +544,23 @@ describe("Phase 5 — property sidebar data-layer (transition override / vibrato
     expect(vocalParamsSig({ ...sigBase, consonantPreroll: false })).not.toBe(vocalParamsSig(sigBase));
   });
 
+  // ── Phase 7 「人声真实化」三旋钮 in the render signature ──
+  it("★ Phase 7 voiceRealism/formantJitter/breathLayer fold OUT at defaults and each non-default is its own signature", () => {
+    // Defaults (0 / 0 / ON=absent) must hash byte-for-byte like the pre-knob string — the fold-away
+    // family's whole point: adding the knobs invalidates no bake that ships today. Pinned against the
+    // LITERAL so a mutation that appends to BOTH sides cannot survive a self-comparison.
+    const pinned = "sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:1";
+    expect(vocalParamsSig(sigBase, true)).toBe(pinned);
+    // …and each non-default is a real, distinct re-render (no aliasing between the three knobs)
+    expect(vocalParamsSig({ ...sigBase, voiceRealism: 5 }, true)).toBe(pinned + "|vr:5");
+    expect(vocalParamsSig({ ...sigBase, formantJitter: 4 }, true)).toBe(pinned + "|fj:4");
+    expect(vocalParamsSig({ ...sigBase, breathLayer: false }, true)).toBe(pinned + "|brl:0");
+    // also undoable track edits on the non-render view
+    expect(vocalParamsSig({ ...sigBase, voiceRealism: 5 })).not.toBe(vocalParamsSig(sigBase));
+    expect(vocalParamsSig({ ...sigBase, formantJitter: 4 })).not.toBe(vocalParamsSig(sigBase));
+    expect(vocalParamsSig({ ...sigBase, breathLayer: false })).not.toBe(vocalParamsSig(sigBase));
+  });
+
   // ── S91 「音素约定」 in the render signature + the two folds that keep it honest ──
   it("★ phonemeSet folds OUT at its default and each convention is its OWN signature", () => {
     // Same literal discipline: the default (words = ABSENT) must hash byte-for-byte like the pre-S91
@@ -638,6 +656,17 @@ describe("S73 — autoTuned 调教所有权标记(假脏铁律全套)", () => {
     expect(buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4])).not.toBe(base); // 关掉是真改动
     useProjectStore.getState().setVocalParams(T, { consonantPreroll: true });
     expect(useProjectStore.getState().tracks[0]!.vocalParams?.consonantPreroll).toBeUndefined();
+    expect(buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4])).toBe(base); // 往返=字节不动
+  });
+
+  it("Phase 7:breathLayer 关→开往返 = 折回 absence(同款极性,无字节假脏)", () => {
+    useProjectStore.getState().setVocalParams(T, { autoTuneFollow: true }); // 确保 vocalParams 已存在
+    const base = buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4]);
+    useProjectStore.getState().setVocalParams(T, { breathLayer: false });
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.breathLayer).toBe(false);
+    expect(buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4])).not.toBe(base); // 关掉是真改动
+    useProjectStore.getState().setVocalParams(T, { breathLayer: true });
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.breathLayer).toBeUndefined();
     expect(buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4])).toBe(base); // 往返=字节不动
   });
 

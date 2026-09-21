@@ -14,11 +14,25 @@ import { clearNodeHistories } from "../workflow/nodeHistory";
 // references used at runtime), which ESM resolves safely.
 import { cancelExtractionsForTeardown } from "../vocal/midiExtract";
 import { clearClipboard } from "../clipboard";
+import { fitTimelineToContent } from "../timeline/fitView";
 import { buildSaveBundle, parseLoadedBundle, type LoadedProject } from "./bundle";
 import { hasUnsavedWork, isRecoveryPending, markAutosaveBaseline } from "./autosave";
 import { healLoadedTrackAvatars } from "../workflow/modelPathHeal";
+import { useSoundfontStore, defaultSoundfontFor, firstPresetOf } from "../../store/soundfont";
+import { buildDemoTracks } from "./demoContent";
+import { rememberRecentProject } from "./recentProjects";
 
 const t = (k: string) => i18n.t(k);
+
+/** 启动欢迎页在工程被加载/保存时自动关闭(File 菜单、快捷键等旁路入口)。事件在 DOM 提交
+ *  之后派发;欢迎页自身发起的动作已先行 onClose,重复关闭是无害幂等。 */
+function announceDocumentLoaded(): void {
+  try {
+    window.dispatchEvent(new Event("utai:project-loaded"));
+  } catch {
+    /* 非 DOM 环境(测试) — 无监听者 */
+  }
+}
 
 /** Surface an error as a toast (one place for the repeated `e instanceof Error ? …` idiom). */
 function reportError(e: unknown) {
@@ -151,6 +165,51 @@ export async function newProjectFile(): Promise<void> {
     useHistoryStore.getState().reset(); // a fresh project = clean history (no undo until a new edit)
     useHistoryStore.getState().markSaved(); // baseline = the empty project
     void markAutosaveBaseline(); // a fresh project — any previous recovery file is now obsolete
+    fitTimelineToContent(); // empty → reset zoom to 1×
+    announceDocumentLoaded(); // 欢迎页若还开着 → 让位关闭
+  } catch (e) {
+    reportError(e);
+  } finally {
+    busy = false;
+  }
+}
+
+/** 一键加载示例工程（File 菜单 / 新手入口）：8 小节四轨模板，新建语义 ——
+ *  复用 new/open 的同一套 busy guard + 丢弃确认 + teardown（音频/编辑器/剪贴板状态
+ *  全部按"换文档"清理），历史重置（不可 undo 回加载前，与每个 DAW 一致）。 */
+export async function loadDemoProject(): Promise<void> {
+  if (busy) return;
+  busy = true;
+  try {
+    if (!(await confirmDiscardIfDirty())) return;
+    // 音色分配在 teardown 之前刷新（不依赖当前文档，失败 → 轨道不挂音色，不阻塞）。
+    const kindByTrack: Array<"piano" | "chords" | "bass" | "drums"> = ["piano", "chords", "bass", "drums"];
+    const assigns: Array<{ fontId: string; presetId: string; presetName: string } | undefined> = [];
+    try {
+      await useSoundfontStore.getState().refresh();
+      const fonts = useSoundfontStore.getState().fonts;
+      for (const kind of kindByTrack) {
+        const font = defaultSoundfontFor(kind, fonts);
+        const preset = font ? firstPresetOf(font) : null;
+        assigns.push(font && preset ? { fontId: font.id, presetId: preset.id, presetName: preset.name } : undefined);
+      }
+    } catch {
+      // 列不出音源 → 四轨全部不挂音色（轨道头占位提示），流程继续。
+    }
+    teardownForLoad();
+    const tracks = buildDemoTracks();
+    tracks.forEach((tr, i) => { const sf = assigns[i]; if (sf) tr.soundfont = sf; });
+    useProjectStore.setState({
+      name: "Demo · 儿歌示例", filePath: null, tracks,
+      tempo: 120, timeSignature: [4, 4], dirty: false, playheadTick: 0,
+    });
+    useAppStore.getState().clearSelection();
+    useHistoryStore.getState().reset();
+    useHistoryStore.getState().markSaved();
+    void markAutosaveBaseline();
+    fitTimelineToContent();
+    announceDocumentLoaded(); // 欢迎页若还开着 → 让位关闭
+    useAppStore.getState().showBanner(t("demo.loaded"), "load");
   } catch (e) {
     reportError(e);
   } finally {
@@ -160,19 +219,26 @@ export async function newProjectFile(): Promise<void> {
 
 export async function openProjectFile(): Promise<void> {
   if (busy) return;
+  const sel = await openDialog({
+    title: t("project.openTitle"),
+    directory: false,
+    multiple: false,
+    filters: [{ name: "MunoAI Project", extensions: ["usp"] }],
+  });
+  if (!sel || typeof sel !== "string") return;
+  await openProjectFromPath(sel);
+}
+
+/** 直接打开指定 .usp(启动欢迎页"最近打开"卡片,无文件对话框)。与 openProjectFile 共用同一
+ *  busy guard + 丢弃确认 + teardown 纪律。返回 false = 用户取消/打开失败(欢迎页保持打开)。 */
+export async function openProjectFromPath(uspPath: string): Promise<boolean> {
+  if (busy) return false;
   busy = true;
   try {
-    if (!(await confirmDiscardIfDirty())) return;
-    const sel = await openDialog({
-      title: t("project.openTitle"),
-      directory: false,
-      multiple: false,
-      filters: [{ name: "UtaiSynthesizer Project", extensions: ["usp"] }],
-    });
-    if (!sel || typeof sel !== "string") return;
+    if (!(await confirmDiscardIfDirty())) return false;
     // Extract the archive (to a work dir) BEFORE tearing down the current project, so a bad/missing
     // archive leaves the open project intact.
-    const opened = await invoke<{ work_dir: string; project_json: string }>("open_project_archive", { uspPath: sel });
+    const opened = await invoke<{ work_dir: string; project_json: string }>("open_project_archive", { uspPath });
     const loaded = parseLoadedBundle(opened.project_json, opened.work_dir);
     // S64 portability: avatar paths persist absolute — re-resolve from the singer registry so a
     // project from a moved install / another machine shows its avatars (history resets below, so
@@ -180,7 +246,7 @@ export async function openProjectFile(): Promise<void> {
     await healLoadedTrackAvatars(loaded.tracks);
     teardownForLoad();
     useProjectStore.setState({
-      name: loaded.name, filePath: sel, tracks: loaded.tracks,
+      name: loaded.name, filePath: uspPath, tracks: loaded.tracks,
       tempo: loaded.tempo, timeSignature: loaded.timeSignature, dirty: false, playheadTick: 0,
     });
     useAppStore.getState().clearSelection();
@@ -188,6 +254,7 @@ export async function openProjectFile(): Promise<void> {
     useHistoryStore.getState().reset();
     useHistoryStore.getState().markSaved(); // the loaded state is the clean baseline
     void markAutosaveBaseline(); // opened a project — any previous recovery file is now obsolete
+    fitTimelineToContent(); // default: see the whole song at a glance
     loadOriginalPeaks(loaded.tracks);
     // The load is COMMITTED — only now is it safe to reclaim older extractions. Rust deliberately
     // defers this cleanup to us: a failed open must never delete the previously-open project's
@@ -197,9 +264,13 @@ export async function openProjectFile(): Promise<void> {
     if (!isRecoveryPending()) {
       await invoke("prune_usp_work", { keepDir: opened.work_dir }).catch(() => {});
     }
+    rememberRecentProject(uspPath, loaded.name); // 欢迎页"最近打开"列表
+    announceDocumentLoaded();
     useAppStore.getState().showBanner(`${t("project.loaded")} · ${loaded.name}`, "load");
+    return true;
   } catch (e) {
     reportError(e);
+    return false;
   } finally {
     busy = false;
   }
@@ -242,7 +313,7 @@ export async function saveProjectFileAs(): Promise<boolean> {
     const uspPath = await saveDialog({
       title: t("project.saveAsTitle"),
       defaultPath: `${name}.usp`,
-      filters: [{ name: "UtaiSynthesizer Project", extensions: ["usp"] }],
+      filters: [{ name: "MunoAI Project", extensions: ["usp"] }],
     });
     if (!uspPath) return false;
     return await writeArchive(uspPath, true);
@@ -265,6 +336,8 @@ async function writeArchive(uspPath: string, rename: boolean): Promise<boolean> 
     useProjectStore.setState({ filePath: uspPath, dirty: false, name });
     useHistoryStore.getState().markSaved(); // undoing back to here reads as "no unsaved changes"
     void markAutosaveBaseline(); // saved → nothing unsaved to recover
+    rememberRecentProject(uspPath, name); // 欢迎页"最近打开"列表
+    announceDocumentLoaded();
     if (missing.length > 0) {
       // The archive was written, but some referenced audio no longer existed on disk (cache sweep /
       // deleted source) and was skipped — a clean "saved" banner would read as everything intact.
@@ -299,9 +372,12 @@ export async function restoreAutosave(env: { filePath: string | null; name: stri
     });
     useAppStore.getState().clearSelection();
     useHistoryStore.getState().reset(); // fresh history; do NOT markSaved (savedSig stays null → stays dirty)
+    fitTimelineToContent(); // default: see the whole song at a glance
     loadOriginalPeaks(loaded.tracks);
+    announceDocumentLoaded(); // 恢复的工程接管界面 → 欢迎页让位关闭
     useAppStore.getState().showBanner(`${t("project.recovered")} · ${loaded.name}`, "load");
   } catch (e) {
     reportError(e);
   }
 }
+

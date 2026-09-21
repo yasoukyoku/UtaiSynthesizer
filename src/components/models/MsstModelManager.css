@@ -1,4 +1,4 @@
-.msst-model-manager {
+﻿.msst-model-manager {
   position: fixed;
   /* size is state-driven (useFloatingPanel inline style, S67 resizable panels) */
   min-width: 380px;
@@ -48,7 +48,7 @@
 
 .msst-error {
   padding: var(--space-md) var(--space-lg);
-  background: var(--color-error-dim, #3a1520);
+  background: color-mix(in srgb, var(--color-error) 12%, var(--bg-panel));
   color: var(--color-error, #ff4466);
   font-size: var(--font-size-xs);
   cursor: pointer;
@@ -104,36 +104,123 @@
 
 .msst-model-card-wrap {
   display: flex;
+  /* long categories (vocals 鈮?18 models) must scroll, not compress: overflow:hidden would
+     zero min-height and let default flex-shrink:1 squash cards into clipped slivers */
+  flex-shrink: 0;
   border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--bg-surface) 0%, var(--bg-base) 100%);
+  box-shadow: var(--shadow-sm);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  animation: fadeUpIn 0.18s ease;
+}
+
+.msst-model-card-wrap:hover {
+  border-color: var(--accent-secondary);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  transform: translateY(-1px);
 }
 
 .msst-model-card-wrap.installed {
   border-color: var(--accent-primary-dim);
 }
 
-.msst-model-card-slide {
-  width: 0;
-  overflow: hidden;
-  transition: width 0.15s ease;
-  flex-shrink: 0;
-}
-
-.msst-model-card-slide button {
+.msst-model-card-status {
+  width: 36px;
+  min-width: 36px;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  min-width: 30px;
-  height: 100%;
-  border: none;
+  background: rgba(255, 255, 255, 0.02);
   border-right: 1px solid var(--border-subtle);
-  font-size: 14px;
-  padding: 0;
-  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.2s ease;
 }
 
-.msst-model-card-wrap:hover .msst-model-card-slide {
-  width: 30px;
+.msst-model-card-wrap.installed .msst-model-card-status {
+  background: rgba(74, 222, 128, 0.05);
+}
+
+.msst-model-card-status button.model-status-icon.primary {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-primary);
+  color: #000;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 0 8px var(--accent-primary-glow);
+}
+
+.msst-model-card-status button.model-status-icon.primary:hover {
+  transform: scale(1.1);
+  background: #fff;
+}
+
+.model-status-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  opacity: 0.8;
+  width: 20px;
+  height: 20px;
+}
+
+.model-status-icon.installed {
+  color: var(--color-success, var(--color-success));
+}
+
+.model-status-icon.downloading {
+  color: var(--accent-primary);
+  animation: spin 2s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.essential-badge {
+  margin-left: 8px;
+  background: rgba(255, 193, 7, 0.15);
+  color: #ffc107;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 193, 7, 0.3);
+  font-weight: bold;
+  vertical-align: middle;
+  text-transform: uppercase;
+}
+
+.model-vpn-badge {
+  margin-left: 8px;
+  background: rgba(255, 99, 132, 0.12);
+  color: #ff6384;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 99, 132, 0.3);
+  font-weight: bold;
+  vertical-align: middle;
+}
+
+.rm-download-note {
+  margin: 8px 10px 4px;
+  padding: 6px 10px;
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: rgba(0, 229, 255, 0.05);
+  border: 1px solid rgba(0, 229, 255, 0.12);
+  border-radius: 6px;
 }
 
 .msst-model-card {
@@ -161,6 +248,34 @@
   font-size: var(--font-size-xs);
   color: var(--text-muted);
   font-family: var(--font-mono);
+  background: rgba(0, 229, 255, 0.05);
+  padding: 0 4px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 229, 255, 0.1);
+}
+
+.model-newbie-tip {
+  font-size: 11px;
+  color: var(--accent-secondary);
+  background: rgba(255, 184, 108, 0.08);
+  padding: 4px 8px;
+  border-radius: 4px;
+  margin-top: 4px;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  line-height: 1.4;
+}
+
+.model-newbie-tip .tip-icon {
+  font-size: 12px;
+  filter: drop-shadow(0 0 4px var(--accent-secondary));
+}
+
+.model-rating {
+  color: #ffea00;
+  text-shadow: 0 0 8px rgba(255, 234, 0, 0.4);
+  letter-spacing: 1px;
 }
 
 .model-card-desc {
@@ -186,7 +301,7 @@
 
 .model-status-installed {
   font-size: var(--font-size-xs);
-  color: var(--color-success, #4ade80);
+  color: var(--color-success, var(--color-success));
   font-family: var(--font-mono);
 }
 
@@ -347,7 +462,7 @@
 }
 
 .msst-onnx-ok {
-  color: var(--color-success, #4ade80);
+  color: var(--color-success, var(--color-success));
   font-size: 10px;
 }
 
@@ -369,7 +484,7 @@
   border-color: var(--accent-primary);
 }
 
-/* S66: conversions are single-flight app-wide — other convert buttons gray out while one runs */
+/* S66: conversions are single-flight app-wide 鈥?other convert buttons gray out while one runs */
 .msst-convert-btn:disabled {
   opacity: 0.4;
   cursor: default;
@@ -502,7 +617,7 @@
   white-space: pre-line;
 }
 
-/* S82d r3: aligned action columns (§user). The old space-between spread the slack between
+/* S82d r3: aligned action columns (搂user). The old space-between spread the slack between
    EVERY child, so audition/export/delete drifted with each row's content width; now the info
    column eats all slack (flex: 1) and the actions right-pack at constant offsets. The lg gap
    doubles as the mis-tap guard between buttons. */
@@ -511,7 +626,7 @@
   align-items: center;
   gap: var(--space-lg);
   /* horizontal inset (r4): un-hug both edges so the visual weight sits centered instead of
-     leaning hard left (§user) */
+     leaning hard left (搂user) */
   padding: var(--space-md) var(--space-md);
   border-bottom: 1px solid var(--border-subtle);
 }
@@ -524,7 +639,7 @@
   flex: 1;
 }
 
-/* steady column widths across label variants (导出/Export/書き出し, 删除/Delete) */
+/* steady column widths across label variants (瀵煎嚭/Export/鏇搞亶鍑恒仐, 鍒犻櫎/Delete) */
 .rm-voice-item .model-export-btn,
 .rm-voice-item .model-delete-btn {
   min-width: 44px;
@@ -546,8 +661,8 @@
   display: flex;
   align-items: center;
   gap: var(--space-sm);
-  /* S82d r5: badges are ATOMIC — when the info column tightens (export/delete columns), the
-     line must not wrap internally (§user: vocoder rows broke into two lines). The one
+  /* S82d r5: badges are ATOMIC 鈥?when the info column tightens (export/delete columns), the
+     line must not wrap internally (搂user: vocoder rows broke into two lines). The one
      shrinkable segment is .rm-meta-shrink (ellipsis; full text in its title). */
   overflow: hidden;
 }
@@ -570,12 +685,12 @@
   line-height: 1.6;
   padding: var(--space-sm) var(--space-md);
   border: 1px solid var(--border-subtle);
-  background: var(--bg-secondary);
+  background: var(--bg-panel);
   margin: 0 0 var(--space-sm) 0;
 }
 
 .rm-voice-item-warn {
-  color: var(--accent-warning, #c88a2b);
+  color: var(--color-warning);
   border: 1px solid currentColor;
   padding: 0 4px;
   font-size: var(--font-size-xs);
@@ -583,7 +698,7 @@
 
 /* pinned built-in default-vocoder row: visually a resident, not a user item */
 .rm-voice-item-builtin {
-  background: var(--bg-secondary);
+  background: var(--bg-panel);
   border-left: 2px solid var(--accent-primary);
 }
 
@@ -663,7 +778,7 @@
 
 .rm-import-error {
   padding: var(--space-sm) var(--space-md);
-  background: var(--color-error-dim, #3a1520);
+  background: color-mix(in srgb, var(--color-error) 12%, var(--bg-panel));
   color: var(--color-error, #ff4466);
   font-size: var(--font-size-xs);
 }
@@ -726,9 +841,9 @@
   font-size: var(--font-size-xs);
 }
 
-/* ── S81: batch range-test row. Permanent (never a one-shot button), so it has to sit quietly
+/* 鈹€鈹€ S81: batch range-test row. Permanent (never a one-shot button), so it has to sit quietly
       under the filter bar when idle and stay readable for the minutes a run can take. Square
-      corners + existing tokens only — no new control vocabulary. ── */
+      corners + existing tokens only 鈥?no new control vocabulary. 鈹€鈹€ */
 .rm-range-batch {
   display: flex;
   align-items: center;
@@ -760,7 +875,7 @@
   transition: width 120ms linear;
 }
 
-/* ── S60-2: per-model vocal-range row (label + adjust/retest; testing progress) ── */
+/* 鈹€鈹€ S60-2: per-model vocal-range row (label + adjust/retest; testing progress) 鈹€鈹€ */
 .rm-range-row {
   display: flex;
   align-items: center;
@@ -769,14 +884,14 @@
   color: var(--text-muted);
   font-family: var(--font-mono);
   margin-top: 2px;
-  /* S60d3 chips can exceed the card width — wrap BETWEEN segments (segments are
+  /* S60d3 chips can exceed the card width 鈥?wrap BETWEEN segments (segments are
      atomic, see .rm-range-text below), never mid-text */
   flex-wrap: wrap;
   row-gap: 2px;
 }
 /* atomic row segments: the range/comfort text and caution chips never break internally;
    pathological widths ellipsize (values repeat in the title tooltip). NO overflow rule
-   on .rm-range-edit — it would clip slider handles (S59c lesson). */
+   on .rm-range-edit 鈥?it would clip slider handles (S59c lesson). */
 .rm-range-text,
 .rm-range-caution {
   white-space: nowrap;
@@ -784,7 +899,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* model-quirk chips live on their OWN line under the range row (§user: inline crowded
+/* model-quirk chips live on their OWN line under the range row (搂user: inline crowded
    the row); the info column's 2px gap provides the rhythm, no extra top margin */
 .rm-range-caution-row {
   margin-top: 0;
@@ -796,10 +911,10 @@
   color: var(--text-muted);
   opacity: 0.7;
 }
-/* model-quirk chips (artifact zones / in-range weak notes) — same warn family as
+/* model-quirk chips (artifact zones / in-range weak notes) 鈥?same warn family as
    .rm-voice-item-warn; informational, not an error */
 .rm-range-caution {
-  color: var(--accent-warning, #c88a2b);
+  color: var(--color-warning);
   cursor: help;
 }
 .rm-range-btn {
@@ -817,12 +932,12 @@
   padding: 0 2px;
 }
 
-/* ── S60-4: per-model audition button + speaker picker ── */
+/* 鈹€鈹€ S60-4: per-model audition button + speaker picker 鈹€鈹€ */
 .rm-audition {
   display: flex;
   align-items: center;
   gap: var(--space-xs);
-  /* spacing to neighbours comes from .rm-voice-item's gap — an extra margin here would
+  /* spacing to neighbours comes from .rm-voice-item's gap 鈥?an extra margin here would
      unbalance the aligned action columns (S82d r3) */
 }
 .rm-audition-btn {
@@ -830,9 +945,24 @@
   height: 20px;
   line-height: 18px;
 }
+/* 璇曞惉瀹屾垚鐨勪笅杞芥寜閽?鈥斺€?涓庤瘯鍚寜閽悓鎺?绱壊绯诲渾瑙掋€?*/
+.rm-audition-dl {
+  min-width: 20px;
+  height: 20px;
+  line-height: 16px;
+  color: var(--text-secondary);
+  border-color: var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+}
+.rm-audition-dl:hover {
+  color: var(--accent-secondary);
+  border-color: var(--accent-secondary);
+  background: var(--accent-secondary-glow);
+}
 /* S82d: THE speaker selector (one per model row, range-row start; the audition button
-   follows it via lifted state). 16px chip matching the .rm-range-btn row rhythm — a
-   full-height select dwarfed the xs lines and read as crowding (§user, twice). */
+   follows it via lifted state). 16px chip matching the .rm-range-btn row rhythm 鈥?a
+   full-height select dwarfed the xs lines and read as crowding (搂user, twice). */
 .rm-range-spk {
   height: 16px;
   line-height: 14px;
@@ -851,4 +981,54 @@
 .rm-range-edit .sep-param-row {
   margin: 0;
   min-width: 150px;
+}
+
+/* 鈹€鈹€ 搂user 涓€閿笅杞藉繀澶囩粍浠舵í骞?鈹€鈹€ */
+.amt-oneclick-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 8px 4px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(0, 229, 255, 0.08), rgba(124, 77, 255, 0.10));
+  border: 1px solid rgba(0, 229, 255, 0.35);
+}
+.amt-oneclick-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.amt-oneclick-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.amt-oneclick-sub {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.amt-oneclick-btn {
+  flex-shrink: 0;
+  height: 34px;
+  padding: 0 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 229, 255, 0.5);
+  background: rgba(0, 229, 255, 0.16);
+  color: #00e5ff;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.amt-oneclick-btn:hover:not(:disabled) {
+  background: rgba(0, 229, 255, 0.28);
+}
+.amt-oneclick-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }

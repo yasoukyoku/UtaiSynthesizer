@@ -1,4 +1,5 @@
 import type { Track } from "../types/project";
+import { getRandomTrackColor } from "./trackColors";
 
 /** A blank track of `trackType` — THE one source for the Track literal built by TrackList's add-track
  *  buttons AND the score importer (src/lib/vocal/import.ts). Keeping it here means a new Track field
@@ -9,6 +10,7 @@ export function blankTrack(id: string, name: string, trackType: Track["trackType
     id,
     name,
     trackType,
+    color: getRandomTrackColor(),
     segments: [],
     volumeDb: 0,
     pan: 0,

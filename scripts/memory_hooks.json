@@ -154,23 +154,16 @@
       "match": [
         "converter/architectures/",
         "scripts/g2p_rulers/",
-        "src/lib/vocal/",
-        "src-tauri/src/inference/g2p",
-        "src-tauri/src/inference/score2cv"
+        "src/lib/vocal/"
       ],
       "headline": "你在动词典线 / G2P / 人声轨那一块 —— 它的 session 行 S83-S113 在 S135 被整块搬出 MEMORY.md 了。",
       "must_read": [
-        "memory_dictline_sessions_index.md",
-        "project_v2_s170_reclist_and_log_triage.md"
+        "memory_dictline_sessions_index.md"
       ],
       "hard_rules": [
         "⛔ 那 31 行里的钩子**全部仍然有效**(G2P/各语词典 · syllabify/onset/接缝 · allocate_in_note/借帧/PHONE_DUR_PRIORS · 音域扩展 donor · UTAU 别名 · restToken/吸附 · 反投影尺子)。去那篇 grep 你要动的模块名。",
         "⛔ 造新尺子/改判据前先读 `scripts/g2p_rulers/README.md` 的 8 条硬规矩。",
-        "⚠ 收到某个词唱错的反馈:意语先读 it_troncamento_open_costs 的判定流程,德语先 grep de_glide_open_costs。",
-        "⛔⛔ S170 —— **引曝光度必须写明分母**:token/bigram × pooled/per-lang × 位置。S99 的 てゅ=`t j ɯ` 当年只查了 token(`j` n=4868),而 ja `t`+`j` 二元组 = **0** —— 同一条「不许映射到 n=0」的规矩,在上一层被违反了。训练集分母 = `splits/{train,val}_final` = **44947**(不是 `manifest_final` 的 163729);校准锚点 = 重现 `score2cv.rs:41` 的 ja n=4338 / ɲ=92。量 **npz**(训练器真吃的那层),别量 alignment/manifest。",
-        "⛔ S170 —— **「能解析 + 音素在词表内」不是判据**:くぁ 塌成 [k a]、か゚ 塌成 [k a]、が 的 NFD 形塌成 [k a],三者全都满足它,448 条测试全绿。要断言的是**两个不同拼写不产出相同音素**、**加了修饰符必须改变结果**(`s170_a_real_modified_spelling_never_leaves_the_phones_unchanged`)。",
-        "⛔ S170 —— `foreign_kana_phones` 的通用规则把基假名的最后一个音素当韵核丢掉;**当那个音素是滑音来源时(う/い 整个 mora、く/ぐ 的 [ɯ])它就删掉了滑音** ⇒ 必须进 FOREIGN_KANA_EXPLICIT。加 `C w V`/`C j V` 这类三音素 mora 时**同时查时长**:cluster 里的滑音在训练里多是 1 帧(`CLUSTER_GLIDE_ONSET_FRAMES`),pooled 先验会给 3-4 倍;而且**所有读 onset 目标的地方(含 `score2cv_audit.rs`)要一起改**,否则审计会永远报假 STARVED。",
-        "⚠ S170 —— 修 G2P 之前先对齐**训练标注**:把训练语料的 UST 歌词列与 mono_label 逐音节对齐,得到「假名 → 训练标注」真值表(工装 `TESTING\\\\s170_scratch\\\\lane_g2p\\\\`)。S170 用它一次查出 17 条推理侧与标注不一致(kw/gw 10 + ty/dy 7)。⛔ 鼻浊音 [ŋ] 与 でぇ 已定案不改,理由在 S170 全档。"
+        "⚠ 收到某个词唱错的反馈:意语先读 it_troncamento_open_costs 的判定流程,德语先 grep de_glide_open_costs。"
       ]
     },
     {
@@ -202,7 +195,7 @@
         "MsstModelManager.tsx",
         "score2svc.rs",
         "score2cv.rs",
-        "src-tauri/src/commands/inference.rs",
+        "commands/inference.rs",
         "score2svc_mg.rs",
         "src-tauri/src/inference/rvc.rs",
         "src-tauri/src/inference/f0.rs",

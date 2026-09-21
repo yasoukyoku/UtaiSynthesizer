@@ -1,0 +1,494 @@
+/* ═══════════════════════════════════════════════════
+   Studio Pro 风格底部 docked Inspector 面板 (v4)
+   结构: Header(名称/关闭) → 录音+静音/独奏+音量数字+歌手/语言/音源行
+        → 通道条主区(平衡旋钮/音量推子+刻度+分轨电平/固定音源槽+动态效果器插槽+竖直发送) → 轨道切换 tabs
+   ═══════════════════════════════════════════════════ */
+
+.inspector-dock {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 280px;
+  background: var(--bg-surface, #1a1a24);
+  border-top: 1px solid var(--border-subtle, #333);
+  display: flex;
+  flex-direction: column;
+  z-index: 900;
+  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.4);
+  animation: inspectorSlideUp 0.18s ease-out;
+  font-family: var(--ui-font, -apple-system, "Segoe UI", sans-serif);
+  overflow: hidden;
+}
+
+@keyframes inspectorSlideUp {
+  from { transform: translateY(100%); opacity: 0; }
+  to   { transform: translateY(0);     opacity: 1; }
+}
+
+/* ── HEADER ── */
+.inspector-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 14px;
+  background: var(--bg-secondary, #22222e);
+  border-bottom: 1px solid var(--border-subtle, #2a2a3a);
+  height: 36px;
+  flex-shrink: 0;
+}
+
+.inspector-close {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary, #888);
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 14px;
+}
+.inspector-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary, #eee);
+}
+
+.inspector-track-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary, #eee);
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.05);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inspector-db-readout {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary, #eee);
+  background: var(--bg-tertiary, #181822);
+  padding: 2px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border-subtle, #333);
+  min-width: 70px;
+  text-align: right;
+}
+
+/* 静音 / 独奏 — 与录音大按钮同尺寸, 下移到录音行 (从 header 移出) */
+.inspector-state-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 700;
+  padding: 7px 22px;
+  border-radius: 6px;
+  letter-spacing: 1px;
+  border: 1px solid var(--border-subtle, #333);
+  background: var(--bg-tertiary, #181822);
+  color: var(--text-secondary, #bbb);
+  cursor: pointer;
+  transition: all 0.12s;
+  flex-shrink: 0;
+}
+.inspector-state-btn:hover {
+  color: var(--text-primary, #eee);
+  border-color: var(--border-default, #555);
+}
+.inspector-state-btn.active-mute  { background: #ef4444; border-color: #ef4444; color: #fff; }
+.inspector-state-btn.active-solo  { background: #f59e0b; border-color: #f59e0b; color: #fff; }
+
+.inspector-header-spacer { flex: 1; }
+
+/* ── 通用下拉/字段标签 (录音行) ── */
+.inspector-input-select {
+  background: var(--bg-tertiary, #181822);
+  border: 1px solid var(--border-subtle, #333);
+  border-radius: 3px;
+  color: var(--text-secondary, #bbb);
+  font-size: 11px;
+  padding: 2px 6px;
+  outline: none;
+  cursor: pointer;
+}
+.inspector-input-select:focus { border-color: #a855f7; }
+
+/* ── 录音 + 歌手/语言/音源行 ── */
+.inspector-rec-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 14px;
+  background: var(--bg-secondary, #20202a);
+  border-bottom: 1px solid var(--border-subtle, #2a2a3a);
+  min-height: 36px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.inspector-field-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary, #999);
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+/* 录音大按钮 — 醒目 (再放大) */
+.inspector-rec-big {
+  font-size: 15px;
+  font-weight: 700;
+  padding: 8px 32px;
+  border-radius: 6px;
+  letter-spacing: 2px;
+}
+.inspector-rec-btn {
+  flex-shrink: 0;
+  background: var(--bg-tertiary, #181822);
+  border: 1px solid var(--border-subtle, #333);
+  border-radius: 4px;
+  color: var(--text-secondary, #bbb);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.inspector-rec-btn:hover { border-color: #f87171; color: #f87171; }
+.inspector-rec-btn.recording {
+  background: #dc2626;
+  border-color: #ef4444;
+  color: #fff;
+  animation: rec-pulse 1s ease-in-out infinite;
+}
+@keyframes rec-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+  50% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+}
+.inspector-singer-avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  border: 1px solid var(--border-subtle, #333);
+}
+.inspector-lang-select { flex-shrink: 0; }
+
+/* ── MAIN AREA — 通道条 ── */
+.inspector-main {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  gap: 24px;
+  padding: 10px 18px;
+  background: var(--bg-surface, #1a1a24);
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* PAN KNOB GROUP — 左右声道平衡 */
+.inspector-pan-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 84px;
+}
+.inspector-pan-label {
+  font-size: 10px;
+  color: var(--text-tertiary, #888);
+  white-space: nowrap;
+}
+.inspector-pan-knob {
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  border: 2px solid var(--border-subtle, #444);
+  background: radial-gradient(circle at 35% 30%, #4a4a5c, #1e1e28);
+  position: relative;
+  cursor: pointer;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.5);
+  transition: border-color 0.15s;
+}
+.inspector-pan-knob:hover { border-color: #a855f7; }
+.inspector-pan-indicator {
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  width: 2px;
+  height: 12px;
+  background: linear-gradient(to bottom, #a855f7, #c084fc);
+  border-radius: 1px;
+  transform-origin: 50% 21px;
+}
+.inspector-pan-value {
+  font-size: 10px;
+  font-family: monospace;
+  color: var(--text-tertiary, #888);
+}
+
+/* VOLUME FADER GROUP — 竖直推子 + dB 刻度 */
+.inspector-volume-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.inspector-volume-label {
+  font-size: 10px;
+  color: var(--text-tertiary, #888);
+}
+.inspector-volume-faderbox {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+}
+/* dB 刻度: 推子映射是线性的 (min..max), 刻度位置 = (db-min)/(max-min); TSX 里已钳制到盒内 */
+.inspector-fader-scale {
+  position: relative;
+  width: 26px;
+  font-size: 8px;
+  font-family: monospace;
+  color: var(--text-tertiary, #666);
+}
+.inspector-fader-scale span {
+  position: absolute;
+  right: 2px;
+  transform: translateY(50%);
+  line-height: 1;
+}
+
+/* PLUGINS AREA (right side) */
+.inspector-plugins-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  position: relative;
+}
+.inspector-plugin-insert-row {
+  display: flex;
+  gap: 4px;
+  align-items: stretch;
+  flex-wrap: wrap;
+}
+.inspector-plugin-slot {
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--text-tertiary, #777);
+  border: 1px solid var(--border-subtle, #3a3a4a);
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.12s;
+  background: rgba(255, 255, 255, 0.02);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.inspector-plugin-slot:hover {
+  border-color: #a855f7;
+  background: rgba(168, 85, 247, 0.08);
+  color: #c084fc;
+}
+.inspector-plugin-slot-active {
+  border-color: #a855f7;
+  background: rgba(168, 85, 247, 0.15);
+  color: #c084fc;
+}
+.inspector-plugin-clear {
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary, #777);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 2px;
+  line-height: 1;
+  margin-left: 2px;
+}
+.inspector-plugin-clear:hover {
+  color: #ef4444;
+}
+/* 槽 1 — 固定音源插槽: 不可点击更换 (换音源走上方「音源」下拉), 高亮提示 */
+.inspector-font-slot {
+  border-color: rgba(168, 85, 247, 0.45);
+  background: rgba(168, 85, 247, 0.08);
+  color: #c084fc;
+  cursor: default;
+  font-weight: 600;
+}
+/* 「＋ 添加效果器」— 虚线框强调可追加 */
+.inspector-plugin-add {
+  border-style: dashed;
+  border-color: var(--border-default, #555);
+  color: var(--text-secondary, #aaa);
+}
+.inspector-plugin-add:hover {
+  border-color: #a855f7;
+  color: #c084fc;
+  background: rgba(168, 85, 247, 0.12);
+}
+
+/* INSERT PLUGIN POPOVER MENU — 由点击槽位触发 */
+.inspector-insert-menu {
+  position: absolute;
+  top: 30px;
+  left: 0;
+  min-width: 180px;
+  background: var(--bg-surface, #1a1a24);
+  border: 1px solid var(--border-default, #444);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  z-index: 1000;
+  padding: 4px 0;
+  overflow: hidden;
+}
+.inspector-insert-menu-title {
+  padding: 6px 12px;
+  font-size: 10px;
+  color: var(--text-tertiary, #777);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border-subtle, #2a2a3a);
+  margin-bottom: 2px;
+}
+.inspector-insert-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 12px;
+  font-size: 12px;
+  color: var(--text-secondary, #bbb);
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.inspector-insert-item:hover {
+  background: rgba(168, 85, 247, 0.15);
+  color: #c084fc;
+}
+.inspector-insert-item-icon {
+  font-size: 14px;
+}
+.inspector-insert-clear {
+  border-top: 1px solid var(--border-subtle, #2a2a3a);
+  margin-top: 4px;
+  color: #ef4444;
+}
+.inspector-insert-clear:hover {
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--color-error);
+}
+
+/* ── SENDS 行 — 每轨 Reverb/Delay 发送 ── */
+.inspector-sends-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  margin-top: auto;
+  background: linear-gradient(180deg, #1f2937 0%, #111827 100%);
+  border-radius: 8px;
+  border: 1px solid #374151;
+}
+.inspector-sends-label { font-size: 10px; font-weight: 700; color: #06b6d4; min-width: 32px; }
+/* 竖直发送小推子 (与音量推子同操作方式) */
+.inspector-send-vert {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.inspector-send-vert-name {
+  font-size: 10px;
+  color: #9ca3af;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.inspector-sends-reset {
+  font-size: 9px; padding: 3px 6px; border-radius: 4px; border: 1px solid #4b5563;
+  background: transparent; color: #9ca3af; cursor: pointer; font-family: inherit;
+}
+.inspector-sends-reset:hover { border-color: var(--color-error); color: var(--color-error); }
+
+/* ── RESIZE HANDLE — lives INSIDE the dock top edge, never clipped (top: 0) ── */
+.inspector-resize-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 8px;
+  cursor: ns-resize;
+  background: transparent;
+  z-index: 10;
+  /* Expand hit-area 4px UP above the dock so the edge is easy to grab */
+  margin-top: -4px;
+  padding-bottom: 4px;
+}
+.inspector-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 48px;
+  height: 2px;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.18);
+  transition: background 0.12s, width 0.12s, height 0.12s;
+}
+.inspector-resize-handle:hover::after,
+.inspector-resize-handle.is-dragging::after {
+  background: #a855f7;
+  height: 3px;
+  width: 72px;
+}
+/* While actively dragging, make the whole handle solid for visual feedback */
+.inspector-resize-handle.is-dragging {
+  background: rgba(168, 85, 247, 0.06);
+}
+
+/* ── TRACK SWITCH TABS — very bottom row, colorful track names ── */
+.inspector-track-tabs {
+  display: flex;
+  gap: 3px;
+  padding: 4px 14px;
+  background: var(--bg-secondary, #1e1e28);
+  border-top: 1px solid var(--border-subtle, #2a2a3a);
+  flex-shrink: 0;
+  height: 30px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.inspector-track-tab {
+  flex-shrink: 0;
+  padding: 2px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.12s;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary, #bbb);
+}
+.inspector-track-tab:hover {
+  border-color: var(--border-default, #555);
+}
+.inspector-track-tab.active {
+  border-color: var(--accent-primary, #a855f7);
+  color: #fff;
+  background: rgba(168, 85, 247, 0.2);
+}

@@ -76,11 +76,11 @@
   --space-2xl: 24px;
   --space-3xl: 32px;
 
-  /* Radius — minimal, retro/angular */
-  --radius-sm: 1px;
-  --radius-md: 2px;
-  --radius-lg: 3px;
-  --radius-xl: 4px;
+  /* Radius — soft, friendly rounded corners */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 9px;
+  --radius-xl: 14px;
 
   /* Shadows */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
@@ -99,4 +99,194 @@
   --z-overlay: 100;
   --z-modal: 1000;
   --z-tooltip: 2000;
+}
+
+/* === 内置皮肤 (Skins) — 通过 <html data-skin="…"> 切换，仅覆盖主色/次色/轨道色/淡色底 ===
+ *  base `:root` = 「经典·青碧」(teal)。以下每套只改配色变量，阴影/圆角/字体各套沿用全局。 */
+[data-skin="junzi"] {
+  /* 君子·紫 */
+  --bg-base: #0e0c1a;
+  --bg-deep: #090613;
+  --bg-surface: #161230;
+  --bg-panel: #1d1738;
+  --bg-elevated: #251c49;
+  --bg-hover: #2d2260;
+  --border-subtle: #2a2150;
+  --border-default: #3a2e6c;
+  --border-strong: #4c3d8a;
+  --accent-primary: #a78bfa;
+  --accent-primary-dim: #8b5cf6;
+  --accent-primary-glow: rgba(167, 139, 250, 0.16);
+  --accent-primary-bright: #c4b5fd;
+  --accent-secondary: #f472b6;
+  --accent-secondary-dim: #ec4899;
+  --accent-secondary-glow: rgba(244, 114, 182, 0.16);
+  --piano-grid: rgba(167, 139, 250, 0.07);
+  --piano-grid-beat: rgba(167, 139, 250, 0.13);
+  --piano-grid-bar: rgba(167, 139, 250, 0.22);
+  --track-vocal: #a78bfa;
+  --track-audio: #f472b6;
+  --track-instrument: #818cf8;
+  --shadow-glow: 0 0 12px rgba(167, 139, 250, 0.16);
+}
+
+[data-skin="ocean"] {
+  /* 湛蓝·海 — 深海军蓝背景 */
+  --bg-base: #0a1226;
+  --bg-deep: #060b16;
+  --bg-surface: #101b36;
+  --bg-panel: #16234a;
+  --bg-elevated: #1d2d5c;
+  --bg-hover: #25376e;
+  --border-subtle: #1c2b4e;
+  --border-default: #2a3f6e;
+  --border-strong: #3a5290;
+  --accent-primary: #60a5fa;
+  --accent-primary-dim: #3b82f6;
+  --accent-primary-glow: rgba(96, 165, 250, 0.16);
+  --accent-primary-bright: #93c5fd;
+  --accent-secondary: #22d3ee;
+  --accent-secondary-dim: #06b6d4;
+  --accent-secondary-glow: rgba(34, 211, 238, 0.16);
+  --piano-grid: rgba(96, 165, 250, 0.07);
+  --piano-grid-beat: rgba(96, 165, 250, 0.13);
+  --piano-grid-bar: rgba(96, 165, 250, 0.22);
+  --track-vocal: #60a5fa;
+  --track-audio: #38bdf8;
+  --track-instrument: #818cf8;
+  --shadow-glow: 0 0 12px rgba(96, 165, 250, 0.16);
+}
+
+[data-skin="sakura"] {
+  /* 樱瓣·粉 */
+  --bg-base: #170d14;
+  --bg-deep: #10070c;
+  --bg-surface: #21121c;
+  --bg-panel: #2a1a26;
+  --bg-elevated: #352031;
+  --bg-hover: #3f2638;
+  --border-subtle: #3a2030;
+  --border-default: #4d2c3f;
+  --border-strong: #623a4f;
+  --accent-primary: #fb7185;
+  --accent-primary-dim: #f43f5e;
+  --accent-primary-glow: rgba(251, 113, 133, 0.16);
+  --accent-primary-bright: #fda4af;
+  --accent-secondary: #c084fc;
+  --accent-secondary-dim: #a855f7;
+  --accent-secondary-glow: rgba(192, 132, 252, 0.16);
+  --piano-grid: rgba(251, 113, 133, 0.07);
+  --piano-grid-beat: rgba(251, 113, 133, 0.13);
+  --piano-grid-bar: rgba(251, 113, 133, 0.22);
+  --track-vocal: #fb7185;
+  --track-audio: #e879f9;
+  --track-instrument: #f472b6;
+  --shadow-glow: 0 0 12px rgba(251, 113, 133, 0.16);
+}
+
+[data-skin="mint"] {
+  /* 薄荷·翠 — 深翠绿背景 */
+  --bg-base: #081712;
+  --bg-deep: #05100c;
+  --bg-surface: #0e211a;
+  --bg-panel: #142e24;
+  --bg-elevated: #1a3a2e;
+  --bg-hover: #214739;
+  --border-subtle: #173023;
+  --border-default: #234534;
+  --border-strong: #2f5a47;
+  --accent-primary: #34d399;
+  --accent-primary-dim: #10b981;
+  --accent-primary-glow: rgba(52, 211, 153, 0.16);
+  --accent-primary-bright: #6ee7b7;
+  --accent-secondary: #2dd4bf;
+  --accent-secondary-dim: #14b8a6;
+  --accent-secondary-glow: rgba(45, 212, 191, 0.16);
+  --piano-grid: rgba(52, 211, 153, 0.07);
+  --piano-grid-beat: rgba(52, 211, 153, 0.13);
+  --piano-grid-bar: rgba(52, 211, 153, 0.22);
+  --track-vocal: #34d399;
+  --track-audio: #2dd4bf;
+  --track-instrument: #6ee7b7;
+  --shadow-glow: 0 0 12px rgba(52, 211, 153, 0.16);
+}
+
+[data-skin="sunset"] {
+  /* 熔橙·暖 — 深暖棕背景 */
+  --bg-base: #1a0f08;
+  --bg-deep: #120a06;
+  --bg-surface: #241610;
+  --bg-panel: #2e1d15;
+  --bg-elevated: #3a251b;
+  --bg-hover: #482e21;
+  --border-subtle: #33210f;
+  --border-default: #472e17;
+  --border-strong: #5d3d20;
+  --accent-primary: #fb923c;
+  --accent-primary-dim: #f97316;
+  --accent-primary-glow: rgba(251, 146, 60, 0.16);
+  --accent-primary-bright: #fdba74;
+  --accent-secondary: #f472b6;
+  --accent-secondary-dim: #ec4899;
+  --accent-secondary-glow: rgba(244, 114, 182, 0.16);
+  --piano-grid: rgba(251, 146, 60, 0.07);
+  --piano-grid-beat: rgba(251, 146, 60, 0.13);
+  --piano-grid-bar: rgba(251, 146, 60, 0.22);
+  --track-vocal: #fb923c;
+  --track-audio: #fb7185;
+  --track-instrument: #fbbf24;
+  --shadow-glow: 0 0 12px rgba(251, 146, 60, 0.16);
+}
+
+/* 皮肤应用时把「软件Logo」渐变同步到当前主色 —— 仅当 HTML 有 data-skin 时生效。 */
+html[data-skin] .titlebar-logo {
+  --brand-grad-a: var(--accent-primary-bright, #c4b5fd);
+  --brand-grad-b: var(--accent-primary, #8b5cf6);
+}
+
+/* 卡片入场动画（柔和淡入+轻微上浮）—— 应用在主要卡片容器上 */
+@keyframes fadeUpIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ═══════════════════════════════════════
+   LIGHT THEME — 覆盖 :root vars
+   ═══════════════════════════════════════ */
+[data-theme="light"] {
+  --bg-deep: #f5f7fb;
+  --bg-base: #ffffff;
+  --bg-surface: #f0f3f8;
+  --bg-panel: #e8ebf2;
+  --bg-elevated: #dfe3ec;
+  --bg-hover: #d5dae5;
+  --border-subtle: #e4e8f0;
+  --border-default: #c8d0de;
+  --border-strong: #a5b0c4;
+  --accent-primary: #0891b2;
+  --accent-primary-dim: #0e7490;
+  --accent-primary-glow: rgba(8, 145, 178, 0.15);
+  --accent-primary-bright: #06b6d4;
+  --accent-secondary: #6366f1;
+  --accent-secondary-dim: #4f46e5;
+  --accent-secondary-glow: rgba(99, 102, 241, 0.15);
+  --accent-tertiary: #e11d48;
+  --accent-tertiary-dim: #be123c;
+  --color-success: #16a34a;
+  --color-warning: #d97706;
+  --color-error: #dc2626;
+  --color-info: #2563eb;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --text-inverse: #ffffff;
+  --piano-white: #ffffff;
+  --piano-black: #0f172a;
+  --piano-grid: rgba(8, 145, 178, 0.06);
+  --piano-grid-beat: rgba(8, 145, 178, 0.12);
+  --piano-grid-bar: rgba(8, 145, 178, 0.22);
+  --track-vocal: #0891b2;
+  --track-audio: #2563eb;
+  --track-instrument: #6366f1;
+  --note-rest: #cbd5e1;
 }

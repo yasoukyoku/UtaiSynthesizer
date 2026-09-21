@@ -25,7 +25,7 @@ export const VOCAL_LANGUAGES: readonly VocalLanguage[] = [
   { id: 6, code: "it", short: "IT", defaultLyric: "a" },
 ];
 
-export const DEFAULT_LANG_ID = 2; // ja — the historical default (DEFAULT_VOCAL_PARAMS.langId)
+export const DEFAULT_LANG_ID = 0; // zh - app-wide default (Chinese-first, S92)
 
 const BY_CODE = new Map(VOCAL_LANGUAGES.map((l) => [l.code, l]));
 const BY_ID = new Map(VOCAL_LANGUAGES.map((l) => [l.id, l]));

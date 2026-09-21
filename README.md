@@ -1,21 +1,19 @@
-# UtaiSynthesizer
+# MunoAI
 
 **English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-[![Release](https://img.shields.io/github/v/release/yasoukyoku/UtaiSynthesizer)](https://github.com/yasoukyoku/UtaiSynthesizer/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-informational)
-[![QQ Group](https://img.shields.io/badge/QQ-1058227212-1EBAFC)](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2)](https://discord.com/invite/p3fGh942fJ)
-[![Website](https://img.shields.io/badge/Website-utaisynthesizer.net-2B6D51?labelColor=202321)](https://utaisynthesizer.net)
 
-A singing-voice synthesis DAW for Windows. Write notes on a piano roll and hear them **sung
-directly by an SVC voice model** (score → [Score2ConVec](https://github.com/yasoukyoku/Score2ConVec)
-→ SVC decode — no intermediate human vocal needed), render AI covers with a per-clip node
-workflow, separate vocals from songs natively, and train your own voice models on-device —
-all in one app, with no Python required at inference time.
+**MunoAI**（造乐之地 — "The Land of Music Creation"）is an all-in-one AI music workstation
+for Windows: a singing-voice synthesis DAW, a local AI song studio, and a mastering suite in a
+single app. Write notes on a piano roll and hear them **sung directly by an SVC voice model**
+(score → [Score2ConVec](https://github.com/yasoukyoku/Score2ConVec) → SVC decode — no
+intermediate human vocal needed), render AI covers with a per-clip node workflow, separate
+vocals from songs natively, **generate complete songs on-device**, master your mixes, and
+train your own voice models — all locally, with no Python required at inference time.
 
-![UtaiSynthesizer — arrangement view](docs/images/overview-arrangement.png)
+![MunoAI — arrangement view](docs/images/overview-arrangement.png)
 
 ## Features
 
@@ -29,17 +27,27 @@ all in one app, with no Python required at inference time.
   natively in Rust) → RVC / So-VITS-SVC 4.0 & 4.1 voice conversion (shallow diffusion,
   NSF-HiFiGAN enhancer/vocoders, multi-speaker blending) → spectral transpose → back onto
   the track as non-destructive sub-lanes.
+- **Song Studio (歌曲制作)** — complete song generation on-device: lyric/creative assistance
+  from a local **GGUF LLM engine** (Yue2 and other GGUF models, downloaded in-app), followed
+  by full song rendering with local music-generation models (ACE-Step / HeartMuLa family).
+  Everything runs locally — no cloud API required.
 - **On-device training** — RVC, SoVITS 4.1/4.0/4.0-v2, shallow diffusion, and vocoder fine-tuning,
   **managing datasets, multi-speaker structure and archives as projects**, on embedded portable
   Python runtimes (NVIDIA / AMD / Intel / CPU packs, downloaded in-app;
   self-contained CUDA runtime — no CUDA Toolkit install needed).
+- **Mastering & loudness suite** — true-peak / loudness measurement (LUFS), clip detection,
+  DC-offset cleanup, stereo-width, phase-correlation metering and a mastering chain with
+  bus EQ, saturation and dithering.
+- **SoundFont / MIDI synthesis** — FluidSynth-based playback of **SF2 / SFZ** soundfonts for
+  instrument and accompaniment tracks, plus vocal-to-MIDI transcription (GAME engine).
 - **DAW fundamentals** — multi-track timeline, drag-drop import with smart placement,
   crossfades, clip/track clipboard, BPM & beat-grid detection, pitch-preserving time-stretch
   (Signalsmith), loudness envelopes, minimap, full undo/redo.
 - **Vocal-range tooling** — automatic range testing of voice models, comfort-zone tuning, and
   opt-in range extension (out-of-range phrases are synthesized inside the model's comfort zone
   and shifted back with the Signalsmith engine).
-- **Vocal-to-MIDI** — transcribe a separated vocal stem into editable notes (GAME engine).
+- **Compliance guard** — built-in checks that flag potentially infringing or mislabeled
+  AI-generated content before export, so you stay in control of what you publish.
 - Exports: audio (wav / flac / mp3 / ogg / opus / m4a) with what-you-hear offline mixdown
   parity, scores (ust / ustx / midi), and **voice-model packages (.zip — move a model to another
   machine and re-import it losslessly)**. Imports: ustx / ust / midi, 9 audio formats, and model packages.
@@ -47,7 +55,7 @@ all in one app, with no Python required at inference time.
   mirror options, minisign-signed auto-updates.
 
 **Just want to use the app?** Grab the installer from
-[Releases](https://github.com/yasoukyoku/UtaiSynthesizer/releases) and read the
+[Releases](https://github.com/junziai/munoai/releases) and read the
 **[User Guide](docs/user-guide.en.md)** — no development setup needed. The installed
 directory is fully portable (copy it anywhere, data travels with it).
 
@@ -74,7 +82,7 @@ The C++ time-stretch crate builds with the `cc` crate via MSVC — no libclang/b
 | `bin/ffmpeg.exe` | decode fallback + all non-wav export encoding | [gyan.dev "essentials"](https://www.gyan.dev/ffmpeg/builds/) GPL build (mirrored at [GyanD/codexffmpeg](https://github.com/GyanD/codexffmpeg/releases)); must include `libmp3lame/libvorbis/libopus/aac/flac` encoders |
 | `runtime/ort/*.dll` | ONNX Runtime **1.24.4 DirectML build** (`onnxruntime.dll`, `onnxruntime_providers_shared.dll`, `DirectML.dll`) | [Microsoft.ML.OnnxRuntime.DirectML 1.24.4](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.DirectML/1.24.4) NuGet package (+ the DirectML redistributable DLL). The version must match the `ort` crate's API level — mismatched DLLs deadlock at init |
 | `data/dictionaries/*.tsv` | G2P dictionaries (8 files) for zh/en/de/fr/es/it lyrics | currently easiest: install a release build and copy its `data\dictionaries` folder (a build-from-source script is a known gap) |
-| `data/models/` | voice/separation/aux models | downloaded in-app (Settings → Model Assets, Resource Manager) |
+| `data/models/` | voice/separation/aux/song models | downloaded in-app (Settings → Model Assets, Resource Manager) |
 | `converter/.venv` | Python env for importing `.pth` voice models | optional — the in-app "CPU runtime" pack (Settings → Training Runtime) substitutes |
 
 Everything else (icons, installer art, vendored C++/Python) is tracked in the repo.
@@ -113,6 +121,8 @@ Notes:
 | Frontend | React 19 + TypeScript + zustand + Canvas 2D (piano roll / arrangement are OFF-React canvases), @xyflow/react for the node editor |
 | Backend | one Rust process; all DSP + inference in-process |
 | Inference | ONNX Runtime via `ort` (load-dynamic): **DirectML** shipped by default, optional self-contained **CUDA** runtime downloaded in-app, CPU fallback |
+| Song generation | local GGUF LLM engine (Yue2) for lyrics/assist + ACE-Step / HeartMuLa music models for full-song rendering |
+| SoundFont | FluidSynth via FFI for SF2 / SFZ instrument playback |
 | Training | vendored training ports (RVC / so-vits-svc / SingingVocoders) executed on embedded portable Python runtime packs |
 
 **Vocal synthesis chain** (the piano-roll path):
@@ -128,8 +138,8 @@ score (notes + lyrics)
 [**Score2ConVec**](https://github.com/yasoukyoku/Score2ConVec) is the score-to-content-vector
 model that makes this possible: it maps a symbolic score directly into the ContentVec feature
 space that SVC models consume, so any ordinary SVC voice model can *sing a score* without a
-human guide vocal. It was trained specifically for this project; the repo hosts the model,
-training code and details.
+human guide vocal. It was trained specifically for the original UtaiSynthesizer project; the
+repo hosts the model, training code and details.
 
 Cover mode uses the same SVC decoders with ContentVec as the feature extractor and RMVPE for
 pitch. Source separation is a native Rust reimplementation of the MSST/UVR model families
@@ -142,7 +152,7 @@ tooling · `docs/` user guides.
 
 ## Responsible use & disclaimer
 
-UtaiSynthesizer is a creative tool. **You are solely responsible for what you make with it.**
+MunoAI is a creative tool. **You are solely responsible for what you make with it.**
 
 - **Voice rights.** Only train or use voice models when you have the right to do so: your own
   voice, a consenting person's voice, or characters/datasets whose license permits it. Do not
@@ -164,16 +174,13 @@ UtaiSynthesizer is a creative tool. **You are solely responsible for what you ma
 ## Known limitations & open questions
 
 Things we know about, have deliberately left open, and would genuinely like help with.
-They are open because we cannot answer them on the hardware we have — not because nobody
-looked.
 
 - **Training throughput on large machines is left on the table.** The data loader now sizes
   its worker/prefetch pool against the machine's *available commit* instead of a fixed
   number, but it is **reduce-only**: a roomy machine gets exactly the upstream defaults, and
   nothing ever raises them. Going *higher* on a big box is a performance claim we cannot
   make responsibly — worker count is not monotonic in speed, and settling it needs several
-  machines with different RAM/CPU running real datasets. We develop on a single box
-  (32 GB RAM, RTX 3080 Ti 12 GB), so we have no way to find the knee.
+  machines with different RAM/CPU running real datasets.
   **If you have bigger hardware**: measurements (step time vs worker count on a real
   dataset), an issue, or a PR would be very welcome. The knob and the reasoning live in
   `training/utai_train/loader_budget.py`.
@@ -189,9 +196,8 @@ looked.
 
 ## Community
 
-- **QQ group**: [1058227212](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
-- **Discord**: <https://discord.com/invite/p3fGh942fJ>
-- **Bugs / feature requests**: [GitHub Issues](https://github.com/yasoukyoku/UtaiSynthesizer/issues)
+- **QQ group**: 4446804
+- **Bugs / feature requests**: [GitHub Issues](https://github.com/junziai/munoai/issues)
   (please attach app version + logs — see the in-app Log page)
 - Security issues: see [SECURITY.md](SECURITY.md)
 

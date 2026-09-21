@@ -1,0 +1,145 @@
+/* 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?   馃幑 Virtual Piano Keyboard
+   鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?*/
+.vp-container {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: none;
+  padding: 2px 8px 3px;
+  background: var(--bg-panel, var(--bg-panel));
+  border-top: 1px solid var(--border-default, var(--border-default));
+}
+.vp-toggle {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-default, var(--border-default));
+  background: var(--bg-surface, var(--bg-surface));
+  color: var(--accent-primary, var(--accent-primary));
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s ease;
+}
+.vp-toggle:hover {
+  border-color: var(--accent-primary, var(--accent-primary));
+  background: var(--bg-hover, var(--bg-hover));
+}
+/* —— 底部工作流快捷按钮栏: 钢琴按钮 + AI 快捷按钮 横排 —— */
+.vp-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  width: 100%;
+}
+.vp-sep {
+  width: 1px;
+  height: 14px;
+  margin: 0 4px;
+  background: var(--border-default, var(--border-default));
+}
+.vp-quick {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border-default, var(--border-default));
+  background: var(--bg-surface, var(--bg-surface));
+  color: var(--text-primary, var(--text-primary));
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.vp-quick:hover {
+  border-color: var(--accent-primary, var(--accent-primary));
+  background: var(--bg-hover, var(--bg-hover));
+}
+.vp-keyboard {
+  width: 100%;
+  max-width: 800px;
+  margin-top: 4px;
+  user-select: none;
+}
+.vp-white-row {
+  display: flex;
+  position: relative;
+  height: 70px;
+  background: #000;
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow: inset 0 -4px 8px rgba(0,0,0,0.5);
+}
+.vp-white {
+  flex: 1;
+  border: none;
+  border-right: 1px solid #1a1a1a;
+  background: linear-gradient(180deg, #f8f8f8 0%, #d8d8d8 100%);
+  cursor: pointer;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 4px;
+  transition: background 0.05s;
+  font-family: inherit;
+}
+.vp-white:hover {
+  background: linear-gradient(180deg, #ffffff 0%, #e8e8e8 100%);
+}
+.vp-white.vp-active {
+  background: linear-gradient(180deg, var(--accent-primary) 0%, var(--accent-primary-dim) 100%);
+  box-shadow: inset 0 2px 6px rgba(0,0,0,0.4);
+}
+.vp-white-label {
+  font-size: 9px;
+  font-weight: 700;
+  color: #444;
+  pointer-events: none;
+}
+.vp-white.vp-active .vp-white-label {
+  color: #fff;
+}
+.vp-black-row {
+  position: relative;
+  height: 44px;
+  margin-top: -44px;
+  pointer-events: none;
+}
+.vp-black {
+  position: absolute;
+  top: 0;
+  width: calc(100% / 28 * 0.55); /* 榛戦敭瀹藉害 鈮?鐧介敭 55% */
+  height: 100%;
+  transform: translateX(-50%);
+  border: none;
+  border-radius: 0 0 3px 3px;
+  background: linear-gradient(180deg, #333 0%, #0a0a0a 100%);
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.6);
+  font-family: inherit;
+  transition: background 0.05s;
+}
+.vp-black:hover {
+  background: linear-gradient(180deg, #444 0%, #111 100%);
+}
+.vp-black.vp-active-black {
+  background: linear-gradient(180deg, var(--accent-secondary) 0%, var(--accent-secondary-dim) 100%);
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.4);
+}
+.vp-hint {
+  font-size: 10px;
+  color: var(--text-muted, var(--text-muted));
+  text-align: center;
+  margin-top: 6px;
+  padding: 4px 8px;
+}
+.vp-hint code {
+  background: var(--bg-surface, var(--bg-surface));
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: var(--accent-secondary, var(--accent-secondary));
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+}

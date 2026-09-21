@@ -1,11 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { Segment, ProcessedOutput, Track } from "../../types/project";
-import type { Workflow } from "../../types/project";
+// ── 纯前端音频管线辅助函数 (Web Audio 侧) ──
+import type { Workflow, WorkflowNodeType } from "../../types/project";
 import { parseWorkflowGraph } from "./graph";
+import { NODE_PORTS } from "./ports";
 import { useProjectStore } from "../../store/project";
 import { useWorkflowStore } from "../../store/workflow";
+import { useAmtStore } from "../../store/amt";
 import { useAppStore, type MissingModelItem } from "../../store/app";
+import { useHistoryStore } from "../../store/history";
 import { useMsstModelStore } from "../../store/msst-models";
 import { useAudioStore } from "../../store/audio";
 import { logToBackend } from "../log";
@@ -15,6 +18,86 @@ import { DEFAULT_OUTPUT_GROUP } from "../constants";
 import { MSST_CATALOG, MSST_DEFAULT_PRECISION, type MsstArchitecture } from "../models/msst-catalog";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, buildVoiceOptions } from "./voiceDefaults";
 import { healVoiceModelPath, healMsstModelPath } from "./modelPathHeal";
+import { matchInstrumentWav } from "../amtSource";
+import { analyzeChords, type ChordAnalysisNote, type ChordSegment } from "../analysis/chordAnalysis";
+import { arrange } from "../arrangement/arranger";
+import { generateChordMidi } from "../arrangement/chordMidi";
+import { TICKS_PER_BEAT } from "../constants";
+import type { ArrangeMood, ArrangeStyle } from "../arrangement/styles";
+// P2-14 歌曲制作节点族（规划 11.4）：统一走 runSongTask
+import { runSongTask, type SongTaskPayload, type SongTaskResult } from "../song/runSongTask";
+import { ACE_TRACK_CLASSES, DEMUCS_STEM_KINDS, type SongTaskId } from "../models/song-tasks";
+import { abcToMidi } from "../backendSong";
+// P2 符号域原创化节点族（规划 7.1）：确定性 MIDI 变换 / 旋律重构 / 和声重配 / 曲式编辑 / 换气规划。
+import {
+  humanizeNotes,
+  applyVelocityCurve,
+  swingQuantizeNotes,
+  varyRhythm,
+  type VelocityCurveKind,
+  type RhythmVariationMode,
+} from "../symbol/midiTransforms";
+import {
+  degreeSwap,
+  rhythmRestructure,
+  contourMorph,
+  motifDevelop,
+  melodySimilarity,
+  type MotifTechnique,
+} from "../symbol/melodyRestructure";
+import { reharmonizeSegments, type ReharmStrategy } from "../symbol/reharmonize";
+import { editStructure, type StructureOp } from "../symbol/structure";
+import { planBreathPoints } from "../symbol/breathPlan";
+import { parseChordLabel, isMinorishQuality, PITCH_NAMES, segmentsToChordBlock } from "../symbol/chords";
+import { DEFAULT_SYMBOL_SEED } from "../symbol/rng";
+
+export async function audioBufferToWav(buf: AudioBuffer): Promise<ArrayBuffer> {
+  const numCh = buf.numberOfChannels;
+  const sr = buf.sampleRate;
+  const samples = buf.length;
+  const bytesPerSample = 2;
+  const blockAlign = numCh * bytesPerSample;
+  const byteRate = sr * blockAlign;
+  const dataSize = samples * blockAlign;
+  const bufSize = 44 + dataSize;
+  const out = new ArrayBuffer(bufSize);
+  const view = new DataView(out);
+  let off = 0;
+  const writeStr = (s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(off++, s.charCodeAt(i)); };
+  writeStr("RIFF"); view.setUint32(off, 36 + dataSize, true); off += 4;
+  writeStr("WAVE"); writeStr("fmt ");
+  view.setUint32(off, 16, true); off += 4;
+  view.setUint16(off, 1, true); off += 2;          // PCM
+  view.setUint16(off, numCh, true); off += 2;
+  view.setUint32(off, sr, true); off += 4;
+  view.setUint32(off, byteRate, true); off += 4;
+  view.setUint16(off, blockAlign, true); off += 2;
+  view.setUint16(off, bytesPerSample * 8, true); off += 2;
+  writeStr("data"); view.setUint32(off, dataSize, true); off += 4;
+  const chans: Float32Array[] = [];
+  for (let c = 0; c < numCh; c++) chans.push(buf.getChannelData(c));
+  for (let s = 0; s < samples; s++) {
+    for (let c = 0; c < numCh; c++) {
+      const v = Math.max(-1, Math.min(1, (chans[c] ?? new Float32Array(buf.length))[s] ?? 0));
+      view.setInt16(off, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+      off += 2;
+    }
+  }
+  return out;
+}
+export function arrayBufToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i] ?? 0);
+  return btoa(bin);
+}
+// Tauri writeFile (dynamic import, avoid static import breaking browser preview)
+export async function writeFile(path: string, data: ArrayBuffer): Promise<void> {
+  const fs = await import("@tauri-apps/plugin-fs");
+  await fs.writeFile(path, new Uint8Array(data));
+}
+import type { Segment, ProcessedOutput, Track } from "../../types/project";
+
 import i18n from "../../i18n";
 
 interface AudioFileInfo {
@@ -189,6 +272,17 @@ export async function collectMissingModels(
   return items;
 }
 
+/** Localize a `parseWorkflowGraph` throw. These are FRONTEND sentinels (English, thrown by graph.ts), so
+ *  they never appear in `backendErrorMessage`'s Rust CODE map and used to reach the user as raw English —
+ *  including the "contains a cycle" text a dangling edge could trigger on a graph with no visible cycle. */
+function graphErrorMessage(msg: string): string {
+  if (msg.includes("more than one input node")) return i18n.t("workflow.errGraphMultiInput");
+  if (msg.includes("no input node")) return i18n.t("workflow.errGraphNoInput");
+  if (msg.includes("no output nodes")) return i18n.t("workflow.errGraphNoOutput");
+  if (msg.includes("cycle")) return i18n.t("workflow.errGraphCycle");
+  return i18n.t("workflow.errGraphInvalid");
+}
+
 /** Gate a run BEFORE the caller mutates anything (deposit invalidation, store state). The two run entry
  *  points (WorkflowEditor handleExecute / handleRunSingleNode) MUST await this FIRST — previously the
  *  busy/drain checks lived inside executeWorkflow, i.e. AFTER handleExecute had already stripped the
@@ -206,6 +300,19 @@ export async function preflightRun(
   // entry and orphan its UI state.
   if (running()) {
     useAppStore.getState().showToast(i18n.t("workflow.runBusy"), "info");
+    return false;
+  }
+  // Graph legality BEFORE anything is touched. executeWorkflow parses twice: the first parse (participant
+  // roster) swallows the throw, then startExecution + clearNodeOutputs run, and only the second parse
+  // reports the failure — so an unrunnable graph (cycle / dangling edge / missing IO node) cost the
+  // segment every deposited lane before erroring out, exactly the "rejected run cost the track its lanes
+  // for nothing" hazard this gate exists to prevent. Rejecting here keeps the lanes intact.
+  try {
+    parseWorkflowGraph(workflow);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    useAppStore.getState().showToast(graphErrorMessage(msg), "error");
+    logToBackend("warn", `Workflow run rejected — invalid graph: ${msg}`);
     return false;
   }
   // S66: unconverted/missing models → the one-click dialog instead of a mid-run error. Read-only
@@ -247,6 +354,38 @@ async function ensureRunDir(segmentId: string): Promise<string> {
   return raw.replace(/\\/g, "/");
 }
 
+/** 规划 6-3 旁通透传：bypass 节点不执行，把上游输入原样落到输出端口 ——
+ *  第 i 个出口拿第 min(i, 最后一个已连入口) 的值（1→1 直通、split 双路同源、merge 取首路），
+ *  下游照常拿到数据、链路不断。返回的 map 同时写进 dataMap 与 nodeOutputs。 */
+function bypassPassThrough(
+  gn: { inEdges: Array<{ fromNode: string; fromPort: number; toPort: number }> },
+  nodeType: WorkflowNodeType,
+  dataMap: Map<string, Map<number, string>>,
+): Map<number, string> {
+  const ins: { toPort: number; path: string }[] = [];
+  for (const e of gn.inEdges) {
+    const v = dataMap.get(e.fromNode)?.get(e.fromPort);
+    if (v) ins.push({ toPort: e.toPort, path: v });
+  }
+  ins.sort((a, b) => a.toPort - b.toPort);
+  const pass = new Map<number, string>();
+  if (ins.length > 0) {
+    const outs = NODE_PORTS[nodeType]?.outputs ?? [];
+    const outCount = outs.length || 1;
+    for (let i = 0; i < outCount; i++) {
+      // Only fill ports whose declared kind can actually carry the upstream payload. Filling
+      // EVERY port meant a bypassed analysis node pushed its audio into its REPORT port (a
+      // report consumer then parsed a WAV path as JSON), and a bypassed msstSeparation aimed
+      // all 5 stem ports at the unseparated mix — 5 identical "stems" deposited as lanes.
+      // A report/chords port has no honest passthrough value, so leave it empty.
+      const kind = outs[i];
+      if (kind === "report" || kind === "chords") continue;
+      pass.set(i, ins[Math.min(i, ins.length - 1)]!.path);
+    }
+  }
+  return pass;
+}
+
 /** Returns the number of lanes that reached Output nodes (0 = nothing landed — the caller
  *  toasts). The actual track deposit is done by the live reconciler / RenderLinkWatcher. */
 export async function executeWorkflow(
@@ -267,14 +406,14 @@ export async function executeWorkflow(
       return t !== "input" && t !== "output";
     });
   } catch { /* reported by the parse inside the try below */ }
-  store.startExecution(segmentId, participants);
-  store.clearNodeStatuses(segmentId);
-  // A full run recomputes every node. Drop any warm/rehydrated cache first so the live reconciler shows
-  // loading placeholders and deposits each lane FRESH as its node finishes — never an early decode of a
-  // deterministic path this run is about to overwrite in place (the crash-recovery "keeps old stem" hazard).
-  store.clearNodeOutputs(segmentId);
 
   try {
+    store.startExecution(segmentId, participants);
+    store.clearNodeStatuses(segmentId);
+    // A full run recomputes every node. Drop any warm/rehydrated cache first so the live reconciler shows
+    // loading placeholders and deposits each lane FRESH as its node finishes — never an early decode of a
+    // deterministic path this run is about to overwrite in place (the crash-recovery "keeps old stem" hazard).
+    store.clearNodeOutputs(segmentId);
     logToBackend("info", `Workflow started (${workflow.nodes.length} nodes)`);
     const graph = parseWorkflowGraph(workflow);
 
@@ -285,7 +424,8 @@ export async function executeWorkflow(
     for (const nodeId of graph.sorted) {
       const gn = graph.nodes.get(nodeId)!;
       if (gn.node.nodeType !== "input" && gn.node.nodeType !== "output") {
-        store.setNodeStatus(segmentId, nodeId, "waiting");
+        // 旁通节点预标 "bypassed"（规划 6-3）：徽标直达，不留等待假象。
+        store.setNodeStatus(segmentId, nodeId, gn.node.bypass ? "bypassed" : "waiting");
       }
     }
 
@@ -318,6 +458,18 @@ export async function executeWorkflow(
 
       if (nodeType === "input" || nodeType === "output") continue;
 
+      // 规划 6-3 旁通（A/B 冻结）：不执行、不耗算力，输入原样透传到输出端口后跳过。
+      // 旁通节点对整链零损伤（没跑模型），SNR 统计（编辑器实时口径）也按跳过处理。
+      if (gn.node.bypass) {
+        const pass = bypassPassThrough(gn, nodeType, dataMap);
+        dataMap.set(nodeId, pass);
+        if (pass.size > 0) {
+          useWorkflowStore.getState().setNodeOutputs(segmentId, nodeId, Array.from(pass.values()));
+        }
+        store.setNodeStatus(segmentId, nodeId, "bypassed");
+        continue;
+      }
+
       if (useWorkflowStore.getState().isCancelled(segmentId)) {
         throw new Error("Cancelled");
       }
@@ -330,7 +482,12 @@ export async function executeWorkflow(
       if (outputData.size > 0) {
         useWorkflowStore.getState().setNodeOutputs(segmentId, nodeId, Array.from(outputData.values()));
       }
-      store.setNodeStatus(segmentId, nodeId, "completed");
+      // executeNode 内部的兜底分支（如 speedShift/deepOriginal 失败透传）会把节点标成 "degraded"。
+      // 此时不要覆盖成 "completed"——让用户一眼看到这一步实际没生效。
+      const curStatus = useWorkflowStore.getState().nodeStatuses[segmentId]?.[nodeId];
+      if (curStatus !== "degraded" && curStatus !== "error") {
+        store.setNodeStatus(segmentId, nodeId, "completed");
+      }
     }
 
     const laneCount = countOutputLanes(graph, dataMap);
@@ -425,9 +582,19 @@ export async function executeSingleNode(
       if (id === targetNodeId) break;
     }
   } catch { /* reported by the parse inside the try below */ }
-  store.startExecution(segmentId, participants);
+
+  // Which node is actually executing — the catch below used to blame `targetNodeId` unconditionally, but
+  // this loop runs the whole ancestor chain, so an upstream failure (e.g. `has no input connected`) painted
+  // the target red and attached the upstream's message to it. executeWorkflow gets this right via
+  // executions[].currentNodeId; the single-node path never wrote that field, hence a local cursor.
+  let activeNodeId = targetNodeId;
 
   try {
+    store.startExecution(segmentId, participants);
+    // Mirror executeWorkflow: drop the previous run's badges. clearPendingStatuses (the settle path)
+    // deliberately KEEPS error/degraded, so without this a stale red/amber badge from an earlier attempt
+    // rode along into the new run and looked like this run had already failed.
+    store.clearNodeStatuses(segmentId);
     const graph = parseWorkflowGraph(workflow);
     // Run-unique dir here too: a single-node re-run only writes the nodes it actually EXECUTES (cached
     // upstreams keep their old-run paths in dataMap), so re-executed outputs land at fresh paths and the
@@ -459,6 +626,19 @@ export async function executeSingleNode(
       const gn = graph.nodes.get(nodeId)!;
       if (gn.node.nodeType === "input" || gn.node.nodeType === "output") continue;
 
+      // 规划 6-3 旁通：单节点链路里的 bypass 节点同样不执行 —— 置于缓存复用分支之前，
+      // 防止它 bypass 前遗留的旧缓存被当作旁通输出继续下沉。
+      if (gn.node.bypass) {
+        const pass = bypassPassThrough(gn, gn.node.nodeType, dataMap);
+        dataMap.set(nodeId, pass);
+        if (pass.size > 0) {
+          store.setNodeOutputs(segmentId, nodeId, Array.from(pass.values()));
+        }
+        store.setNodeStatus(segmentId, nodeId, "bypassed");
+        if (nodeId === targetNodeId) break;
+        continue;
+      }
+
       if (useWorkflowStore.getState().isCancelled(segmentId)) {
         throw new Error("Cancelled");
       }
@@ -467,7 +647,11 @@ export async function executeSingleNode(
       // a multi-output node with just the DEPOSITED ports (a sparse array with holes); reusing that would
       // feed `undefined` to a downstream node reading a non-deposited port ("has no input connected"). A
       // hole means that port isn't cached → fall through and RE-RUN the node to regenerate all ports.
-      const cached = store.nodeOutputs[segmentId]?.[nodeId];
+      // Read the LIVE store, not the run-start snapshot: zustand replaces the object on every set, so the
+      // outputs this very loop wrote via setNodeOutputs were invisible through `store` and a node could be
+      // re-executed in the same run it had just produced. (The degraded check below already re-reads for
+      // the same reason.)
+      const cached = useWorkflowStore.getState().nodeOutputs[segmentId]?.[nodeId];
       if (cached && cached.length > 0 && nodeId !== targetNodeId && isDenseCache(cached)) {
         const m = new Map<number, string>();
         cached.forEach((p, i) => m.set(i, p));
@@ -476,6 +660,7 @@ export async function executeSingleNode(
       }
 
       store.setNodeStatus(segmentId, nodeId, "running");
+      activeNodeId = nodeId;
 
       const outputData = await executeNode(
         nodeId, gn.node.nodeType, gn.node.params as Record<string, unknown>,
@@ -486,7 +671,12 @@ export async function executeSingleNode(
       if (outputData.size > 0) {
         store.setNodeOutputs(segmentId, nodeId, Array.from(outputData.values()));
       }
-      store.setNodeStatus(segmentId, nodeId, "completed");
+      // 与 executeWorkflow 同一守卫：executeNode 的兜底透传会把节点标成 "degraded"，
+      // 不要覆盖成 "completed"（单节点路径此前无条件覆盖，损伤态一闪即逝）。
+      const curStatus = useWorkflowStore.getState().nodeStatuses[segmentId]?.[nodeId];
+      if (curStatus !== "degraded" && curStatus !== "error") {
+        store.setNodeStatus(segmentId, nodeId, "completed");
+      }
 
       if (nodeId === targetNodeId) break;
     }
@@ -501,12 +691,111 @@ export async function executeSingleNode(
     // Same single localization point as executeWorkflow's catch (cancel checked first).
     const display = cancelled ? "Cancelled" : (backendErrorMessage(msg) ?? msg);
     if (!cancelled) {
-      store.setNodeStatus(segmentId, targetNodeId, "error");
-      store.setNodeError(segmentId, targetNodeId, display);
+      store.setNodeStatus(segmentId, activeNodeId, "error");
+      store.setNodeError(segmentId, activeNodeId, display);
       maybeShowErrorModal(msg, display);
     }
     store.clearPendingStatuses(segmentId);
     store.failExecution(segmentId, display);
+  }
+}
+
+// ── P2-14 歌曲节点辅助（规划 11.3/11.4）───────────────────────────────────
+
+/** 11.3 约定：歌词/提示词源节点输出 `lyrics://` 前缀的虚拟文本；非前缀 = 文件路径（忽略）。 */
+function songPortText(v: string | undefined): string | undefined {
+  return v?.startsWith("lyrics://") ? v.slice("lyrics://".length) : undefined;
+}
+
+/** 歌曲节点统一执行壳：进度接线到节点进度条；歌曲任务无取消命令，完成后检查
+ *  isCancelled 再 throw "Cancelled"，避免产物沉积到已取消的执行。 */
+async function runSongNode(
+  task: SongTaskId,
+  payload: SongTaskPayload,
+  nodeId: string,
+  segmentId: string,
+): Promise<SongTaskResult> {
+  const result = await runSongTask(task, payload, {
+    onProgress: (p) => useWorkflowStore.getState().setNodeProgress(segmentId, nodeId, p.percent / 100),
+  });
+  if (useWorkflowStore.getState().isCancelled(segmentId)) throw new Error("Cancelled");
+  return result;
+}
+
+// ── P2 符号域节点族共享解析辅助 ──────────────────────────────────────────
+
+/** 枚举 select 参数的安全取值：组件存 0..n-1 的索引，越界/缺省钳到 fallback。 */
+function pickEnum<T extends string>(
+  params: Record<string, unknown>,
+  key: string,
+  values: readonly T[],
+  fallbackIdx: number,
+): T {
+  const idx = Math.max(0, Math.min(values.length - 1, Math.round((params[key] as number) ?? fallbackIdx)));
+  return values[idx]!;
+}
+
+/** 符号域节点族的统一 MIDI 输入解析：三种形态 —
+ *  ① JSON 音符数组（`[...]`，harmonizer/melodyGen 的输出形态）
+ *  ② JSON 包裹对象（`{notes:[...], ppq?}`）
+ *  ③ .mid/.midi 文件路径（走 import_score_file）
+ *  返回 ChordAnalysisNote[]；解析不出音符时在源头响亮失败（不静默透传）。 */
+async function resolveMidiNotes(
+  input: string,
+  what: string,
+): Promise<{ notes: ChordAnalysisNote[]; ppq: number }> {
+  const trimmed = input.trim();
+  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const rawNotes = Array.isArray(parsed) ? parsed : parsed?.notes;
+      if (Array.isArray(rawNotes)) {
+        const notes = rawNotes.filter(
+          (n: any) => n && typeof n.pitch === "number" && typeof n.tick === "number",
+        );
+        if (notes.length > 0) return { notes, ppq: typeof parsed?.ppq === "number" ? parsed.ppq : 480 };
+      }
+    } catch { /* fall through → 当作文件路径 */ }
+  }
+  const ext = (input.split(".").pop() ?? "").toLowerCase();
+  if (ext === "mid" || ext === "midi") {
+    const res = await invoke<any>("import_score_file", { path: input });
+    const notes = (res?.tracks ?? []).flatMap((t: any) =>
+      (t.notes ?? []).map((n: any) => ({
+        tick: n.tick, duration: n.duration, pitch: n.pitch, velocity: n.velocity ?? 100,
+      })),
+    );
+    if (notes.length > 0) return { notes, ppq: res?.ppq ?? 480 };
+  }
+  throw new Error(`${what}: 需要 MIDI 输入（.mid/.midi 文件、音符数组 JSON 或 {notes:[...]}）`);
+}
+
+/** 符号域和弦节点族（reharmonize/structureEdit/melodyGen）的统一和弦输入解析：
+ *  接受 chordBlockIn 的 `{type:"chordBlock", chords:[{label,root}], bpm}` 或
+ *  chordDetect 的 `{segments:[{startTick,endTick,label}]}`，label 一律经
+ *  parseChordLabel 补全 quality/bass，统一成 ChordSegment[]（缺时间戳时按每和弦一小节铺）。 */
+function resolveChordSegments(input: string, what: string): { segments: ChordSegment[]; bpm?: number } {
+  try {
+    const parsed = JSON.parse(input);
+    const raw = parsed.type === "chordBlock" ? parsed.chords : parsed.segments;
+    if (!Array.isArray(raw) || raw.length === 0) throw new Error("no chords");
+    const barTicks = 4 * TICKS_PER_BEAT;
+    const segments = raw.flatMap((c: any, i: number): ChordSegment[] => {
+      if (typeof c?.label !== "string" || !c.label.trim()) return [];
+      const p = parseChordLabel(c.label);
+      return [{
+        startTick: typeof c.startTick === "number" ? c.startTick : i * barTicks,
+        endTick: typeof c.endTick === "number" ? c.endTick : (i + 1) * barTicks,
+        root: p.root,
+        quality: p.quality,
+        bass: p.bass,
+        label: c.label,
+      }];
+    });
+    if (segments.length === 0) throw new Error("no valid labels");
+    return { segments, bpm: typeof parsed.bpm === "number" ? parsed.bpm : undefined };
+  } catch {
+    throw new Error(`${what}: 需要 chordBlock 输入（chordBlockIn 或 chordDetect 的 JSON）`);
   }
 }
 
@@ -524,12 +813,26 @@ async function executeNode(
     const upstream = dataMap.get(edge.fromNode);
     if (upstream) {
       const path = upstream.get(edge.fromPort);
-      if (path) inputPaths.set(edge.toPort, path);
+      if (!path) continue;
+      // Two edges landing on the SAME input port used to overwrite each other silently, and which one
+      // survived depended on connection insertion order — the same graph could feed a different source
+      // after a save/load reordered `connections`. First edge wins deterministically, and the loser is
+      // logged so a mis-wired canvas is diagnosable instead of looking like the wrong node just ran.
+      if (inputPaths.has(edge.toPort)) {
+        logToBackend("warn", `Node "${nodeId}" (${nodeType}) has multiple edges on input port ${edge.toPort} — ignoring the one from ${edge.fromNode}:${edge.fromPort}`);
+        continue;
+      }
+      inputPaths.set(edge.toPort, path);
     }
   }
 
+    // Source nodes (no inputs) are self-contained — skip the primary-input guard.
+  // P2-14: songLyrics/songPrompt 纯文本源；songSheet 源音频可空（11.2）。
+  const SOURCE_NODE_TYPES = new Set(["midiFileIn", "chordBlockIn", "songLyrics", "songPrompt", "songSheet"]);
+  const isSourceNode = SOURCE_NODE_TYPES.has(nodeType);
+
   const primaryInput = inputPaths.get(0);
-  if (!primaryInput) {
+  if (!primaryInput && !isSourceNode) {
     throw new Error(`Node "${nodeId}" (${nodeType}) has no input connected`);
   }
 
@@ -547,12 +850,18 @@ async function executeNode(
         throw new Error(`${isRvc ? "RVC" : "SoVITS"} node has no voice model selected — import one in the resource manager`);
       }
       const outputPath = `${cacheDir}/${nodeId}_${nodeType}.wav`;
-      // Drive the node's (generic) progress bar off the Rust `voice-progress` events, filtered
-      // by nodeId. The listener is torn down in `finally` so a failed/cancelled run can't leak it.
+      // Drive the node's (generic) progress bar off the Rust `voice-progress` events. The wire key is
+      // SEGMENT-QUALIFIED, not the bare nodeId: a split copies the workflow verbatim, so both halves
+      // carry the SAME node ids, and two segments may run concurrently (preflightRun only guards
+      // same-segment double-dispatch). Filtering on the bare id made segment A's events drive segment
+      // B's bar as well — B's listener closes over B's segmentId, so A's percentages were written to
+      // B's node. Rust treats node_id as an opaque progress-routing token (progress_emitter is its
+      // only consumer), so qualifying it is contract-safe. Torn down in `finally` — no leak on failure.
+      const progressKey = `${segmentId}::${nodeId}`;
       const unlisten = await listen<{ node_id: string; progress: number }>(
         "voice-progress",
         (e) => {
-          if (e.payload.node_id === nodeId) {
+          if (e.payload.node_id === progressKey) {
             useWorkflowStore.getState().setNodeProgress(segmentId, nodeId, e.payload.progress);
           }
         },
@@ -569,8 +878,9 @@ async function executeNode(
           {
             voiceName,
             modelPath,
-            audioPath: primaryInput,
-            nodeId,
+            audioPath: primaryInput!,
+            // Must match the listener's filter above — Rust echoes this token back verbatim.
+            nodeId: progressKey,
             outputPath,
             options: buildVoiceOptions(isRvc ? RVC_DEFAULTS : SOVITS_DEFAULTS, params),
           },
@@ -594,8 +904,10 @@ async function executeNode(
         MSST_CATALOG.find((e) => e.filename === modelFile)?.architecture ??
         (useMsstModelStore.getState().installed.find((m) => m.filename === modelFile)
           ?.architecture as MsstArchitecture | undefined);
+      // Hoisted out of `config` because the completion check below needs it to verify stem PROVENANCE.
+      const msstOutputDir = `${cacheDir}/${nodeId}`;
       const config = {
-        audioPath: primaryInput,
+        audioPath: primaryInput!,
         // S64 portability: recompute from the current models dir + stable modelFile (stale absolute
         // path after an install/data-dir move; the node UI only heals on mount).
         modelPath: await healMsstModelPath(
@@ -605,10 +917,8 @@ async function executeNode(
         // Per-NODE subdir: Rust names stems by LABEL only ("vocals.wav"), so two separation nodes in one
         // run emitting a same-labeled stem would overwrite each other inside the shared run dir. Rust
         // create_dir_all's the output dir before writing.
-        outputDir: `${cacheDir}/${nodeId}`,
-        // NO `device` key: this config never carried the EP. Rust picks it from the GLOBAL
-        // OnnxEngine preference (Settings), and its SeparationConfig.device field — which nothing
-        // ever read — was removed in S170. Sending it again would re-create the lie, not the feature.
+        outputDir: msstOutputDir,
+        device: (params.device as string) ?? "cpu",
         normalize: (params.normalize as boolean) ?? false,
         useTta: (params.useTta as boolean) ?? false,
         shifts: (params.shifts as number) ?? 0,
@@ -673,8 +983,19 @@ async function executeNode(
       if (!status.stems || status.stems.length === 0) {
         throw new Error("MSST separation reported Completed but produced no stems");
       }
-      for (let i = 0; i < status.stems.length; i++) {
-        outputData.set(i, status.stems[i]!.path);
+      // PROVENANCE gate. The Rust separation state is one GLOBAL slot, and `run_msst_separation` calls
+      // clear_completed() then installs a fresh status — so if another segment dispatches its own
+      // separation in the window between our job finishing and this read, the "Completed" we observe
+      // carries THAT job's stems. We'd then deposit another segment's vocals as our own lanes: silent,
+      // plausible-looking, and nearly impossible to diagnose from the UI. Every stem we accept must live
+      // under the per-node outputDir we asked for, which no other node can ever be handed.
+      const dirPrefix = msstOutputDir.replace(/\\/g, "/").toLowerCase();
+      const ours = status.stems.filter((s) => s.path.replace(/\\/g, "/").toLowerCase().startsWith(dirPrefix));
+      if (ours.length === 0) {
+        throw new Error("MSST separation result belongs to another job (a separation was started elsewhere mid-run) — re-run this node");
+      }
+      for (let i = 0; i < ours.length; i++) {
+        outputData.set(i, ours[i]!.path);
       }
       break;
     }
@@ -693,7 +1014,7 @@ async function executeNode(
         ? params.formantFollow
         : params.preserveFormants === true ? 0 : 1;
       if (semitones === 0 && formantOffset === 0) {
-        outputData.set(0, primaryInput);
+        outputData.set(0, primaryInput!);
         break;
       }
       const outputPath = `${cacheDir}/${nodeId}_transpose.wav`;
@@ -712,13 +1033,1407 @@ async function executeNode(
     case "split": {
       const numOutputs = (params.outputs as number) ?? 2;
       for (let i = 0; i < numOutputs; i++) {
-        outputData.set(i, primaryInput);
+        outputData.set(i, primaryInput!);
       }
       break;
     }
+
+    // ── Phase 1 母带合规节点族: merge / complianceCheck / lufsNormalize / dither ──
+    case "merge": {
+      const inputs = [...inputPaths.values()];
+      if (inputs.length <= 1) {
+        // 单路输入直接透传 (全局守卫已保证端口 0 必有连接).
+        outputData.set(0, primaryInput!);
+        break;
+      }
+      const outputPath = `${cacheDir}/${nodeId}_merge.wav`;
+      // mix_audio_files: 单声道自动升为立体声, 短输入补静音, 未钳位 Float 求和.
+      await invoke("mix_audio_files", { paths: inputs, output: outputPath });
+      outputData.set(0, outputPath);
+      break;
+    }
+
+    case "complianceCheck": {
+      // 音频原样透传 (端口 0), 合规报告 JSON 走端口 1 — 不打断下游音频链.
+      const report = await invoke<Record<string, unknown>>("compliance_check", { path: primaryInput });
+      outputData.set(0, primaryInput!);
+      outputData.set(1, JSON.stringify(report));
+      break;
+    }
+
+    case "lufsNormalize": {
+      const targetLufs = (params.targetLufs as number) ?? -16;
+      const outputPath = `${cacheDir}/${nodeId}_lufs.wav`;
+      await invoke("normalize_to_lufs", { input: primaryInput, targetLufs, output: outputPath });
+      outputData.set(0, outputPath);
+      break;
+    }
+
+    case "dither": {
+      // 0=无 / 1=TPDF / 2=TPDF+二阶噪声整形 (默认带整形, 固定种子结果可复现).
+      const ditherType = Math.max(0, Math.min(2, Math.round((params.ditherType as number) ?? 2)));
+      const outputPath = `${cacheDir}/${nodeId}_dither.wav`;
+      await invoke("apply_dither", { input: primaryInput, ditherType, output: outputPath });
+      outputData.set(0, outputPath);
+      break;
+    }
+
+    // ── Phase 4 母带补全节点族: busEq / stereoWidth / saturate / phaseRotate / dcRemove ──
+    case "busEq": {
+      // 5 段母线 EQ (hpf30 / lowShelf120 / peak500 / peak2.5k / highShelf10k).
+      // BandDto 的 serde 字段名保持 snake_case gain_db — Tauri 只转换命令参数名, 不转换结构体字段.
+      const g = (i: number) => Math.max(-12, Math.min(12, (params[`eqGain${i}`] as number) ?? 0));
+      const bands = [
+        { type: "hpf", freq: 30, gain_db: 0, q: 0.707, enabled: ((params.eqHpf as number) ?? 1) > 0 },
+        { type: "lowShelf", freq: 120, gain_db: g(0), q: 0.707, enabled: true },
+        { type: "peaking", freq: 500, gain_db: g(1), q: 1.0, enabled: true },
+        { type: "peaking", freq: 2500, gain_db: g(2), q: 1.0, enabled: true },
+        { type: "highShelf", freq: 10000, gain_db: g(3), q: 0.707, enabled: true },
+      ];
+      if (!bands.some((b) => b.enabled && (b.type === "hpf" || Math.abs(b.gain_db) > 1e-6))) {
+        // 全部归零 → 恒等直通, 免一次无意义的重采样/重写.
+        outputData.set(0, primaryInput!);
+        break;
+      }
+      const outputPath = `${cacheDir}/${nodeId}_buseq.wav`;
+      await invoke("apply_bus_eq", { input: primaryInput, bands, output: outputPath });
+      outputData.set(0, outputPath);
+      break;
+    }
+
+    case "stereoWidth": {
+      // M/S 宽度: 0=单声道, 1=原样, 上限 1.5 (Rust 侧二次钳位兜底).
+      const width = Math.max(0, Math.min(1.5, (params.width as number) ?? 1));
+      if (Math.abs(width - 1) < 1e-6) {
+        outputData.set(0, primaryInput!);
+        break;
+      }
+      const outputPath = `${cacheDir}/${nodeId}_width.wav`;
+      await invoke("apply_stereo_width", { input: primaryInput, width, output: outputPath });
+      outputData.set(0, outputPath);
+      break;
+    }
+
+    case "saturate": {
+      // tanh 归一化饱和: drive 0=旁通, 计划默认 5% 轻激励; 输出永不超 0dBFS.
+      const drive = Math.max(0, Math.min(1, (params.drive as number) ?? 0.05));
+      if (drive < 1e-4) {
+        outputData.set(0, primaryInput!);
+        break;
+      }
+      const outputPath = `${cacheDir}/${nodeId}_saturate.wav`;
+      await invoke("apply_saturate", { input: primaryInput, drive, output: outputPath });
+      outputData.set(0, outputPath);
+      break;
+    }
+
+    case "phaseRotate": {
+      // 8 级全通级联相位旋转: strength 0=旁通; 仅做峰值余量工具, 不做检测规避.
+      const strength = Math.max(0, Math.min(1, (params.strength as number) ?? 0));
+      if (strength < 1e-6) {
+        outputData.set(0, primaryInput!);
+        break;
+      }
+      const outputPath = `${cacheDir}/${nodeId}_phase.wav`;
+      await invoke("apply_phase_rotate", { input: primaryInput, strength, output: outputPath });
+      outputData.set(0, outputPath);
+      break;
+    }
+
+    case "dcRemove": {
+      // 测量并移除直流偏移 (配方 F ①, 母带链第一环).
+      const outputPath = `${cacheDir}/${nodeId}_dc.wav`;
+      await invoke("remove_dc", { input: primaryInput, output: outputPath });
+      outputData.set(0, outputPath);
+      break;
+    }
+
+    // ── Phase 5 分析可视化节点族: 零损伤 — 端口 0 音频原样透传, 报告 JSON 走旁路端口 ──
+    case "spectrogram": {
+      // 5-1: Inferno PNG 落盘为 artifact (端口 1), 几何报告 JSON 走端口 2.
+      const pngPath = `${cacheDir}/${nodeId}_spectrogram.png`;
+      const report = await invoke<Record<string, unknown>>("analyze_spectrogram", {
+        input: primaryInput,
+        output: pngPath,
+      });
+      outputData.set(0, primaryInput!);
+      outputData.set(1, pngPath);
+      outputData.set(2, JSON.stringify(report));
+      break;
+    }
+
+    case "f0Curve": {
+      // 5-2: 全分辨率 NCCF 音高轨迹 (~86fps) — 报告 JSON 走端口 1.
+      const report = await invoke<Record<string, unknown>>("track_f0", { input: primaryInput });
+      outputData.set(0, primaryInput!);
+      outputData.set(1, JSON.stringify(report));
+      break;
+    }
+
+    case "timbreMetrics": {
+      // 5-3: 谱质心 / 滚降 / 过零率 / MFCC — 报告 JSON 走端口 1.
+      const report = await invoke<Record<string, unknown>>("analyze_timbre", { input: primaryInput });
+      outputData.set(0, primaryInput!);
+      outputData.set(1, JSON.stringify(report));
+      break;
+    }
+
+    case "harmonicityCheck": {
+      // 5-4: 谐波健康 8 指标 (S163 内核的工作流节点面); f0Hz=0 → 自动检测.
+      const f0Hz = Math.max(0, (params.f0Hz as number) ?? 0);
+      const report = await invoke<Record<string, unknown>>("analyze_harmonicity", {
+        input: primaryInput,
+        f0Hz: f0Hz > 0 ? f0Hz : null,
+      });
+      outputData.set(0, primaryInput!);
+      outputData.set(1, JSON.stringify(report));
+      break;
+    }
+
+    case "spectralCompare": {
+      // 5-5: B 口接对比音频 — 倍频程频段差 + 对数梅尔余弦/L2 (B 自动重采样); A 原样透传.
+      const bInput = inputPaths.get(1);
+      if (!bInput) throw new Error(`Node "${nodeId}" (spectralCompare) has no B input connected`);
+      const report = await invoke<Record<string, unknown>>("compare_spectra", {
+        inputA: primaryInput,
+        inputB: bInput,
+      });
+      outputData.set(0, primaryInput!);
+      outputData.set(1, JSON.stringify(report));
+      break;
+    }
+
+    case "dtwAlign": {
+      // 5-6: 对数梅尔序列 DTW; band=Sakoe-Chiba 带宽 (0=不限); A 原样透传.
+      const bInput = inputPaths.get(1);
+      if (!bInput) throw new Error(`Node "${nodeId}" (dtwAlign) has no B input connected`);
+      const band = Math.max(0, Math.round((params.band as number) ?? 0));
+      const report = await invoke<Record<string, unknown>>("dtw_compare", {
+        inputA: primaryInput,
+        inputB: bInput,
+        band: band > 0 ? band : null,
+      });
+      outputData.set(0, primaryInput!);
+      outputData.set(1, JSON.stringify(report));
+      break;
+    }
+
+    case "abCompare": {
+      // 5-7: 双输入零处理直通 — A→端口 0, B→端口 1 (纯前端, 无 Rust 命令).
+      const bInput = inputPaths.get(1);
+      if (!bInput) throw new Error(`Node "${nodeId}" (abCompare) has no B input connected`);
+      outputData.set(0, primaryInput!);
+      outputData.set(1, bInput);
+      break;
+    }
+
+    case "lufsAnalyze": {
+      // 5-8: BS.1770 整合响度 + 真峰值 (后端 measure_loudness); targetLufs 仅作报告对照基准, 音频原样透传.
+      const targetLufs = (params.targetLufs as number) ?? -16;
+      const report = await invoke<Record<string, unknown>>("measure_loudness", {
+        path: primaryInput,
+      });
+      const integrated = report.integrated_lufs as number;
+      outputData.set(0, primaryInput!);
+      outputData.set(1, JSON.stringify({
+        ...report,
+        target_lufs: targetLufs,
+        delta_lufs: Number.isFinite(integrated)
+          ? Math.round((integrated - targetLufs) * 10) / 10
+          : null,
+      }));
+      break;
+    }
+
+    case "amtMidi": {
+      const midiMode = (params.midiMode as string) ?? "smart";
+      const useGpu = (params.useGpu as boolean) ?? true;
+      const backend = (params.backend as string) ?? "yourmt3";
+      const quantizeGrid = (params.quantizeGrid as string) ?? "off";
+      const midiTrackMode = (params.midiTrackMode as string) ?? "multi_track";
+      const muscriptorInstruments = (params.muscriptorInstruments as string[]) ?? [];
+      // Python contract: only "official" | "telknet" (never the legacy "sustain_connect").
+      // Sanitize legacy persisted values so old projects keep working.
+      const rawChain = (params.muscriptorChain as string) ?? "official";
+      const muscriptorChain = rawChain === "telknet" ? "telknet" : "official";
+      const outDir = `${cacheDir}/amt_${nodeId}`;
+      const isMulti = ["smart", "vocal_split", "six_stem_split"].includes(midiMode);
+
+      // Stream sidecar progress into the node's progress bar. The sidecar
+      // reports overall progress in [0,1] on the `progress` field.
+      // Segment-qualified wire key, same reason as the rvc/sovits bar: split halves share node ids, so
+      // the bare id let one segment's sidecar drive the other's bar. Here it ALSO fixes a real
+      // process-registry collision — Rust keys `active_amt` (pid map behind cancel_amt_midi) by this
+      // token, so two concurrent segments running the same node id overwrote each other's pid entry and
+      // a cancel killed one sidecar while orphaning the other. The frontend-side ids below
+      // (materializeAmtMidiTracks / useAmtStore.setRun) stay BARE — they key UI state, not the wire.
+      const progressKey = `${segmentId}::${nodeId}`;
+      // Declared BEFORE the listener that writes it: the subscription is live the moment `listen`
+      // resolves, so a progress line arriving in that gap would hit the binding in its TDZ.
+      let lastProgressAt = Date.now();
+      const unlisten = await listen<{
+        node_id: string | null;
+        progress: number;
+        total: number;
+        message: string | null;
+      }>("amt-progress", (e) => {
+        if (e.payload.node_id && e.payload.node_id !== progressKey) return;
+        const p = e.payload.total > 0 ? e.payload.progress / e.payload.total : e.payload.progress;
+        lastProgressAt = Date.now();
+        useWorkflowStore.getState().setNodeProgress(segmentId, nodeId, Math.min(1, Math.max(0, p)));
+      });
+
+      // Stall watchdog. `run_amt_midi` awaits the sidecar's stdout to EOF, so a wedged sidecar (CUDA
+      // hang, OOM-thrash, a model download stuck on a dead socket) never resolves and never rejects —
+      // the node sat at its last percentage forever and, because the execution entry stays "running",
+      // the segment could not be re-run even after the user gave up. Same no-PROGRESS policy as the MSST
+      // loop rather than a wall clock: a legitimately slow CPU transcription keeps emitting progress and
+      // is never killed, while a true stall is force-terminated via the pid registry.
+      const AMT_STALL_TIMEOUT = 300 * 1000;
+      let stalled = false;
+      const watchdog = setInterval(() => {
+        if (Date.now() - lastProgressAt <= AMT_STALL_TIMEOUT) return;
+        stalled = true;
+        // Killing the sidecar is what makes the pending invoke reject — without it the await
+        // below would keep hanging and this flag would never be read.
+        void invoke("cancel_amt_midi", { nodeId: progressKey }).catch(() => {});
+      }, 5000);
+
+      try {
+        let res;
+        try {
+          res = await invoke<{
+          midi_path: string;
+          total_notes: number | null;
+          processing_time_secs: number;
+          stem_midi_paths: Record<string, string> | null;
+          vocal_midi_path: string | null;
+          accompaniment_midi_path: string | null;
+          merged_midi_path: string | null;
+          separated_audio: Record<string, string> | null;
+        }>("run_amt_midi", {
+          audioPath: primaryInput!,
+          midiMode,
+          transcriptionBackend: isMulti ? backend : null,
+          yourmt3Model: null,
+          muscriptorModel: null,
+          midiTrackMode: isMulti ? midiTrackMode : null,
+          tempoMode: null,
+          customBpm: null,
+          quantizeNotes: quantizeGrid !== "off",
+          quantizeGrid: quantizeGrid === "off" ? null : quantizeGrid,
+          useGpu,
+          gpuDevice: 0,
+          outputDir: outDir,
+          nodeId: progressKey,
+          muscriptorInstruments: backend === "muscriptor" ? muscriptorInstruments : null,
+          muscriptorProcessingChain: backend === "muscriptor" ? muscriptorChain : null,
+        });
+        } catch (e) {
+          // The Stop button force-kills the AMT sidecar (cancel_amt_all). A kill makes the
+          // in-flight run_amt_midi reject with a non-cancel error; if the run was actually
+          // flagged cancelled, settle as a clean "Cancelled" so no red node / error modal.
+          if (useWorkflowStore.getState().isCancelled(segmentId)) {
+            await invoke("cancel_amt_all").catch(() => {});
+            throw new Error("Cancelled");
+          }
+          // Our own watchdog killed it — report the stall, not the kill's generic sidecar error
+          // (which reads like a crash and sends users hunting for a nonexistent model problem).
+          if (stalled) {
+            throw new Error("AMT transcription stalled: no progress for 300s (possible crash or out-of-memory)");
+          }
+          throw e;
+        }
+        // Separation-only modes (vocal_split / six_stem_split) emit WAV stems
+        // in separated_audio rather than a MIDI — fall back to the first stem
+        // so the node has a real, playable output.
+        const primaryOut = res.midi_path || Object.values(res.separated_audio ?? {})[0] || "";
+        outputData.set(0, primaryOut);
+
+        // Expose additional MIDI artifacts (per-stem, vocal/accomp, merged) as
+        // extra output slots so the node preview can show download buttons for
+        // each. Slot 0 = primary; 1+ = supplementary.
+        let slot = 1;
+        if (res.merged_midi_path) outputData.set(slot++, res.merged_midi_path);
+        if (res.vocal_midi_path) outputData.set(slot++, res.vocal_midi_path);
+        if (res.accompaniment_midi_path) outputData.set(slot++, res.accompaniment_midi_path);
+        if (res.stem_midi_paths) {
+          for (const [, p] of Object.entries(res.stem_midi_paths)) {
+            if (p) outputData.set(slot++, p);
+          }
+        }
+        // Also expose separated WAV stems as output slots (for split modes).
+        if (res.separated_audio) {
+          for (const [, p] of Object.entries(res.separated_audio)) {
+            if (p) outputData.set(slot++, p);
+          }
+        }
+
+        useWorkflowStore.getState().setNodeProgress(segmentId, nodeId, 1);
+        // Capture run context so the MIDI workbench can re-quantize / re-tempo.
+        useAmtStore.getState().setRun({
+          nodeId,
+          audioPath: primaryInput!,
+          midiPath: res.midi_path,
+          mode: midiMode,
+          backend,
+          totalNotes: res.total_notes,
+          processingTimeSecs: res.processing_time_secs,
+        });
+        // 节点转换完成后，把输出的 MIDI 自动落到主时间线：一个乐器音符轨道，
+        // 替换本节点之前生成的轨道（去重），轨道名用 MIDI 里的乐器名。
+        if (res.midi_path) {
+          await materializeAmtMidiTracks(nodeId, res.midi_path, midiTrackMode, primaryInput, outDir);
+        }
+
+        // 🎵 Beat-This: 音频源自动测速 → 填工程 BPM (fire-and-forget,不阻塞节点执行).
+        const audioExts = new Set(["wav", "mp3", "flac", "ogg", "m4a", "aiff", "aac", "opus"]);
+        const isAudio = primaryInput && audioExts.has((primaryInput.split(".").pop() ?? "").toLowerCase());
+        if (isAudio) {
+          void (async () => {
+            try {
+              const tempo = await invoke<{ bpm: number; confidence: number; not_constant?: boolean }>(
+                "analyze_segment_tempo", { path: primaryInput, windowStartMs: 0, windowEndMs: 0, beats_per_bar: 4 }
+              );
+              // Nothing awaits this IIFE, so it outlives the node — and used to land AFTER a Stop,
+              // rewriting project BPM and toasting for a run the user had already cancelled. Re-check
+              // once the invoke resolves and drop the result if the run is gone.
+              if (useWorkflowStore.getState().isCancelled(segmentId)) return;
+              if (tempo && tempo.bpm > 30 && tempo.bpm < 300) {
+                const prev = useProjectStore.getState().tempo;
+                if (Math.abs(prev - tempo.bpm) > 0.5) {
+                  useProjectStore.getState().setTempo(Math.round(tempo.bpm * 10) / 10);
+                  useAppStore.getState().showToast(
+                    `🎵 Beat-This: 检测 BPM ${Math.round(tempo.bpm * 10) / 10} (置信度 ${Math.round(tempo.confidence * 100)}%) — 工程已自动填入`,
+                    "info",
+                  );
+                }
+              }
+            } catch { /* tempo 检测失败不影响转谱 */ }
+          })();
+        }
+      } finally {
+        clearInterval(watchdog);
+        unlisten();
+      }
+      break;
+    }
+
+    // ── 纯前端/AI 自动编曲节点 (不需要 Tauri backend, 浏览器里也能跑) ──
+
+    case "speedShift": {
+      // Signalsmith spectral time-stretch (保音高变速). Rust backend handles the DSP.
+      // time_factor = 1/rate  (rate=2.0x -> factor=0.5  half duration)
+      // rate=0.5x -> factor=2.0  double duration)
+      const rate = (params.rate as number) ?? 1.0;
+      if (Math.abs(rate - 1.0) < 0.001) {
+        // Near-identity: passthrough (no DSP cost, cache-friendly)
+        outputData.set(0, primaryInput!);
+        break;
+      }
+      if (isSourceNode) {
+        throw new Error("speedShift requires an input connection (audio or MIDI)");
+      }
+      const timeFactor = 1 / rate;
+      try {
+        const result = await invoke<{ output_path: string; duration_ms: number; sample_rate: number; channels: number }>(
+          "stretch_segment_audio", { path: primaryInput, time_factor: timeFactor }
+        );
+        outputData.set(0, result.output_path);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // STRETCH_RATIO_RANGE: user set an extreme rate we can't handle
+        if (msg.includes("STRETCH_RATIO_RANGE")) {
+          throw new Error("Speed rate must be between 0.25x and 4.0x");
+        }
+        // Other failure (missing file etc.) — fallback passthrough, don't break the graph.
+        // 节点随后会被外层标成 "completed"，静默兜底会让用户误以为变速生效了 —— 标 degraded + toast 双保险。
+        outputData.set(0, primaryInput!);
+        const detail = backendErrorMessage(msg) ?? msg;
+        console.warn("[speedShift] stretch failed, passthrough fallback:", msg);
+        useWorkflowStore.getState().setNodeStatus(segmentId, nodeId, "degraded");
+        useWorkflowStore.getState().setNodeError(segmentId, nodeId, detail);
+        useAppStore.getState().showToast(
+          i18n.t("workflow.warnSpeedShiftFallback", { detail }),
+          "warning",
+        );
+      }
+      break;
+    }
+
+    case "chordDetect": {
+      if (isSourceNode) throw new Error("chordDetect needs audio/MIDI input");
+      if (!primaryInput) throw new Error("chordDetect: no input connected");
+      const ext = (primaryInput.split(".").pop() ?? "").toLowerCase();
+      let notes: Array<{ tick: number; duration: number; pitch: number; velocity?: number }> = [];
+      let ppq = 480;
+      if (ext === "mid" || ext === "midi") {
+        const res = await invoke<any>("import_score_file", { path: primaryInput });
+        notes = (res?.tracks ?? []).flatMap((t: any) =>
+          (t.notes ?? []).map((n: any) => ({ tick: n.tick, duration: n.duration, pitch: n.pitch, velocity: n.velocity }))
+        );
+        ppq = res?.ppq ?? 480;
+      } else {
+        throw new Error("chordDetect needs MIDI input. Connect an AMT node upstream (audio → AMT → chordDetect)");
+      }
+      if (notes.length === 0) throw new Error("chordDetect: input has no notes");
+      const result = analyzeChords(notes, ppq, 4);
+      outputData.set(0, JSON.stringify({
+        segments: result.segments.map((s) => ({ startTick: s.startTick, endTick: s.endTick, label: s.label })),
+        key: result.key.label, confidence: result.key.confidence,
+      }));
+      outputData.set(1, result.segments.map((s) => s.label).join(" | "));
+      break;
+    }
+
+    case "autoArrange": {
+      if (isSourceNode) throw new Error("autoArrange needs MIDI or chord input");
+      if (!primaryInput) throw new Error("autoArrange: no input connected");
+
+      // 1. Parse input to notes (MIDI file) or chord block (JSON)
+      let notes: ChordAnalysisNote[] = [];
+      
+      let chordBlock: { chords: Array<{ label: string; root: number; quality?: string }>; bpm?: number } | null = null;
+
+      if (primaryInput.trim().startsWith("{")) {
+        // JSON input: could be chordBlock or notes array
+        try {
+          const parsed = JSON.parse(primaryInput);
+          if (parsed.type === "chordBlock" && parsed.chords) {
+            chordBlock = parsed;
+          } else if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].pitch != null) {
+            notes = parsed as ChordAnalysisNote[];
+          }
+        } catch { /* ignore */ }
+      } else {
+        // File path — try import_score_file
+        const ext = (primaryInput.split(".").pop() ?? "").toLowerCase();
+        if (ext === "mid" || ext === "midi") {
+          const res = await invoke<any>("import_score_file", { path: primaryInput });
+          notes = (res?.tracks ?? []).flatMap((t: any) =>
+            (t.notes ?? []).map((n: any) => ({ tick: n.tick, duration: n.duration, pitch: n.pitch, velocity: n.velocity ?? 100 }))
+          );
+          void (res?.ppq);
+        } else {
+          throw new Error("autoArrange needs MIDI input (.mid/.midi), chord block, or AMT node upstream");
+        }
+      }
+
+      // 2. If we got notes → run arrange() (real engine). If only chord block → build fake "block chord" notes.
+      let chordAnalysisNotes: ChordAnalysisNote[] = notes;
+      if (chordBlock && notes.length === 0) {
+        // Synthesize block chord notes from chord labels → arrange engine treats them as "stub melody".
+        // Each chord gets 2 block octaves on beats 1+3 (C4..C5), then piano takes the voicing below.
+        const beatsPerBar = 4;
+        const chordNotes: ChordAnalysisNote[] = [];
+        chordBlock.chords.forEach((c, i) => {
+          const barStart = i * beatsPerBar * TICKS_PER_BEAT;
+          const rootPc = c.root;
+          chordNotes.push({ tick: barStart, duration: beatsPerBar * TICKS_PER_BEAT, pitch: rootPc + 60, velocity: 90 });
+          chordNotes.push({ tick: barStart + TICKS_PER_BEAT * 2, duration: TICKS_PER_BEAT * 2, pitch: rootPc + 72, velocity: 80 });
+        });
+        chordAnalysisNotes = chordNotes;
+      }
+      if (chordAnalysisNotes.length === 0) throw new Error("autoArrange: no notes or chord blocks to arrange");
+
+      // 3. Call real arrange() engine — same as DAW menu layer
+      const proj = useProjectStore.getState();
+      const style = (params.style as ArrangeStyle) ?? "pop";
+      const mood = (params.mood as ArrangeMood) ?? "neutral";
+      const res = arrange({
+        notes: chordAnalysisNotes,
+        tempo: proj.tempo,
+        timeSignature: proj.timeSignature,
+        style,
+        mood,
+      });
+      if (!res || res.bars === 0) throw new Error("autoArrange: arrange engine produced no output");
+
+      // 4. Write the per-track JSON files, outputData holds paths.
+      // The dir must be created FIRST: nothing else makes it (MSST/AMT get theirs from Rust/sidecar), so
+      // writeTextFile into `<cacheDir>/arrange_<nodeId>/…` failed on a non-existent parent and the node
+      // threw for what looks like an arrange failure. ensure_cache_dir is create_dir_all on the Rust side.
+      const outDir = (
+        await invoke<string>("ensure_cache_dir", { segmentId: `${segmentId}/arrange_${nodeId}` })
+      ).replace(/\\/g, "/");
+      const fs = await import("@tauri-apps/plugin-fs").catch(() => null);
+      /** Returns the PATH on success, or null when there's no fs to write with — the caller decides what
+       *  to publish. Previously the no-fs branch returned the JSON text while the caller stored `path`
+       *  regardless, so every port pointed at a file that had never been written. */
+      const writeJson = async (filePath: string, data: unknown): Promise<string | null> => {
+        if (!fs || typeof (fs as { writeTextFile?: unknown }).writeTextFile !== "function") return null;
+        await fs.writeTextFile(filePath, JSON.stringify(data));
+        return filePath;
+      };
+
+      // Collects: outputData maps slot → result
+      // 🎵 全部 11 轨输出 (OPT1+OPT2 扩充乐器现在也走 workflow 节点)
+      const tracks = [
+        { key: "drums",       label: "🥁 Drums",       notes: res.drums },
+        { key: "bass",        label: "🎸 Bass",        notes: res.bass },
+        { key: "piano",       label: "🎹 Piano",       notes: res.piano },
+        { key: "guitarArp",   label: "🪕 GuitarArp",  notes: res.guitarArp },
+        { key: "guitarStrum", label: "🎶 Strum",       notes: res.guitarStrum },
+        { key: "epiano",      label: "🎼 E.Piano",     notes: res.epiano },
+        { key: "strings",     label: "🎻 Strings",     notes: res.strings },
+        { key: "pad",         label: "🪟 Pad",         notes: res.pad },
+        { key: "synthPad",    label: "🎛 SynthPad",    notes: res.synthPad },
+        { key: "pluck",       label: "💠 Pluck",       notes: res.pluck },
+        { key: "melody",      label: "✨ Lead",        notes: res.melody },
+      ];
+      const manifest: any = { style, mood, key: res.key.label, confidence: res.key.confidence, bars: res.bars, startTick: res.startTick, endTick: res.endTick };
+      for (let i = 0; i < tracks.length; i++) {
+        const t = tracks[i]!;
+        const payload = { key: res.key.label, chords: res.chords, notes: t.notes };
+        const written = await writeJson(`${outDir}/${t.key}.json`, payload);
+        manifest[t.key + "Notes"] = t.notes.length;
+        // Publish the file path when it exists, else the JSON inline. Both readings are accepted by the
+        // symbolic consumers (harmonizer/autoArrange sniff a leading `{` and read `.notes`), so the
+        // fallback still carries real data instead of naming a file that was never written.
+        outputData.set(i, written ?? JSON.stringify(payload));
+      }
+      // 和弦摘要挂在末端口，供下游 harmonizer/melodyGen 直接当 chordBlock 读（内联 JSON，与
+      // chordDetect/chordBlockIn 的出口口径一致 —— chords 类端口一律传内容而非路径）。
+      outputData.set(tracks.length, JSON.stringify({ chords: res.chords, key: res.key.label, bars: res.bars }));
+      break;
+    }
+
+    case "deepOriginal": {
+      const rate = (params.rate as number) ?? 1.0;
+      const semitones = (params.semitones as number) ?? 0;
+      let outPath = primaryInput ?? "";
+      if (!isSourceNode && primaryInput && Math.abs(rate - 1.0) > 0.001) {
+        try {
+          const s = await invoke<{ output_path: string }>("stretch_segment_audio", { path: primaryInput, time_factor: 1 / rate });
+          outPath = s.output_path;
+        } catch (err) {
+          // 兜底透传保持图能跑完，但节点会被外层标 "completed" —— 标 degraded + toast 双保险。
+          const msg = err instanceof Error ? err.message : String(err);
+          const detail = backendErrorMessage(msg) ?? msg;
+          console.warn("[deepOriginal] stretch failed, passthrough fallback:", msg);
+          useWorkflowStore.getState().setNodeStatus(segmentId, nodeId, "degraded");
+          useWorkflowStore.getState().setNodeError(segmentId, nodeId, detail);
+          useAppStore.getState().showToast(
+            i18n.t("workflow.warnDeepOrigStretchFallback", { detail }),
+            "warning",
+          );
+        }
+      }
+      if (!isSourceNode && primaryInput && semitones !== 0) {
+        try {
+          const tpath = cacheDir + "/deepOrig_" + nodeId + ".wav";
+          await invoke("transpose_audio", { path: outPath, semitones, formantFollow: 1, formantOffset: 0, outputPath: tpath });
+          outPath = tpath;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const detail = backendErrorMessage(msg) ?? msg;
+          console.warn("[deepOriginal] transpose failed, passthrough fallback:", msg);
+          useWorkflowStore.getState().setNodeStatus(segmentId, nodeId, "degraded");
+          useWorkflowStore.getState().setNodeError(segmentId, nodeId, detail);
+          useAppStore.getState().showToast(
+            i18n.t("workflow.warnDeepOrigTransposeFallback", { detail }),
+            "warning",
+          );
+        }
+      }
+      for (let p = 0; p < 5; p++) outputData.set(p, outPath);
+      break;
+    }
+
+    case "midiFileIn": {
+      const filePath = (params.filePath as string) ?? "";
+      if (!filePath) throw new Error("MIDI File In: pick a .mid file first (click the button)");
+      outputData.set(0, filePath);
+      break;
+    }
+
+    case "chordBlockIn": {
+      const chordStr = (params.chords as string) ?? "C | Am | F | G";
+      const bpm = (params.bpm as number) ?? 120;
+      const rootMap2: Record<string, number> = { C: 0, "C#": 1, Db: 1, D: 2, "D#": 3, Eb: 3, E: 4, F: 5, "F#": 6, Gb: 6, G: 7, "G#": 8, Ab: 8, A: 9, "A#": 10, Bb: 10, B: 11 };
+      const parts = chordStr.split(/[|,;]/).map((s) => s.trim()).filter(Boolean);
+      const chords = parts.map((label) => {
+        const m = label.match(/^([A-G][#b]?)/);
+        return { label, root: (rootMap2[m?.[1] ?? "C"] ?? 0) };
+      });
+      outputData.set(0, JSON.stringify({ type: "chordBlock", chords, bpm, ppq: 480 }));
+      break;
+    }
+
+    case "soundfontRender": {
+      // 符号域 → 声音域：把上游的 MIDI 文件路径 / 音符 JSON 用 SoundFont 离线渲染成 WAV。
+      // 入口两种形态都要吃：midiFileIn/amtMidi 给的是 .mid 路径，harmonizer/melodyGen 等
+      // 符号域节点给的是 JSON.stringify(notes)。与 harmonizer 的解析口径保持一致。
+      if (!primaryInput) throw new Error("soundfontRender: no input connected");
+      const fontId = (params.fontId as string) ?? "";
+      const presetId = (params.presetId as string) ?? "";
+      if (!fontId || !presetId) {
+        throw new Error("soundfontRender: pick a soundfont and preset on the node first");
+      }
+      let sfNotes: ChordAnalysisNote[] = [];
+      // MIDI 文件自带 bpm，优先用它；JSON 音符流没有 tempo 信息，退回工程 BPM。
+      let sfBpm = useProjectStore.getState().tempo;
+      if (primaryInput.trim().startsWith("{") || primaryInput.trim().startsWith("[")) {
+        try {
+          const parsed = JSON.parse(primaryInput);
+          if (Array.isArray(parsed)) sfNotes = parsed;
+          else if (Array.isArray(parsed.notes)) sfNotes = parsed.notes;
+          if (!Array.isArray(parsed) && typeof parsed.bpm === "number") sfBpm = parsed.bpm;
+        } catch {
+          throw new Error("soundfontRender: input is not valid note JSON");
+        }
+      } else {
+        const sfExt = (primaryInput.split(".").pop() ?? "").toLowerCase();
+        if (sfExt !== "mid" && sfExt !== "midi") {
+          throw new Error("soundfontRender needs MIDI input (a .mid path or a note-JSON stream)");
+        }
+        const score = await invoke<any>("import_score_file", { path: primaryInput });
+        sfNotes = (score?.tracks ?? []).flatMap((tr: any) =>
+          (tr.notes ?? []).map((n: any) => ({
+            // 轨道自身的 start_tick 是段落偏移，音符 tick 是轨内相对量 —— 漏加会把
+            // 所有轨道压到 0 起点，多轨渲染直接串味。
+            tick: (tr.start_tick ?? 0) + n.tick,
+            duration: n.duration,
+            pitch: n.pitch,
+            velocity: n.velocity,
+          })),
+        );
+        if (typeof score?.bpm === "number" && score.bpm > 0) sfBpm = score.bpm;
+      }
+      if (sfNotes.length === 0) throw new Error("soundfontRender: input has no notes");
+      const sfTempo = sfBpm > 0 ? sfBpm : 120;
+      const secPerTick = 60 / sfTempo / TICKS_PER_BEAT;
+      const renderNotes = sfNotes.map((n) => ({
+        start: n.tick * secPerTick,
+        dur: n.duration * secPerTick,
+        key: n.pitch,
+        vel: n.velocity ?? 100,
+      }));
+      const sfWavPath = await invoke<string>("render_soundfont_notes", {
+        fontId,
+        presetId,
+        notes: renderNotes,
+        sampleRate: (params.sampleRate as number) ?? 44100,
+        backend: (params.backend as string) ?? "builtin",
+      });
+      outputData.set(0, sfWavPath);
+      break;
+    }
+
+    case "melodySimilarity": {
+      // 原创性闸门：A(端口 0)是待查旋律，B(端口 1)是参考旋律(通常是扒下来的原曲)。
+      // 相似度算法直接复用 symbol/melodyRestructure 那套(音高间隔 3-gram Jaccard +
+      // 相对首音音高 3-gram + Parsons 轮廓 Pearson)，这里只负责取音符、判阈值、出报告。
+      if (!primaryInput) throw new Error(`Node "${nodeId}" (melodySimilarity) has no A input connected`);
+      const msBInput = inputPaths.get(1);
+      if (!msBInput) throw new Error(`Node "${nodeId}" (melodySimilarity) has no B input connected`);
+      const msA = await resolveMidiNotes(primaryInput, "melodySimilarity A");
+      const msB = await resolveMidiNotes(msBInput, "melodySimilarity B");
+      const msScore = melodySimilarity(msA.notes, msB.notes);
+      // 节点上的阈值是百分数(0-100)，算法给的是 0-1 —— 比之前先归一化，别拿 35 去比 0.42。
+      const msThreshold = Math.max(0, Math.min(100, (params.threshold as number) ?? 35)) / 100;
+      // 低于阈值才算过闸：相似度越高越可疑，这个判断方向反了整个节点就废了。
+      const msPass = msScore < msThreshold;
+      outputData.set(0, primaryInput);
+      outputData.set(1, JSON.stringify({
+        similarity: Number(msScore.toFixed(4)),
+        similarityPercent: Number((msScore * 100).toFixed(2)),
+        threshold: Number(msThreshold.toFixed(4)),
+        thresholdPercent: Number((msThreshold * 100).toFixed(2)),
+        pass: msPass,
+        verdict: msPass ? "original" : "too_similar",
+        notesA: msA.notes.length,
+        notesB: msB.notes.length,
+      }));
+      break;
+    }
+
+    case "harmonizer": {
+      if (isSourceNode) throw new Error("harmonizer needs MIDI or chord input");
+      if (!primaryInput) throw new Error("harmonizer: no input connected");
+      let notes: ChordAnalysisNote[] = [];
+      if (primaryInput.trim().startsWith("{")) {
+        try {
+          const parsed = JSON.parse(primaryInput);
+          if (Array.isArray(parsed)) notes = parsed;
+          else if (parsed.notes) notes = parsed.notes;
+        } catch { /* ignore */ }
+      } else {
+        const ext = (primaryInput.split(".").pop() ?? "").toLowerCase();
+        if (ext === "mid" || ext === "midi") {
+          const res = await invoke<any>("import_score_file", { path: primaryInput });
+          notes = (res?.tracks ?? []).flatMap((t: any) =>
+            (t.notes ?? []).map((n: any) => ({ tick: n.tick, duration: n.duration, pitch: n.pitch, velocity: n.velocity ?? 100 }))
+          );
+        } else {
+          throw new Error("harmonizer needs MIDI input or chordDetect/autoArrange output");
+        }
+      }
+      if (notes.length === 0) throw new Error("harmonizer: no notes");
+      const proj = useProjectStore.getState();
+      const style = (params.chordStyle as string) ?? "POP_STANDARD";
+      const chordsPerBar = (params.chordsPerBar as number) ?? 1;
+      const keyName = (params.key as string) ?? "auto";
+      const res = generateChordMidi({
+        notes,
+        timeSignature: proj.timeSignature,
+        style: style as any,
+        chordsPerBar: chordsPerBar === 2 ? 2 : 1,
+        key: keyName,
+      });
+      if (!res) throw new Error("harmonizer: no chord output");
+      outputData.set(0, JSON.stringify(res.notes));
+      outputData.set(1, JSON.stringify({ segments: res.segments, key: res.key.label, bars: res.bars }));
+      break;
+    }
+
+    case "melodyGen": {
+      if (isSourceNode) throw new Error("melodyGen needs chord input");
+      if (!primaryInput) throw new Error("melodyGen: no chord input connected");
+      // P2-8 重做（规划 4.2）：chordBlock → externalChords/externalKey 直喂 arrange，
+      // 旋律由和弦内音+调式音阶按小节生成。stub 骨架只负责撑起与和弦段对齐的时值跨度
+      // （arrange 对空音符直接返回 null），起音 tick 跟随和弦段，保证旋律小节落在正确的和弦上。
+      const { segments: chordSegs, bpm } = resolveChordSegments(primaryInput, "melodyGen");
+      const proj = useProjectStore.getState();
+      const style = (params.style as ArrangeStyle) ?? "pop";
+      const mood = (params.mood as ArrangeMood) ?? "neutral";
+      const stubNotes: ChordAnalysisNote[] = chordSegs.map((c) => ({
+        tick: c.startTick,
+        duration: Math.max(TICKS_PER_BEAT, c.endTick - c.startTick),
+        pitch: c.root + 60,
+        velocity: 90,
+      }));
+      const first = chordSegs[0]!;
+      const minor = isMinorishQuality(first.quality);
+      const res = arrange({
+        notes: stubNotes,
+        tempo: bpm ?? proj.tempo,
+        timeSignature: proj.timeSignature,
+        style,
+        mood,
+        externalChords: chordSegs,
+        externalKey: {
+          tonic: first.root,
+          major: !minor,
+          confidence: 0.5,
+          label: PITCH_NAMES[first.root] + (minor ? "m" : ""),
+        },
+      });
+      if (!res) throw new Error("melodyGen: arrange failed");
+      outputData.set(0, JSON.stringify(res.melody));
+      outputData.set(1, JSON.stringify({ style, mood, key: res.key.label, bars: res.bars, chordCount: chordSegs.length }));
+      break;
+    }
+
+    // ── P2-14 歌曲制作节点族（规划 11.2/11.4，统一走 runSongTask）──────────
+
+    case "songLyrics": {
+      const text = ((params.text as string) ?? "").trim();
+      if (!text) throw new Error(i18n.t("songNode.errEmptyLyrics"));
+      outputData.set(0, `lyrics://${text}`);
+      break;
+    }
+
+    case "songPrompt": {
+      const text = ((params.text as string) ?? "").trim();
+      if (!text) throw new Error(i18n.t("songNode.errEmptyPrompt"));
+      // 同用 lyrics:// 前缀标记"虚拟文本"（11.3）；songGen 按端口序区分歌词/提示词
+      outputData.set(0, `lyrics://${text}`);
+      break;
+    }
+
+    case "songGen": {
+      const task: SongTaskId = (params.songTask as string) === "instrumental" ? "instrumental" : "generate";
+      const lyrics = songPortText(inputPaths.get(0)) ?? (params.lyrics as string) ?? "";
+      const prompt = songPortText(inputPaths.get(1)) ?? (params.prompt as string) ?? "";
+      const refAudio = inputPaths.get(2);
+      const payload: SongTaskPayload = {
+        model: (params.model as string) ?? "acestep-v1.5",
+        lyrics,
+        prompt,
+        durationSec: (params.durationSec as number) ?? 0,
+        seed: (params.seed as number) ?? undefined,
+        wantStems: (params.wantStems as boolean) ?? false,
+        wantMidi: (params.wantMidi as boolean) ?? false,
+        wantLrc: (params.wantLrc as boolean) ?? false,
+        extra: {
+          ...(params.cot ? { cot: params.cot as string } : {}),
+          ...((params.guidanceScale as number) ? { guidance_scale: params.guidanceScale as number } : {}),
+          ...((params.numInferenceSteps as number) ? { inference_steps: params.numInferenceSteps as number } : {}),
+          // 参考音频（可空端口 2）：非前缀 = 真实文件路径 → audio2audio
+          ...(refAudio && !refAudio.startsWith("lyrics://")
+            ? { ref_audio_input: refAudio, audio2audio_enable: true }
+            : {}),
+        },
+      };
+      const result = await runSongNode(task, payload, nodeId, segmentId);
+      const outs = result.outputs;
+      const audio = outs.find((o) => o.audio_path)?.audio_path;
+      const midi = outs.find((o) => o.midi_path)?.midi_path;
+      const lrc = outs.find((o) => o.lrc_path)?.lrc_path;
+      if (audio) outputData.set(0, audio);
+      if (midi) outputData.set(1, midi);
+      if (lrc) outputData.set(2, lrc);
+      const stems = outs.find((o) => o.stems)?.stems;
+      if (stems) {
+        // 端口 3+i 按 ACE_TRACK_CLASSES 固定顺序展开（与 UI outputLabels 一致）
+        ACE_TRACK_CLASSES.forEach((cls, i) => {
+          const p = stems[cls];
+          if (p) outputData.set(3 + i, p);
+        });
+      }
+      break;
+    }
+
+    case "songCover": {
+      const prompt = songPortText(inputPaths.get(2)) ?? "";
+      const refAudio = inputPaths.get(1);
+      const payload: SongTaskPayload = {
+        songName: (params.songName as string) || undefined,
+        srcAudioPath: primaryInput!,
+        prompt,
+        coverStrength: (params.coverStrength as number) ?? 0.5,
+        extra: refAudio && !refAudio.startsWith("lyrics://")
+          ? { ref_audio_input: refAudio, audio2audio_enable: true }
+          : undefined,
+      };
+      const result = await runSongNode("cover", payload, nodeId, segmentId);
+      const audio = result.outputs.find((o) => o.audio_path)?.audio_path;
+      if (audio) outputData.set(0, audio);
+      break;
+    }
+
+    case "songRepaint": {
+      const prompt = songPortText(inputPaths.get(1)) ?? "";
+      const payload: SongTaskPayload = {
+        songName: (params.songName as string) || undefined,
+        srcAudioPath: primaryInput!,
+        prompt,
+        repaintStart: (params.repaintStart as number) ?? 0,
+        repaintEnd: (params.repaintEnd as number) ?? 0,
+      };
+      const result = await runSongNode("repaint", payload, nodeId, segmentId);
+      const audio = result.outputs.find((o) => o.audio_path)?.audio_path;
+      if (audio) outputData.set(0, audio);
+      break;
+    }
+
+    case "songComplete": {
+      const classes = (params.trackClasses as string[]) ?? ["drums", "bass", "guitar"];
+      const payload: SongTaskPayload = {
+        srcAudioPath: primaryInput!,
+        prompt: songPortText(inputPaths.get(1)) ?? "",
+        trackClasses: classes,
+      };
+      const result = await runSongNode("complete", payload, nodeId, segmentId);
+      const outs = result.outputs;
+      const audio = outs.find((o) => o.audio_path)?.audio_path;
+      if (audio) outputData.set(0, audio);
+      const stems = outs.find((o) => o.stems)?.stems;
+      if (stems) {
+        // 端口 1+i 按勾选顺序（与 UI outputLabels 一致）
+        classes.forEach((cls, i) => {
+          const p = stems[cls];
+          if (p) outputData.set(1 + i, p);
+        });
+      }
+      break;
+    }
+
+    case "songExtract": {
+      const classes = (params.trackClasses as string[]) ?? [...ACE_TRACK_CLASSES];
+      const payload: SongTaskPayload = {
+        srcAudioPath: primaryInput!,
+        trackClasses: classes,
+      };
+      const result = await runSongNode("extract", payload, nodeId, segmentId);
+      const stems = result.outputs.find((o) => o.stems)?.stems;
+      if (stems) {
+        classes.forEach((cls, i) => {
+          const p = stems[cls];
+          if (p) outputData.set(i, p);
+        });
+      }
+      break;
+    }
+
+    case "songLego": {
+      const payload: SongTaskPayload = {
+        srcAudioPath: primaryInput!,
+        prompt: songPortText(inputPaths.get(1)) ?? "",
+        trackName: (params.trackName as string) ?? "guitar",
+      };
+      const result = await runSongNode("lego", payload, nodeId, segmentId);
+      const audio = result.outputs.find((o) => o.audio_path)?.audio_path;
+      if (audio) outputData.set(0, audio);
+      break;
+    }
+
+    case "songStems": {
+      const payload: SongTaskPayload = {
+        songName: (params.songName as string) || undefined,
+        srcAudioPath: primaryInput!,
+      };
+      const result = await runSongNode("stems", payload, nodeId, segmentId);
+      const stems = result.outputs.find((o) => o.stems)?.stems;
+      if (stems) {
+        // demucs 四轨固定顺序（与 UI outputLabels 一致）
+        DEMUCS_STEM_KINDS.forEach((cls, i) => {
+          const p = stems[cls];
+          if (p) outputData.set(i, p);
+        });
+      }
+      break;
+    }
+
+    case "songSheet": {
+      const payload: SongTaskPayload = {
+        prompt: (params.prompt as string) || undefined,
+      };
+      const result = await runSongNode("sheet", payload, nodeId, segmentId);
+      const outs = result.outputs;
+      const abcPath = outs.find((o) => o.abc_path)?.abc_path;
+      const midiPath = outs.find((o) => o.midi_path)?.midi_path;
+      if (abcPath) outputData.set(0, abcPath);
+      if (midiPath) {
+        outputData.set(1, midiPath);
+      } else if (abcPath) {
+        // 后端只回了 ABC 时，前端补一步 abc_to_midi（注意：入参是 ABC 文本内容而非路径）
+        const fs = await import("@tauri-apps/plugin-fs");
+        const abc = await fs.readTextFile(abcPath);
+        // Write beside the RUN's other artifacts, not next to the backend's ABC. The ABC lives in the
+        // song-task output dir, which is NOT run-unique — a re-run produced the same `.mid` path, so the
+        // reconciler's KEEP branch held the previous deposit and the new sheet never reached the lane.
+        const outPath = `${cacheDir}/sheet_${nodeId}.mid`;
+        const midi = await abcToMidi(abc, outPath);
+        outputData.set(1, midi || outPath);
+      }
+      break;
+    }
+
+    // ── P2 符号域原创化节点族（规划 7.1/4.2）：确定性变换、种子可复现。
+    // 音符族输出统一为音符数组 JSON（`[...]`），可被同族节点继续链式消费
+    // （resolveMidiNotes 同时接受数组与 {notes:[...]} 包裹两种形态）。
+
+    case "midiHumanize": {
+      const { notes } = await resolveMidiNotes(primaryInput!, "midiHumanize");
+      const out = humanizeNotes(notes, {
+        timingMs: (params.timingMs as number) ?? 12,
+        velocityJitter: (params.velocityJitter as number) ?? 8,
+        tempo: useProjectStore.getState().tempo,
+        seed: (params.seed as number) ?? DEFAULT_SYMBOL_SEED,
+      });
+      outputData.set(0, JSON.stringify(out));
+      break;
+    }
+
+    case "velocityCurve": {
+      const { notes } = await resolveMidiNotes(primaryInput!, "velocityCurve");
+      const curve = pickEnum<VelocityCurveKind>(params, "curve", ["crescendo", "decrescendo", "arch", "custom"], 2);
+      // custom 曲线：0-100 采样值序列（逗号/空白分隔），归一到 0..1（applyVelocityCurve 的 shape 约定）
+      const shape = ((params.customShape as string) ?? "")
+        .split(/[\s,;]+/)
+        .filter((s) => s !== "")
+        .map((s) => Number(s))
+        .filter((n) => Number.isFinite(n))
+        .map((n) => Math.min(1, Math.max(0, n / 100)));
+      const out = applyVelocityCurve(notes, {
+        curve,
+        intensity: (params.intensity as number) ?? 60,
+        ...(curve === "custom" && shape.length >= 2 ? { shape } : {}),
+      });
+      outputData.set(0, JSON.stringify(out));
+      break;
+    }
+
+    case "swingQuantize": {
+      const { notes } = await resolveMidiNotes(primaryInput!, "swingQuantize");
+      const out = swingQuantizeNotes(notes, {
+        grid: (params.grid as number) === 1 ? 16 : 8,
+        swing: (params.swing as number) ?? 55,
+        quantize: (params.quantize as number) ?? 0,
+      });
+      outputData.set(0, JSON.stringify(out));
+      break;
+    }
+
+    case "melodyReharm": {
+      const { notes } = await resolveMidiNotes(primaryInput!, "melodyReharm");
+      const out = degreeSwap(notes, {
+        density: (params.density as number) ?? 40,
+        seed: (params.seed as number) ?? DEFAULT_SYMBOL_SEED,
+      });
+      outputData.set(0, JSON.stringify(out));
+      break;
+    }
+
+    case "rhythmRestructure": {
+      const { notes } = await resolveMidiNotes(primaryInput!, "rhythmRestructure");
+      const proj = useProjectStore.getState();
+      const out = rhythmRestructure(notes, {
+        strength: (params.strength as number) ?? 60,
+        beatsPerBar: (params.beatsPerBar as number) ?? proj.timeSignature[0] ?? 4,
+        seed: (params.seed as number) ?? DEFAULT_SYMBOL_SEED,
+      });
+      outputData.set(0, JSON.stringify(out));
+      break;
+    }
+
+    case "contourMorph": {
+      const { notes } = await resolveMidiNotes(primaryInput!, "contourMorph");
+      const out = contourMorph(notes, {
+        strength: (params.strength as number) ?? 60,
+        keepClimax: (params.keepClimax as number) !== 0,
+        seed: (params.seed as number) ?? DEFAULT_SYMBOL_SEED,
+      });
+      outputData.set(0, JSON.stringify(out));
+      break;
+    }
+
+    case "motifDevelop": {
+      const { notes } = await resolveMidiNotes(primaryInput!, "motifDevelop");
+      const out = motifDevelop(notes, {
+        technique: pickEnum<MotifTechnique>(params, "technique", ["sequence", "invert", "retrograde", "augment", "diminish", "mixed"], 5),
+        motifBars: Math.min(4, Math.max(2, (params.motifBars as number) ?? 2)),
+        beatsPerBar: useProjectStore.getState().timeSignature[0] ?? 4,
+        seed: (params.seed as number) ?? DEFAULT_SYMBOL_SEED,
+      });
+      outputData.set(0, JSON.stringify(out));
+      break;
+    }
+
+    case "reharmonize": {
+      const { segments: chordSegs, bpm } = resolveChordSegments(primaryInput!, "reharmonize");
+      const out = reharmonizeSegments(chordSegs, {
+        strategies: [pickEnum<ReharmStrategy>(params, "strategy", ["diatonic", "borrowed", "tritone", "extension"], 0)],
+        density: (params.density as number) ?? 50,
+        seed: (params.seed as number) ?? DEFAULT_SYMBOL_SEED,
+      });
+      // 端口 0：chordBlock 形态（与 chordBlockIn 输出对齐，可回喂 melodyGen/harmonizer）；
+      // 端口 1：chordDetect 兼容的 segments + bars 概览
+      outputData.set(0, JSON.stringify(segmentsToChordBlock(out, bpm)));
+      const barTicks = (useProjectStore.getState().timeSignature[0] ?? 4) * TICKS_PER_BEAT;
+      outputData.set(1, JSON.stringify({
+        segments: out.map((s) => ({ startTick: s.startTick, endTick: s.endTick, label: s.label })),
+        bars: Math.ceil((out[out.length - 1]?.endTick ?? 0) / barTicks),
+      }));
+      break;
+    }
+
+    case "rhythmVariation": {
+      const { notes } = await resolveMidiNotes(primaryInput!, "rhythmVariation");
+      const out = varyRhythm(notes, {
+        mode: pickEnum<RhythmVariationMode>(params, "mode", ["push", "layBack", "syncopate", "sparse"], 0),
+        amount: (params.amount as number) ?? 50,
+        beatsPerBar: useProjectStore.getState().timeSignature[0] ?? 4,
+        seed: (params.seed as number) ?? DEFAULT_SYMBOL_SEED,
+      });
+      outputData.set(0, JSON.stringify(out));
+      break;
+    }
+
+    case "structureEdit": {
+      const { segments: chordSegs, bpm } = resolveChordSegments(primaryInput!, "structureEdit");
+      const beatsPerBar = useProjectStore.getState().timeSignature[0] ?? 4;
+      const out = editStructure(chordSegs, {
+        op: pickEnum<StructureOp>(params, "op", ["repeatTail", "dropTail", "transposeTail", "lengthenTail"], 0),
+        sectionBars: Math.min(8, Math.max(1, (params.sectionBars as number) ?? 4)),
+        beatsPerBar,
+        semitones: Math.min(12, Math.max(-12, (params.semitones as number) ?? 2)),
+        ppq: TICKS_PER_BEAT,
+      });
+      outputData.set(0, JSON.stringify(segmentsToChordBlock(out, bpm)));
+      outputData.set(1, JSON.stringify({
+        segments: out.map((s) => ({ startTick: s.startTick, endTick: s.endTick, label: s.label })),
+        bars: Math.ceil((out[out.length - 1]?.endTick ?? 0) / (beatsPerBar * TICKS_PER_BEAT)),
+      }));
+      break;
+    }
+
+    case "breathPlanner": {
+      const { notes, ppq } = await resolveMidiNotes(primaryInput!, "breathPlanner");
+      const lyrics = ((params.lyrics as string) ?? "").trim();
+      const points = planBreathPoints(notes, {
+        minGapBeats: (params.minGapBeats as number) ?? 1,
+        ppq,
+        ...(lyrics ? { lyrics } : {}),
+      });
+      // 端口 0：原样透传（换气点是「标注层」，不改变音符流）；端口 1：换气点 JSON
+      outputData.set(0, primaryInput!);
+      outputData.set(1, JSON.stringify(points));
+      break;
+    }
+
+    default:
+      // 良构的 WorkflowNodeType 到不了这里（input/output 在 :379/:520 已被上游跳过），
+      // 但旧存档或「union 加了新成员却没写 engine case」以前会静默落到这里——
+      // 返回空 outputData 后节点照样 "completed"，下游只会报出莫名其妙的 "no input connected"。
+      // 在源头响亮地失败，别让错误漂到下游。
+      throw new Error(`executeNode: unhandled node type "${nodeType}"`);
   }
 
   return outputData;
+}
+
+/** Single merged MIDI file → per-instrument note tracks in the main timeline.
+ *  The AMT sidecar writes ONE merged .mid whose TRACKS are the instruments (this is the
+ *  reliable source of per-stem data — the sidecar's `stem_midi_paths` map is unpopulated at
+ *  runtime). Repeating the same node REPLACES its prior auto-generated tracks (tagged by
+ *  `amtNodeId`) instead of piling up duplicates. Track names come from the MIDI TrackName
+ *  (fallback: <midi file base>_<index>), so "出来多少个就显示多少个，名字是乐器名"。 */
+async function materializeAmtMidiTracks(
+  nodeId: string,
+  midiPath: string,
+  trackMode = "multi_track",
+  sourceAudioPath?: string,
+  playbackDir?: string,
+): Promise<void> {
+  const showToast = useAppStore.getState().showToast;
+  // 撤销全覆盖（§user）：节点的"去旧建新"落轨合并成一步撤销——没有事务时，
+  // removeTrack + N×addTrack 会碎成 N+1 步，撤销只能一条条退，体验极差。
+  useHistoryStore.getState().beginTransaction();
+  try {
+    const project = useProjectStore.getState();
+    // Replace any earlier auto-generated tracks from THIS node (dedup on re-run).
+    for (const t of [...project.tracks]) {
+      if (t.amtNodeId === nodeId) useProjectStore.getState().removeTrack(t.id);
+    }
+
+    let score: ImportedAmtScore;
+    try {
+      score = await invoke<ImportedAmtScore>("import_score_file", { path: midiPath });
+    } catch (e) {
+      showToast(i18n.t("amt.midiParseFailed", "MIDI 解析失败：无法读取转换结果。"), "error");
+      return;
+    }
+    const tracks = score.tracks?.filter((t) => t.notes && t.notes.length > 0) ?? [];
+    if (tracks.length === 0) return;
+
+    const base =
+      midiPath.split(/[/\\]/).pop()?.replace(/\.[^.]+$/, "") || nodeId;
+    const addTrack = useProjectStore.getState().addTrack;
+
+    // Synthesize per-instrument playback WAVs so every materialized track is AUDIBLE —
+    // notes-only tracks play nothing in the DAW transport. Best-effort: on failure we
+    // still import the notes (visible, editable), they'd just be silent.
+    let wavs: Record<string, string> = {};
+    let fullMixWav: string | undefined;
+    if (sourceAudioPath && playbackDir) {
+      try {
+        const pb = await invoke<any>("amt_prepare_playback", {
+          midiPath,
+          audioPath: sourceAudioPath,
+          outputDir: playbackDir,
+        });
+        wavs = (pb?.instrument_wavs ?? {}) as Record<string, string>;
+        fullMixWav = pb?.transcription_wav || undefined;
+        await invoke("allow_asset_dir", { dir: playbackDir }).catch(() => {});
+      } catch (e) {
+        console.warn(`[amtMidi] playback synthesis failed for ${nodeId}:`, e);
+      }
+    }
+
+    // Per-track GM metadata (program+channel) maps track names onto the sidecar's
+    // "gm:NNN"/"drums" WAV keys — the human names alone never match.
+    let metaTracks: any[] = [];
+    try {
+      const meta = await invoke<any>("amt_midi_metadata", { midiPath });
+      metaTracks = meta?.tracks ?? [];
+    } catch { /* best-effort */ }
+    const metaFor = (name: string) =>
+      metaTracks.find((m: any) => m.name === name) || undefined;
+
+    /** Build a playable audio lane for one track's WAV (peaks + duration). */
+    const buildLane = async (
+      wav: string,
+      segmentId: string,
+      label: string,
+      maxTick: number,
+    ): Promise<ProcessedOutput | undefined> => {
+      let totalDurationMs = Math.max(1, (maxTick / (480 * (120 / 60))) * 1000);
+      let waveformPeaks: number[] | undefined;
+      try {
+        const data = await useAudioStore.getState().loadAudioFile(wav);
+        if (data.durationMs > 0) totalDurationMs = data.durationMs;
+        if (data.peaks && data.peaks.length > 0) waveformPeaks = data.peaks;
+      } catch { /* best-effort waveform */ }
+      return {
+        laneId: segmentId,
+        laneLabel: label,
+        group: label,
+        audioPath: wav,
+        totalDurationMs,
+        waveformPeaks,
+      } as ProcessedOutput;
+    };
+
+    // 单轨道模式：把所有乐器合并进一条轨道（轨道名 = MIDI 文件名），整条挂
+    // 全乐器混音 WAV 保证可播放。
+    if (trackMode === "single_track") {
+      const allNotes = tracks.flatMap((it) =>
+        it.notes.map((n) => ({
+          id: crypto.randomUUID(),
+          tick: n.tick,
+          duration: n.duration,
+          pitch: n.pitch,
+          lyric: n.lyric || "La",
+          velocity: n.velocity ?? 100,
+        })),
+      );
+      let maxTick = 0;
+      for (const n of allNotes) maxTick = Math.max(maxTick, n.tick + n.duration);
+      const segmentId = crypto.randomUUID();
+      const lane = fullMixWav ? await buildLane(fullMixWav, segmentId, base, maxTick) : undefined;
+      addTrack({
+        id: crypto.randomUUID(),
+        name: localizeTrackName(base, 0),
+        trackType: "instrument",
+        volumeDb: 0,
+        pan: 0,
+        muted: false,
+        solo: false,
+        expanded: false,
+        laneControls: {},
+        amtNodeId: nodeId,
+        segments: [
+          {
+            id: segmentId,
+            startTick: 0,
+            durationTicks: Math.max(1, maxTick),
+            content: { type: "notes", notes: allNotes },
+            processedOutputs: lane ? [lane] : undefined,
+          },
+        ],
+      });
+      showToast(i18n.t("amt.nodeTracksGenerated", { count: 1 }), "success");
+      return;
+    }
+
+    // 全轨道（multi_track）模式：一个乐器一条轨道，轨道名 = 乐器名，每条挂
+    // 对应乐器的合成 WAV 保证可播放。
+    for (let i = 0; i < tracks.length; i++) {
+      const it = tracks[i];
+      if (!it?.notes || it.notes.length === 0) continue;
+      const name = localizeTrackName(it.name?.trim() || `${base}_${i + 1}`, i);
+      const maxTick = it.notes.reduce(
+        (m, n) => Math.max(m, n.tick + n.duration),
+        it.start_tick ?? 0,
+      );
+      const mt = metaFor(it.name || "");
+      const wav = matchInstrumentWav(wavs, it.name || "", mt?.program ?? null, mt?.channel ?? null);
+      const segmentId = crypto.randomUUID();
+      const lane = wav ? await buildLane(wav, segmentId, name, maxTick) : undefined;
+      addTrack({
+        id: crypto.randomUUID(),
+        name,
+        trackType: "instrument",
+        volumeDb: 0,
+        pan: 0,
+        muted: false,
+        solo: false,
+        expanded: false,
+        laneControls: {},
+        amtNodeId: nodeId,
+        segments: [
+          {
+            id: segmentId,
+            startTick: 0,
+            durationTicks: Math.max(1, maxTick),
+            content: {
+              type: "notes",
+              notes: it.notes.map((n) => ({
+                id: crypto.randomUUID(),
+                tick: n.tick,
+                duration: n.duration,
+                pitch: n.pitch,
+                lyric: n.lyric || "La",
+                velocity: n.velocity ?? 100,
+              })),
+            },
+            processedOutputs: lane ? [lane] : undefined,
+          },
+        ],
+      });
+    }
+    showToast(i18n.t("amt.nodeTracksGenerated", { count: tracks.length }), "success");
+  } catch (e) {
+    // 从不阻断主流程：MIDI 落轨失败只提示，不影响工作流运行结果本身。
+    showToast(i18n.t("amt.nodeTracksFailed", "MIDI 音轨生成失败。"), "error");
+  } finally {
+    useHistoryStore.getState().commitTransaction();
+  }
+}
+
+/** Shape of `import_score_file`'s result consumed by materializeAmtMidiTracks. */
+interface ImportedAmtScore {
+  tracks: {
+    name: string;
+    start_tick: number;
+    notes: { tick: number; duration: number; pitch: number; lyric?: string; velocity?: number }[];
+  }[];
+}
+
+/** MuScriptor 乐器名 / 六轨分离 stem 名 → 中文轨道名。
+ *  匹配时先精确匹配乐器 ID，再大小写不敏感做子串兜底，
+ *  最后 fallback 到原始名（MIDI TrackName 可能是任意字符串）。 */
+const STEM_ZH_MAP: Record<string, string> = {
+  // 六轨分离 stem 名
+  vocals: "人声",
+  voice: "人声",
+  drums: "鼓组",
+  drum: "鼓组",
+  bass: "贝斯",
+  guitar: "吉他",
+  piano: "钢琴",
+  other: "其他",
+  // MuScriptor 乐器名
+  acoustic_piano: "原声钢琴",
+  electric_piano: "电钢琴",
+  chromatic_percussion: "半音阶打击乐",
+  organ: "风琴",
+  acoustic_guitar: "原声吉他",
+  clean_electric_guitar: "干净电吉他",
+  distorted_electric_guitar: "失真电吉他",
+  acoustic_bass: "原声贝斯",
+  electric_bass: "电贝斯",
+  violin: "小提琴",
+  viola: "中提琴",
+  cello: "大提琴",
+  contrabass: "低音提琴",
+  orchestral_harp: "管弦乐竖琴",
+  timpani: "定音鼓",
+  string_ensemble: "弦乐合奏",
+  synth_strings: "合成弦乐",
+  orchestra_hit: "管弦乐击奏",
+  trumpet: "小号",
+  trombone: "长号",
+  tuba: "大号",
+  french_horn: "圆号",
+  brass_section: "铜管乐组",
+  soprano_and_alto_sax: "高音/中音萨克斯",
+  tenor_sax: "次中音萨克斯",
+  baritone_sax: "上低音萨克斯",
+  oboe: "双簧管",
+  english_horn: "英国管",
+  bassoon: "巴松管",
+  clarinet: "单簧管",
+  flutes: "长笛组",
+  synth_lead: "合成主音",
+  synth_pad: "合成铺底",
+};
+
+function localizeTrackName(raw: string | undefined | null, index: number): string {
+  if (!raw) return `轨道 ${index + 1}`;
+  const trimmed = raw.trim();
+  // 先精确匹配
+  if (STEM_ZH_MAP[trimmed]) return STEM_ZH_MAP[trimmed]!;
+  // 再做大小写不敏感子串匹配（处理 "Drums-1" / "vocals_clean" 这类）
+  const lower = trimmed.toLowerCase();
+  for (const [key, zh] of Object.entries(STEM_ZH_MAP)) {
+    if (lower.includes(key)) return zh;
+  }
+  // 最后 fallback：如果全是英文就原样返回（可能是 unknown instrument），否则原样
+  return trimmed;
 }
 
 /**
@@ -846,9 +2561,20 @@ export function collectCachedPaths(
       missing = true;
       continue;
     }
+    // MIDI is NOT an audio lane: deposits always decode via load_audio_file, which a .mid can never
+    // satisfy (ffmpeg "Invalid data"). AMT's MIDI result is surfaced as NOTE tracks by
+    // materializeAmtMidiTracks instead — skip it here so the Output node never errors/litters a lane.
+    if (!isAudioFile(audioPath)) continue;
     paths.push({ laneId: laneIdFor(outputNodeId, edge), laneLabel: laneLabelFor(graph, base, gn.inEdges.length, edge), group: base, audioPath, outputNodeId });
   }
   return { paths, missing };
+}
+
+/** Is this a decodable AUDIO file (not a MIDI/score file)? Deposit-as-lane and matching all go
+ *  through audio decode, so non-audio outputs (MIDI) must be excluded from audio lanes. */
+export function isAudioFile(p: string): boolean {
+  const ext = p.split(/[/\\]/).pop()?.split(".").pop()?.toLowerCase() ?? "";
+  return !["mid", "midi", "kar", "smf"].includes(ext);
 }
 
 /**
